@@ -1,13 +1,17 @@
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../app.js";
 import { openPactFuseDb } from "../db/index.js";
+import { completeJob, enqueueJob, leaseNextJob } from "../services/jobs.js";
 import { createVerifierAdapter } from "../services/verifier.js";
 import type { ServiceCtx } from "../types.js";
 
-function makeApp() {
+function makeApp(dbPath = ":memory:") {
   const ctx: ServiceCtx = {
-    db: openPactFuseDb(":memory:"),
+    db: openPactFuseDb(dbPath),
     verifier: createVerifierAdapter(),
     clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
     logger: {
@@ -40,6 +44,22 @@ describe("pactfuse-api P0", () => {
     expect(first.json.data.sessionId).toBe(second.json.data.sessionId);
   });
 
+  it("serializes concurrent idempotent session creation to one stored event", async () => {
+    const { app } = makeApp();
+    const body = { idempotencyKey: "sess-concurrent", payload: { label: "concurrent" } };
+
+    const results = await Promise.all(Array.from({ length: 16 }, () => post(app, "/api/v1/sessions", body)));
+    const sessionIds = new Set(results.map((result) => result.json.data.sessionId));
+    const requestIds = new Set(results.map((result) => result.json.requestId));
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${results[0].json.data.sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(results.every((result) => result.status === 201)).toBe(true);
+    expect(sessionIds.size).toBe(1);
+    expect(requestIds.size).toBe(1);
+    expect(replayJson.data.events).toHaveLength(1);
+  });
+
   it("returns deterministic idempotency conflicts for the same key with a different hash", async () => {
     const { app } = makeApp();
 
@@ -64,6 +84,27 @@ describe("pactfuse-api P0", () => {
 
     expect(res.status).toBe(400);
     expect(res.json.error.code).toBe("bad_request");
+  });
+
+  it("rejects invalid JSON and oversized JSON bodies as bad requests", async () => {
+    const { app } = makeApp();
+    const invalid = await app.request("/api/v1/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not-json",
+    });
+    const oversized = await app.request("/api/v1/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(3 * 1024 * 1024) },
+      body: "{}",
+    });
+    const invalidJson = await invalid.json();
+    const oversizedJson = await oversized.json();
+
+    expect(invalid.status).toBe(400);
+    expect(invalidJson.error.code).toBe("bad_request");
+    expect(oversized.status).toBe(400);
+    expect(oversizedJson.error.code).toBe("bad_request");
   });
 
   it("keeps the verifier route fail-closed", async () => {
@@ -94,6 +135,16 @@ describe("pactfuse-api P0", () => {
     expect(json.data.rows).toHaveLength(6);
     expect(json.data.rows.every((row: { status: string }) => row.status === "pending")).toBe(true);
     expect(json.data.winnerClaimAllowed).toBe(false);
+  });
+
+  it("returns bad_request for missing evidence query parameters", async () => {
+    const { app } = makeApp();
+
+    const res = await app.request("/api/v1/evidence/judge-check");
+    const json = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(json.error.code).toBe("bad_request");
   });
 
   it("appends monotonic evidence event sequences", async () => {
@@ -148,6 +199,67 @@ describe("pactfuse-api P0", () => {
     expect(ingest.json.data.proofAuthority).toBe(false);
     expect(judgeJson.data.rows.some((row: { status: string }) => row.status === "pass")).toBe(false);
     expect(judgeJson.data.winnerClaimAllowed).toBe(false);
+  });
+
+  it("keeps artifact reads fail-closed and validates path parameters", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-artifact");
+    const spendId = hex32("artifact-spend");
+    const artifactHash = hex32("artifact");
+
+    const pending = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/0x1234/${artifactHash}`);
+    const pendingJson = await pending.json();
+    const invalidPayer = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/not-a-hex/${artifactHash}`);
+    const invalidJson = await invalidPayer.json();
+
+    expect(pending.status).toBe(423);
+    expect(pendingJson.error.code).toBe("proof_pending");
+    expect(invalidPayer.status).toBe(400);
+    expect(invalidJson.error.code).toBe("bad_request");
+  });
+
+  it("persists sessions across database reopen", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-api-"));
+    const dbPath = join(dir, "pactfuse.sqlite");
+    try {
+      const first = makeApp(dbPath);
+      const sessionId = await createSession(first.app, "sess-persist");
+      first.ctx.db.sqlite.close();
+
+      const second = makeApp(dbPath);
+      const res = await second.app.request(`/api/v1/sessions/${sessionId}`);
+      const json = await res.json();
+
+      expect(res.status).toBe(200);
+      expect(json.data.sessionId).toBe(sessionId);
+      expect(json.data.latestEventSeq).toBe(1);
+      second.ctx.db.sqlite.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leases jobs once and preserves dedupe identity", async () => {
+    const { ctx } = makeApp();
+    const job = enqueueJob(ctx, {
+      kind: "index-chain-window",
+      dedupeKey: "chain:1:100",
+      payload: { fromBlock: "1", toBlock: "100" },
+    });
+    const duplicate = enqueueJob(ctx, {
+      kind: "index-chain-window",
+      dedupeKey: "chain:1:100",
+      payload: { fromBlock: "1", toBlock: "100" },
+    });
+    const lease = leaseNextJob(ctx, ["index-chain-window"], "tester");
+    const empty = leaseNextJob(ctx, ["index-chain-window"], "tester");
+    const done = completeJob(ctx, job.jobId, "succeeded");
+
+    expect(duplicate.jobId).toBe(job.jobId);
+    expect(lease?.jobId).toBe(job.jobId);
+    expect(lease?.attempts).toBe(1);
+    expect(empty).toBeNull();
+    expect(done.status).toBe("succeeded");
   });
 
   it("keeps missing live evidence from enabling winner claims", async () => {

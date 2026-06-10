@@ -55,6 +55,8 @@ const JUDGE_ROWS = [
   ["lease_execution", "Lease execution", "pending MCP transcript and lease run proof"],
 ] as const;
 
+const idempotencyLocks = new Map<string, Promise<void>>();
+
 export async function createSession(input: CreateSessionInput, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
   const parsed = parseStrict(CreateSessionInputSchema, input);
   return withIdempotency(ctx, "sessions:create", parsed.idempotencyKey, parsed, async (requestId) => {
@@ -610,6 +612,64 @@ export async function readAgentTranscript(sessionId: string, ctx: ServiceCtx): P
   };
 }
 
+export async function readArtifactAccess(
+  input: {
+    sessionId: string;
+    spendId: string;
+    payer: string;
+    artifactHash: string;
+    bearerToken: string | null;
+  },
+  ctx: ServiceCtx,
+): Promise<ServiceResult<unknown>> {
+  const requestId = newRequestId("artifact_access");
+  const sessionId = parseStrict(Hex32Schema, input.sessionId);
+  const spendId = parseStrict(Hex32Schema, input.spendId);
+  const artifactHash = parseStrict(Hex32Schema, input.artifactHash);
+  assertSession(ctx, sessionId, requestId);
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT token_hash, status
+       FROM artifact_access_tokens
+       WHERE session_id = ? AND spend_id = ? AND payer = ? AND artifact_hash = ?`,
+    )
+    .all(sessionId, spendId, input.payer, artifactHash) as Row[];
+  if (rows.length === 0) {
+    return {
+      ok: false,
+      requestId,
+      error: proofPendingError(requestId, "artifact access is pending live settlement and bearer-token proof"),
+    };
+  }
+  if (!input.bearerToken) {
+    return {
+      ok: false,
+      requestId,
+      error: proofPendingError(requestId, "artifact bearer token is required but no proof-valid token is active"),
+    };
+  }
+  const tokenHash = sha256Hex(input.bearerToken);
+  const active = rows.find((row) => row.status === "active" && row.token_hash === tokenHash);
+  if (!active) {
+    return {
+      ok: false,
+      requestId,
+      error: proofPendingError(requestId, "artifact bearer token is not backed by a proof-valid active access row"),
+    };
+  }
+  return {
+    ok: true,
+    requestId,
+    data: {
+      sessionId,
+      spendId,
+      artifactHash,
+      status: "available",
+      winnerClaimAllowed: false,
+    },
+  };
+}
+
 export function listEventsAfterEventId(ctx: ServiceCtx, sessionId: string, afterEventId: string | null): EvidenceEvent[] {
   const parsedSessionId = parseStrict(Hex32Schema, sessionId);
   assertSession(ctx, parsedSessionId, newRequestId("stream"));
@@ -724,6 +784,18 @@ async function withIdempotency<T>(
   requestBody: unknown,
   executor: (requestId: string) => Promise<ServiceResult<T>> | ServiceResult<T>,
 ): Promise<ServiceResult<T>> {
+  return withProcessLock(`${actionScope}:${idempotencyKey}`, async () =>
+    withIdempotencyUnlocked(ctx, actionScope, idempotencyKey, requestBody, executor),
+  );
+}
+
+async function withIdempotencyUnlocked<T>(
+  ctx: ServiceCtx,
+  actionScope: string,
+  idempotencyKey: string,
+  requestBody: unknown,
+  executor: (requestId: string) => Promise<ServiceResult<T>> | ServiceResult<T>,
+): Promise<ServiceResult<T>> {
   const requestHash = hashJson(requestBody);
   const existing = ctx.db.sqlite
     .prepare("SELECT request_id, request_hash, response_json FROM api_requests WHERE action_scope = ? AND idempotency_key = ?")
@@ -751,6 +823,25 @@ async function withIdempotency<T>(
     )
     .run(requestId, actionScope, idempotencyKey, requestHash, JSON.stringify(result), ctx.clock.now().toISOString());
   return result;
+}
+
+async function withProcessLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = idempotencyLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chained = previous.then(() => next, () => next);
+  idempotencyLocks.set(key, chained);
+  await previous.catch(() => undefined);
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (idempotencyLocks.get(key) === chained) {
+      idempotencyLocks.delete(key);
+    }
+  }
 }
 
 function getSessionRow(ctx: ServiceCtx, sessionId: string): Row | undefined {

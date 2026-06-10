@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import {
+  HexSchema,
   Hex32Schema,
   SessionScopedEnvelopeSchema,
   CreateSessionInputSchema,
@@ -17,6 +18,7 @@ import {
   ingestCawReceiptBundle,
   listEventsAfterEventId,
   readAgentTranscript,
+  readArtifactAccess,
   readJudgeCheck,
   readRunnerHeartbeat,
   refundUndeliveredArtifact,
@@ -26,7 +28,9 @@ import {
   signArtifactQuote,
   verifyEvidenceForSession,
 } from "./services/service.js";
-import { newRequestId, proofPendingError, toApiError } from "./util.js";
+import { badRequestError, newRequestId, toApiError } from "./util.js";
+
+const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
 
 const ROUTES = [
   ["GET", "/healthz"],
@@ -117,15 +121,13 @@ export function createApp(ctx: ServiceCtx): Hono {
   );
 
   app.get("/api/v1/artifacts/:sessionId/:spendId/:payer/:artifactHash", async (c) => {
-    const requestId = newRequestId("artifact");
-    Hex32Schema.parse(c.req.param("sessionId"));
-    Hex32Schema.parse(c.req.param("spendId"));
-    Hex32Schema.parse(c.req.param("artifactHash"));
-    return send(c, {
-      ok: false,
-      requestId,
-      error: proofPendingError(requestId, "artifact access is pending live settlement and bearer-token proof"),
-    });
+    const sessionId = Hex32Schema.parse(c.req.param("sessionId"));
+    const spendId = Hex32Schema.parse(c.req.param("spendId"));
+    const payer = HexSchema.parse(c.req.param("payer"));
+    const artifactHash = Hex32Schema.parse(c.req.param("artifactHash"));
+    const authorization = c.req.header("authorization") ?? "";
+    const bearerToken = authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : null;
+    return send(c, await readArtifactAccess({ sessionId, spendId, payer, artifactHash, bearerToken }, ctx));
   });
 
   app.post("/api/v1/artifacts/refund", async (c) =>
@@ -179,19 +181,35 @@ export function createApp(ctx: ServiceCtx): Hono {
 }
 
 async function readJson(c: Context): Promise<unknown> {
-  try {
-    return await c.req.json();
-  } catch {
+  const contentLength = c.req.header("content-length");
+  if (contentLength && Number(contentLength) > MAX_JSON_BODY_BYTES) {
+    throwBadRequest("request body exceeds the 2 MiB limit", { contentLength });
+  }
+  const text = await c.req.text();
+  if (Buffer.byteLength(text, "utf8") > MAX_JSON_BODY_BYTES) {
+    throwBadRequest("request body exceeds the 2 MiB limit");
+  }
+  if (text.trim() === "") {
     return {};
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throwBadRequest("request body must be valid JSON");
   }
 }
 
 function requiredQuery(c: Context, name: string): string {
   const value = c.req.query(name);
   if (!value) {
-    throw new Error(`missing query parameter: ${name}`);
+    throwBadRequest(`missing query parameter: ${name}`);
   }
   return value;
+}
+
+function throwBadRequest(message: string, details?: Record<string, unknown>): never {
+  const requestId = newRequestId("bad_request");
+  throw Object.assign(new Error(message), { apiError: badRequestError(requestId, message, details) });
 }
 
 function send<T>(c: Context, result: ServiceResult<T>, okStatus = 200): Response {
@@ -206,6 +224,10 @@ function statusFor(code: string): number {
   switch (code) {
     case "bad_request":
       return 400;
+    case "unauthorized":
+      return 401;
+    case "forbidden":
+      return 403;
     case "not_found":
       return 404;
     case "idempotency_conflict":
