@@ -670,6 +670,51 @@ export async function readArtifactAccess(
   };
 }
 
+export function recordMcpAdapterCall(
+  input: {
+    sessionId?: string | null;
+    toolName: string;
+    request: Record<string, JsonValue>;
+    response: Record<string, JsonValue>;
+    status: "succeeded" | "failed" | "blocked";
+  },
+  ctx: ServiceCtx,
+): { callId: string; requestHash: string; responseHash: string; evidenceEventId?: string } {
+  const createdAt = ctx.clock.now().toISOString();
+  const requestHash = hashJson(input.request);
+  const responseHash = hashJson(input.response);
+  const callId = hashJson({
+    sessionId: input.sessionId ?? null,
+    toolName: input.toolName,
+    requestHash,
+    responseHash,
+    createdAt,
+  });
+  ctx.db.sqlite
+    .prepare(
+      `INSERT INTO mcp_adapter_calls
+        (call_id, session_id, tool_name, request_hash, response_hash, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(callId, input.sessionId ?? null, input.toolName, requestHash, responseHash, input.status, createdAt);
+  if (!input.sessionId) {
+    return { callId, requestHash, responseHash };
+  }
+  const event = appendEvidenceEvent(ctx, {
+    sessionId: input.sessionId,
+    authority: "operator",
+    kind: "mcp.adapter.call",
+    payload: {
+      callId,
+      toolName: input.toolName,
+      requestHash,
+      responseHash,
+      status: input.status,
+    },
+  });
+  return { callId, requestHash, responseHash, evidenceEventId: event.eventId };
+}
+
 export function listEventsAfterEventId(ctx: ServiceCtx, sessionId: string, afterEventId: string | null): EvidenceEvent[] {
   const parsedSessionId = parseStrict(Hex32Schema, sessionId);
   assertSession(ctx, parsedSessionId, newRequestId("stream"));

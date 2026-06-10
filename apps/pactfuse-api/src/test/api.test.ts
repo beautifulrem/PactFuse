@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { createApp } from "../app.js";
 import { openPactFuseDb } from "../db/index.js";
 import { completeJob, enqueueJob, leaseNextJob } from "../services/jobs.js";
+import { recordMcpAdapterCall } from "../services/service.js";
 import { createVerifierAdapter } from "../services/verifier.js";
 import type { ServiceCtx } from "../types.js";
 
@@ -260,6 +261,28 @@ describe("pactfuse-api P0", () => {
     expect(lease?.attempts).toBe(1);
     expect(empty).toBeNull();
     expect(done.status).toBe("succeeded");
+  });
+
+  it("records MCP adapter calls with request and response hashes", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-mcp-audit");
+
+    const call = recordMcpAdapterCall(
+      {
+        sessionId,
+        toolName: "pactfuse_get_judge_check",
+        request: { sessionId },
+        response: { winnerClaimAllowed: false },
+        status: "succeeded",
+      },
+      ctx,
+    );
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(call.callId).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(call.evidenceEventId).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).toContain("mcp.adapter.call");
   });
 
   it("keeps missing live evidence from enabling winner claims", async () => {

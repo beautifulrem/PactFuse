@@ -97,6 +97,16 @@ export function forbiddenError(requestId: string, message: string): ApiError {
   };
 }
 
+export function rateLimitedError(requestId: string): ApiError {
+  return {
+    code: "rate_limited",
+    message: "request rate limit exceeded",
+    requestId,
+    retryable: true,
+    downgrade: "none",
+  };
+}
+
 export function notFoundError(requestId: string, subject: string): ApiError {
   return {
     code: "not_found",

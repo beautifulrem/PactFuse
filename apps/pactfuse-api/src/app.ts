@@ -28,9 +28,11 @@ import {
   signArtifactQuote,
   verifyEvidenceForSession,
 } from "./services/service.js";
-import { badRequestError, newRequestId, toApiError } from "./util.js";
+import { badRequestError, newRequestId, rateLimitedError, toApiError } from "./util.js";
 
 const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_REQUESTS = 600;
 
 const ROUTES = [
   ["GET", "/healthz"],
@@ -58,12 +60,30 @@ const ROUTES = [
 
 export function createApp(ctx: ServiceCtx): Hono {
   const app = new Hono();
+  const rateBuckets = new Map<string, { count: number; resetAt: number }>();
 
   app.onError((error, c) => {
     const requestId = newRequestId("unhandled");
     const apiError = toApiError(error, requestId);
     ctx.logger.error({ error, requestId }, "unhandled API error");
     return c.json({ ok: false, requestId, error: apiError }, statusFor(apiError.code) as 400);
+  });
+
+  app.use("*", async (c, next) => {
+    const now = Date.now();
+    const client = c.req.header("x-forwarded-for") ?? c.req.header("cf-connecting-ip") ?? "local";
+    const key = `${client}:${c.req.method}:${c.req.path}`;
+    const bucket = rateBuckets.get(key);
+    const nextBucket =
+      !bucket || bucket.resetAt <= now ? { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS } : { ...bucket, count: bucket.count + 1 };
+    rateBuckets.set(key, nextBucket);
+    c.header("x-ratelimit-limit", String(RATE_LIMIT_MAX_REQUESTS));
+    c.header("x-ratelimit-remaining", String(Math.max(0, RATE_LIMIT_MAX_REQUESTS - nextBucket.count)));
+    if (nextBucket.count > RATE_LIMIT_MAX_REQUESTS) {
+      const requestId = newRequestId("rate_limit");
+      return c.json({ ok: false, requestId, error: rateLimitedError(requestId) }, 429);
+    }
+    await next();
   });
 
   app.get("/healthz", (c) =>
@@ -238,6 +258,8 @@ function statusFor(code: string): number {
     case "verifier_failed_closed":
     case "mode_locked":
       return 422;
+    case "rate_limited":
+      return 429;
     default:
       return 500;
   }

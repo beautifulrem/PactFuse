@@ -54,6 +54,7 @@ export const ApiErrorCodeSchema = z.enum([
   "proof_blocked",
   "verifier_failed_closed",
   "mode_locked",
+  "rate_limited",
   "internal_error",
 ]);
 
