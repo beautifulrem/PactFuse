@@ -59,6 +59,13 @@ const ROUTES = [
   ["GET", "/api/v1/evidence/stream"],
 ] as const;
 
+const PROOF_FIELD_ROUTES: Record<string, string[]> = {
+  "/api/v1/caw/receipts/ingest": ["proofAuthority", "winnerClaimAllowed"],
+  "/api/v1/evidence/verify": ["schemaOk", "proofChipAllowed", "winnerClaimAllowed", "finalVerifierComplete"],
+  "/api/v1/evidence/judge-check": ["winnerClaimAllowed", "rows.status", "rows.authority"],
+  "/api/v1/evidence/replay-bundle": ["winnerClaimAllowed", "eventRoot", "judgeCheck"],
+};
+
 export function createApp(ctx: ServiceCtx): Hono {
   const app = new Hono();
   const rateBuckets = new Map<string, { count: number; resetAt: number }>();
@@ -270,12 +277,26 @@ function statusFor(code: string): number {
 function buildOpenApi(): Record<string, unknown> {
   const paths: Record<string, Record<string, unknown>> = {};
   for (const [method, path] of ROUTES) {
+    const proofFields = PROOF_FIELD_ROUTES[path] ?? [];
     paths[path] = {
       ...(paths[path] ?? {}),
       [method.toLowerCase()]: {
         operationId: `${method.toLowerCase()}_${path.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "")}`,
+        ...(proofFields.length > 0
+          ? {
+              "x-pactfuse-proof-fields": proofFields,
+              "x-pactfuse-proof-authority": "fail-closed",
+            }
+          : {}),
         responses: {
-          "200": { description: "PactFuse fail-closed P0 response" },
+          "200": {
+            description: "PactFuse fail-closed P0 response",
+            content: {
+              "application/json": {
+                schema: responseSchemaFor(path),
+              },
+            },
+          },
         },
       },
     };
@@ -288,6 +309,84 @@ function buildOpenApi(): Record<string, unknown> {
       description: "Generated from the P0 route registry and shared strict schemas. Proof authority remains fail-closed.",
     },
     paths,
+    components: {
+      schemas: {
+        ApiError: {
+          type: "object",
+          required: ["code", "message", "requestId", "retryable", "downgrade"],
+          properties: {
+            code: { type: "string" },
+            message: { type: "string" },
+            requestId: { type: "string" },
+            retryable: { type: "boolean" },
+            downgrade: { enum: ["pending", "blocked", "failed", "none"] },
+          },
+        },
+        ServiceError: {
+          type: "object",
+          required: ["ok", "requestId", "error"],
+          properties: {
+            ok: { const: false },
+            requestId: { type: "string" },
+            error: { $ref: "#/components/schemas/ApiError" },
+          },
+        },
+        FailClosedProofState: {
+          type: "object",
+          required: ["proofChipAllowed", "winnerClaimAllowed", "finalVerifierComplete"],
+          properties: {
+            schemaOk: { type: "boolean" },
+            proofAuthority: { const: false },
+            proofChipAllowed: { const: false },
+            winnerClaimAllowed: { const: false },
+            finalVerifierComplete: { const: false },
+          },
+        },
+        VerifierRunResponse: serviceResponseSchema({
+          allOf: [{ $ref: "#/components/schemas/FailClosedProofState" }],
+        }),
+        JudgeCheckData: {
+          type: "object",
+          required: ["winnerClaimAllowed", "rows"],
+          properties: {
+            winnerClaimAllowed: { const: false },
+            rows: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["status", "authority"],
+                properties: {
+                  status: { enum: ["pending", "pass", "fail", "blocked", "fixture", "manual"] },
+                  authority: { enum: ["proof", "delivery", "operator", "advisory", "fixture"] },
+                },
+              },
+            },
+          },
+        },
+        JudgeCheckResponse: serviceResponseSchema({
+          $ref: "#/components/schemas/JudgeCheckData",
+        }),
+        CawReceiptIngestResponse: serviceResponseSchema({
+          type: "object",
+          required: ["receiptBundleHash", "proofAuthority", "winnerClaimAllowed"],
+          properties: {
+            receiptBundleHash: { type: "string" },
+            proofAuthority: { const: false },
+            winnerClaimAllowed: { const: false },
+          },
+        }),
+        ReplayBundleResponse: serviceResponseSchema({
+          type: "object",
+          required: ["winnerClaimAllowed", "eventRoot", "judgeCheck"],
+          properties: {
+            winnerClaimAllowed: { const: false },
+            eventRoot: { type: "string" },
+            judgeCheck: { $ref: "#/components/schemas/JudgeCheckData" },
+          },
+        }),
+        ServiceResponse: serviceResponseSchema({ type: "object" }),
+      },
+    },
     "x-pactfuse-modes": {
       CLAIM_MODE: "simulated",
       PAYMENT_MODE: "mocked",
@@ -295,5 +394,37 @@ function buildOpenApi(): Record<string, unknown> {
       IDENTITY_MODE: "pending",
       WINNER_CLAIM_ALLOWED: false,
     },
+  };
+}
+
+function responseSchemaFor(path: string): Record<string, unknown> {
+  switch (path) {
+    case "/api/v1/evidence/verify":
+      return { $ref: "#/components/schemas/VerifierRunResponse" };
+    case "/api/v1/evidence/judge-check":
+      return { $ref: "#/components/schemas/JudgeCheckResponse" };
+    case "/api/v1/caw/receipts/ingest":
+      return { $ref: "#/components/schemas/CawReceiptIngestResponse" };
+    case "/api/v1/evidence/replay-bundle":
+      return { $ref: "#/components/schemas/ReplayBundleResponse" };
+    default:
+      return { $ref: "#/components/schemas/ServiceResponse" };
+  }
+}
+
+function serviceResponseSchema(data: Record<string, unknown>): Record<string, unknown> {
+  return {
+    oneOf: [
+      {
+        type: "object",
+        required: ["ok", "requestId", "data"],
+        properties: {
+          ok: { const: true },
+          requestId: { type: "string" },
+          data,
+        },
+      },
+      { $ref: "#/components/schemas/ServiceError" },
+    ],
   };
 }

@@ -167,6 +167,30 @@ describe("pactfuse-api P0", () => {
     expect(json.error.code).toBe("bad_request");
   });
 
+  it("publishes fail-closed proof fields in the OpenAPI contract", async () => {
+    const { app } = makeApp();
+
+    const res = await app.request("/api/v1/openapi.json");
+    const json = await res.json();
+    const serialized = JSON.stringify(json);
+
+    expect(res.status).toBe(200);
+    expect(json.paths["/api/v1/evidence/verify"].post["x-pactfuse-proof-fields"]).toEqual([
+      "schemaOk",
+      "proofChipAllowed",
+      "winnerClaimAllowed",
+      "finalVerifierComplete",
+    ]);
+    expect(json.paths["/api/v1/caw/receipts/ingest"].post["x-pactfuse-proof-fields"]).toEqual([
+      "proofAuthority",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.components.schemas.FailClosedProofState.properties.proofChipAllowed.const).toBe(false);
+    expect(json.components.schemas.FailClosedProofState.properties.winnerClaimAllowed.const).toBe(false);
+    expect(json.components.schemas.FailClosedProofState.properties.finalVerifierComplete.const).toBe(false);
+    expect(serialized).not.toContain('"verified"');
+  });
+
   it("appends monotonic evidence event sequences", async () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-events");
