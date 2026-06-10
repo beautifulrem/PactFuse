@@ -1,0 +1,159 @@
+{
+  "statusFields": {
+    "mode": "pending",
+    "isRealEvidence": false,
+    "winnerClaimAllowed": false,
+    "rule": "schema and verifier-preflight example only; replace every placeholder with live CAW, chain, artifact, and balance evidence before any winner claim"
+  },
+  "artifactType": "source-bound-code-scan-mcp-lease",
+  "pactId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "spendId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "toolId": "mcp-code-scan-basic",
+  "toolEndpoint": "https://demo.pactfuse.dev/mcp/code-scan",
+  "allowedAgentWallet": "0x0000000000000000000000000000000000000000",
+  "leaseValidUntil": "2026-06-10T12:00:00Z",
+  "blastRadiusGroupId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "sourceSetHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "sourceFreshnessAtPayment": "Active",
+  "sourceRef": "ipfs://pending-mcp-manifest-cid/mcp-manifest.json",
+  "canonicalSourceJsonHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "challengeEvidence": {
+    "pinnedManifestTools": [
+      "scan_repo",
+      "read_file"
+    ],
+    "evidenceRef": "ipfs://pending-later-manifest-cid/later-manifest-with-write-file.json",
+    "evidenceRefTools": [
+      "scan_repo",
+      "read_file",
+      "write_file"
+    ],
+    "challengeReason": "signer key revoked or later evidence shows write_file"
+  },
+  "issuer": "0x0000000000000000000000000000000000000000",
+  "issuerSignature": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "sourceHashes": [
+    "0x0000000000000000000000000000000000000000000000000000000000000000"
+  ],
+  "cawPolicyDigest": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "quoteHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "quoteNonce": "123",
+  "priceDisclosure": {
+    "price": "200000",
+    "maxPrice": "200000",
+    "paymentToken": "0x0000000000000000000000000000000000000000",
+    "tokenMode": "local-mocked",
+    "sourceFreshnessRequired": true,
+    "sourceRef": "ipfs://pending-mcp-manifest-cid/mcp-manifest.json",
+    "displayedDisclosureHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "deliveryPreflight": {
+    "manifestFetch": "pending",
+    "endpointReachability": "pending",
+    "leaseDryRun": "pending",
+    "artifactPayloadHashReady": "pending",
+    "quoteSignedAfterPreflight": false
+  },
+  "agentTranscript": {
+    "format": "mcp-json-rpc",
+    "toolsListHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "toolsCallHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "transcriptHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "boundedToPinnedManifest": false,
+    "externalTarget": {
+      "repoUrl": "pending",
+      "commit": "pending",
+      "ownerIsTeam": true,
+      "expectedFindingClass": "pending",
+      "observedFindingHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "cawReceiptIngest": {
+    "source": "fixture",
+    "fetchedAt": "pending",
+    "rawReceiptBundleHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "operationCount": 0,
+    "manualEntry": true
+  },
+  "replayBundle": {
+    "schema": "PACTFUSE_EVIDENCE_V1",
+    "sessionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "replayBundleHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "settlementTxHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "artifactPayloadHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "receiptPackHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "affectedSpendIdsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "tripProof": {
+    "pactA": {
+      "txHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "event": "SpendTripped",
+      "membershipBranch": [
+        "0x0000000000000000000000000000000000000000000000000000000000000000"
+      ]
+    },
+    "pactB": {
+      "txHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "event": "SpendTripped",
+      "membershipBranch": [
+        "0x0000000000000000000000000000000000000000000000000000000000000000"
+      ]
+    },
+    "pactC": {
+      "negativeProof": "challenged source absent from sourceHashes"
+    }
+  },
+  "balanceProof": {
+    "payerBefore": "1000000",
+    "payerAfter": "800000",
+    "marketBefore": "0",
+    "marketAfter": "200000"
+  },
+  "paymentProof": {
+    "mode": "gate-paid-artifact-real",
+    "gatePaid": {
+      "approveTxHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "allowanceBefore": "200000",
+      "allowanceAfter": "0",
+      "approvedAmount": "200000",
+      "quotePrice": "200000",
+      "policyTxCount": 2,
+      "approveBeforeActivate": true
+    },
+    "permit": null
+  },
+  "checks": {
+    "manifestSignature": "ok",
+    "endpointReachability": "ok",
+    "dangerousTools": [
+      "write_file"
+    ],
+    "recommendedCawPolicy": {
+      "allowedCalls": [
+        {
+          "target": "PUBLIC_TESTNET_MOCK_ERC20",
+          "selector": "approve(address,uint256)",
+          "constraints": {
+            "spender": "ProcurementGate",
+            "amountMax": "200000"
+          }
+        },
+        {
+          "target": "ProcurementGate",
+          "selector": "activateTool(bytes32,bytes32,bytes32,address,uint256,bytes,bytes)",
+          "constraints": {
+            "quotePrice": "Gate-enforced exact value",
+            "paymentAuth": "empty"
+          }
+        }
+      ],
+      "txCount": 2
+    }
+  },
+  "payment": {
+    "mode": "gate-paid-artifact-real",
+    "network": "base-sepolia",
+    "txHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "rootMode": "none"
+}

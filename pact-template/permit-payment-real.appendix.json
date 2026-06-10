@@ -1,0 +1,121 @@
+{
+  "intent": "Appendix fallback: Agent may buy one source-bound code-scan MCP lease through PactFuse using CAW-signed GatePaymentAuthorization and EIP-2612 Permit",
+  "execution_plan": "Sign GatePaymentAuthorization, sign EIP-2612 Permit, then call ProcurementGate.activateTool. Do not call PaidArtifactMarket directly.",
+  "evidence_requirements": [
+    "This appendix JSON alone is not enough for permit-payment-real.",
+    "CAW message_sign receipts must include exact typed-data hashes for GatePaymentAuthorization and EIP-2612 Permit.",
+    "Gate/verifier evidence must bind sessionId, spendId, validUntil, sourceSetHash, quoteHash, paymentAuthNonce, and tokenAuthHash.",
+    "Owner-pre-signed token authorization outside CAW is fixture evidence.",
+    "EIP-3009 is P1 only."
+  ],
+  "completion_conditions": [
+    { "type": "tx_count", "threshold": "1" },
+    { "type": "time_elapsed", "threshold": "7200" }
+  ],
+  "policies": [
+    {
+      "name": "pactfuse-sign-gate-payment-authorization",
+      "type": "message_sign",
+      "rules": {
+        "effect": "allow",
+        "when": {
+          "chain_in": ["TBASE_SETH"],
+          "primary_type_in": ["GatePaymentAuthorization"],
+          "source_address_in": [
+            { "chain_id": "TBASE_SETH", "address": "<agentWallet>" }
+          ],
+          "domain_match": [
+            { "param_name": "chainId", "op": "eq", "value": "<chainId>" },
+            { "param_name": "verifyingContract", "op": "eq", "value": "<ProcurementGate>" }
+          ],
+          "message_match": [
+            { "param_name": "gate", "op": "eq", "value": "<ProcurementGate>" },
+            { "param_name": "pactId", "op": "eq", "value": "<pactId>" },
+            { "param_name": "sessionId", "op": "eq", "value": "<sessionId>" },
+            { "param_name": "spendId", "op": "eq", "value": "<spendId>" },
+            { "param_name": "validUntil", "op": "lte", "value": "<validUntil>" },
+            { "param_name": "sourceSetHash", "op": "eq", "value": "<sourceSetHash>" },
+            { "param_name": "quoteHash", "op": "eq", "value": "<quoteHash>" },
+            { "param_name": "paymentAuthNonce", "op": "eq", "value": "<paymentAuthNonce>" },
+            { "param_name": "tokenAuthHash", "op": "eq", "value": "<tokenAuthHash>" },
+            { "param_name": "payer", "op": "eq", "value": "<agentWallet>" },
+            { "param_name": "paymentToken", "op": "eq", "value": "<PUBLIC_TESTNET_MOCK_ERC20>" },
+            { "param_name": "market", "op": "eq", "value": "<PaidArtifactMarket>" },
+            { "param_name": "price", "op": "lte", "value": "200000" }
+          ]
+        },
+        "deny_if": {
+          "usage_limits": { "rolling_24h": { "request_count_gt": 1 } }
+        }
+      }
+    },
+    {
+      "name": "pactfuse-sign-token-permit",
+      "type": "message_sign",
+      "rules": {
+        "effect": "allow",
+        "when": {
+          "chain_in": ["TBASE_SETH"],
+          "primary_type_in": ["Permit"],
+          "source_address_in": [
+            { "chain_id": "TBASE_SETH", "address": "<agentWallet>" }
+          ],
+          "domain_match": [
+            { "param_name": "chainId", "op": "eq", "value": "<chainId>" },
+            { "param_name": "verifyingContract", "op": "eq", "value": "<PUBLIC_TESTNET_MOCK_ERC20>" }
+          ],
+          "message_match": [
+            { "param_name": "owner", "op": "eq", "value": "<agentWallet>" },
+            { "param_name": "spender", "op": "eq", "value": "<ProcurementGate>" },
+            { "param_name": "value", "op": "lte", "value": "200000" }
+          ]
+        },
+        "deny_if": {
+          "usage_limits": { "rolling_24h": { "request_count_gt": 1 } }
+        }
+      }
+    },
+    {
+      "name": "pactfuse-gate-activate-with-payment-auth-only",
+      "type": "contract_call",
+      "rules": {
+        "effect": "allow",
+        "when": {
+          "chain_in": ["TBASE_SETH"],
+          "target_in": [
+            {
+              "chain_id": "TBASE_SETH",
+              "contract_addr": "<ProcurementGate>",
+              "function_id": "<activateTool-selector>"
+            }
+          ],
+          "params_match": [
+            { "param_name": "pactId", "op": "eq", "value": "<pactId>" },
+            { "param_name": "toolId", "op": "eq", "value": "<toolId>" },
+            { "param_name": "paymentToken", "op": "eq", "value": "<PUBLIC_TESTNET_MOCK_ERC20>" },
+            { "param_name": "maxPrice", "op": "lte", "value": "200000" }
+          ]
+        },
+        "deny_if": {
+          "usage_limits": { "rolling_24h": { "tx_count_gt": 1 } }
+        }
+      },
+      "function_abis": [
+        {
+          "type": "function",
+          "selector": "<activateTool-selector>",
+          "name": "activateTool",
+          "inputs": [
+            { "name": "pactId", "type": "bytes32" },
+            { "name": "spendId", "type": "bytes32" },
+            { "name": "toolId", "type": "bytes32" },
+            { "name": "paymentToken", "type": "address" },
+            { "name": "maxPrice", "type": "uint256" },
+            { "name": "signedQuote", "type": "bytes" },
+            { "name": "paymentAuth", "type": "bytes" }
+          ]
+        }
+      ]
+    }
+  ]
+}

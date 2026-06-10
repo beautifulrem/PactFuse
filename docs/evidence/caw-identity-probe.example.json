@@ -1,0 +1,32 @@
+{
+  "mode": "pending",
+  "paymentMode": "gate-paid-artifact-real",
+  "chainId": null,
+  "cawWallet": null,
+  "senderProbe": {
+    "pactId": null,
+    "requestId": null,
+    "txHash": null,
+    "emittedMsgSender": null
+  },
+  "approveProbe": {
+    "pactId": null,
+    "requestId": null,
+    "txHash": null,
+    "approvalOwner": null,
+    "spender": null,
+    "amount": null
+  },
+  "activationProbe": {
+    "pactId": null,
+    "requestId": null,
+    "txHash": null,
+    "activationPayer": null
+  },
+  "registeredSpend": {
+    "spendId": null,
+    "agentWallet": null
+  },
+  "pass": false,
+  "rule": "pass only if emittedMsgSender, approvalOwner, activationPayer, and registeredSpend.agentWallet are the same address"
+}

@@ -1,0 +1,42 @@
+{
+  "statusFields": {
+    "mode": "pending",
+    "isRealEvidence": false,
+    "winnerClaimAllowed": false,
+    "rule": "pass only after canonicalReceipt is canonicalized, rawReceiptHash matches the raw CAW receipt ingest bundle, and tx/request count plus expiry fields prove the CAW claim"
+  },
+  "canonicalReceipt": {
+    "pactId": null,
+    "policyDigest": null,
+    "approvedAt": null,
+    "expiresAt": null,
+    "chainId": null,
+    "wallet": null,
+    "completionConditions": [
+      {
+        "type": "tx_count",
+        "threshold": null,
+        "used": null
+      },
+      {
+        "type": "time_elapsed",
+        "thresholdSeconds": null
+      }
+    ],
+    "operationLimits": {
+      "txCountLimit": null,
+      "txCountUsed": null,
+      "requestCountLimit": null,
+      "requestCountUsed": null
+    },
+    "targetAllowlist": [
+      {
+        "target": null,
+        "selector": null
+      }
+    ],
+    "paramsDigest": null,
+    "rawReceiptJcs": null,
+    "rawReceiptHash": null
+  }
+}

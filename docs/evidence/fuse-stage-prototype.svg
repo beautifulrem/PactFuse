@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="760" viewBox="0 0 1440 760" role="img" aria-labelledby="title desc">
+  <title id="title">PactFuse Fuse Stage prototype</title>
+  <desc id="desc">Fixture-only procurement breaker panel preview. A and B cartridges sit in socket clips with metal ferrules; their filament windows show broken filaments with blow marks and popped red trip flags, and their token-flow lines stay cold at 0 moved. C remains bridged as the target clean lane with a continuous green filament and recessed flag. The challenged source bus carries an amber drift observed advisory tag.</desc>
+  <defs>
+    <linearGradient id="ceramic" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E9EEF5"/>
+    </linearGradient>
+    <linearGradient id="ferrule" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#E2E8F0"/>
+      <stop offset="0.5" stop-color="#94A3B8"/>
+      <stop offset="1" stop-color="#CBD5E1"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1440" height="760" fill="#F8FAFC"/>
+  <path d="M0 184H1440 M0 316H1440 M0 448H1440 M0 580H1440 M0 712H1440" stroke="#E5EAF1" stroke-width="1"/>
+  <path d="M72 92V642 M1368 92V642" stroke="#E5EAF1" stroke-width="1"/>
+
+  <rect x="72" y="34" width="212" height="26" rx="5" fill="#EEF2F7" stroke="#D7DEE8"/>
+  <text x="86" y="52" fill="#64748B" font-family="Fira Code, monospace" font-size="13">target fixture board</text>
+  <text x="1168" y="52" fill="#64748B" font-family="Fira Code, monospace" font-size="14">no proof pass rendered</text>
+
+  <text x="72" y="102" fill="#111827" font-family="Fira Sans, Arial, sans-serif" font-size="30" font-weight="800">Procurement breaker panel</text>
+  <text x="72" y="130" fill="#64748B" font-family="Fira Sans, Arial, sans-serif" font-size="16">Cobo authority enters on blue; challenged A/B open cold; clean C settles on green current.</text>
+
+  <line x1="90" y1="196" x2="1328" y2="196" stroke="#2563EB" stroke-width="18" stroke-linecap="round"/>
+  <text x="96" y="174" fill="#2563EB" font-family="Fira Code, monospace" font-size="14">CAW-authorized path</text>
+
+  <!-- Lane A -->
+  <g transform="translate(124 260)">
+    <text x="0" y="-18" fill="#64748B" font-family="Fira Code, monospace" font-size="13">source bus: challenged</text>
+    <rect x="186" y="-32" width="196" height="20" rx="10" fill="#FFFBEB" stroke="#D97706"/>
+    <text x="198" y="-18" fill="#9A3412" font-family="Fira Code, monospace" font-size="12">drift observed (advisory)</text>
+
+    <!-- live bus into cartridge, de-energized bus after trip -->
+    <line x1="44" y1="34" x2="158" y2="34" stroke="#CBD5E1" stroke-width="10" stroke-linecap="round"/>
+    <line x1="502" y1="34" x2="668" y2="34" stroke="#E2E8F0" stroke-width="4" stroke-linecap="round"/>
+
+    <!-- socket clips -->
+    <path d="M158 10 v40 a6 6 0 0 0 6 6 h28 a6 6 0 0 0 6 -6 v-40" fill="none" stroke="#94A3B8" stroke-width="5"/>
+    <path d="M462 10 v40 a6 6 0 0 0 6 6 h28 a6 6 0 0 0 6 -6 v-40" fill="none" stroke="#94A3B8" stroke-width="5"/>
+
+    <!-- ferrules + ceramic body + filament window -->
+    <rect x="162" y="8" width="34" height="52" rx="5" fill="url(#ferrule)" stroke="#64748B"/>
+    <rect x="464" y="8" width="34" height="52" rx="5" fill="url(#ferrule)" stroke="#64748B"/>
+    <rect x="196" y="12" width="268" height="44" rx="6" fill="url(#ceramic)" stroke="#94A3B8" stroke-width="2"/>
+    <rect x="216" y="18" width="228" height="20" rx="3" fill="#FFFFFF" stroke="#CBD5E1"/>
+
+    <!-- broken filament with blow mark -->
+    <path d="M220 28 l24 0 l10 6 l10 -6 l24 0 l12 6" fill="none" stroke="#DC2626" stroke-width="4" stroke-linecap="round"/>
+    <path d="M440 28 l-24 0 l-10 6 l-10 -6 l-24 0 l-12 6" fill="none" stroke="#DC2626" stroke-width="4" stroke-linecap="round"/>
+    <ellipse cx="330" cy="29" rx="13" ry="7" fill="#9CA3AF" opacity="0.55"/>
+    <path d="M318 35 L327 23 M333 23 L342 35" stroke="#DC2626" stroke-width="3" stroke-linecap="round"/>
+
+    <!-- popped trip flag -->
+    <line x1="430" y1="12" x2="430" y2="-2" stroke="#64748B" stroke-width="3"/>
+    <rect x="422" y="-12" width="16" height="12" rx="2" fill="#DC2626"/>
+
+    <!-- rating stamp -->
+    <text x="330" y="51" text-anchor="middle" fill="#64748B" font-family="Fira Code, monospace" font-size="11">A · code-scan · cap 25 mock · 0x3f…9a</text>
+
+    <text x="540" y="14" fill="#DC2626" font-family="Fira Sans, Arial, sans-serif" font-size="22" font-weight="800">A tripped</text>
+    <line x1="688" y1="34" x2="1068" y2="34" stroke="#94A3B8" stroke-width="4" stroke-dasharray="12 10"/>
+    <text x="1092" y="40" fill="#64748B" font-family="Fira Code, monospace" font-size="18">0 moved</text>
+  </g>
+
+  <!-- Lane B -->
+  <g transform="translate(124 392)">
+    <text x="0" y="-18" fill="#64748B" font-family="Fira Code, monospace" font-size="13">source bus: challenged</text>
+
+    <line x1="44" y1="34" x2="158" y2="34" stroke="#CBD5E1" stroke-width="10" stroke-linecap="round"/>
+    <line x1="502" y1="34" x2="668" y2="34" stroke="#E2E8F0" stroke-width="4" stroke-linecap="round"/>
+
+    <path d="M158 10 v40 a6 6 0 0 0 6 6 h28 a6 6 0 0 0 6 -6 v-40" fill="none" stroke="#94A3B8" stroke-width="5"/>
+    <path d="M462 10 v40 a6 6 0 0 0 6 6 h28 a6 6 0 0 0 6 -6 v-40" fill="none" stroke="#94A3B8" stroke-width="5"/>
+
+    <rect x="162" y="8" width="34" height="52" rx="5" fill="url(#ferrule)" stroke="#64748B"/>
+    <rect x="464" y="8" width="34" height="52" rx="5" fill="url(#ferrule)" stroke="#64748B"/>
+    <rect x="196" y="12" width="268" height="44" rx="6" fill="url(#ceramic)" stroke="#94A3B8" stroke-width="2"/>
+    <rect x="216" y="18" width="228" height="20" rx="3" fill="#FFFFFF" stroke="#CBD5E1"/>
+
+    <path d="M220 28 l24 0 l10 6 l10 -6 l24 0 l12 6" fill="none" stroke="#DC2626" stroke-width="4" stroke-linecap="round"/>
+    <path d="M440 28 l-24 0 l-10 6 l-10 -6 l-24 0 l-12 6" fill="none" stroke="#DC2626" stroke-width="4" stroke-linecap="round"/>
+    <ellipse cx="330" cy="29" rx="13" ry="7" fill="#9CA3AF" opacity="0.55"/>
+    <path d="M318 35 L327 23 M333 23 L342 35" stroke="#DC2626" stroke-width="3" stroke-linecap="round"/>
+
+    <line x1="430" y1="12" x2="430" y2="-2" stroke="#64748B" stroke-width="3"/>
+    <rect x="422" y="-12" width="16" height="12" rx="2" fill="#DC2626"/>
+
+    <text x="330" y="51" text-anchor="middle" fill="#64748B" font-family="Fira Code, monospace" font-size="11">B · dep-audit · cap 18 mock · 0x3f…9a</text>
+
+    <text x="540" y="14" fill="#DC2626" font-family="Fira Sans, Arial, sans-serif" font-size="22" font-weight="800">B tripped</text>
+    <line x1="688" y1="34" x2="1068" y2="34" stroke="#94A3B8" stroke-width="4" stroke-dasharray="12 10"/>
+    <text x="1092" y="40" fill="#64748B" font-family="Fira Code, monospace" font-size="18">0 moved</text>
+  </g>
+
+  <!-- Lane C -->
+  <g transform="translate(124 524)">
+    <text x="0" y="-18" fill="#64748B" font-family="Fira Code, monospace" font-size="13">source bus: clean</text>
+
+    <line x1="44" y1="34" x2="158" y2="34" stroke="#16A34A" stroke-width="10" stroke-linecap="round"/>
+    <line x1="502" y1="34" x2="1068" y2="34" stroke="#16A34A" stroke-width="6" stroke-linecap="round"/>
+
+    <path d="M158 10 v40 a6 6 0 0 0 6 6 h28 a6 6 0 0 0 6 -6 v-40" fill="none" stroke="#16A34A" stroke-width="5"/>
+    <path d="M462 10 v40 a6 6 0 0 0 6 6 h28 a6 6 0 0 0 6 -6 v-40" fill="none" stroke="#16A34A" stroke-width="5"/>
+
+    <rect x="162" y="8" width="34" height="52" rx="5" fill="url(#ferrule)" stroke="#16A34A"/>
+    <rect x="464" y="8" width="34" height="52" rx="5" fill="url(#ferrule)" stroke="#16A34A"/>
+    <rect x="196" y="12" width="268" height="44" rx="6" fill="url(#ceramic)" stroke="#16A34A" stroke-width="2"/>
+    <rect x="216" y="18" width="228" height="20" rx="3" fill="#FFFFFF" stroke="#BBF7D0"/>
+
+    <!-- continuous filament -->
+    <path d="M220 28 l30 0 l12 6 l16 -6 l24 0 l16 6 l16 -6 l24 0 l16 6 l16 -6 l30 0" fill="none" stroke="#16A34A" stroke-width="4" stroke-linecap="round"/>
+
+    <!-- recessed (not popped) flag -->
+    <rect x="422" y="4" width="16" height="8" rx="2" fill="#CBD5E1"/>
+
+    <text x="330" y="51" text-anchor="middle" fill="#16A34A" font-family="Fira Code, monospace" font-size="11">C · code-scan · cap 25 mock · 0x8c…41</text>
+
+    <text x="540" y="14" fill="#16A34A" font-family="Fira Sans, Arial, sans-serif" font-size="22" font-weight="800">C target: clean path</text>
+    <rect x="1010" y="46" width="248" height="34" rx="8" fill="#F0FDF4" stroke="#BBF7D0"/>
+    <text x="1026" y="69" fill="#16A34A" font-family="Fira Code, monospace" font-size="16">target receipt + lease</text>
+  </g>
+
+  <rect x="0" y="642" width="1440" height="58" fill="#FFF7ED"/>
+  <line x1="0" y1="642" x2="1440" y2="642" stroke="#FED7AA"/>
+  <line x1="0" y1="700" x2="1440" y2="700" stroke="#FED7AA"/>
+  <text x="94" y="676" fill="#9A3412" font-family="Fira Sans, Arial, sans-serif" font-size="18" font-weight="700">Consequence strip:</text>
+  <text x="280" y="676" fill="#111827" font-family="Fira Sans, Arial, sans-serif" font-size="18">+write_file blocked on A/B · clean scan ran on C · fixture only, no proof pass.</text>
+</svg>

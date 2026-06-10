@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PactFuse Fusebox Preview</title>
+    <style>
+      :root {
+        --bg: #f8fafc;
+        --surface: #ffffff;
+        --ink: #111827;
+        --muted: #64748b;
+        --line: #d7dee8;
+        --caw: #2563eb;
+        --trip: #dc2626;
+        --clean: #16a34a;
+        --warn: #d97706;
+        --metal: #94a3b8;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: "IBM Plex Sans", "Fira Sans", Arial, sans-serif;
+      }
+
+      .preview {
+        min-height: 100dvh;
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        gap: 12px;
+        padding: 16px;
+      }
+
+      .stamp {
+        background: var(--ink);
+        color: white;
+        padding: 10px 14px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 16px;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      .ticker {
+        position: relative;
+        display: grid;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        gap: 0;
+        margin-top: 10px;
+        min-height: 58px;
+        padding: 8px 0 0;
+      }
+
+      .ticker::before {
+        content: "";
+        position: absolute;
+        left: 4%;
+        right: 4%;
+        top: 20px;
+        height: 3px;
+        background:
+          linear-gradient(90deg, rgba(217, 119, 6, 0.25), rgba(100, 116, 139, 0.2)),
+          repeating-linear-gradient(90deg, transparent 0 18px, rgba(217, 119, 6, 0.5) 18px 24px);
+      }
+
+      .slot {
+        position: relative;
+        min-height: 50px;
+        padding: 24px 6px 0;
+        font-size: 13px;
+        text-align: center;
+        display: block;
+      }
+
+      .slot::before {
+        content: "";
+        position: absolute;
+        top: 7px;
+        left: 50%;
+        width: 14px;
+        height: 14px;
+        margin-left: -7px;
+        border: 2px solid var(--warn);
+        border-radius: 50%;
+        background: var(--bg);
+        box-shadow: 0 0 0 4px var(--surface);
+      }
+
+      .slot[data-state="pending"]::before {
+        border-color: var(--muted);
+        background: white;
+      }
+
+      .slot[data-state="fixture"]::after {
+        content: "";
+        position: absolute;
+        top: 4px;
+        left: 50%;
+        width: 22px;
+        height: 22px;
+        margin-left: -11px;
+        border: 1px dashed rgba(217, 119, 6, 0.75);
+        border-radius: 50%;
+        opacity: 0.75;
+      }
+
+      .slot strong {
+        display: block;
+        font-size: 12px;
+      }
+
+      .slot span {
+        color: var(--warn);
+        font-family: "JetBrains Mono", "Fira Code", monospace;
+        font-size: 12px;
+      }
+
+      .main {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 68px;
+        gap: 12px;
+        min-height: 0;
+      }
+
+      .board {
+        min-height: 0;
+        border-top: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+        border-radius: 6px;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.84), rgba(241, 245, 249, 0.72)),
+          repeating-linear-gradient(90deg, transparent 0 64px, rgba(148, 163, 184, 0.12) 64px 65px);
+        padding: 6px;
+      }
+
+      .board img {
+        display: block;
+        width: 100%;
+        height: min(68dvh, 760px);
+        object-fit: contain;
+      }
+
+      .mobile-panel {
+        display: none;
+      }
+
+      .tray {
+        border-left: 1px solid var(--line);
+        background: transparent;
+        display: grid;
+        align-content: start;
+        justify-items: center;
+        gap: 10px;
+        padding: 10px 6px;
+      }
+
+      .tray button {
+        width: 44px;
+        height: 44px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg);
+        color: var(--ink);
+        font-weight: 800;
+      }
+
+      .heartbeat {
+        position: relative;
+        min-height: 76px;
+        border-top: 1px solid var(--line);
+        background: transparent;
+        display: grid;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        gap: 0;
+        padding: 24px 10px 10px;
+      }
+
+      .heartbeat::before {
+        content: "";
+        position: absolute;
+        left: 22px;
+        right: 22px;
+        top: 18px;
+        height: 3px;
+        background: repeating-linear-gradient(90deg, #cbd5e1 0 18px, transparent 18px 26px);
+      }
+
+      .heartbeat::after {
+        content: "";
+        position: absolute;
+        top: 12px;
+        left: calc(100% - 37px);
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        background: var(--warn);
+      }
+
+      .beat {
+        position: relative;
+        padding: 12px 6px 0;
+        color: var(--muted);
+        font-size: 13px;
+        text-align: center;
+      }
+
+      .beat::before {
+        content: "";
+        position: absolute;
+        top: -11px;
+        left: 50%;
+        width: 9px;
+        height: 9px;
+        margin-left: -4.5px;
+        border-radius: 50%;
+        background: #cbd5e1;
+      }
+
+      @media (max-width: 700px) {
+        .preview {
+          padding: 10px;
+        }
+
+        .stamp {
+          display: block;
+        }
+
+        .ticker {
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+
+        .main {
+          grid-template-columns: 1fr;
+        }
+
+        .tray {
+          grid-template-columns: repeat(3, 44px);
+          justify-content: start;
+        }
+
+        .board img {
+          display: none;
+        }
+
+        .mobile-panel {
+          display: grid;
+          gap: 12px;
+          padding: 14px;
+          min-height: 420px;
+          background:
+            linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(248, 250, 252, 0.86)),
+            repeating-linear-gradient(180deg, transparent 0 58px, rgba(148, 163, 184, 0.16) 58px 59px);
+        }
+
+        .mobile-panel h1 {
+          margin: 0;
+          font-size: 22px;
+          line-height: 1.05;
+          letter-spacing: 0;
+        }
+
+        .mobile-panel p {
+          margin: 0;
+          color: var(--muted);
+          font-size: 13px;
+        }
+
+        .mobile-board-label {
+          width: max-content;
+          max-width: 100%;
+          border: 1px solid var(--line);
+          border-radius: 5px;
+          padding: 4px 8px;
+          color: var(--muted);
+          font-family: "JetBrains Mono", "Fira Code", monospace;
+          font-size: 11px;
+        }
+
+        .mobile-bus {
+          height: 10px;
+          border-radius: 999px;
+          background: var(--caw);
+        }
+
+        .mobile-lane {
+          display: grid;
+          grid-template-columns: 84px minmax(0, 1fr) 76px;
+          gap: 10px;
+          align-items: center;
+          min-height: 62px;
+          border-top: 1px solid rgba(203, 213, 225, 0.7);
+        }
+
+        .mobile-lane span {
+          color: var(--muted);
+          font-family: "JetBrains Mono", "Fira Code", monospace;
+          font-size: 11px;
+        }
+
+        .mobile-fuse {
+          height: 28px;
+          border: 2px solid var(--metal);
+          border-radius: 6px;
+          background: linear-gradient(180deg, #ffffff, #e9eef5);
+          position: relative;
+        }
+
+        .mobile-fuse::before,
+        .mobile-fuse::after {
+          content: "";
+          position: absolute;
+          top: 9px;
+          width: 34%;
+          height: 3px;
+          border-radius: 999px;
+          background: currentColor;
+        }
+
+        .mobile-fuse::before {
+          left: 10%;
+        }
+
+        .mobile-fuse::after {
+          right: 10%;
+        }
+
+        .mobile-lane[data-state="trip"] {
+          color: var(--trip);
+        }
+
+        .mobile-lane[data-state="clean"] {
+          color: var(--clean);
+        }
+
+        .mobile-lane[data-state="clean"] .mobile-fuse::before {
+          left: 10%;
+          right: 10%;
+          width: auto;
+        }
+
+        .mobile-lane[data-state="clean"] .mobile-fuse::after {
+          display: none;
+        }
+
+        .mobile-lane strong {
+          font-size: 15px;
+          line-height: 1.15;
+        }
+
+        .mobile-current {
+          text-align: right;
+          font-family: "JetBrains Mono", "Fira Code", monospace;
+          font-size: 12px;
+          color: var(--muted);
+        }
+
+        .mobile-lane[data-state="clean"] .mobile-current {
+          color: var(--clean);
+        }
+
+        .mobile-consequence {
+          border-top: 1px solid #fed7aa;
+          background: #fff7ed;
+          margin: 2px -14px -14px;
+          padding: 12px 14px;
+          color: var(--ink);
+          font-size: 13px;
+        }
+
+        .heartbeat {
+          grid-template-columns: 1fr;
+          padding: 10px 10px 10px 22px;
+          gap: 4px;
+        }
+
+        .heartbeat::before {
+          left: 12px;
+          right: auto;
+          top: 18px;
+          bottom: 18px;
+          width: 3px;
+          height: auto;
+          background: repeating-linear-gradient(180deg, #cbd5e1 0 18px, transparent 18px 26px);
+        }
+
+        .heartbeat::after {
+          display: none;
+        }
+
+        .beat {
+          text-align: left;
+          padding: 4px 6px;
+        }
+
+        .beat::before {
+          left: -10px;
+          top: 8px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="preview">
+      <header>
+        <div class="stamp">
+          <span>FIXTURE - design preview only</span>
+          <span>No live CAW receipt, no proof pass, no winner claim</span>
+        </div>
+        <section class="ticker" aria-label="Fixture proof ticker">
+          <div class="slot" data-state="fixture"><strong>CAW deny</strong><span>fixture</span></div>
+          <div class="slot" data-state="pending"><strong>CAW path</strong><span>pending</span></div>
+          <div class="slot" data-state="fixture"><strong>Source</strong><span>fixture</span></div>
+          <div class="slot" data-state="fixture"><strong>A/B trip</strong><span>fixture</span></div>
+          <div class="slot" data-state="pending"><strong>C settle</strong><span>pending</span></div>
+          <div class="slot" data-state="pending"><strong>Artifact</strong><span>pending</span></div>
+          <div class="slot" data-state="pending"><strong>Lease used</strong><span>pending</span></div>
+        </section>
+      </header>
+
+      <section class="main" aria-label="Fusebox preview workspace">
+        <section class="board" aria-label="Dominant fuse stage preview">
+          <img src="../../../../docs/evidence/fuse-stage-prototype.svg" alt="Fixture-only fuse stage showing A and B tripped before token movement and C as the target clean lane." />
+          <div class="mobile-panel" aria-label="Mobile stacked fuse stage preview">
+            <div class="mobile-board-label">target fixture board</div>
+            <h1>Procurement breaker panel</h1>
+            <p>Cobo authority enters on blue; challenged A/B open cold; clean C is the target path.</p>
+            <div class="mobile-bus" aria-hidden="true"></div>
+            <div class="mobile-lane" data-state="trip">
+              <span>A challenged</span>
+              <div class="mobile-fuse" aria-hidden="true"></div>
+              <strong>A tripped</strong>
+              <span></span>
+              <span>+write_file</span>
+              <div class="mobile-current">0 moved</div>
+            </div>
+            <div class="mobile-lane" data-state="trip">
+              <span>B challenged</span>
+              <div class="mobile-fuse" aria-hidden="true"></div>
+              <strong>B tripped</strong>
+              <span></span>
+              <span>same source</span>
+              <div class="mobile-current">0 moved</div>
+            </div>
+            <div class="mobile-lane" data-state="clean">
+              <span>C clean</span>
+              <div class="mobile-fuse" aria-hidden="true"></div>
+              <strong>C target</strong>
+              <span></span>
+              <span>read-only scan</span>
+              <div class="mobile-current">target lease</div>
+            </div>
+            <div class="mobile-consequence">+write_file blocked on A/B. Clean scan target stays on C. Fixture only, no proof pass.</div>
+          </div>
+        </section>
+        <aside class="tray" aria-label="Collapsed fixture proof tray">
+          <button type="button" aria-label="Open Judge Check fixture tray">JC</button>
+          <button type="button" aria-label="Open evidence fixture tray">EV</button>
+          <button type="button" aria-label="Copy replay hash fixture">#</button>
+        </aside>
+      </section>
+
+      <footer class="heartbeat" aria-label="Fixture runner heartbeat">
+        <div class="beat" data-step="plan-built">plan</div>
+        <div class="beat" data-step="caw-requested">CAW request</div>
+        <div class="beat" data-step="bypass-denied">bypass denied</div>
+        <div class="beat" data-step="source-challenged">source challenged</div>
+        <div class="beat" data-step="ab-trip">A/B trip</div>
+        <div class="beat" data-step="clean-recovery-selected">clean recovery</div>
+        <div class="beat" data-step="lease-pending">lease pending</div>
+      </footer>
+    </main>
+  </body>
+</html>

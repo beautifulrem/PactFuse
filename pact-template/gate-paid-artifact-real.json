@@ -1,0 +1,87 @@
+{
+  "intent": "Agent may buy one source-bound code-scan MCP lease only through PactFuse ProcurementGate",
+  "execution_plan": "Approve ProcurementGate for the observed quote price within the Pact maxPrice cap, then call ProcurementGate.activateTool. Do not call PaidArtifactMarket directly.",
+  "completion_conditions": [
+    { "type": "tx_count", "threshold": "2" },
+    { "type": "time_elapsed", "threshold": "7200" }
+  ],
+  "policies": [
+    {
+      "name": "pactfuse-approve-gate-capped",
+      "type": "contract_call",
+      "rules": {
+        "effect": "allow",
+        "when": {
+          "chain_in": ["TBASE_SETH"],
+          "target_in": [
+            {
+              "chain_id": "TBASE_SETH",
+              "contract_addr": "<PUBLIC_TESTNET_MOCK_ERC20>",
+              "function_id": "<erc20-approve-selector>"
+            }
+          ],
+          "params_match": [
+            { "param_name": "spender", "op": "eq", "value": "<ProcurementGate>" },
+            { "param_name": "amount", "op": "lte", "value": "200000" }
+          ]
+        },
+        "deny_if": {
+          "usage_limits": { "rolling_24h": { "tx_count_gt": 1 } }
+        }
+      },
+      "function_abis": [
+        {
+          "type": "function",
+          "selector": "<erc20-approve-selector>",
+          "name": "approve",
+          "inputs": [
+            { "name": "spender", "type": "address" },
+            { "name": "amount", "type": "uint256" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "pactfuse-gate-activate-only",
+      "type": "contract_call",
+      "rules": {
+        "effect": "allow",
+        "when": {
+          "chain_in": ["TBASE_SETH"],
+          "target_in": [
+            {
+              "chain_id": "TBASE_SETH",
+              "contract_addr": "<ProcurementGate>",
+              "function_id": "<activateTool-selector>"
+            }
+          ],
+          "params_match": [
+            { "param_name": "pactId", "op": "eq", "value": "<pactId>" },
+            { "param_name": "toolId", "op": "eq", "value": "<toolId>" },
+            { "param_name": "paymentToken", "op": "eq", "value": "<PUBLIC_TESTNET_MOCK_ERC20>" },
+            { "param_name": "maxPrice", "op": "lte", "value": "200000" }
+          ]
+        },
+        "deny_if": {
+          "usage_limits": { "rolling_24h": { "tx_count_gt": 1 } }
+        }
+      },
+      "function_abis": [
+        {
+          "type": "function",
+          "selector": "<activateTool-selector>",
+          "name": "activateTool",
+          "inputs": [
+            { "name": "pactId", "type": "bytes32" },
+            { "name": "spendId", "type": "bytes32" },
+            { "name": "toolId", "type": "bytes32" },
+            { "name": "paymentToken", "type": "address" },
+            { "name": "maxPrice", "type": "uint256" },
+            { "name": "signedQuote", "type": "bytes" },
+            { "name": "paymentAuth", "type": "bytes" }
+          ]
+        }
+      ]
+    }
+  ]
+}

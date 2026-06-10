@@ -1,0 +1,32 @@
+{
+  "chainId": "TBASE_SETH",
+  "publicTestMockErc20": "0x1111111111111111111111111111111111111111",
+  "procurementGate": "0x2222222222222222222222222222222222222222",
+  "erc20ApproveSelector": "0x095ea7b3",
+  "activateToolSelector": "0x12345678",
+  "toolId": "0x3333333333333333333333333333333333333333333333333333333333333333",
+  "maxPrice": "200000",
+  "pacts": [
+    {
+      "label": "A",
+      "pactId": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "spendId": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+      "quoteNonce": "1001",
+      "sourceBinding": "challenged"
+    },
+    {
+      "label": "B",
+      "pactId": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "spendId": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc",
+      "quoteNonce": "1002",
+      "sourceBinding": "challenged"
+    },
+    {
+      "label": "C",
+      "pactId": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "spendId": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccd",
+      "quoteNonce": "1003",
+      "sourceBinding": "clean"
+    }
+  ]
+}

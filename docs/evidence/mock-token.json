@@ -1,0 +1,14 @@
+{
+  "mode": "pending",
+  "isRealEvidence": false,
+  "tokenMode": "mock-test-token",
+  "chainId": null,
+  "symbol": null,
+  "decimals": null,
+  "address": null,
+  "deploymentTxHash": null,
+  "explorerUrl": null,
+  "codeHash": null,
+  "winnerClaimAllowed": false,
+  "rule": "pass only after the public testnet mock ERC20 address, deployment tx hash, explorer URL, decimals, and code hash are recorded"
+}
