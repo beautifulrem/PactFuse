@@ -449,6 +449,42 @@ describe("pactfuse-api P0", () => {
     expect(verify.json.data.warnings).toContain("caw proof provider is unconfigured: CAW receipt source is not configured");
     expect(verify.json.data.raw.proofProviders).toHaveLength(2);
   });
+
+  it("passes pinned Pact template hashes into the verifier", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-template-verify");
+
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-template-mismatch",
+      payload: {
+        receipt: {
+          artifactType: "source-bound-code-scan-mcp-lease",
+          pactId: hex32("template-pact"),
+          spendId: hex32("template-spend"),
+          toolId: "mcp-code-scan-basic",
+          pactTemplateHash: hex32("wrong-template"),
+          paymentProof: {
+            mode: "gate-paid-artifact-real",
+            gatePaid: {},
+          },
+          payment: {
+            mode: "gate-paid-artifact-real",
+          },
+        },
+      },
+    });
+
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.proofChipAllowed).toBe(false);
+    expect(verify.json.data.raw.pactTemplates).toEqual([
+      expect.objectContaining({ mode: "gate-paid-artifact-real", templateHash: hex32("gate-paid-template") }),
+      expect.objectContaining({ mode: "permit-payment-real", templateHash: hex32("permit-template") }),
+    ]);
+    expect(verify.json.data.raw.proofCompletenessErrors).toContain(
+      "pactTemplateHash must match pinned gate-paid-artifact-real template hash",
+    );
+  });
 });
 
 async function createSession(app: ReturnType<typeof createApp>, key: string): Promise<string> {

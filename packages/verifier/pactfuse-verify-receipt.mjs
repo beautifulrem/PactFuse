@@ -505,7 +505,7 @@ function checkReplayBundle(root, errors) {
   }
 }
 
-function checkProofChipCompleteness(root, errors) {
+function checkProofChipCompleteness(root, errors, options = {}) {
   for (const path of [
     ["sessionId"],
     ["pactId"],
@@ -534,6 +534,7 @@ function checkProofChipCompleteness(root, errors) {
   checkAgentTranscript(root, errors);
   checkCawReceiptIngest(root, errors);
   checkReplayBundle(root, errors);
+  checkPactTemplateBinding(root, errors, options);
 
   const proofMode = at(root, ["paymentProof", "mode"]);
   if (proofMode === "gate-paid-artifact-real") {
@@ -545,6 +546,27 @@ function checkProofChipCompleteness(root, errors) {
   errors.push(
     "current scaffold is not a final proof-chip verifier; it has not recomputed chain events, CAW typed-data hashes, recovered signers, canonical receipt hashes, priceDisclosure/displayed hash, delivery preflight hash, raw CAW receipt bundle membership, MCP Agent Transcript hashes, Judge Check rows, the PACTFUSE_EVIDENCE_V1 replay bundle, or rootMode-vs-BlastRadiusRoot on-chain consistency (incl. publisher validation in published mode)",
   );
+}
+
+function checkPactTemplateBinding(root, errors, options) {
+  const proofMode = at(root, ["paymentProof", "mode"]);
+  if (!proofMode) {
+    return;
+  }
+  const templateHash = at(root, ["pactTemplateHash"]) ?? at(root, ["pactTemplate", "templateHash"]);
+  if (!templateHash) {
+    errors.push("missing required field: pactTemplateHash");
+    return;
+  }
+  const templates = Array.isArray(options.pactTemplates) ? options.pactTemplates : [];
+  const expected = templates.find((template) => isObject(template) && template.mode === proofMode);
+  if (!expected) {
+    errors.push(`no pinned Pact template hash provided for paymentProof.mode ${proofMode}`);
+    return;
+  }
+  if (asText(templateHash) !== asText(expected.templateHash)) {
+    errors.push(`pactTemplateHash must match pinned ${proofMode} template hash`);
+  }
 }
 
 export function verifyEvidence(receipt, options = {}) {
@@ -601,7 +623,7 @@ export function verifyEvidence(receipt, options = {}) {
     ...markers.nulls.map((marker) => `proof chip contains null at ${marker.path}`),
   ];
   const proofCompletenessErrors = [];
-  checkProofChipCompleteness(receipt, proofCompletenessErrors);
+  checkProofChipCompleteness(receipt, proofCompletenessErrors, options);
   proofChipErrors.push(...proofCompletenessErrors);
 
   if (!requestedWinnerClaimAllowed) {
