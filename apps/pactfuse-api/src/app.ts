@@ -66,6 +66,8 @@ const ROUTES = [
 
 const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/caw/receipts/ingest": ["proofAuthority", "winnerClaimAllowed"],
+  "/api/v1/artifacts/preflight": ["preflightId", "artifactHashPreview", "priceDisclosureHash", "winnerClaimAllowed"],
+  "/api/v1/quotes": ["preflightId", "quoteSignedAfterPreflight", "priceDisclosureHash", "winnerClaimAllowed"],
   "/api/v1/mcp/audit": ["proofAuthority", "winnerClaimAllowed", "requestHash", "responseHash"],
   "/api/v1/evidence/verify": ["schemaOk", "proofChipAllowed", "winnerClaimAllowed", "finalVerifierComplete"],
   "/api/v1/evidence/judge-check": ["winnerClaimAllowed", "rows.status", "rows.authority"],
@@ -449,10 +451,54 @@ function buildOpenApi(): Record<string, unknown> {
         }),
         CawReceiptIngestResponse: serviceResponseSchema({
           type: "object",
-          required: ["receiptBundleHash", "proofAuthority", "winnerClaimAllowed"],
+          required: ["receiptBundleHash", "operationId", "receiptCount", "proofAuthority", "winnerClaimAllowed"],
           properties: {
             receiptBundleHash: { type: "string" },
+            operationId: { anyOf: [{ type: "string" }, { type: "null" }] },
+            receiptCount: { type: "integer", minimum: 1, maximum: 64 },
             proofAuthority: { const: false },
+            winnerClaimAllowed: { const: false },
+          },
+        }),
+        ArtifactPreflightResponse: serviceResponseSchema({
+          type: "object",
+          required: [
+            "preflightId",
+            "artifactHashPreview",
+            "priceDisclosureHash",
+            "sourceStateSnapshotHash",
+            "status",
+            "winnerClaimAllowed",
+          ],
+          properties: {
+            preflightId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            artifactHashPreview: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            priceDisclosureHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            sourceStateSnapshotHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            status: { enum: ["pending_live_delivery"] },
+            winnerClaimAllowed: { const: false },
+          },
+        }),
+        QuoteResponse: serviceResponseSchema({
+          type: "object",
+          required: [
+            "quoteId",
+            "quoteHash",
+            "preflightId",
+            "priceDisclosureHash",
+            "sourceStateSnapshotHash",
+            "quoteSignedAfterPreflight",
+            "status",
+            "winnerClaimAllowed",
+          ],
+          properties: {
+            quoteId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            quoteHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            preflightId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            priceDisclosureHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            sourceStateSnapshotHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            quoteSignedAfterPreflight: { const: true },
+            status: { enum: ["mocked_after_preflight_not_chain_settleable"] },
             winnerClaimAllowed: { const: false },
           },
         }),
@@ -661,6 +707,10 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/JudgeCheckResponse" };
     case "/api/v1/caw/receipts/ingest":
       return { $ref: "#/components/schemas/CawReceiptIngestResponse" };
+    case "/api/v1/artifacts/preflight":
+      return { $ref: "#/components/schemas/ArtifactPreflightResponse" };
+    case "/api/v1/quotes":
+      return { $ref: "#/components/schemas/QuoteResponse" };
     case "/api/v1/mcp/audit":
       return { $ref: "#/components/schemas/McpAuditResponse" };
     case "/api/v1/evidence/replay-bundle":

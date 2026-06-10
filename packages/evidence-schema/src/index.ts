@@ -160,6 +160,7 @@ export const ArtifactPreflightPayloadSchema = z
 export const QuotePayloadSchema = z
   .object({
     spendId: Hex32Schema,
+    preflightId: Hex32Schema,
     artifactCommitment: Hex32Schema,
     priceAtomic: DecimalStringSchema,
     quoteNonce: z.string().min(1).max(128),

@@ -276,6 +276,9 @@ export async function buildCawOperation(input: SessionScopedEnvelope, ctx: Servi
   const payload = parseStrict(CawOperationBuildPayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("caw:operations:build", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
+    if (payload.spendId) {
+      assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    }
     const createdAt = ctx.clock.now().toISOString();
     const pactTemplate = ctx.templates.require("gate-paid-artifact-real");
     const operationId = hashJson({ sessionId: envelope.sessionId, payload, requestId });
@@ -331,12 +334,22 @@ export async function ingestCawReceiptBundle(
   const payload = parseStrict(CawReceiptIngestPayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("caw:receipts:ingest", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
+    if (!payload.manual && !payload.operationId) {
+      throw Object.assign(new Error("CAW receipt ingest requires operationId"), {
+        apiError: badRequestError(requestId, "non-manual CAW receipt ingest requires operationId"),
+      });
+    }
     const receiptBundleHash = hashJson(payload.receipts);
     const createdAt = ctx.clock.now().toISOString();
     if (payload.operationId) {
-      ctx.db.sqlite
+      const result = ctx.db.sqlite
         .prepare("UPDATE caw_receipt_operations SET receipt_bundle_hash = ?, status = ? WHERE operation_id = ? AND session_id = ?")
         .run(receiptBundleHash, payload.manual ? "fixture_manual_receipt" : "ingested_pending_proof", payload.operationId, envelope.sessionId);
+      if (result.changes === 0) {
+        throw Object.assign(new Error("CAW operation not found for receipt ingest"), {
+          apiError: notFoundError(requestId, "caw operation"),
+        });
+      }
     }
     const event = appendEvidenceEvent(ctx, {
       sessionId: envelope.sessionId,
@@ -344,7 +357,9 @@ export async function ingestCawReceiptBundle(
       kind: "caw.receipt.ingested.fixture",
       payload: {
         receiptBundleHash,
+        operationId: payload.operationId ?? null,
         sourceLabel: payload.sourceLabel,
+        receiptCount: payload.receipts.length,
         manual: payload.manual,
         proofAuthority: false,
         status: payload.manual ? "fixture_manual_receipt" : "ingested_pending_proof",
@@ -356,6 +371,8 @@ export async function ingestCawReceiptBundle(
       evidenceEventId: event.eventId,
       data: {
         receiptBundleHash,
+        operationId: payload.operationId ?? null,
+        receiptCount: payload.receipts.length,
         status: payload.manual ? "fixture_manual_receipt" : "ingested_pending_proof",
         proofAuthority: false,
         winnerClaimAllowed: false,
@@ -369,6 +386,7 @@ export async function runArtifactPreflight(input: SessionScopedEnvelope, ctx: Se
   const payload = parseStrict(ArtifactPreflightPayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("artifacts:preflight", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
+    assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
     const createdAt = ctx.clock.now().toISOString();
     const preflightId = hashJson({ sessionId: envelope.sessionId, payload, requestId });
     ctx.db.sqlite
@@ -391,13 +409,27 @@ export async function runArtifactPreflight(input: SessionScopedEnvelope, ctx: Se
       sessionId: envelope.sessionId,
       authority: "operator",
       kind: "artifact.preflight.pending",
-      payload: { preflightId, spendId: payload.spendId, status: "pending_live_delivery" },
+      payload: {
+        preflightId,
+        spendId: payload.spendId,
+        artifactHashPreview: payload.artifactHashPreview,
+        priceDisclosureHash: payload.priceDisclosureHash,
+        sourceStateSnapshotHash: payload.sourceStateSnapshotHash,
+        status: "pending_live_delivery",
+      },
     });
     return {
       ok: true,
       requestId,
       evidenceEventId: event.eventId,
-      data: { preflightId, status: "pending_live_delivery", winnerClaimAllowed: false },
+      data: {
+        preflightId,
+        artifactHashPreview: payload.artifactHashPreview,
+        priceDisclosureHash: payload.priceDisclosureHash,
+        sourceStateSnapshotHash: payload.sourceStateSnapshotHash,
+        status: "pending_live_delivery",
+        winnerClaimAllowed: false,
+      },
     };
   });
 }
@@ -407,24 +439,35 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
   const payload = parseStrict(QuotePayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("quotes:sign", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
+    assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    const preflight = requireQuotePreflight(ctx, envelope.sessionId, payload, requestId);
+    const priceDisclosureHash = String(preflight.price_disclosure_hash);
+    const sourceStateSnapshotHash = String(preflight.source_state_snapshot_hash);
     const createdAt = ctx.clock.now().toISOString();
     const quoteHash = hashJson({
       sessionId: envelope.sessionId,
       ...payload,
+      priceDisclosureHash,
+      sourceStateSnapshotHash,
+      quoteSignedAfterPreflight: true,
       modes: LOCKED_RUNTIME_MODES,
     });
     const quoteId = hashJson({ quoteHash, requestId });
     ctx.db.sqlite
       .prepare(
         `INSERT INTO quotes
-          (quote_id, session_id, spend_id, artifact_commitment, price_atomic, quote_nonce, valid_until_block, quote_hash, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'mocked_not_chain_settleable', ?)`,
+          (quote_id, session_id, spend_id, preflight_id, artifact_commitment, price_disclosure_hash, source_state_snapshot_hash,
+           price_atomic, quote_nonce, valid_until_block, quote_hash, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mocked_after_preflight_not_chain_settleable', ?)`,
       )
       .run(
         quoteId,
         envelope.sessionId,
         payload.spendId,
+        payload.preflightId,
         payload.artifactCommitment,
+        priceDisclosureHash,
+        sourceStateSnapshotHash,
         payload.priceAtomic,
         payload.quoteNonce,
         payload.validUntilBlock,
@@ -435,13 +478,32 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
       sessionId: envelope.sessionId,
       authority: "advisory",
       kind: "quote.signed.mocked",
-      payload: { quoteId, quoteHash, status: "mocked_not_chain_settleable" },
+      payload: {
+        quoteId,
+        quoteHash,
+        spendId: payload.spendId,
+        preflightId: payload.preflightId,
+        artifactCommitment: payload.artifactCommitment,
+        priceDisclosureHash,
+        sourceStateSnapshotHash,
+        quoteSignedAfterPreflight: true,
+        status: "mocked_after_preflight_not_chain_settleable",
+      },
     });
     return {
       ok: true,
       requestId,
       evidenceEventId: event.eventId,
-      data: { quoteId, quoteHash, status: "mocked_not_chain_settleable", winnerClaimAllowed: false },
+      data: {
+        quoteId,
+        quoteHash,
+        preflightId: payload.preflightId,
+        priceDisclosureHash,
+        sourceStateSnapshotHash,
+        quoteSignedAfterPreflight: true,
+        status: "mocked_after_preflight_not_chain_settleable",
+        winnerClaimAllowed: false,
+      },
     };
   });
 }
@@ -1231,6 +1293,50 @@ function assertSession(ctx: ServiceCtx, sessionId: string, requestId: string): v
   if (!getSessionRow(ctx, sessionId)) {
     throw Object.assign(new Error("session not found"), { apiError: notFoundError(requestId, "session") });
   }
+}
+
+function assertSpend(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): void {
+  const spend = ctx.db.sqlite
+    .prepare("SELECT spend_id FROM spends WHERE session_id = ? AND spend_id = ?")
+    .get(sessionId, spendId) as Row | undefined;
+  if (!spend) {
+    throw Object.assign(new Error("spend not found"), { apiError: notFoundError(requestId, "spend") });
+  }
+}
+
+function requireQuotePreflight(
+  ctx: ServiceCtx,
+  sessionId: string,
+  payload: { spendId: string; preflightId: string; artifactCommitment: string },
+  requestId: string,
+): Row {
+  const preflight = ctx.db.sqlite
+    .prepare(
+      `SELECT preflight_id, spend_id, artifact_hash_preview, price_disclosure_hash, source_state_snapshot_hash, status
+       FROM artifact_preflights
+       WHERE session_id = ? AND preflight_id = ? AND spend_id = ?`,
+    )
+    .get(sessionId, payload.preflightId, payload.spendId) as Row | undefined;
+  if (!preflight) {
+    throw Object.assign(new Error("artifact preflight is required before quote signing"), {
+      apiError: proofPendingError(requestId, "artifact preflight is required before quote signing"),
+    });
+  }
+  if (preflight.status !== "pending_live_delivery") {
+    throw Object.assign(new Error("artifact preflight is not quote-eligible"), {
+      apiError: proofBlockedError(requestId, "artifact preflight is not quote-eligible", {
+        status: String(preflight.status),
+      }),
+    });
+  }
+  if (preflight.artifact_hash_preview !== payload.artifactCommitment) {
+    throw Object.assign(new Error("quote artifact commitment does not match preflight preview"), {
+      apiError: proofBlockedError(requestId, "quote artifact commitment must match the artifact preflight preview", {
+        preflightId: payload.preflightId,
+      }),
+    });
+  }
+  return preflight;
 }
 
 function insertPendingJudgeRows(ctx: ServiceCtx, sessionId: string, createdAt: string): void {

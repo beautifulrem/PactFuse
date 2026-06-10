@@ -224,6 +224,24 @@ describe("pactfuse-api P0", () => {
       "proofAuthority",
       "winnerClaimAllowed",
     ]);
+    expect(json.paths["/api/v1/artifacts/preflight"].post["x-pactfuse-proof-fields"]).toEqual([
+      "preflightId",
+      "artifactHashPreview",
+      "priceDisclosureHash",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/quotes"].post["x-pactfuse-proof-fields"]).toEqual([
+      "preflightId",
+      "quoteSignedAfterPreflight",
+      "priceDisclosureHash",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/quotes"].post.responses["201"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/QuoteResponse",
+    );
+    expect(json.components.schemas.QuoteResponse.oneOf[0].properties.data.properties.quoteSignedAfterPreflight.const).toBe(
+      true,
+    );
     expect(json.paths["/api/v1/mcp/audit"].post["x-pactfuse-proof-fields"]).toEqual([
       "proofAuthority",
       "winnerClaimAllowed",
@@ -355,6 +373,76 @@ describe("pactfuse-api P0", () => {
     expect(judgeJson.data.winnerClaimAllowed).toBe(false);
   });
 
+  it("requires non-manual CAW receipt ingest to bind an existing operation", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-caw-receipt-binding");
+    const spendId = await registerSpend(app, sessionId);
+
+    const missingOperationId = await post(app, "/api/v1/caw/receipts/ingest", {
+      sessionId,
+      idempotencyKey: "caw-receipt-missing-operation-id",
+      payload: {
+        sourceLabel: "caw-api",
+        receipts: [{ requestId: "req-1", spendId }],
+        manual: false,
+      },
+    });
+    const unknownOperation = await post(app, "/api/v1/caw/receipts/ingest", {
+      sessionId,
+      idempotencyKey: "caw-receipt-unknown-operation",
+      payload: {
+        sourceLabel: "caw-api",
+        operationId: "missing-operation",
+        receipts: [{ requestId: "req-2", spendId }],
+        manual: false,
+      },
+    });
+
+    expect(missingOperationId.status).toBe(400);
+    expect(missingOperationId.json.error.code).toBe("bad_request");
+    expect(unknownOperation.status).toBe(404);
+    expect(unknownOperation.json.error.code).toBe("not_found");
+  });
+
+  it("links non-manual CAW receipt ingest to a built operation", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-caw-receipt-linked");
+    const spendId = await registerSpend(app, sessionId);
+
+    const operation = await post(app, "/api/v1/caw/operations/build", {
+      sessionId,
+      idempotencyKey: "build-linked-caw-op",
+      payload: {
+        spendId,
+        operationKind: "activate_tool",
+        target: "0x1234",
+        selector: "0xabcdef12",
+      },
+    });
+    const ingest = await post(app, "/api/v1/caw/receipts/ingest", {
+      sessionId,
+      idempotencyKey: "ingest-linked-caw-receipt",
+      payload: {
+        sourceLabel: "caw-api",
+        operationId: operation.json.data.operationId,
+        receipts: [{ requestId: "req-linked", spendId }],
+        manual: false,
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const event = replayJson.data.events.find((candidate: { kind: string }) => candidate.kind === "caw.receipt.ingested.fixture");
+
+    expect(operation.status).toBe(201);
+    expect(ingest.status).toBe(202);
+    expect(ingest.json.data.operationId).toBe(operation.json.data.operationId);
+    expect(ingest.json.data.receiptCount).toBe(1);
+    expect(ingest.json.data.status).toBe("ingested_pending_proof");
+    expect(ingest.json.data.proofAuthority).toBe(false);
+    expect(event.payload.operationId).toBe(operation.json.data.operationId);
+    expect(event.payload.receiptCount).toBe(1);
+  });
+
   it("keeps artifact reads fail-closed and validates path parameters", async () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-artifact");
@@ -370,6 +458,140 @@ describe("pactfuse-api P0", () => {
     expect(pendingJson.error.code).toBe("proof_pending");
     expect(invalidPayer.status).toBe(400);
     expect(invalidJson.error.code).toBe("bad_request");
+  });
+
+  it("requires registered spends before artifact preflight", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-preflight-spend-required");
+
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "preflight-missing-spend",
+      payload: {
+        spendId: hex32("missing-spend"),
+        artifactHashPreview: hex32("artifact-preview"),
+        endpointUrl: "https://example.com/artifact",
+        priceDisclosureHash: hex32("price-disclosure"),
+        sourceStateSnapshotHash: hex32("source-state"),
+      },
+    });
+
+    expect(preflight.status).toBe(404);
+    expect(preflight.json.error.code).toBe("not_found");
+  });
+
+  it("requires an artifact preflight before signing mocked quotes", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-quote-preflight-required");
+    const spendId = await registerSpend(app, sessionId);
+
+    const quote = await post(app, "/api/v1/quotes", {
+      sessionId,
+      idempotencyKey: "quote-without-preflight",
+      payload: {
+        spendId,
+        preflightId: hex32("missing-preflight"),
+        artifactCommitment: hex32("artifact-preview"),
+        priceAtomic: "1000",
+        quoteNonce: "quote-no-preflight",
+        validUntilBlock: "123",
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(quote.status).toBe(423);
+    expect(quote.json.error.code).toBe("proof_pending");
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("quote.signed.mocked");
+  });
+
+  it("binds mocked quote signing to the matching artifact preflight", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-quote-preflight-bound");
+    const spendId = await registerSpend(app, sessionId);
+    const artifactHashPreview = hex32("artifact-preview-bound");
+    const priceDisclosureHash = hex32("price-disclosure-bound");
+    const sourceStateSnapshotHash = hex32("source-state-bound");
+
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "preflight-before-quote",
+      payload: {
+        spendId,
+        artifactHashPreview,
+        endpointUrl: "https://example.com/artifact",
+        priceDisclosureHash,
+        sourceStateSnapshotHash,
+      },
+    });
+    const quote = await post(app, "/api/v1/quotes", {
+      sessionId,
+      idempotencyKey: "quote-after-preflight",
+      payload: {
+        spendId,
+        preflightId: preflight.json.data.preflightId,
+        artifactCommitment: artifactHashPreview,
+        priceAtomic: "1000",
+        quoteNonce: "quote-after-preflight",
+        validUntilBlock: "123",
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const quoteEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "quote.signed.mocked");
+
+    expect(preflight.status).toBe(202);
+    expect(preflight.json.data.artifactHashPreview).toBe(artifactHashPreview);
+    expect(preflight.json.data.priceDisclosureHash).toBe(priceDisclosureHash);
+    expect(preflight.json.data.sourceStateSnapshotHash).toBe(sourceStateSnapshotHash);
+    expect(quote.status).toBe(201);
+    expect(quote.json.data.preflightId).toBe(preflight.json.data.preflightId);
+    expect(quote.json.data.priceDisclosureHash).toBe(priceDisclosureHash);
+    expect(quote.json.data.sourceStateSnapshotHash).toBe(sourceStateSnapshotHash);
+    expect(quote.json.data.quoteSignedAfterPreflight).toBe(true);
+    expect(quote.json.data.status).toBe("mocked_after_preflight_not_chain_settleable");
+    expect(quoteEvent.payload).toEqual(
+      expect.objectContaining({
+        preflightId: preflight.json.data.preflightId,
+        artifactCommitment: artifactHashPreview,
+        priceDisclosureHash,
+        sourceStateSnapshotHash,
+        quoteSignedAfterPreflight: true,
+      }),
+    );
+  });
+
+  it("blocks mocked quotes whose artifact commitment diverges from preflight", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-quote-preflight-mismatch");
+    const spendId = await registerSpend(app, sessionId);
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "preflight-mismatch",
+      payload: {
+        spendId,
+        artifactHashPreview: hex32("artifact-preview-original"),
+        endpointUrl: "https://example.com/artifact",
+        priceDisclosureHash: hex32("price-disclosure-mismatch"),
+        sourceStateSnapshotHash: hex32("source-state-mismatch"),
+      },
+    });
+
+    const quote = await post(app, "/api/v1/quotes", {
+      sessionId,
+      idempotencyKey: "quote-preflight-mismatch",
+      payload: {
+        spendId,
+        preflightId: preflight.json.data.preflightId,
+        artifactCommitment: hex32("artifact-preview-tampered"),
+        priceAtomic: "1000",
+        quoteNonce: "quote-preflight-mismatch",
+        validUntilBlock: "123",
+      },
+    });
+
+    expect(quote.status).toBe(422);
+    expect(quote.json.error.code).toBe("proof_blocked");
   });
 
   it("persists sessions across database reopen", async () => {
@@ -867,11 +1089,12 @@ describe("pactfuse-api P0", () => {
       payload: { label: "provider-status" },
     });
     const sessionId = session.json.data.sessionId;
+    const spendId = await registerSpend(app, sessionId);
     const operation = await post(app, "/api/v1/caw/operations/build", {
       sessionId,
       idempotencyKey: "build-provider-bound-op",
       payload: {
-        spendId: hex32("provider-spend"),
+        spendId,
         operationKind: "activate_tool",
         target: "0x1234",
         selector: "0xabcdef12",
@@ -956,14 +1179,15 @@ async function registerSource(app: ReturnType<typeof createApp>, sessionId: stri
   expect(res.status).toBe(201);
 }
 
-async function registerSpend(app: ReturnType<typeof createApp>, sessionId: string) {
+async function registerSpend(app: ReturnType<typeof createApp>, sessionId: string): Promise<string> {
+  const spendId = hex32("spend");
   const res = await post(app, "/api/v1/spends/register-batch", {
     sessionId,
     idempotencyKey: "spend-register",
     payload: {
       spends: [
         {
-          spendId: hex32("spend"),
+          spendId,
           pactId: "pact-c",
           toolId: "code-scan",
           payer: "0x1234",
@@ -976,6 +1200,7 @@ async function registerSpend(app: ReturnType<typeof createApp>, sessionId: strin
     },
   });
   expect(res.status).toBe(201);
+  return spendId;
 }
 
 async function post(

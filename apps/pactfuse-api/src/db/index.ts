@@ -123,7 +123,10 @@ CREATE TABLE IF NOT EXISTS quotes (
   quote_id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
   spend_id TEXT NOT NULL,
+  preflight_id TEXT NOT NULL,
   artifact_commitment TEXT NOT NULL,
+  price_disclosure_hash TEXT NOT NULL,
+  source_state_snapshot_hash TEXT NOT NULL,
   price_atomic TEXT NOT NULL,
   quote_nonce TEXT NOT NULL,
   valid_until_block TEXT NOT NULL,
@@ -213,6 +216,9 @@ CREATE TABLE IF NOT EXISTS judge_check_rows (
   ensureColumn(sqlite, "mcp_adapter_calls", "audit_nonce", "TEXT");
   ensureColumn(sqlite, "mcp_adapter_calls", "request_json", "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(sqlite, "mcp_adapter_calls", "response_json", "TEXT NOT NULL DEFAULT '{}'");
+  ensureColumn(sqlite, "quotes", "preflight_id", "TEXT");
+  ensureColumn(sqlite, "quotes", "price_disclosure_hash", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
+  ensureColumn(sqlite, "quotes", "source_state_snapshot_hash", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
   sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS mcp_adapter_calls_audit_nonce_idx ON mcp_adapter_calls(audit_nonce) WHERE audit_nonce IS NOT NULL");
 }
 
