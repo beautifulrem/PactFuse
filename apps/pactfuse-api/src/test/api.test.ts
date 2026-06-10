@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
+import { canonicalizeJson } from "@pactfuse/evidence-schema";
 import { createApp } from "../app.js";
 import { openPactFuseDb } from "../db/index.js";
 import { completeJob, enqueueJob, leaseNextJob, requeueExpiredLeases } from "../services/jobs.js";
@@ -265,7 +266,32 @@ describe("pactfuse-api P0", () => {
       "createdAt",
       "proofAuthority",
     ]);
+    expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.required).toEqual([
+      "bundleType",
+      "sessionId",
+      "summaryMode",
+      "asOfEventSeq",
+      "asOfMcpAdapterCallCount",
+      "winnerClaimAllowed",
+      "eventRoot",
+      "agentTranscriptHash",
+      "events",
+      "mcpAdapterCalls",
+      "judgeCheck",
+    ]);
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("mcpAdapterCalls");
+    expect(json.paths["/api/v1/evidence/agent-transcript"].get["x-pactfuse-proof-fields"]).toEqual([
+      "transcriptHash",
+      "toolsCallHash",
+      "boundedToPinnedManifest",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.components.schemas.AgentTranscriptResponse.oneOf[0].properties.data.properties.format.const).toBe(
+      "mcp-json-rpc",
+    );
+    expect(
+      json.components.schemas.AgentTranscriptResponse.oneOf[0].properties.data.properties.boundedToPinnedManifest.const,
+    ).toBe(false);
     expect(json.components.schemas.FailClosedProofState.properties.proofChipAllowed.const).toBe(false);
     expect(json.components.schemas.FailClosedProofState.properties.winnerClaimAllowed.const).toBe(false);
     expect(json.components.schemas.FailClosedProofState.properties.finalVerifierComplete.const).toBe(false);
@@ -285,6 +311,9 @@ describe("pactfuse-api P0", () => {
 
     expect(seqs).toEqual([1, 2, 3]);
     expect(json.data.eventRoot).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(json.data.agentTranscriptHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(json.data.asOfEventSeq).toBe(3);
+    expect(json.data.asOfMcpAdapterCallCount).toBe(0);
   });
 
   it("resumes the SSE stream after an event id", async () => {
@@ -436,6 +465,144 @@ describe("pactfuse-api P0", () => {
         proofAuthority: false,
       }),
     ]);
+    expect(replayJson.data.agentTranscriptHash).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  it("summarizes MCP adapter calls into the agent transcript view without enabling proof claims", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-agent-transcript");
+    const pending = await app.request(`/api/v1/evidence/agent-transcript?sessionId=${sessionId}`);
+    const pendingJson = await pending.json();
+
+    const call = recordMcpAdapterCall(
+      {
+        sessionId,
+        auditNonce: "audit-transcript-summary",
+        toolName: "pactfuse_get_judge_check",
+        request: { sessionId },
+        response: { ok: true, data: { sessionId, winnerClaimAllowed: false } },
+        status: "succeeded",
+      },
+      ctx,
+    );
+    const transcript = await app.request(`/api/v1/evidence/agent-transcript?sessionId=${sessionId}`);
+    const transcriptJson = await transcript.json();
+
+    expect(pending.status).toBe(200);
+    expect(pendingJson.data.status).toBe("pending");
+    expect(pendingJson.data.callCount).toBe(0);
+    expect(pendingJson.data.transcriptHash).toBeNull();
+    expect(transcript.status).toBe(200);
+    expect(transcriptJson.data.status).toBe("summarized");
+    expect(transcriptJson.data.format).toBe("mcp-json-rpc");
+    expect(transcriptJson.data.toolsListHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(transcriptJson.data.toolsCallHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(transcriptJson.data.transcriptHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(transcriptJson.data.boundedToPinnedManifest).toBe(false);
+    expect(transcriptJson.data.winnerClaimAllowed).toBe(false);
+    expect(transcriptJson.data.calls).toEqual([
+      expect.objectContaining({
+        callId: call.callId,
+        auditNonce: "audit-transcript-summary",
+        toolName: "pactfuse_get_judge_check",
+        status: "succeeded",
+      }),
+    ]);
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    expect(replayJson.data.agentTranscriptHash).toBe(hashForTestJson(transcriptJson.data));
+    expect(replayJson.data.asOfMcpAdapterCallCount).toBe(1);
+
+    recordMcpAdapterCall(
+      {
+        sessionId,
+        auditNonce: "audit-transcript-after-snapshot",
+        toolName: "pactfuse_get_replay_bundle",
+        request: { sessionId },
+        response: { ok: true, data: { sessionId } },
+        status: "succeeded",
+      },
+      ctx,
+    );
+    const verifySnapshot = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-agent-transcript-snapshot",
+      payload: { replayBundle: replayJson.data },
+    });
+    const verifyTampered = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-agent-transcript-tampered",
+      payload: {
+        replayBundle: {
+          ...replayJson.data,
+          agentTranscriptHash: hex32("tampered-agent-transcript"),
+        },
+      },
+    });
+
+    expect(verifySnapshot.json.data.errors).not.toContain(
+      "replayBundle.agentTranscriptHash does not match the server transcript snapshot",
+    );
+    expect(verifyTampered.json.data.errors).toContain(
+      "replayBundle.agentTranscriptHash does not match the server transcript snapshot",
+    );
+  });
+
+  it("reports verifier errors when MCP adapter row hashes diverge from evidence events", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-mcp-integrity");
+    const call = recordMcpAdapterCall(
+      {
+        sessionId,
+        auditNonce: "audit-integrity-check",
+        toolName: "pactfuse_get_judge_check",
+        request: { sessionId },
+        response: { ok: true },
+        status: "succeeded",
+      },
+      ctx,
+    );
+    ctx.db.sqlite
+      .prepare("UPDATE mcp_adapter_calls SET response_hash = ? WHERE call_id = ?")
+      .run(hex32("tampered-response"), call.callId);
+
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-mcp-integrity",
+      payload: {},
+    });
+
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.errors).toContain(`mcp adapter call mismatch at responseHash for ${call.callId}`);
+  });
+
+  it("reports verifier errors when raw MCP adapter JSON diverges from stored hashes", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-mcp-raw-integrity");
+    const call = recordMcpAdapterCall(
+      {
+        sessionId,
+        auditNonce: "audit-raw-integrity-check",
+        toolName: "pactfuse_get_judge_check",
+        request: { sessionId },
+        response: { ok: true },
+        status: "succeeded",
+      },
+      ctx,
+    );
+    ctx.db.sqlite
+      .prepare("UPDATE mcp_adapter_calls SET request_json = ?, response_json = ? WHERE call_id = ?")
+      .run(JSON.stringify({ sessionId, tampered: true }), JSON.stringify({ ok: false }), call.callId);
+
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-mcp-raw-integrity",
+      payload: {},
+    });
+
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.errors).toContain(`mcp adapter call request body hash mismatch for ${call.callId}`);
+    expect(verify.json.data.errors).toContain(`mcp adapter call response body hash mismatch for ${call.callId}`);
   });
 
   it("records MCP adapter calls through the HTTP audit endpoint", async () => {
@@ -827,6 +994,10 @@ async function post(
 
 function hex32(seed: string): `0x${string}` {
   return `0x${createHash("sha256").update(seed).digest("hex")}`;
+}
+
+function hashForTestJson(value: unknown): `0x${string}` {
+  return `0x${createHash("sha256").update(canonicalizeJson(value)).digest("hex")}`;
 }
 
 function signAuditPayload(secret: string, payload: unknown): `0x${string}` {

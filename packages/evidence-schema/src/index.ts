@@ -301,8 +301,11 @@ export const ReplayBundleViewSchema = z
     bundleType: z.literal("PACTFUSE_EVIDENCE_V1"),
     sessionId: Hex32Schema,
     summaryMode: z.literal(true),
+    asOfEventSeq: z.number().int().min(0).max(200),
+    asOfMcpAdapterCallCount: z.number().int().min(0).max(200),
     winnerClaimAllowed: z.literal(false),
     eventRoot: Hex32Schema,
+    agentTranscriptHash: Hex32Schema,
     events: z.array(EvidenceEventSchema).max(200),
     mcpAdapterCalls: z.array(McpAdapterCallViewSchema).max(200),
     judgeCheck: JudgeCheckViewSchema,
@@ -318,11 +321,29 @@ export const RunnerHeartbeatViewSchema = z
   })
   .strict();
 
+export const AgentTranscriptCallSummarySchema = z
+  .object({
+    callId: Hex32Schema,
+    auditNonce: z.string().min(12),
+    toolName: z.string().min(1),
+    requestHash: Hex32Schema,
+    responseHash: Hex32Schema,
+    status: z.enum(["succeeded", "failed", "blocked"]),
+    createdAt: IsoDateStringSchema,
+  })
+  .strict();
+
 export const AgentTranscriptViewSchema = z
   .object({
     sessionId: Hex32Schema,
-    status: z.enum(["pending", "blocked"]),
+    status: z.enum(["pending", "blocked", "summarized"]),
+    format: z.literal("mcp-json-rpc"),
+    toolsListHash: Hex32Schema.nullable(),
+    toolsCallHash: Hex32Schema.nullable(),
     transcriptHash: Hex32Schema.nullable(),
+    boundedToPinnedManifest: z.literal(false),
+    callCount: z.number().int().min(0).max(200),
+    calls: z.array(AgentTranscriptCallSummarySchema).max(200),
     winnerClaimAllowed: z.literal(false),
   })
   .strict();

@@ -70,6 +70,7 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/evidence/verify": ["schemaOk", "proofChipAllowed", "winnerClaimAllowed", "finalVerifierComplete"],
   "/api/v1/evidence/judge-check": ["winnerClaimAllowed", "rows.status", "rows.authority"],
   "/api/v1/evidence/replay-bundle": ["winnerClaimAllowed", "eventRoot", "mcpAdapterCalls", "judgeCheck"],
+  "/api/v1/evidence/agent-transcript": ["transcriptHash", "toolsCallHash", "boundedToPinnedManifest", "winnerClaimAllowed"],
 };
 
 export function createApp(ctx: ServiceCtx): Hono {
@@ -468,10 +469,58 @@ function buildOpenApi(): Record<string, unknown> {
         }),
         ReplayBundleResponse: serviceResponseSchema({
           type: "object",
-          required: ["winnerClaimAllowed", "eventRoot", "mcpAdapterCalls", "judgeCheck"],
+          required: [
+            "bundleType",
+            "sessionId",
+            "summaryMode",
+            "asOfEventSeq",
+            "asOfMcpAdapterCallCount",
+            "winnerClaimAllowed",
+            "eventRoot",
+            "agentTranscriptHash",
+            "events",
+            "mcpAdapterCalls",
+            "judgeCheck",
+          ],
           properties: {
+            bundleType: { const: "PACTFUSE_EVIDENCE_V1" },
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            summaryMode: { const: true },
+            asOfEventSeq: { type: "integer", minimum: 0, maximum: 200 },
+            asOfMcpAdapterCallCount: { type: "integer", minimum: 0, maximum: 200 },
             winnerClaimAllowed: { const: false },
             eventRoot: { type: "string" },
+            agentTranscriptHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            events: {
+              type: "array",
+              items: {
+                type: "object",
+                required: [
+                  "sessionId",
+                  "eventId",
+                  "eventSeq",
+                  "eventHash",
+                  "prevProofEventHash",
+                  "authority",
+                  "kind",
+                  "payloadHash",
+                  "payload",
+                  "createdAt",
+                ],
+                properties: {
+                  sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  eventId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  eventSeq: { type: "integer", minimum: 1 },
+                  eventHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  prevProofEventHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  authority: { enum: ["proof", "delivery", "operator", "advisory"] },
+                  kind: { type: "string" },
+                  payloadHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  payload: { type: "object", additionalProperties: true },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
             mcpAdapterCalls: {
               type: "array",
               items: {
@@ -505,6 +554,48 @@ function buildOpenApi(): Record<string, unknown> {
               },
             },
             judgeCheck: { $ref: "#/components/schemas/JudgeCheckData" },
+          },
+        }),
+        AgentTranscriptResponse: serviceResponseSchema({
+          type: "object",
+          required: [
+            "sessionId",
+            "status",
+            "format",
+            "toolsListHash",
+            "toolsCallHash",
+            "transcriptHash",
+            "boundedToPinnedManifest",
+            "callCount",
+            "calls",
+            "winnerClaimAllowed",
+          ],
+          properties: {
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            status: { enum: ["pending", "blocked", "summarized"] },
+            format: { const: "mcp-json-rpc" },
+            toolsListHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            toolsCallHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            transcriptHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            boundedToPinnedManifest: { const: false },
+            callCount: { type: "integer", minimum: 0, maximum: 200 },
+            calls: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["callId", "auditNonce", "toolName", "requestHash", "responseHash", "status", "createdAt"],
+                properties: {
+                  callId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  auditNonce: { type: "string", minLength: 12 },
+                  toolName: { type: "string" },
+                  requestHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  responseHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  status: { enum: ["succeeded", "failed", "blocked"] },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+            winnerClaimAllowed: { const: false },
           },
         }),
         ServiceResponse: serviceResponseSchema({ type: "object" }),
@@ -574,6 +665,8 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/McpAuditResponse" };
     case "/api/v1/evidence/replay-bundle":
       return { $ref: "#/components/schemas/ReplayBundleResponse" };
+    case "/api/v1/evidence/agent-transcript":
+      return { $ref: "#/components/schemas/AgentTranscriptResponse" };
     default:
       return { $ref: "#/components/schemas/ServiceResponse" };
   }

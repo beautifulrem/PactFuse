@@ -533,7 +533,11 @@ export async function verifyEvidenceForSession(
             warnings: [],
             errors: ["missing receipt or replayBundle; fail closed"],
           };
-    const eventLogErrors = verifyEventLogIntegrity(ctx, envelope.sessionId);
+    const eventLogErrors = [
+      ...verifyEventLogIntegrity(ctx, envelope.sessionId),
+      ...verifyMcpAdapterCallIntegrity(ctx, envelope.sessionId),
+      ...verifyReplayBundleBindings(ctx, envelope.sessionId, payload),
+    ];
     const rawErrors = toStringArray(raw.errors);
     const view = VerifierRunViewSchema.parse({
       sessionId: envelope.sessionId,
@@ -599,12 +603,16 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
   assertSession(ctx, parsedSessionId, requestId);
   const events = listEvents(ctx, parsedSessionId, 0, 200);
   const mcpAdapterCalls = listMcpAdapterCalls(ctx, parsedSessionId, 200);
+  const agentTranscript = buildAgentTranscriptData(parsedSessionId, ctx, mcpAdapterCalls.length);
   const data = ReplayBundleViewSchema.parse({
     bundleType: "PACTFUSE_EVIDENCE_V1",
     sessionId: parsedSessionId,
     summaryMode: true,
+    asOfEventSeq: events.at(-1)?.eventSeq ?? 0,
+    asOfMcpAdapterCallCount: mcpAdapterCalls.length,
     winnerClaimAllowed: false,
     eventRoot: hashJson(events.map((event) => event.eventHash)),
+    agentTranscriptHash: hashJson(agentTranscript),
     events,
     mcpAdapterCalls,
     judgeCheck: readJudgeCheckData(parsedSessionId, ctx),
@@ -647,13 +655,45 @@ export async function readAgentTranscript(sessionId: string, ctx: ServiceCtx): P
   return {
     ok: true,
     requestId,
-    data: AgentTranscriptViewSchema.parse({
-      sessionId: parsedSessionId,
-      status: "pending",
-      transcriptHash: null,
-      winnerClaimAllowed: false,
-    }),
+    data: buildAgentTranscriptData(parsedSessionId, ctx),
   };
+}
+
+function buildAgentTranscriptData(sessionId: string, ctx: ServiceCtx, callLimit = 200): unknown {
+  const calls = listMcpAdapterCalls(ctx, sessionId, Math.min(callLimit, 200));
+  const callSummaries = calls.map((call) => ({
+    callId: call.callId,
+    auditNonce: call.auditNonce,
+    toolName: call.toolName,
+    requestHash: call.requestHash,
+    responseHash: call.responseHash,
+    status: call.status,
+    createdAt: call.createdAt,
+  }));
+  const toolsListHash = calls.length > 0 ? hashJson([...new Set(calls.map((call) => call.toolName))].sort()) : null;
+  const toolsCallHash = calls.length > 0 ? hashJson(callSummaries) : null;
+  const transcriptHash =
+    calls.length > 0
+      ? hashJson({
+          format: "mcp-json-rpc",
+          sessionId,
+          toolsListHash,
+          toolsCallHash,
+          callCount: calls.length,
+        })
+      : null;
+  return AgentTranscriptViewSchema.parse({
+    sessionId,
+    status: calls.length > 0 ? "summarized" : "pending",
+    format: "mcp-json-rpc",
+    toolsListHash,
+    toolsCallHash,
+    transcriptHash,
+    boundedToPinnedManifest: false,
+    callCount: calls.length,
+    calls: callSummaries,
+    winnerClaimAllowed: false,
+  });
 }
 
 export async function readArtifactAccess(
@@ -1315,6 +1355,84 @@ function verifyEventLogIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
     expectedSeq += 1;
   }
   return errors;
+}
+
+function verifyMcpAdapterCallIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  const events = listEvents(ctx, sessionId, 0, 200).filter((event) => event.kind === "mcp.adapter.call");
+  const calls = new Map(listMcpAdapterCalls(ctx, sessionId, 200).map((call) => [call.callId, call]));
+  const errors: string[] = [];
+  for (const event of events) {
+    const payload = event.payload;
+    const callId = typeof payload.callId === "string" ? payload.callId : null;
+    if (!callId) {
+      errors.push(`mcp adapter event ${event.eventId} is missing callId`);
+      continue;
+    }
+    const call = calls.get(callId);
+    if (!call) {
+      errors.push(`mcp adapter event ${event.eventId} has no matching adapter call row`);
+      continue;
+    }
+    if (hashJson(call.request) !== call.requestHash) {
+      errors.push(`mcp adapter call request body hash mismatch for ${callId}`);
+    }
+    if (hashJson(call.response) !== call.responseHash) {
+      errors.push(`mcp adapter call response body hash mismatch for ${callId}`);
+    }
+    for (const field of ["auditNonce", "toolName", "requestHash", "responseHash", "status"] as const) {
+      if (payload[field] !== call[field]) {
+        errors.push(`mcp adapter call mismatch at ${field} for ${callId}`);
+      }
+    }
+  }
+  const eventCallIds = new Set(events.map((event) => (typeof event.payload.callId === "string" ? event.payload.callId : null)));
+  for (const callId of calls.keys()) {
+    if (!eventCallIds.has(callId)) {
+      errors.push(`mcp adapter call row ${callId} has no matching evidence event`);
+    }
+  }
+  return errors;
+}
+
+function verifyReplayBundleBindings(
+  ctx: ServiceCtx,
+  sessionId: string,
+  payload: {
+    receipt?: Record<string, JsonValue> | undefined;
+    replayBundle?: Record<string, JsonValue> | undefined;
+  },
+): string[] {
+  const bundle = replayBundleFromVerifierPayload(payload);
+  if (!bundle) {
+    return [];
+  }
+  const errors: string[] = [];
+  if (typeof bundle.sessionId === "string" && bundle.sessionId !== sessionId) {
+    errors.push("replayBundle.sessionId must match verifier sessionId");
+  }
+  if (typeof bundle.agentTranscriptHash !== "string") {
+    return errors;
+  }
+  const asOfCount =
+    typeof bundle.asOfMcpAdapterCallCount === "number" && Number.isInteger(bundle.asOfMcpAdapterCallCount)
+      ? Math.max(0, Math.min(bundle.asOfMcpAdapterCallCount, 200))
+      : 200;
+  const expectedAgentTranscriptHash = hashJson(buildAgentTranscriptData(sessionId, ctx, asOfCount));
+  if (bundle.agentTranscriptHash !== expectedAgentTranscriptHash) {
+    errors.push("replayBundle.agentTranscriptHash does not match the server transcript snapshot");
+  }
+  return errors;
+}
+
+function replayBundleFromVerifierPayload(payload: {
+  receipt?: Record<string, JsonValue> | undefined;
+  replayBundle?: Record<string, JsonValue> | undefined;
+}): Record<string, JsonValue> | null {
+  if (payload.replayBundle) {
+    return payload.replayBundle;
+  }
+  const receiptBundle = payload.receipt?.replayBundle;
+  return receiptBundle && typeof receiptBundle === "object" && !Array.isArray(receiptBundle) ? receiptBundle : null;
 }
 
 function scoped(scope: string, sessionId: string): string {
