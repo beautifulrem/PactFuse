@@ -39,6 +39,7 @@ import {
   notFoundError,
   nowIso,
   parseStrict,
+  proofBlockedError,
   proofPendingError,
   sha256Hex,
   toApiError,
@@ -55,6 +56,7 @@ const JUDGE_ROWS = [
   ["lease_execution", "Lease execution", "pending MCP transcript and lease run proof"],
 ] as const;
 
+const MAX_REPLAY_BUNDLE_BYTES = 2 * 1024 * 1024;
 const idempotencyLocks = new Map<string, Promise<void>>();
 
 export async function createSession(input: CreateSessionInput, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
@@ -219,34 +221,36 @@ export async function registerSourceBoundSpends(
   return withIdempotency(ctx, scoped("spends:register-batch", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
     const createdAt = ctx.clock.now().toISOString();
-    for (const spend of payload.spends) {
-      ctx.db.sqlite
-        .prepare(
-          `INSERT OR REPLACE INTO spends
-            (spend_id, session_id, pact_id, tool_id, payer, agent_wallet, source_hashes_json, max_price_atomic, nonce, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered_pending_chain_log', ?)`,
-        )
-        .run(
-          spend.spendId,
-          envelope.sessionId,
-          spend.pactId,
-          spend.toolId,
-          spend.payer,
-          spend.agentWallet,
-          canonicalizeJson(spend.sourceHashes),
-          spend.maxPriceAtomic,
-          spend.nonce,
-          createdAt,
-        );
-    }
-    const event = appendEvidenceEvent(ctx, {
-      sessionId: envelope.sessionId,
-      authority: "operator",
-      kind: "spend.registered",
-      payload: {
-        spendIds: payload.spends.map((spend) => spend.spendId),
-        status: "registered_pending_chain_log",
-      },
+    const event = withImmediateTransaction(ctx, () => {
+      for (const spend of payload.spends) {
+        ctx.db.sqlite
+          .prepare(
+            `INSERT OR REPLACE INTO spends
+              (spend_id, session_id, pact_id, tool_id, payer, agent_wallet, source_hashes_json, max_price_atomic, nonce, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered_pending_chain_log', ?)`,
+          )
+          .run(
+            spend.spendId,
+            envelope.sessionId,
+            spend.pactId,
+            spend.toolId,
+            spend.payer,
+            spend.agentWallet,
+            canonicalizeJson(spend.sourceHashes),
+            spend.maxPriceAtomic,
+            spend.nonce,
+            createdAt,
+          );
+      }
+      return appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "operator",
+        kind: "spend.registered",
+        payload: {
+          spendIds: payload.spends.map((spend) => spend.spendId),
+          status: "registered_pending_chain_log",
+        },
+      });
     });
     return {
       ok: true,
@@ -577,6 +581,18 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
     events,
     judgeCheck: readJudgeCheckData(parsedSessionId, ctx),
   });
+  const bundleBytes = Buffer.byteLength(canonicalizeJson(data), "utf8");
+  if (bundleBytes > MAX_REPLAY_BUNDLE_BYTES) {
+    return {
+      ok: false,
+      requestId,
+      error: proofBlockedError(requestId, "replay bundle exceeds the 2 MiB response cap", {
+        bundleBytes,
+        maxBytes: MAX_REPLAY_BUNDLE_BYTES,
+        eventCount: events.length,
+      }),
+    };
+  }
   return { ok: true, requestId, data };
 }
 
@@ -754,7 +770,10 @@ export function appendEvidenceEvent(
     payload: Record<string, JsonValue>;
   },
 ): EvidenceEvent {
-  ctx.db.sqlite.exec("BEGIN IMMEDIATE");
+  const ownsTransaction = !isInTransaction(ctx);
+  if (ownsTransaction) {
+    ctx.db.sqlite.exec("BEGIN IMMEDIATE");
+  }
   try {
     const session = getSessionRow(ctx, input.sessionId);
     if (!session) {
@@ -814,10 +833,14 @@ export function appendEvidenceEvent(
         input.authority === "proof" ? eventHash : String(session.latest_proof_event_hash),
         input.sessionId,
       );
-    ctx.db.sqlite.exec("COMMIT");
+    if (ownsTransaction) {
+      ctx.db.sqlite.exec("COMMIT");
+    }
     return event;
   } catch (error) {
-    ctx.db.sqlite.exec("ROLLBACK");
+    if (ownsTransaction) {
+      ctx.db.sqlite.exec("ROLLBACK");
+    }
     throw error;
   }
 }
@@ -842,32 +865,119 @@ async function withIdempotencyUnlocked<T>(
   executor: (requestId: string) => Promise<ServiceResult<T>> | ServiceResult<T>,
 ): Promise<ServiceResult<T>> {
   const requestHash = hashJson(requestBody);
-  const existing = ctx.db.sqlite
-    .prepare("SELECT request_id, request_hash, response_json FROM api_requests WHERE action_scope = ? AND idempotency_key = ?")
-    .get(actionScope, idempotencyKey) as Row | undefined;
-  if (existing) {
-    if (existing.request_hash === requestHash) {
-      return JSON.parse(String(existing.response_json)) as ServiceResult<T>;
+  const requestId = newRequestId("req");
+  let transactionOpen = false;
+  try {
+    ctx.db.sqlite.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const existing = ctx.db.sqlite
+      .prepare(
+        `SELECT request_id, request_hash, response_json, status
+         FROM api_requests
+         WHERE action_scope = ? AND idempotency_key = ?`,
+      )
+      .get(actionScope, idempotencyKey) as Row | undefined;
+    if (existing) {
+      ctx.db.sqlite.exec("COMMIT");
+      transactionOpen = false;
+      if (existing.request_hash === requestHash && String(existing.status ?? "completed") === "completed") {
+        return JSON.parse(String(existing.response_json)) as ServiceResult<T>;
+      }
+      if (existing.request_hash === requestHash) {
+        const completed = await waitForCompletedIdempotency<T>(ctx, actionScope, idempotencyKey, requestHash);
+        if (completed) {
+          return completed;
+        }
+        const pendingRequestId = newRequestId("idem_pending");
+        return {
+          ok: false,
+          requestId: pendingRequestId,
+          error: proofPendingError(pendingRequestId, "matching idempotent request is still running"),
+        };
+      }
+      const conflictRequestId = newRequestId("idem_conflict");
+      return { ok: false, requestId: conflictRequestId, error: conflictError(conflictRequestId) };
     }
-    const requestId = newRequestId("idem_conflict");
-    return { ok: false, requestId, error: conflictError(requestId) };
+    ctx.db.sqlite
+      .prepare(
+        `INSERT INTO api_requests
+          (request_id, action_scope, idempotency_key, request_hash, response_json, status, created_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+      )
+      .run(
+        requestId,
+        actionScope,
+        idempotencyKey,
+        requestHash,
+        JSON.stringify(pendingIdempotencyResponse(requestId)),
+        ctx.clock.now().toISOString(),
+      );
+    ctx.db.sqlite.exec("COMMIT");
+    transactionOpen = false;
+  } catch (error) {
+    if (transactionOpen) {
+      ctx.db.sqlite.exec("ROLLBACK");
+    }
+    throw error;
   }
 
-  const requestId = newRequestId("req");
   let result: ServiceResult<T>;
   try {
     result = await executor(requestId);
   } catch (error) {
     result = { ok: false, requestId, error: toApiError(error, requestId) };
   }
-  ctx.db.sqlite
-    .prepare(
-      `INSERT INTO api_requests
-        (request_id, action_scope, idempotency_key, request_hash, response_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-    .run(requestId, actionScope, idempotencyKey, requestHash, JSON.stringify(result), ctx.clock.now().toISOString());
+  if (shouldPersistIdempotencyResult(result)) {
+    ctx.db.sqlite
+      .prepare("UPDATE api_requests SET response_json = ?, status = 'completed' WHERE request_id = ? AND status = 'pending'")
+      .run(JSON.stringify(result), requestId);
+  } else {
+    ctx.db.sqlite.prepare("DELETE FROM api_requests WHERE request_id = ? AND status = 'pending'").run(requestId);
+  }
   return result;
+}
+
+async function waitForCompletedIdempotency<T>(
+  ctx: ServiceCtx,
+  actionScope: string,
+  idempotencyKey: string,
+  requestHash: string,
+): Promise<ServiceResult<T> | null> {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await sleep(25);
+    const row = ctx.db.sqlite
+      .prepare(
+        `SELECT request_hash, response_json, status
+         FROM api_requests
+         WHERE action_scope = ? AND idempotency_key = ?`,
+      )
+      .get(actionScope, idempotencyKey) as Row | undefined;
+    if (!row || row.request_hash !== requestHash) {
+      return null;
+    }
+    if (String(row.status ?? "completed") === "completed") {
+      return JSON.parse(String(row.response_json)) as ServiceResult<T>;
+    }
+  }
+  return null;
+}
+
+function pendingIdempotencyResponse(requestId: string): ServiceResult<never> {
+  return {
+    ok: false,
+    requestId,
+    error: proofPendingError(requestId, "idempotent request reserved but not completed yet"),
+  };
+}
+
+function shouldPersistIdempotencyResult<T>(result: ServiceResult<T>): boolean {
+  return result.ok || (!result.error.retryable && result.error.code !== "internal_error");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function withProcessLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -887,6 +997,29 @@ async function withProcessLock<T>(key: string, fn: () => Promise<T>): Promise<T>
       idempotencyLocks.delete(key);
     }
   }
+}
+
+function withImmediateTransaction<T>(ctx: ServiceCtx, fn: () => T): T {
+  const ownsTransaction = !isInTransaction(ctx);
+  if (ownsTransaction) {
+    ctx.db.sqlite.exec("BEGIN IMMEDIATE");
+  }
+  try {
+    const result = fn();
+    if (ownsTransaction) {
+      ctx.db.sqlite.exec("COMMIT");
+    }
+    return result;
+  } catch (error) {
+    if (ownsTransaction) {
+      ctx.db.sqlite.exec("ROLLBACK");
+    }
+    throw error;
+  }
+}
+
+function isInTransaction(ctx: ServiceCtx): boolean {
+  return Boolean((ctx.db.sqlite as unknown as { isTransaction?: boolean }).isTransaction);
 }
 
 function getSessionRow(ctx: ServiceCtx, sessionId: string): Row | undefined {

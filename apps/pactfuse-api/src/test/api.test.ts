@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../app.js";
 import { openPactFuseDb } from "../db/index.js";
-import { completeJob, enqueueJob, leaseNextJob } from "../services/jobs.js";
-import { recordMcpAdapterCall } from "../services/service.js";
+import { completeJob, enqueueJob, leaseNextJob, requeueExpiredLeases } from "../services/jobs.js";
+import { appendEvidenceEvent, recordMcpAdapterCall } from "../services/service.js";
 import { createVerifierAdapter } from "../services/verifier.js";
 import type { ServiceCtx } from "../types.js";
 
@@ -254,13 +254,33 @@ describe("pactfuse-api P0", () => {
     });
     const lease = leaseNextJob(ctx, ["index-chain-window"], "tester");
     const empty = leaseNextJob(ctx, ["index-chain-window"], "tester");
-    const done = completeJob(ctx, job.jobId, "succeeded");
+    const done = completeJob(ctx, job.jobId, lease?.leaseToken ?? "", "succeeded");
 
     expect(duplicate.jobId).toBe(job.jobId);
     expect(lease?.jobId).toBe(job.jobId);
+    expect(lease?.leaseToken).toMatch(/^0x[0-9a-f]{64}$/);
     expect(lease?.attempts).toBe(1);
     expect(empty).toBeNull();
     expect(done.status).toBe("succeeded");
+  });
+
+  it("rejects stale job lease completion after an expired lease is requeued", async () => {
+    const { ctx } = makeApp();
+    const job = enqueueJob(ctx, {
+      kind: "index-chain-window",
+      dedupeKey: "chain:2:200",
+      payload: { fromBlock: "2", toBlock: "200" },
+    });
+    const staleLease = leaseNextJob(ctx, ["index-chain-window"], "old-worker");
+    const requeued = requeueExpiredLeases(ctx, "2026-06-11T00:00:01.000Z");
+    const currentLease = leaseNextJob(ctx, ["index-chain-window"], "new-worker");
+
+    expect(staleLease?.jobId).toBe(job.jobId);
+    expect(requeued).toBe(1);
+    expect(currentLease?.jobId).toBe(job.jobId);
+    expect(currentLease?.leaseToken).not.toBe(staleLease?.leaseToken);
+    expect(() => completeJob(ctx, job.jobId, staleLease?.leaseToken ?? "", "succeeded")).toThrow(/lease token/);
+    expect(completeJob(ctx, job.jobId, currentLease?.leaseToken ?? "", "succeeded").status).toBe("succeeded");
   });
 
   it("records MCP adapter calls with request and response hashes", async () => {
@@ -283,6 +303,68 @@ describe("pactfuse-api P0", () => {
     expect(call.callId).toMatch(/^0x[0-9a-f]{64}$/);
     expect(call.evidenceEventId).toMatch(/^0x[0-9a-f]{64}$/);
     expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).toContain("mcp.adapter.call");
+  });
+
+  it("blocks replay bundles that exceed the response byte cap", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-replay-cap");
+
+    for (let index = 0; index < 3; index += 1) {
+      appendEvidenceEvent(ctx, {
+        sessionId,
+        authority: "operator",
+        kind: "runner.heartbeat",
+        payload: {
+          index,
+          blob: "x".repeat(800_000),
+        },
+      });
+    }
+
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(replay.status).toBe(422);
+    expect(replayJson.error.code).toBe("proof_blocked");
+    expect(replayJson.error.details.bundleBytes).toBeGreaterThan(2 * 1024 * 1024);
+  });
+
+  it("does not cache transient verifier failures under an idempotency key", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-verifier-retry");
+    let calls = 0;
+    ctx.verifier = {
+      verify: async () => {
+        calls += 1;
+        if (calls === 1) {
+          throw new Error("verifier transient failure");
+        }
+        return {
+          schemaOk: true,
+          proofChipAllowed: false,
+          winnerClaimAllowed: false,
+          requestedWinnerClaimAllowed: false,
+          finalVerifierComplete: false,
+          warnings: [],
+          errors: [],
+        };
+      },
+    };
+    const body = {
+      sessionId,
+      idempotencyKey: "verify-retry",
+      payload: { receipt: { receiptId: "retry" } },
+    };
+
+    const first = await post(app, "/api/v1/evidence/verify", body);
+    const second = await post(app, "/api/v1/evidence/verify", body);
+
+    expect(first.status).toBe(500);
+    expect(first.json.error.code).toBe("internal_error");
+    expect(second.status).toBe(200);
+    expect(second.json.ok).toBe(true);
+    expect(second.json.requestId).not.toBe(first.json.requestId);
+    expect(calls).toBe(2);
   });
 
   it("keeps missing live evidence from enabling winner claims", async () => {

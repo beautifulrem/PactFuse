@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS api_requests (
   idempotency_key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
   response_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'completed',
   created_at TEXT NOT NULL,
   UNIQUE(action_scope, idempotency_key)
 );
@@ -204,4 +205,12 @@ CREATE TABLE IF NOT EXISTS judge_check_rows (
   PRIMARY KEY(session_id, row_id)
 );
 `);
+  ensureColumn(sqlite, "api_requests", "status", "TEXT NOT NULL DEFAULT 'completed'");
+}
+
+function ensureColumn(sqlite: DatabaseSync, table: string, column: string, ddl: string): void {
+  const rows = sqlite.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!rows.some((row) => row.name === column)) {
+    sqlite.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  }
 }

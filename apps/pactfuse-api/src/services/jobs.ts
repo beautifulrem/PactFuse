@@ -24,6 +24,7 @@ export type JobLease = {
   attempts: number;
   payload: Record<string, JsonValue>;
   lockedAt: string | null;
+  leaseToken: string | null;
 };
 
 export function enqueueJob(ctx: ServiceCtx, input: EnqueueJobInput): JobLease {
@@ -70,9 +71,15 @@ export function leaseNextJob(ctx: ServiceCtx, kinds: string[], leaseOwner = newR
       ctx.db.sqlite.exec("COMMIT");
       return null;
     }
+    const leaseToken = hashJson({
+      jobId: String(row.job_id),
+      leaseOwner,
+      now,
+      requestId: newRequestId("lease"),
+    });
     ctx.db.sqlite
       .prepare("UPDATE jobs SET status = 'leased', locked_at = ?, attempts = attempts + 1 WHERE job_id = ? AND status = 'queued'")
-      .run(`${now}:${leaseOwner}`, String(row.job_id));
+      .run(`${now}|${leaseOwner}|${leaseToken}`, String(row.job_id));
     ctx.db.sqlite.exec("COMMIT");
     return readJob(ctx, String(row.job_id));
   } catch (error) {
@@ -81,8 +88,24 @@ export function leaseNextJob(ctx: ServiceCtx, kinds: string[], leaseOwner = newR
   }
 }
 
-export function completeJob(ctx: ServiceCtx, jobId: string, status: Extract<JobStatus, "succeeded" | "failed" | "blocked">): JobLease {
-  ctx.db.sqlite.prepare("UPDATE jobs SET status = ?, locked_at = NULL WHERE job_id = ?").run(status, jobId);
+export function completeJob(
+  ctx: ServiceCtx,
+  jobId: string,
+  leaseToken: string,
+  status: Extract<JobStatus, "succeeded" | "failed" | "blocked">,
+): JobLease {
+  const result = ctx.db.sqlite
+    .prepare(
+      `UPDATE jobs
+       SET status = ?, locked_at = NULL
+       WHERE job_id = ?
+         AND status = 'leased'
+         AND locked_at LIKE ?`,
+    )
+    .run(status, jobId, `%|${leaseToken}`);
+  if (Number(result.changes) !== 1) {
+    throw new Error("job lease token mismatch or job is no longer leased");
+  }
   return readJob(ctx, jobId);
 }
 
@@ -111,5 +134,11 @@ function readJob(ctx: ServiceCtx, jobId: string): JobLease {
     attempts: Number(row.attempts),
     payload: JSON.parse(String(row.payload_json)) as Record<string, JsonValue>,
     lockedAt: row.locked_at === null ? null : String(row.locked_at),
+    leaseToken: row.locked_at === null ? null : parseLeaseToken(String(row.locked_at)),
   };
+}
+
+function parseLeaseToken(lockedAt: string): string | null {
+  const parts = lockedAt.split("|");
+  return parts.length === 3 ? (parts[2] ?? null) : null;
 }

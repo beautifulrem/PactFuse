@@ -126,3 +126,14 @@ export function proofPendingError(requestId: string, message: string): ApiError 
     downgrade: "pending",
   };
 }
+
+export function proofBlockedError(requestId: string, message: string, details?: Record<string, unknown>): ApiError {
+  return {
+    code: "proof_blocked",
+    message,
+    requestId,
+    retryable: false,
+    downgrade: "blocked",
+    details: details as never,
+  };
+}

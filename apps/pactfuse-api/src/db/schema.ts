@@ -18,6 +18,7 @@ export const apiRequests = sqliteTable(
     idempotencyKey: text("idempotency_key").notNull(),
     requestHash: text("request_hash").notNull(),
     responseJson: text("response_json").notNull(),
+    status: text("status").notNull().default("completed"),
     createdAt: text("created_at").notNull(),
   },
   (table) => ({

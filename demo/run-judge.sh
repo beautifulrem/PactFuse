@@ -90,7 +90,15 @@ fi
 
 echo
 echo "-- Receipt verifier preflight (fail-closed; pending example) --"
-node packages/verifier/pactfuse-verify-receipt.mjs --schema-only docs/evidence/receipt-pack.pending.example.json || true
+VERIFIER_JSON="$(node packages/verifier/pactfuse-verify-receipt.mjs --schema-only docs/evidence/receipt-pack.pending.example.json)"
+printf '%s\n' "$VERIFIER_JSON"
+node -e 'const j=JSON.parse(process.argv[1]); if (!(j.schemaOk === true && j.proofChipAllowed === false && j.finalVerifierComplete === false && j.winnerClaimAllowed === false)) process.exit(1)' "$VERIFIER_JSON"
+if node packages/verifier/pactfuse-verify-receipt.mjs docs/evidence/receipt-pack.pending.example.json >/dev/null; then
+  echo "[blocked] pending receipt example unexpectedly passed proof-chip verification"
+  MISSING=1
+else
+  echo "[ok] pending receipt example is schema-valid but rejected by proof-chip verification"
+fi
 
 if api_ready; then
   echo
