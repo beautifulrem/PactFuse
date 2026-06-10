@@ -190,6 +190,17 @@ export const VerifyEvidencePayloadSchema = z
   })
   .strict();
 
+export const McpAdapterAuditPayloadSchema = z
+  .object({
+    sessionId: Hex32Schema.optional(),
+    auditNonce: z.string().min(12).max(160).regex(/^[a-zA-Z0-9:_-]+$/),
+    toolName: z.string().min(1).max(160),
+    request: JsonObjectSchema,
+    response: JsonObjectSchema,
+    status: z.enum(["succeeded", "failed", "blocked"]),
+  })
+  .strict();
+
 export const EvidenceAuthoritySchema = z.enum(["proof", "delivery", "operator", "advisory"]);
 export const EvidenceEventKindSchema = z.enum([
   "session.created",
@@ -269,6 +280,22 @@ export const JudgeCheckViewSchema = z
   })
   .strict();
 
+export const McpAdapterCallViewSchema = z
+  .object({
+    callId: Hex32Schema,
+    sessionId: Hex32Schema.nullable(),
+    auditNonce: z.string().min(12),
+    toolName: z.string().min(1),
+    requestHash: Hex32Schema,
+    responseHash: Hex32Schema,
+    request: JsonObjectSchema,
+    response: JsonObjectSchema,
+    status: z.enum(["succeeded", "failed", "blocked"]),
+    createdAt: IsoDateStringSchema,
+    proofAuthority: z.literal(false),
+  })
+  .strict();
+
 export const ReplayBundleViewSchema = z
   .object({
     bundleType: z.literal("PACTFUSE_EVIDENCE_V1"),
@@ -277,6 +304,7 @@ export const ReplayBundleViewSchema = z
     winnerClaimAllowed: z.literal(false),
     eventRoot: Hex32Schema,
     events: z.array(EvidenceEventSchema).max(200),
+    mcpAdapterCalls: z.array(McpAdapterCallViewSchema).max(200),
     judgeCheck: JudgeCheckViewSchema,
   })
   .strict();

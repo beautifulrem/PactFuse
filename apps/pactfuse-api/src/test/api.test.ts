@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -15,7 +15,10 @@ import { appendEvidenceEvent, recordMcpAdapterCall } from "../services/service.j
 import { createVerifierAdapter } from "../services/verifier.js";
 import type { ServiceCtx } from "../types.js";
 
-function makeApp(dbPath = ":memory:") {
+const MCP_AUDIT_TOKEN = "test-mcp-audit-token";
+
+function makeApp(dbPath = ":memory:", options: { mcpAuditSecret?: string | null } = {}) {
+  const mcpAuditSecret = options.mcpAuditSecret === undefined ? MCP_AUDIT_TOKEN : options.mcpAuditSecret;
   const ctx: ServiceCtx = {
     db: openPactFuseDb(dbPath),
     verifier: createVerifierAdapter(),
@@ -33,6 +36,7 @@ function makeApp(dbPath = ":memory:") {
         templateHash: hex32("permit-template"),
       },
     ]),
+    mcpAuditSecret,
     clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
     logger: {
       info: () => undefined,
@@ -144,6 +148,40 @@ describe("pactfuse-api P0", () => {
     expect(res.json.data.winnerClaimAllowed).toBe(false);
   });
 
+  it("does not expose MCP audit secrets or derived token hashes in health output", async () => {
+    const { app } = makeApp();
+
+    const health = await app.request("/healthz");
+    const healthJson = await health.json();
+    const serialized = JSON.stringify(healthJson);
+
+    expect(health.status).toBe(200);
+    expect(serialized).not.toContain("mcpAuditSecret");
+    expect(serialized).not.toContain("mcpAuditTokenHash");
+    expect(serialized).not.toContain(MCP_AUDIT_TOKEN);
+  });
+
+  it("surfaces disabled MCP audit readiness and rejects audit writes when the secret is missing", async () => {
+    const { app } = makeApp(":memory:", { mcpAuditSecret: null });
+    const ready = await app.request("/readyz");
+    const readyJson = await ready.json();
+    const auditPayload = {
+      auditNonce: "audit-http-missing-secret",
+      toolName: "pactfuse_get_judge_check",
+      request: {},
+      response: { ok: true },
+      status: "succeeded",
+    };
+    const audit = await post(app, "/api/v1/mcp/audit", auditPayload, {
+      "x-pactfuse-audit-signature": signAuditPayload(MCP_AUDIT_TOKEN, auditPayload),
+    });
+
+    expect(ready.status).toBe(200);
+    expect(readyJson.mcpAudit).toEqual({ mode: "hmac-shared-secret", configured: false });
+    expect(audit.status).toBe(403);
+    expect(audit.json.error.code).toBe("forbidden");
+  });
+
   it("returns six pending Judge Check rows", async () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-judge");
@@ -185,6 +223,49 @@ describe("pactfuse-api P0", () => {
       "proofAuthority",
       "winnerClaimAllowed",
     ]);
+    expect(json.paths["/api/v1/mcp/audit"].post["x-pactfuse-proof-fields"]).toEqual([
+      "proofAuthority",
+      "winnerClaimAllowed",
+      "requestHash",
+      "responseHash",
+    ]);
+    expect(json.paths["/api/v1/mcp/audit"].post.responses["202"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/McpAuditResponse",
+    );
+    expect(json.paths["/api/v1/mcp/audit"].post.parameters).toEqual([
+      expect.objectContaining({
+        name: "x-pactfuse-audit-signature",
+        in: "header",
+        required: true,
+      }),
+    ]);
+    expect(json.paths["/api/v1/mcp/audit"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/McpAdapterAuditPayload",
+    );
+    expect(json.components.schemas.McpAdapterAuditPayload.required).toEqual([
+      "auditNonce",
+      "toolName",
+      "request",
+      "response",
+      "status",
+    ]);
+    expect(json.components.schemas.SessionScopedEnvelope.required).toEqual(["sessionId", "idempotencyKey"]);
+    expect(
+      json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.mcpAdapterCalls.items.required,
+    ).toEqual([
+      "callId",
+      "sessionId",
+      "auditNonce",
+      "toolName",
+      "requestHash",
+      "responseHash",
+      "request",
+      "response",
+      "status",
+      "createdAt",
+      "proofAuthority",
+    ]);
+    expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("mcpAdapterCalls");
     expect(json.components.schemas.FailClosedProofState.properties.proofChipAllowed.const).toBe(false);
     expect(json.components.schemas.FailClosedProofState.properties.winnerClaimAllowed.const).toBe(false);
     expect(json.components.schemas.FailClosedProofState.properties.finalVerifierComplete.const).toBe(false);
@@ -346,6 +427,182 @@ describe("pactfuse-api P0", () => {
     expect(call.callId).toMatch(/^0x[0-9a-f]{64}$/);
     expect(call.evidenceEventId).toMatch(/^0x[0-9a-f]{64}$/);
     expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).toContain("mcp.adapter.call");
+    expect(replayJson.data.mcpAdapterCalls).toEqual([
+      expect.objectContaining({
+        toolName: "pactfuse_get_judge_check",
+        request: { sessionId },
+        response: { winnerClaimAllowed: false },
+        status: "succeeded",
+        proofAuthority: false,
+      }),
+    ]);
+  });
+
+  it("records MCP adapter calls through the HTTP audit endpoint", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-mcp-http-audit");
+
+    const auditPayload = {
+      sessionId,
+      auditNonce: "audit-http-success",
+      toolName: "pactfuse_get_replay_bundle",
+      request: { sessionId },
+      response: { ok: true, data: { winnerClaimAllowed: false } },
+      status: "succeeded",
+    };
+    const audit = await post(app, "/api/v1/mcp/audit", auditPayload, {
+      "x-pactfuse-audit-signature": signAuditPayload(MCP_AUDIT_TOKEN, auditPayload),
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const event = replayJson.data.events.find((candidate: { kind: string }) => candidate.kind === "mcp.adapter.call");
+
+    expect(audit.status).toBe(202);
+    expect(audit.json.data.callId).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(audit.json.data.requestHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(audit.json.data.responseHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(audit.json.data.proofAuthority).toBe(false);
+    expect(audit.json.data.winnerClaimAllowed).toBe(false);
+    expect(event.payload.toolName).toBe("pactfuse_get_replay_bundle");
+    expect(event.payload.status).toBe("succeeded");
+    expect(replayJson.data.mcpAdapterCalls).toEqual([
+      expect.objectContaining({
+        toolName: "pactfuse_get_replay_bundle",
+        auditNonce: "audit-http-success",
+        request: { sessionId },
+        response: { ok: true, data: { winnerClaimAllowed: false } },
+        status: "succeeded",
+        proofAuthority: false,
+      }),
+    ]);
+  });
+
+  it("rejects unauthenticated MCP audit writes before adding replay rows", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-mcp-forgery");
+
+    const audit = await post(app, "/api/v1/mcp/audit", {
+      sessionId,
+      auditNonce: "audit-http-forgery",
+      toolName: "pactfuse_get_replay_bundle",
+      request: { sessionId },
+      response: { ok: true },
+      status: "succeeded",
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(audit.status).toBe(403);
+    expect(audit.json.error.code).toBe("forbidden");
+    expect(replayJson.data.mcpAdapterCalls).toEqual([]);
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("mcp.adapter.call");
+  });
+
+  it("handles MCP audit retries idempotently by audit nonce", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-mcp-audit-retry");
+    const auditPayload = {
+      sessionId,
+      auditNonce: "audit-http-retry",
+      toolName: "pactfuse_get_judge_check",
+      request: { sessionId },
+      response: { ok: true, data: { winnerClaimAllowed: false } },
+      status: "succeeded",
+    };
+
+    const first = await post(app, "/api/v1/mcp/audit", auditPayload, {
+      "x-pactfuse-audit-signature": signAuditPayload(MCP_AUDIT_TOKEN, auditPayload),
+    });
+    const second = await post(app, "/api/v1/mcp/audit", auditPayload, {
+      "x-pactfuse-audit-signature": signAuditPayload(MCP_AUDIT_TOKEN, auditPayload),
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(first.status).toBe(202);
+    expect(second.status).toBe(202);
+    expect(second.json.data.callId).toBe(first.json.data.callId);
+    expect(replayJson.data.mcpAdapterCalls).toHaveLength(1);
+    expect(replayJson.data.events.filter((event: { kind: string }) => event.kind === "mcp.adapter.call")).toHaveLength(1);
+  });
+
+  it("rejects MCP audit nonce reuse with a different payload", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-mcp-audit-conflict");
+    const auditPayload = {
+      sessionId,
+      auditNonce: "audit-http-conflict",
+      toolName: "pactfuse_get_judge_check",
+      request: { sessionId },
+      response: { ok: true },
+      status: "succeeded",
+    };
+    const conflictingPayload = {
+      ...auditPayload,
+      response: { ok: false },
+    };
+
+    await post(app, "/api/v1/mcp/audit", auditPayload, {
+      "x-pactfuse-audit-signature": signAuditPayload(MCP_AUDIT_TOKEN, auditPayload),
+    });
+    const conflict = await post(app, "/api/v1/mcp/audit", conflictingPayload, {
+      "x-pactfuse-audit-signature": signAuditPayload(MCP_AUDIT_TOKEN, conflictingPayload),
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(conflict.status).toBe(409);
+    expect(conflict.json.error.code).toBe("idempotency_conflict");
+    expect(replayJson.data.mcpAdapterCalls).toHaveLength(1);
+    expect(replayJson.data.mcpAdapterCalls[0].response).toEqual({ ok: true });
+  });
+
+  it("rejects signed MCP audits for missing sessions without orphan rows", async () => {
+    const { app, ctx } = makeApp();
+    const missingSessionId = hex32("missing-mcp-session");
+    const auditPayload = {
+      sessionId: missingSessionId,
+      auditNonce: "audit-http-missing-session",
+      toolName: "pactfuse_get_replay_bundle",
+      request: { sessionId: missingSessionId },
+      response: { ok: true },
+      status: "succeeded",
+    };
+
+    const audit = await post(app, "/api/v1/mcp/audit", auditPayload, {
+      "x-pactfuse-audit-signature": signAuditPayload(MCP_AUDIT_TOKEN, auditPayload),
+    });
+    const row = ctx.db.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM mcp_adapter_calls WHERE audit_nonce = ?")
+      .get("audit-http-missing-session") as { count: number };
+
+    expect(audit.status).toBe(404);
+    expect(audit.json.error.code).toBe("not_found");
+    expect(row.count).toBe(0);
+  });
+
+  it("rejects MCP audits with mismatched session ids across request and response", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-mcp-audit-mismatch");
+    const otherSessionId = hex32("other-mcp-session");
+    const auditPayload = {
+      sessionId,
+      auditNonce: "audit-http-session-mismatch",
+      toolName: "pactfuse_get_replay_bundle",
+      request: { sessionId: otherSessionId },
+      response: { ok: true, data: { sessionId } },
+      status: "succeeded",
+    };
+
+    const audit = await post(app, "/api/v1/mcp/audit", auditPayload, {
+      "x-pactfuse-audit-signature": signAuditPayload(MCP_AUDIT_TOKEN, auditPayload),
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(audit.status).toBe(400);
+    expect(audit.json.error.code).toBe("bad_request");
+    expect(replayJson.data.mcpAdapterCalls).toHaveLength(0);
   });
 
   it("blocks replay bundles that exceed the response byte cap", async () => {
@@ -554,10 +811,15 @@ async function registerSpend(app: ReturnType<typeof createApp>, sessionId: strin
   expect(res.status).toBe(201);
 }
 
-async function post(app: ReturnType<typeof createApp>, path: string, body: unknown) {
+async function post(
+  app: ReturnType<typeof createApp>,
+  path: string,
+  body: unknown,
+  headers: Record<string, string> = {},
+) {
   const res = await app.request(path, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
   return { status: res.status, json: await res.json() };
@@ -565,4 +827,28 @@ async function post(app: ReturnType<typeof createApp>, path: string, body: unkno
 
 function hex32(seed: string): `0x${string}` {
   return `0x${createHash("sha256").update(seed).digest("hex")}`;
+}
+
+function signAuditPayload(secret: string, payload: unknown): `0x${string}` {
+  return `0x${createHmac("sha256", secret).update(JSON.stringify(sortForTestCanonicalJson(payload))).digest("hex")}`;
+}
+
+function sortForTestCanonicalJson(value: unknown): unknown {
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sortForTestCanonicalJson(item));
+  }
+  if (typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      const child = (value as Record<string, unknown>)[key];
+      if (child !== undefined) {
+        result[key] = sortForTestCanonicalJson(child);
+      }
+    }
+    return result;
+  }
+  return null;
 }

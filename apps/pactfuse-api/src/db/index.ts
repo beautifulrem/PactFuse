@@ -158,11 +158,15 @@ CREATE TABLE IF NOT EXISTS lease_runs (
 CREATE TABLE IF NOT EXISTS mcp_adapter_calls (
   call_id TEXT PRIMARY KEY,
   session_id TEXT,
+  audit_nonce TEXT,
   tool_name TEXT NOT NULL,
   request_hash TEXT NOT NULL,
   response_hash TEXT NOT NULL,
+  request_json TEXT NOT NULL DEFAULT '{}',
+  response_json TEXT NOT NULL DEFAULT '{}',
   status TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  UNIQUE(audit_nonce)
 );
 
 CREATE TABLE IF NOT EXISTS evidence_events (
@@ -206,6 +210,10 @@ CREATE TABLE IF NOT EXISTS judge_check_rows (
 );
 `);
   ensureColumn(sqlite, "api_requests", "status", "TEXT NOT NULL DEFAULT 'completed'");
+  ensureColumn(sqlite, "mcp_adapter_calls", "audit_nonce", "TEXT");
+  ensureColumn(sqlite, "mcp_adapter_calls", "request_json", "TEXT NOT NULL DEFAULT '{}'");
+  ensureColumn(sqlite, "mcp_adapter_calls", "response_json", "TEXT NOT NULL DEFAULT '{}'");
+  sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS mcp_adapter_calls_audit_nonce_idx ON mcp_adapter_calls(audit_nonce) WHERE audit_nonce IS NOT NULL");
 }
 
 function ensureColumn(sqlite: DatabaseSync, table: string, column: string, ddl: string): void {

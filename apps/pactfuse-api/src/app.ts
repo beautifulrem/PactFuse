@@ -1,10 +1,13 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import {
   HexSchema,
   Hex32Schema,
+  McpAdapterAuditPayloadSchema,
   SessionScopedEnvelopeSchema,
   CreateSessionInputSchema,
+  canonicalizeJson,
 } from "@pactfuse/evidence-schema";
 import type { Context } from "hono";
 import type { ServiceCtx, ServiceResult } from "./types.js";
@@ -22,6 +25,7 @@ import {
   readJudgeCheck,
   readProofProviderStatus,
   readRunnerHeartbeat,
+  recordMcpAdapterAudit,
   refundUndeliveredArtifact,
   registerSignedSource,
   registerSourceBoundSpends,
@@ -29,41 +33,43 @@ import {
   signArtifactQuote,
   verifyEvidenceForSession,
 } from "./services/service.js";
-import { badRequestError, newRequestId, rateLimitedError, toApiError } from "./util.js";
+import { badRequestError, forbiddenError, newRequestId, rateLimitedError, toApiError } from "./util.js";
 
 const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 600;
 
 const ROUTES = [
-  ["GET", "/healthz"],
-  ["GET", "/readyz"],
-  ["GET", "/api/v1/openapi.json"],
-  ["POST", "/api/v1/sessions"],
-  ["GET", "/api/v1/sessions/{sessionId}"],
-  ["POST", "/api/v1/sources/register"],
-  ["POST", "/api/v1/sources/challenge"],
-  ["POST", "/api/v1/spends/register-batch"],
-  ["POST", "/api/v1/caw/operations/build"],
-  ["POST", "/api/v1/caw/receipts/ingest"],
-  ["POST", "/api/v1/artifacts/preflight"],
-  ["POST", "/api/v1/quotes"],
-  ["GET", "/api/v1/artifacts/{sessionId}/{spendId}/{payer}/{artifactHash}"],
-  ["POST", "/api/v1/artifacts/refund"],
-  ["POST", "/api/v1/lease/execute"],
-  ["POST", "/api/v1/evidence/verify"],
-  ["GET", "/api/v1/evidence/judge-check"],
-  ["GET", "/api/v1/evidence/replay-bundle"],
-  ["GET", "/api/v1/evidence/runner-heartbeat"],
-  ["GET", "/api/v1/evidence/agent-transcript"],
-  ["GET", "/api/v1/evidence/stream"],
+  { method: "GET", path: "/healthz", okStatus: 200 },
+  { method: "GET", path: "/readyz", okStatus: 200 },
+  { method: "GET", path: "/api/v1/openapi.json", okStatus: 200 },
+  { method: "POST", path: "/api/v1/sessions", okStatus: 201 },
+  { method: "GET", path: "/api/v1/sessions/{sessionId}", okStatus: 200 },
+  { method: "POST", path: "/api/v1/sources/register", okStatus: 201 },
+  { method: "POST", path: "/api/v1/sources/challenge", okStatus: 202 },
+  { method: "POST", path: "/api/v1/spends/register-batch", okStatus: 201 },
+  { method: "POST", path: "/api/v1/caw/operations/build", okStatus: 201 },
+  { method: "POST", path: "/api/v1/caw/receipts/ingest", okStatus: 202 },
+  { method: "POST", path: "/api/v1/artifacts/preflight", okStatus: 202 },
+  { method: "POST", path: "/api/v1/quotes", okStatus: 201 },
+  { method: "GET", path: "/api/v1/artifacts/{sessionId}/{spendId}/{payer}/{artifactHash}", okStatus: 200 },
+  { method: "POST", path: "/api/v1/artifacts/refund", okStatus: 202 },
+  { method: "POST", path: "/api/v1/lease/execute", okStatus: 202 },
+  { method: "POST", path: "/api/v1/mcp/audit", okStatus: 202 },
+  { method: "POST", path: "/api/v1/evidence/verify", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/judge-check", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/replay-bundle", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/runner-heartbeat", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/agent-transcript", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/stream", okStatus: 200 },
 ] as const;
 
 const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/caw/receipts/ingest": ["proofAuthority", "winnerClaimAllowed"],
+  "/api/v1/mcp/audit": ["proofAuthority", "winnerClaimAllowed", "requestHash", "responseHash"],
   "/api/v1/evidence/verify": ["schemaOk", "proofChipAllowed", "winnerClaimAllowed", "finalVerifierComplete"],
   "/api/v1/evidence/judge-check": ["winnerClaimAllowed", "rows.status", "rows.authority"],
-  "/api/v1/evidence/replay-bundle": ["winnerClaimAllowed", "eventRoot", "judgeCheck"],
+  "/api/v1/evidence/replay-bundle": ["winnerClaimAllowed", "eventRoot", "mcpAdapterCalls", "judgeCheck"],
 };
 
 export function createApp(ctx: ServiceCtx): Hono {
@@ -109,6 +115,10 @@ export function createApp(ctx: ServiceCtx): Hono {
       db: "ready",
       verifier: "fail-closed-scaffold",
       proofProviders: await readProofProviderStatus(ctx),
+      mcpAudit: {
+        mode: "hmac-shared-secret",
+        configured: Boolean(ctx.mcpAuditSecret),
+      },
       winnerClaimAllowed: false,
     });
   });
@@ -165,6 +175,10 @@ export function createApp(ctx: ServiceCtx): Hono {
 
   app.post("/api/v1/lease/execute", async (c) =>
     send(c, await executeLease(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202),
+  );
+
+  app.post("/api/v1/mcp/audit", async (c) =>
+    send(c, recordMcpAdapterAudit(authorizeMcpAudit(c, ctx, McpAdapterAuditPayloadSchema.parse(await readJson(c))), ctx), 202),
   );
 
   app.post("/api/v1/evidence/verify", async (c) =>
@@ -241,6 +255,36 @@ function throwBadRequest(message: string, details?: Record<string, unknown>): ne
   throw Object.assign(new Error(message), { apiError: badRequestError(requestId, message, details) });
 }
 
+function authorizeMcpAudit(c: Context, ctx: ServiceCtx, payload: unknown): unknown {
+  const requestId = newRequestId("mcp_audit_auth");
+  const secret = ctx.mcpAuditSecret;
+  const signature = c.req.header("x-pactfuse-audit-signature") ?? "";
+  if (!secret) {
+    throw Object.assign(new Error("MCP audit token is not configured"), {
+      apiError: forbiddenError(requestId, "MCP audit token is not configured"),
+    });
+  }
+  if (!signature || !secureEqualHex(signature, signMcpAuditPayload(secret, payload))) {
+    throw Object.assign(new Error("MCP audit token is invalid"), {
+      apiError: forbiddenError(requestId, "MCP audit signature is invalid"),
+    });
+  }
+  return payload;
+}
+
+function signMcpAuditPayload(secret: string, payload: unknown): `0x${string}` {
+  return `0x${createHmac("sha256", secret).update(canonicalizeJson(payload)).digest("hex")}`;
+}
+
+function secureEqualHex(left: string, right: string): boolean {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(left) || !/^0x[0-9a-fA-F]{64}$/.test(right)) {
+    return false;
+  }
+  const leftBuffer = Buffer.from(left.slice(2), "hex");
+  const rightBuffer = Buffer.from(right.slice(2), "hex");
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
 function send<T>(c: Context, result: ServiceResult<T>, okStatus = 200): Response {
   if (result.ok) {
     return c.json(result, okStatus as 200);
@@ -276,12 +320,16 @@ function statusFor(code: string): number {
 
 function buildOpenApi(): Record<string, unknown> {
   const paths: Record<string, Record<string, unknown>> = {};
-  for (const [method, path] of ROUTES) {
+  for (const { method, path, okStatus } of ROUTES) {
     const proofFields = PROOF_FIELD_ROUTES[path] ?? [];
+    const requestBody = requestBodySchemaFor(method, path);
+    const parameters = parameterSchemaFor(path);
     paths[path] = {
       ...(paths[path] ?? {}),
       [method.toLowerCase()]: {
         operationId: `${method.toLowerCase()}_${path.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "")}`,
+        ...(parameters.length > 0 ? { parameters } : {}),
+        ...(requestBody ? { requestBody } : {}),
         ...(proofFields.length > 0
           ? {
               "x-pactfuse-proof-fields": proofFields,
@@ -289,7 +337,7 @@ function buildOpenApi(): Record<string, unknown> {
             }
           : {}),
         responses: {
-          "200": {
+          [String(okStatus)]: {
             description: "PactFuse fail-closed P0 response",
             content: {
               "application/json": {
@@ -320,6 +368,38 @@ function buildOpenApi(): Record<string, unknown> {
             requestId: { type: "string" },
             retryable: { type: "boolean" },
             downgrade: { enum: ["pending", "blocked", "failed", "none"] },
+          },
+        },
+        CreateSessionInput: {
+          type: "object",
+          required: ["idempotencyKey", "payload"],
+          additionalProperties: false,
+          properties: {
+            idempotencyKey: { type: "string", minLength: 4, maxLength: 160, pattern: "^[a-z][a-z0-9:_-]+$" },
+            payload: { type: "object", additionalProperties: true },
+          },
+        },
+        SessionScopedEnvelope: {
+          type: "object",
+          required: ["sessionId", "idempotencyKey"],
+          additionalProperties: false,
+          properties: {
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            idempotencyKey: { type: "string", minLength: 4, maxLength: 160, pattern: "^[a-z][a-z0-9:_-]+$" },
+            payload: { type: "object", additionalProperties: true },
+          },
+        },
+        McpAdapterAuditPayload: {
+          type: "object",
+          required: ["auditNonce", "toolName", "request", "response", "status"],
+          additionalProperties: false,
+          properties: {
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            auditNonce: { type: "string", minLength: 12, maxLength: 160, pattern: "^[a-zA-Z0-9:_-]+$" },
+            toolName: { type: "string", minLength: 1, maxLength: 160 },
+            request: { type: "object", additionalProperties: true },
+            response: { type: "object", additionalProperties: true },
+            status: { enum: ["succeeded", "failed", "blocked"] },
           },
         },
         ServiceError: {
@@ -375,12 +455,55 @@ function buildOpenApi(): Record<string, unknown> {
             winnerClaimAllowed: { const: false },
           },
         }),
+        McpAuditResponse: serviceResponseSchema({
+          type: "object",
+          required: ["callId", "requestHash", "responseHash", "proofAuthority", "winnerClaimAllowed"],
+          properties: {
+            callId: { type: "string" },
+            requestHash: { type: "string" },
+            responseHash: { type: "string" },
+            proofAuthority: { const: false },
+            winnerClaimAllowed: { const: false },
+          },
+        }),
         ReplayBundleResponse: serviceResponseSchema({
           type: "object",
-          required: ["winnerClaimAllowed", "eventRoot", "judgeCheck"],
+          required: ["winnerClaimAllowed", "eventRoot", "mcpAdapterCalls", "judgeCheck"],
           properties: {
             winnerClaimAllowed: { const: false },
             eventRoot: { type: "string" },
+            mcpAdapterCalls: {
+              type: "array",
+              items: {
+                type: "object",
+                required: [
+                  "callId",
+                  "sessionId",
+                  "auditNonce",
+                  "toolName",
+                  "requestHash",
+                  "responseHash",
+                  "request",
+                  "response",
+                  "status",
+                  "createdAt",
+                  "proofAuthority",
+                ],
+                properties: {
+                  callId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sessionId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  auditNonce: { type: "string", minLength: 12 },
+                  toolName: { type: "string" },
+                  requestHash: { type: "string" },
+                  responseHash: { type: "string" },
+                  request: { type: "object", additionalProperties: true },
+                  response: { type: "object", additionalProperties: true },
+                  status: { enum: ["succeeded", "failed", "blocked"] },
+                  createdAt: { type: "string", format: "date-time" },
+                  proofAuthority: { const: false },
+                },
+              },
+            },
             judgeCheck: { $ref: "#/components/schemas/JudgeCheckData" },
           },
         }),
@@ -397,6 +520,48 @@ function buildOpenApi(): Record<string, unknown> {
   };
 }
 
+function requestBodySchemaFor(method: string, path: string): Record<string, unknown> | null {
+  if (method !== "POST") {
+    return null;
+  }
+  if (path === "/api/v1/mcp/audit") {
+    return jsonRequestBody({ $ref: "#/components/schemas/McpAdapterAuditPayload" });
+  }
+  if (path === "/api/v1/sessions") {
+    return jsonRequestBody({ $ref: "#/components/schemas/CreateSessionInput" });
+  }
+  if (path.startsWith("/api/v1/") && !path.includes("{")) {
+    return jsonRequestBody({ $ref: "#/components/schemas/SessionScopedEnvelope" });
+  }
+  return null;
+}
+
+function parameterSchemaFor(path: string): Record<string, unknown>[] {
+  if (path !== "/api/v1/mcp/audit") {
+    return [];
+  }
+  return [
+    {
+      name: "x-pactfuse-audit-signature",
+      in: "header",
+      required: true,
+      schema: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+      description: "HMAC-SHA256 over the canonical JSON audit payload using PACTFUSE_MCP_AUDIT_TOKEN.",
+    },
+  ];
+}
+
+function jsonRequestBody(schema: Record<string, unknown>): Record<string, unknown> {
+  return {
+    required: true,
+    content: {
+      "application/json": {
+        schema,
+      },
+    },
+  };
+}
+
 function responseSchemaFor(path: string): Record<string, unknown> {
   switch (path) {
     case "/api/v1/evidence/verify":
@@ -405,6 +570,8 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/JudgeCheckResponse" };
     case "/api/v1/caw/receipts/ingest":
       return { $ref: "#/components/schemas/CawReceiptIngestResponse" };
+    case "/api/v1/mcp/audit":
+      return { $ref: "#/components/schemas/McpAuditResponse" };
     case "/api/v1/evidence/replay-bundle":
       return { $ref: "#/components/schemas/ReplayBundleResponse" };
     default:

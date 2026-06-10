@@ -10,6 +10,8 @@ import {
   JudgeCheckViewSchema,
   LeaseExecutePayloadSchema,
   LOCKED_RUNTIME_MODES,
+  McpAdapterAuditPayloadSchema,
+  McpAdapterCallViewSchema,
   QuotePayloadSchema,
   ReplayBundleViewSchema,
   RunnerHeartbeatViewSchema,
@@ -33,6 +35,7 @@ import {
 import type { ProofProviderStatus, ServiceCtx, ServiceResult } from "../types.js";
 import {
   ZERO_HASH,
+  badRequestError,
   conflictError,
   hashJson,
   newRequestId,
@@ -595,6 +598,7 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
   const parsedSessionId = parseStrict(Hex32Schema, sessionId);
   assertSession(ctx, parsedSessionId, requestId);
   const events = listEvents(ctx, parsedSessionId, 0, 200);
+  const mcpAdapterCalls = listMcpAdapterCalls(ctx, parsedSessionId, 200);
   const data = ReplayBundleViewSchema.parse({
     bundleType: "PACTFUSE_EVIDENCE_V1",
     sessionId: parsedSessionId,
@@ -602,6 +606,7 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
     winnerClaimAllowed: false,
     eventRoot: hashJson(events.map((event) => event.eventHash)),
     events,
+    mcpAdapterCalls,
     judgeCheck: readJudgeCheckData(parsedSessionId, ctx),
   });
   const bundleBytes = Buffer.byteLength(canonicalizeJson(data), "utf8");
@@ -712,6 +717,7 @@ export async function readArtifactAccess(
 export function recordMcpAdapterCall(
   input: {
     sessionId?: string | null;
+    auditNonce?: string | null;
     toolName: string;
     request: Record<string, JsonValue>;
     response: Record<string, JsonValue>;
@@ -720,38 +726,170 @@ export function recordMcpAdapterCall(
   ctx: ServiceCtx,
 ): { callId: string; requestHash: string; responseHash: string; evidenceEventId?: string } {
   const createdAt = ctx.clock.now().toISOString();
+  const auditNonce = input.auditNonce ?? newRequestId("mcp_call");
   const requestHash = hashJson(input.request);
   const responseHash = hashJson(input.response);
   const callId = hashJson({
     sessionId: input.sessionId ?? null,
+    auditNonce,
     toolName: input.toolName,
     requestHash,
     responseHash,
     createdAt,
   });
-  ctx.db.sqlite
-    .prepare(
-      `INSERT INTO mcp_adapter_calls
-        (call_id, session_id, tool_name, request_hash, response_hash, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(callId, input.sessionId ?? null, input.toolName, requestHash, responseHash, input.status, createdAt);
-  if (!input.sessionId) {
-    return { callId, requestHash, responseHash };
-  }
-  const event = appendEvidenceEvent(ctx, {
-    sessionId: input.sessionId,
-    authority: "operator",
-    kind: "mcp.adapter.call",
-    payload: {
-      callId,
-      toolName: input.toolName,
-      requestHash,
-      responseHash,
-      status: input.status,
-    },
+  return withImmediateTransaction(ctx, () => {
+    const existing = ctx.db.sqlite
+      .prepare(
+        `SELECT call_id, session_id, tool_name, request_hash, response_hash, status
+         FROM mcp_adapter_calls
+         WHERE audit_nonce = ?`,
+      )
+      .get(auditNonce) as Row | undefined;
+    if (existing) {
+      const isSameCall =
+        (existing.session_id ?? null) === (input.sessionId ?? null) &&
+        existing.tool_name === input.toolName &&
+        existing.request_hash === requestHash &&
+        existing.response_hash === responseHash &&
+        existing.status === input.status;
+      if (!isSameCall) {
+        const requestId = newRequestId("mcp_nonce_conflict");
+        throw Object.assign(new Error("MCP audit nonce conflict"), {
+          apiError: conflictError(requestId, "MCP audit nonce was already used for a different tool call"),
+        });
+      }
+      return {
+        callId: String(existing.call_id),
+        requestHash: String(existing.request_hash),
+        responseHash: String(existing.response_hash),
+      };
+    }
+    ctx.db.sqlite
+      .prepare(
+        `INSERT INTO mcp_adapter_calls
+          (call_id, session_id, audit_nonce, tool_name, request_hash, response_hash, request_json, response_json, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        callId,
+        input.sessionId ?? null,
+        auditNonce,
+        input.toolName,
+        requestHash,
+        responseHash,
+        canonicalizeJson(input.request),
+        canonicalizeJson(input.response),
+        input.status,
+        createdAt,
+      );
+    if (!input.sessionId) {
+      return { callId, requestHash, responseHash };
+    }
+    const event = appendEvidenceEvent(ctx, {
+      sessionId: input.sessionId,
+      authority: "operator",
+      kind: "mcp.adapter.call",
+      payload: {
+        callId,
+        auditNonce,
+        toolName: input.toolName,
+        requestHash,
+        responseHash,
+        status: input.status,
+      },
+    });
+    return { callId, requestHash, responseHash, evidenceEventId: event.eventId };
   });
-  return { callId, requestHash, responseHash, evidenceEventId: event.eventId };
+}
+
+export function recordMcpAdapterAudit(input: unknown, ctx: ServiceCtx): ServiceResult<unknown> {
+  const requestId = newRequestId("mcp_audit");
+  const parsed = parseStrict(McpAdapterAuditPayloadSchema, input);
+  const sessionId = resolveMcpAuditSessionId(parsed, requestId);
+  if (sessionId) {
+    assertSession(ctx, sessionId, requestId);
+  }
+  const audit = recordMcpAdapterCall(
+    {
+      sessionId,
+      auditNonce: parsed.auditNonce,
+      toolName: parsed.toolName,
+      request: parsed.request,
+      response: parsed.response,
+      status: parsed.status,
+    },
+    ctx,
+  );
+  const result: ServiceResult<unknown> = {
+    ok: true,
+    requestId,
+    data: {
+      ...audit,
+      proofAuthority: false,
+      winnerClaimAllowed: false,
+    },
+  };
+  if (audit.evidenceEventId) {
+    return { ...result, evidenceEventId: audit.evidenceEventId };
+  }
+  return result;
+}
+
+function resolveMcpAuditSessionId(parsed: {
+  sessionId?: string | undefined;
+  request: Record<string, JsonValue>;
+  response: Record<string, JsonValue>;
+}): string | null;
+function resolveMcpAuditSessionId(
+  parsed: {
+    sessionId?: string | undefined;
+    request: Record<string, JsonValue>;
+    response: Record<string, JsonValue>;
+  },
+  requestId: string,
+): string | null;
+function resolveMcpAuditSessionId(
+  parsed: {
+    sessionId?: string | undefined;
+    request: Record<string, JsonValue>;
+    response: Record<string, JsonValue>;
+  },
+  requestId = newRequestId("mcp_audit_session"),
+): string | null {
+  const candidates = [
+    parsed.sessionId ?? null,
+    mcpSessionCandidate(parsed.request, "request.sessionId", requestId),
+    mcpSessionCandidate(parsed.response, "response.sessionId", requestId),
+    mcpSessionCandidate(
+      parsed.response.data && typeof parsed.response.data === "object" && !Array.isArray(parsed.response.data)
+        ? parsed.response.data
+        : {},
+      "response.data.sessionId",
+      requestId,
+    ),
+  ].filter((value): value is string => Boolean(value));
+  const unique = [...new Set(candidates)];
+  if (unique.length > 1) {
+    throw Object.assign(new Error("MCP audit sessionId mismatch"), {
+      apiError: badRequestError(requestId, "MCP audit sessionId values must match across request and response", {
+        sessionIds: unique,
+      }),
+    });
+  }
+  return unique[0] ?? null;
+}
+
+function mcpSessionCandidate(value: Record<string, JsonValue>, path: string, requestId: string): string | null {
+  const raw = value.sessionId;
+  if (raw === undefined) {
+    return null;
+  }
+  if (typeof raw !== "string" || !Hex32Schema.safeParse(raw).success) {
+    throw Object.assign(new Error("MCP audit sessionId is invalid"), {
+      apiError: badRequestError(requestId, `MCP audit ${path} must be a 32-byte hex string`),
+    });
+  }
+  return raw;
 }
 
 export function listEventsAfterEventId(ctx: ServiceCtx, sessionId: string, afterEventId: string | null): EvidenceEvent[] {
@@ -1125,6 +1263,33 @@ function listEvents(ctx: ServiceCtx, sessionId: string, afterSeq: number, limit:
       payloadHash: row.payload_hash,
       payload: JSON.parse(String(row.payload_json)),
       createdAt: row.created_at,
+    }),
+  );
+}
+
+function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number) {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM mcp_adapter_calls
+       WHERE session_id = ?
+       ORDER BY created_at ASC, call_id ASC
+       LIMIT ?`,
+    )
+    .all(sessionId, limit) as Row[];
+  return rows.map((row) =>
+    McpAdapterCallViewSchema.parse({
+      callId: row.call_id,
+      sessionId: row.session_id,
+      auditNonce: row.audit_nonce ?? `legacy:${row.call_id}`,
+      toolName: row.tool_name,
+      requestHash: row.request_hash,
+      responseHash: row.response_hash,
+      request: JSON.parse(String(row.request_json)),
+      response: JSON.parse(String(row.response_json)),
+      status: row.status,
+      createdAt: row.created_at,
+      proofAuthority: false,
     }),
   );
 }

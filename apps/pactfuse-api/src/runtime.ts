@@ -19,6 +19,7 @@ export function createServiceCtx(options: {
     chain: createUnconfiguredChainClient(),
     caw: createUnconfiguredCawReceiptSource(),
     templates: createLocalTemplateRegistry(),
+    mcpAuditSecret: process.env.PACTFUSE_MCP_AUDIT_TOKEN ?? null,
     clock: options.clock ?? { now: () => new Date() },
     logger: options.logger ?? pino({ name: "pactfuse-api" }),
     config: {

@@ -66,10 +66,13 @@ export function toApiError(error: unknown, requestId: string): ApiError {
   };
 }
 
-export function conflictError(requestId: string): ApiError {
+export function conflictError(
+  requestId: string,
+  message = "same action scope and idempotency key were used with a different request hash",
+): ApiError {
   return {
     code: "idempotency_conflict",
-    message: "same action scope and idempotency key were used with a different request hash",
+    message,
     requestId,
     retryable: false,
     downgrade: "failed",
