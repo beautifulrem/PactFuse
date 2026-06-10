@@ -30,7 +30,7 @@ import {
   type SessionView,
   type VerifierRunView,
 } from "@pactfuse/evidence-schema";
-import type { ServiceCtx, ServiceResult } from "../types.js";
+import type { ProofProviderStatus, ServiceCtx, ServiceResult } from "../types.js";
 import {
   ZERO_HASH,
   conflictError,
@@ -65,6 +65,7 @@ export async function createSession(input: CreateSessionInput, ctx: ServiceCtx):
     const createdAt = ctx.clock.now().toISOString();
     const runConfigHash = hashJson(parsed.payload);
     const sessionId = sha256Hex(`pactfuse-session:${parsed.idempotencyKey}:${runConfigHash}`);
+    const pactTemplates = ctx.templates.list();
     ctx.db.sqlite
       .prepare(
         `INSERT OR IGNORE INTO sessions
@@ -87,6 +88,7 @@ export async function createSession(input: CreateSessionInput, ctx: ServiceCtx):
       payload: {
         runConfigHash,
         modes: LOCKED_RUNTIME_MODES,
+        pactTemplates,
         winnerClaimAllowed: false,
       },
     });
@@ -98,6 +100,7 @@ export async function createSession(input: CreateSessionInput, ctx: ServiceCtx):
         sessionId,
         runConfigHash,
         modes: LOCKED_RUNTIME_MODES,
+        pactTemplates,
         winnerClaimAllowed: false,
         createdAt,
       },
@@ -271,6 +274,7 @@ export async function buildCawOperation(input: SessionScopedEnvelope, ctx: Servi
   return withIdempotency(ctx, scoped("caw:operations:build", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
     const createdAt = ctx.clock.now().toISOString();
+    const pactTemplate = ctx.templates.require("gate-paid-artifact-real");
     const operationId = hashJson({ sessionId: envelope.sessionId, payload, requestId });
     ctx.db.sqlite
       .prepare(
@@ -296,6 +300,8 @@ export async function buildCawOperation(input: SessionScopedEnvelope, ctx: Servi
       payload: {
         operationId,
         operationKind: payload.operationKind,
+        pactTemplateMode: pactTemplate.mode,
+        pactTemplateHash: pactTemplate.templateHash,
         status: "built_mocked",
       },
     });
@@ -303,7 +309,13 @@ export async function buildCawOperation(input: SessionScopedEnvelope, ctx: Servi
       ok: true,
       requestId,
       evidenceEventId: event.eventId,
-      data: { operationId, status: "built_mocked", winnerClaimAllowed: false },
+      data: {
+        operationId,
+        status: "built_mocked",
+        pactTemplateMode: pactTemplate.mode,
+        pactTemplateHash: pactTemplate.templateHash,
+        winnerClaimAllowed: false,
+      },
     };
   });
 }
@@ -500,10 +512,15 @@ export async function verifyEvidenceForSession(
   const payload = parseStrict(VerifyEvidencePayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("evidence:verify", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
+    const proofProviders = await readProofProviderStatus(ctx);
     const verifierInput = payload.receipt ?? payload.replayBundle ?? {};
     const raw =
       payload.receipt || payload.replayBundle
-        ? await ctx.verifier.verify(verifierInput, { cliMode: payload.schemaOnly ? "schema-only" : "proof-chip" })
+        ? await ctx.verifier.verify(verifierInput, {
+            cliMode: payload.schemaOnly ? "schema-only" : "proof-chip",
+            proofProviders,
+            pactTemplates: ctx.templates.list(),
+          })
         : {
             schemaOk: false,
             proofChipAllowed: false,
@@ -525,9 +542,10 @@ export async function verifyEvidenceForSession(
       errors: [...rawErrors, ...eventLogErrors],
       warnings: [
         ...toStringArray(raw.warnings),
+        ...proofProviderWarnings(proofProviders),
         "P0 route wraps the structural verifier fail-closed; final chain/signature/hash verifier is incomplete",
       ],
-      raw: jsonRecord(raw),
+      raw: jsonRecord({ ...raw, proofProviders, pactTemplates: ctx.templates.list() }),
     });
     const inputHash = hashJson(verifierInput);
     const verifierRunId = hashJson({ sessionId: envelope.sessionId, inputHash, requestId });
@@ -557,6 +575,11 @@ export async function verifyEvidenceForSession(
       data: view,
     };
   });
+}
+
+export async function readProofProviderStatus(ctx: ServiceCtx): Promise<ProofProviderStatus[]> {
+  const [chain, caw] = await Promise.all([ctx.chain.status(), ctx.caw.status()]);
+  return [chain, caw];
 }
 
 export async function readJudgeCheck(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<JudgeCheckView>> {
@@ -1135,6 +1158,12 @@ function scoped(scope: string, sessionId: string): string {
 
 function toStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map((item) => String(item)) : [];
+}
+
+function proofProviderWarnings(statuses: ProofProviderStatus[]): string[] {
+  return statuses
+    .filter((status) => !status.ready)
+    .map((status) => `${status.name} proof provider is ${status.mode}: ${status.reason}`);
 }
 
 function jsonRecord(value: unknown): Record<string, JsonValue> {

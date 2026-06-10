@@ -20,6 +20,7 @@ import {
   readAgentTranscript,
   readArtifactAccess,
   readJudgeCheck,
+  readProofProviderStatus,
   readRunnerHeartbeat,
   refundUndeliveredArtifact,
   registerSignedSource,
@@ -94,12 +95,13 @@ export function createApp(ctx: ServiceCtx): Hono {
     }),
   );
 
-  app.get("/readyz", (c) => {
+  app.get("/readyz", async (c) => {
     ctx.db.sqlite.prepare("SELECT 1").get();
     return c.json({
       ok: true,
       db: "ready",
       verifier: "fail-closed-scaffold",
+      proofProviders: await readProofProviderStatus(ctx),
       winnerClaimAllowed: false,
     });
   });

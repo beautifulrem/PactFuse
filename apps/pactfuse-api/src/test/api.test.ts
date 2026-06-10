@@ -6,6 +6,11 @@ import { describe, expect, it } from "vitest";
 import { createApp } from "../app.js";
 import { openPactFuseDb } from "../db/index.js";
 import { completeJob, enqueueJob, leaseNextJob, requeueExpiredLeases } from "../services/jobs.js";
+import {
+  createStaticTemplateRegistry,
+  createUnconfiguredCawReceiptSource,
+  createUnconfiguredChainClient,
+} from "../services/providers.js";
 import { appendEvidenceEvent, recordMcpAdapterCall } from "../services/service.js";
 import { createVerifierAdapter } from "../services/verifier.js";
 import type { ServiceCtx } from "../types.js";
@@ -14,6 +19,20 @@ function makeApp(dbPath = ":memory:") {
   const ctx: ServiceCtx = {
     db: openPactFuseDb(dbPath),
     verifier: createVerifierAdapter(),
+    chain: createUnconfiguredChainClient(),
+    caw: createUnconfiguredCawReceiptSource(),
+    templates: createStaticTemplateRegistry([
+      {
+        mode: "gate-paid-artifact-real",
+        sourcePath: "/test/gate-paid-artifact-real.json",
+        templateHash: hex32("gate-paid-template"),
+      },
+      {
+        mode: "permit-payment-real",
+        sourcePath: "/test/permit-payment-real.appendix.json",
+        templateHash: hex32("permit-template"),
+      },
+    ]),
     clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
     logger: {
       info: () => undefined,
@@ -388,6 +407,47 @@ describe("pactfuse-api P0", () => {
     expect(lease.json.data.status).toBe("blocked_missing_finalized_settlement");
     expect(lease.json.data.winnerClaimAllowed).toBe(false);
     expect(judgeJson.data.winnerClaimAllowed).toBe(false);
+  });
+
+  it("surfaces fail-closed proof providers and binds Pact template hashes", async () => {
+    const { app } = makeApp();
+    const ready = await app.request("/readyz");
+    const readyJson = await ready.json();
+
+    const session = await post(app, "/api/v1/sessions", {
+      idempotencyKey: "sess-provider-status",
+      payload: { label: "provider-status" },
+    });
+    const sessionId = session.json.data.sessionId;
+    const operation = await post(app, "/api/v1/caw/operations/build", {
+      sessionId,
+      idempotencyKey: "build-provider-bound-op",
+      payload: {
+        spendId: hex32("provider-spend"),
+        operationKind: "activate_tool",
+        target: "0x1234",
+        selector: "0xabcdef12",
+      },
+    });
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-provider-status",
+      payload: { receipt: { receiptId: "provider-status" } },
+    });
+
+    expect(readyJson.proofProviders).toEqual([
+      expect.objectContaining({ name: "chain", mode: "unconfigured", ready: false }),
+      expect.objectContaining({ name: "caw", mode: "unconfigured", ready: false }),
+    ]);
+    expect(session.json.data.pactTemplates).toEqual([
+      expect.objectContaining({ mode: "gate-paid-artifact-real", templateHash: hex32("gate-paid-template") }),
+      expect.objectContaining({ mode: "permit-payment-real", templateHash: hex32("permit-template") }),
+    ]);
+    expect(operation.json.data.pactTemplateMode).toBe("gate-paid-artifact-real");
+    expect(operation.json.data.pactTemplateHash).toBe(hex32("gate-paid-template"));
+    expect(verify.json.data.warnings).toContain("chain proof provider is unconfigured: chain RPC endpoint is not configured");
+    expect(verify.json.data.warnings).toContain("caw proof provider is unconfigured: CAW receipt source is not configured");
+    expect(verify.json.data.raw.proofProviders).toHaveLength(2);
   });
 });
 
