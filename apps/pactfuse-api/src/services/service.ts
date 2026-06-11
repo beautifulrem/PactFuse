@@ -1475,6 +1475,12 @@ export async function verifyCawAllowance(input: SessionScopedEnvelope, ctx: Serv
         });
       }
       const approve = requireCawApproveInteractionForAllowance(ctx, envelope.sessionId, payload, spend, requestId);
+      const auditUsage = requireCawAuditUsageForContractCall(ctx, envelope.sessionId, {
+        interactionId: approve.interactionId,
+        txHash: approve.txHash,
+        operationKind: "approve",
+        requestId,
+      });
       await requireChainReadyForBalanceDelta(ctx, approve.chainId, requestId);
       const blockNumber = await requireTransactionReceiptBlock(ctx, approve.txHash, requestId, "CAW approve");
       if (blockNumber <= 0) {
@@ -1508,6 +1514,10 @@ export async function verifyCawAllowance(input: SessionScopedEnvelope, ctx: Serv
           pactId: approve.pactId,
           cawRequestId: approve.cawRequestId,
           approveTxHash: approve.txHash,
+          auditUsageEventId: auditUsage.usageEventId,
+          auditInteractionId: auditUsage.auditInteractionId,
+          auditPolicyDigest: auditUsage.policyDigest,
+          auditLogHash: auditUsage.auditLogHash,
           chainId: approve.chainId,
           blockNumber,
           preBlockNumber: blockNumber - 1,
@@ -1547,6 +1557,10 @@ export async function verifyCawAllowance(input: SessionScopedEnvelope, ctx: Serv
           approveInteractionId: approve.interactionId,
           cawContractCallEventId: approve.eventId,
           approveTxHash: approve.txHash,
+          auditUsageEventId: auditUsage.usageEventId,
+          auditInteractionId: auditUsage.auditInteractionId,
+          auditPolicyDigest: auditUsage.policyDigest,
+          auditLogHash: auditUsage.auditLogHash,
           chainId: approve.chainId,
           blockNumber,
           preBlockNumber: blockNumber - 1,
@@ -1628,6 +1642,14 @@ export async function syncCawLiveAudit(input: SessionScopedEnvelope, ctx: Servic
         winnerClaimAllowed: false,
       },
     });
+    const usageEvents = appendCawLiveAuditUsageEvents(ctx, {
+      sessionId: envelope.sessionId,
+      auditInteractionId: saved.interactionId,
+      auditEventId: event.eventId,
+      auditRequestHash: saved.requestHash,
+      auditResponseHash: saved.responseHash,
+      response,
+    });
     return {
       ok: true,
       requestId,
@@ -1637,6 +1659,8 @@ export async function syncCawLiveAudit(input: SessionScopedEnvelope, ctx: Servic
         walletId: payload.walletId ?? null,
         requestHash: saved.requestHash,
         responseHash: saved.responseHash,
+        usageEventIds: usageEvents.map((usage) => usage.eventId),
+        usageCount: usageEvents.length,
         status: "live_synced",
         proofAuthority: true,
         winnerClaimAllowed: false,
@@ -1861,6 +1885,183 @@ function cawLiveAuditRequest(payload: CawLiveAuditSyncPayload): Record<string, J
     before: payload.before,
     limit: payload.limit,
   });
+}
+
+type CawLiveAuditUsageCandidate = {
+  auditLogHash: `0x${string}`;
+  auditLogIndex: number;
+  auditLogId: string | null;
+  action: string;
+  result: "allowed" | "denied";
+  policyDigest: `0x${string}`;
+  txHash: `0x${string}`;
+  cawRequestId: string;
+};
+
+function appendCawLiveAuditUsageEvents(
+  ctx: ServiceCtx,
+  input: {
+    sessionId: string;
+    auditInteractionId: `0x${string}`;
+    auditEventId: string;
+    auditRequestHash: `0x${string}`;
+    auditResponseHash: `0x${string}`;
+    response: Record<string, unknown>;
+  },
+): EvidenceEvent[] {
+  const candidates = cawLiveAuditUsageCandidates(input.response);
+  if (candidates.length === 0) {
+    return [];
+  }
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT interaction_id, wallet_id, pact_id, caw_request_id, request_hash, response_hash, request_json
+       FROM caw_live_interactions
+       WHERE session_id = ? AND kind = 'contract_call'
+       ORDER BY created_at ASC, interaction_id ASC`,
+    )
+    .all(input.sessionId) as Row[];
+  const contractEvents = listEvents(ctx, input.sessionId, 0, 200).filter((event) => event.kind === "caw.live.contract_call.submitted");
+  const contractEventsByInteractionId = new Map(
+    contractEvents
+      .map((event) => {
+        const interactionId = typeof event.payload.interactionId === "string" ? event.payload.interactionId : null;
+        return interactionId ? [interactionId, event] : null;
+      })
+      .filter((entry): entry is [string, EvidenceEvent] => Boolean(entry)),
+  );
+  const appended: EvidenceEvent[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    for (const row of rows) {
+      const interactionId = String(row.interaction_id);
+      if (seen.has(`${interactionId}:${candidate.auditLogHash}`)) {
+        continue;
+      }
+      let request: Record<string, unknown>;
+      try {
+        request = JSON.parse(String(row.request_json)) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const event = contractEventsByInteractionId.get(interactionId);
+      if (!event) {
+        continue;
+      }
+      const eventTxHash = optionalHex32(event.payload.txHash);
+      const requestId = optionalString(request.request_id);
+      if (
+        (!requestId || requestId !== candidate.cawRequestId) &&
+        (!eventTxHash || eventTxHash.toLowerCase() !== candidate.txHash.toLowerCase())
+      ) {
+        continue;
+      }
+      const operationKind = String(request.operation_kind ?? "");
+      if (operationKind !== "approve" && operationKind !== "activate_tool") {
+        continue;
+      }
+      seen.add(`${interactionId}:${candidate.auditLogHash}`);
+      appended.push(
+        appendEvidenceEvent(ctx, {
+          sessionId: input.sessionId,
+          authority: "proof",
+          kind: "caw.live.audit.usage.verified",
+          payload: {
+            auditInteractionId: input.auditInteractionId,
+            auditEventId: input.auditEventId,
+            cawContractCallEventId: event.eventId,
+            interactionId,
+            walletId: row.wallet_id ? String(row.wallet_id) : null,
+            pactId: row.pact_id ? String(row.pact_id) : null,
+            cawRequestId: candidate.cawRequestId,
+            operationKind,
+            action: candidate.action,
+            result: candidate.result,
+            policyDigest: candidate.policyDigest,
+            txHash: candidate.txHash,
+            auditLogHash: candidate.auditLogHash,
+            auditLogIndex: candidate.auditLogIndex,
+            auditLogId: candidate.auditLogId,
+            requestHash: String(row.request_hash),
+            responseHash: String(row.response_hash),
+            auditRequestHash: input.auditRequestHash,
+            auditResponseHash: input.auditResponseHash,
+            proofAuthority: true,
+            winnerClaimAllowed: false,
+          },
+        }),
+      );
+    }
+  }
+  return appended;
+}
+
+function cawLiveAuditUsageCandidates(response: Record<string, unknown>): CawLiveAuditUsageCandidate[] {
+  const items = cawLiveAuditItems(response);
+  return items
+    .map((item, index) => cawLiveAuditUsageCandidate(item, index))
+    .filter((candidate): candidate is CawLiveAuditUsageCandidate => Boolean(candidate));
+}
+
+function cawLiveAuditItems(response: Record<string, unknown>): Record<string, unknown>[] {
+  const containers = [
+    response.items,
+    response.logs,
+    response.audit_logs,
+    objectChild(response, "result")?.items,
+    objectChild(response, "result")?.logs,
+    objectChild(response, "data")?.items,
+    objectChild(response, "data")?.logs,
+  ];
+  for (const value of containers) {
+    if (Array.isArray(value)) {
+      return value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)));
+    }
+  }
+  return [];
+}
+
+function cawLiveAuditUsageCandidate(item: Record<string, unknown>, index: number): CawLiveAuditUsageCandidate | null {
+  const cawRequestId = optionalStringFromRecord(item, ["request_id", "requestId", "caw_request_id", "cawRequestId"]);
+  const txHash = optionalHex32(optionalStringFromRecord(item, ["tx_hash", "txHash", "transaction_hash", "transactionHash", "hash"]));
+  const policyDigest = optionalHex32(optionalStringFromRecord(item, ["policy_digest", "policyDigest", "policy_hash", "policyHash"]));
+  const result = cawLiveAuditResult(item);
+  if (!cawRequestId || !txHash || !policyDigest || !result) {
+    return null;
+  }
+  const action = optionalStringFromRecord(item, ["action", "operation", "operation_kind", "operationKind", "type"]) ?? "contract_call";
+  return {
+    auditLogHash: hashJson(normalizeChainJson(item)),
+    auditLogIndex: index,
+    auditLogId: optionalStringFromRecord(item, ["id", "log_id", "logId", "audit_id", "auditId"]),
+    action,
+    result,
+    policyDigest,
+    txHash,
+    cawRequestId,
+  };
+}
+
+function cawLiveAuditResult(item: Record<string, unknown>): "allowed" | "denied" | null {
+  const raw = optionalStringFromRecord(item, ["result", "effect", "decision", "status"]);
+  const value = raw?.toLowerCase();
+  if (value === "allowed" || value === "allow" || value === "approved") {
+    return "allowed";
+  }
+  if (value === "denied" || value === "deny" || value === "rejected") {
+    return "denied";
+  }
+  return null;
+}
+
+function optionalStringFromRecord(record: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+  return null;
 }
 
 function recordCawLiveInteraction(
@@ -2260,6 +2461,7 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
       const spend = requireSpendForBalanceDelta(ctx, envelope.sessionId, payload.spendId, requestId);
       const allowance = requireVerifiedCawAllowance(ctx, envelope.sessionId, payload.spendId, requestId);
       const settlement = requireSettlementForBalanceDelta(ctx, envelope.sessionId, payload, requestId);
+      const activation = requireCawActivationForBalanceDelta(ctx, envelope.sessionId, spend, settlement, requestId);
       if (spend.payer !== spend.agentWallet) {
         throw Object.assign(new Error("token balance delta requires payer to match agentWallet until wallet ownership proof exists"), {
           apiError: proofBlockedError(requestId, "token balance delta requires payer to match agentWallet until wallet ownership proof exists", {
@@ -2294,6 +2496,32 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
         });
       }
       const transferLog = await requireErc20TransferLogForBalanceDelta(ctx, settlement, spend, amount, requestId);
+      const activationEvent = appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "proof",
+        kind: "caw.activation.verified",
+        payload: {
+          spendId: payload.spendId,
+          activateInteractionId: activation.interactionId,
+          cawContractCallEventId: activation.eventId,
+          auditUsageEventId: activation.auditUsageEventId,
+          auditInteractionId: activation.auditInteractionId,
+          auditPolicyDigest: activation.auditPolicyDigest,
+          auditLogHash: activation.auditLogHash,
+          walletId: activation.walletId,
+          pactId: activation.pactId,
+          cawRequestId: activation.cawRequestId,
+          activateTxHash: activation.txHash,
+          settlementEventId: settlement.finalizedEventId,
+          gateEventId: settlement.gateEventId,
+          procurementGateAddress: activation.procurementGateAddress,
+          chainId: activation.chainId,
+          requestHash: activation.requestHash,
+          responseHash: activation.responseHash,
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        },
+      });
       const event = appendEvidenceEvent(ctx, {
         sessionId: envelope.sessionId,
         authority: "proof",
@@ -2303,6 +2531,9 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
           allowanceEventId: allowance.allowanceEventId,
           approveInteractionId: allowance.approveInteractionId,
           approveTxHash: allowance.approveTxHash,
+          activationEventId: activationEvent.eventId,
+          activateInteractionId: activation.interactionId,
+          activateTxHash: activation.txHash,
           settlementEventId: settlement.finalizedEventId,
           gateEventId: settlement.gateEventId,
           txHash: settlement.txHash,
@@ -2345,6 +2576,9 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
           allowanceEventId: allowance.allowanceEventId,
           approveInteractionId: allowance.approveInteractionId,
           approveTxHash: allowance.approveTxHash,
+          activationEventId: activationEvent.eventId,
+          activateInteractionId: activation.interactionId,
+          activateTxHash: activation.txHash,
           settlementEventId: settlement.finalizedEventId,
           txHash: settlement.txHash,
           chainId: settlement.chainId,
@@ -3336,7 +3570,9 @@ async function buildVerifierRunView(
     ...verifySpendBindingIntegrity(ctx, sessionId),
     ...verifyMcpAdapterCallIntegrity(ctx, sessionId),
     ...verifyCawLiveInteractionIntegrity(ctx, sessionId),
+    ...verifyCawLiveAuditUsageIntegrity(ctx, sessionId),
     ...verifyCawAllowanceIntegrity(ctx, sessionId),
+    ...verifyCawActivationIntegrity(ctx, sessionId),
     ...verifyGateFinalityIntegrity(ctx, sessionId),
     ...verifyTokenBalanceDeltaIntegrity(ctx, sessionId),
     ...verifyArtifactAccessTokenIntegrity(ctx, sessionId),
@@ -4006,7 +4242,9 @@ export function appendEvidenceEvent(
       | "caw.live.transfer.submitted"
       | "caw.live.contract_call.submitted"
       | "caw.allowance.verified"
+      | "caw.activation.verified"
       | "caw.live.audit.synced"
+      | "caw.live.audit.usage.verified"
       | "caw.receipt.ingested.fixture"
       | "caw.receipt.ingested.raw"
       | "artifact.preflight.pending"
@@ -5359,6 +5597,55 @@ function requireVerifiedCawAllowance(
   });
 }
 
+function requireCawAuditUsageForContractCall(
+  ctx: ServiceCtx,
+  sessionId: string,
+  input: { interactionId: string; txHash: string; operationKind: "approve" | "activate_tool"; requestId: string },
+): { usageEventId: string; auditInteractionId: string; policyDigest: string; auditLogHash: string } {
+  const integrityErrors = verifyCawLiveAuditUsageIntegrity(ctx, sessionId);
+  if (integrityErrors.length > 0) {
+    throw Object.assign(new Error("CAW live audit usage proof is internally inconsistent"), {
+      apiError: proofBlockedError(input.requestId, "CAW live audit usage proof is internally inconsistent", { errors: integrityErrors }),
+    });
+  }
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT event_id, payload_json
+       FROM evidence_events
+       WHERE session_id = ? AND kind = 'caw.live.audit.usage.verified' AND authority = 'proof'
+       ORDER BY event_seq DESC`,
+    )
+    .all(sessionId) as Row[];
+  for (const row of rows) {
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (
+      payload.interactionId === input.interactionId &&
+      payload.operationKind === input.operationKind &&
+      payload.result === "allowed" &&
+      typeof payload.txHash === "string" &&
+      payload.txHash.toLowerCase() === input.txHash.toLowerCase() &&
+      typeof payload.auditInteractionId === "string" &&
+      typeof payload.policyDigest === "string" &&
+      typeof payload.auditLogHash === "string"
+    ) {
+      return {
+        usageEventId: String(row.event_id),
+        auditInteractionId: payload.auditInteractionId,
+        policyDigest: payload.policyDigest,
+        auditLogHash: payload.auditLogHash,
+      };
+    }
+  }
+  throw Object.assign(new Error("CAW live audit allow usage proof is required for this contract call"), {
+    apiError: proofPendingError(input.requestId, "CAW live audit allow usage proof is required for this contract call"),
+  });
+}
+
 type BalanceDeltaSpend = {
   spendId: string;
   payer: `0x${string}`;
@@ -5379,6 +5666,23 @@ type BalanceDeltaSettlement = {
 type CawApproveInteractionForAllowance = {
   interactionId: string;
   eventId: string;
+  txHash: `0x${string}`;
+  chainId: string;
+  procurementGateAddress: `0x${string}`;
+  walletId: string;
+  pactId: string;
+  cawRequestId: string | null;
+  requestHash: string;
+  responseHash: string;
+};
+
+type CawActivationForBalanceDelta = {
+  interactionId: string;
+  eventId: string;
+  auditUsageEventId: string;
+  auditInteractionId: string;
+  auditPolicyDigest: string;
+  auditLogHash: string;
   txHash: `0x${string}`;
   chainId: string;
   procurementGateAddress: `0x${string}`;
@@ -5595,6 +5899,90 @@ function requireCawApproveInteractionForAllowance(
   }
   throw Object.assign(new Error("CAW allowance proof requires a matching CAW live approve contract call"), {
     apiError: proofPendingError(requestId, "CAW allowance proof requires a matching CAW live approve contract call"),
+  });
+}
+
+function requireCawActivationForBalanceDelta(
+  ctx: ServiceCtx,
+  sessionId: string,
+  spend: BalanceDeltaSpend,
+  settlement: BalanceDeltaSettlement,
+  requestId: string,
+): CawActivationForBalanceDelta {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT interaction_id, wallet_id, pact_id, caw_request_id, request_hash, response_hash, request_json, response_json, status
+       FROM caw_live_interactions
+       WHERE session_id = ? AND kind = 'contract_call'
+       ORDER BY created_at DESC, interaction_id DESC`,
+    )
+    .all(sessionId) as Row[];
+  const events = listEvents(ctx, sessionId, 0, 200).filter((event) => event.kind === "caw.live.contract_call.submitted");
+  const eventsByInteractionId = new Map(
+    events
+      .map((event) => {
+        const interactionId = typeof event.payload.interactionId === "string" ? event.payload.interactionId : null;
+        return interactionId ? [interactionId, event] : null;
+      })
+      .filter((entry): entry is [string, EvidenceEvent] => Boolean(entry)),
+  );
+  for (const row of rows) {
+    const interactionId = String(row.interaction_id);
+    let request: Record<string, unknown>;
+    let response: Record<string, unknown>;
+    try {
+      request = JSON.parse(String(row.request_json)) as Record<string, unknown>;
+      response = JSON.parse(String(row.response_json)) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (request.operation_kind !== "activate_tool" || request.spend_id !== spend.spendId) {
+      continue;
+    }
+    const event = eventsByInteractionId.get(interactionId);
+    if (!event || event.authority !== "proof" || event.payload.proofAuthority !== true || event.payload.winnerClaimAllowed !== false) {
+      continue;
+    }
+    const txHash = requiredChainHex32(event.payload.txHash ?? response.txHash ?? response.tx_hash ?? response.transactionHash, "CAW activate txHash", requestId);
+    if (txHash.toLowerCase() !== settlement.txHash.toLowerCase()) {
+      continue;
+    }
+    const procurementGateAddress = requiredContractAddress(request.contract_addr, "CAW activate contract_addr", requestId);
+    const expectedCalldata = expectedActivateToolCalldata(spend.spendId).toLowerCase();
+    if (
+      String(request.calldata ?? "").toLowerCase() !== expectedCalldata ||
+      String(request.selector ?? "").toLowerCase() !== PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR ||
+      String(request.value ?? "") !== "0" ||
+      String(request.payment_auth ?? "") !== "0x" ||
+      String(request.chain_id ?? "") !== settlement.chainId
+    ) {
+      continue;
+    }
+    const auditUsage = requireCawAuditUsageForContractCall(ctx, sessionId, {
+      interactionId,
+      txHash,
+      operationKind: "activate_tool",
+      requestId,
+    });
+    return {
+      interactionId,
+      eventId: event.eventId,
+      auditUsageEventId: auditUsage.usageEventId,
+      auditInteractionId: auditUsage.auditInteractionId,
+      auditPolicyDigest: auditUsage.policyDigest,
+      auditLogHash: auditUsage.auditLogHash,
+      txHash,
+      chainId: settlement.chainId,
+      procurementGateAddress,
+      walletId: String(row.wallet_id),
+      pactId: String(row.pact_id),
+      cawRequestId: row.caw_request_id ? String(row.caw_request_id) : null,
+      requestHash: String(row.request_hash),
+      responseHash: String(row.response_hash),
+    };
+  }
+  throw Object.assign(new Error("CAW activate_tool proof with matching finalized SpendSettled txHash is required before token balance delta proof"), {
+    apiError: proofPendingError(requestId, "CAW activate_tool proof with matching finalized SpendSettled txHash is required before token balance delta proof"),
   });
 }
 
@@ -8444,6 +8832,88 @@ function verifyMcpAdapterCallIntegrity(ctx: ServiceCtx, sessionId: string): stri
   return errors;
 }
 
+function verifyCawLiveAuditUsageIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  const errors: string[] = [];
+  const events = listEvents(ctx, sessionId, 0, 200);
+  const eventsById = new Map(events.map((event) => [event.eventId, event]));
+  for (const event of events.filter((candidate) => candidate.kind === "caw.live.audit.usage.verified")) {
+    const payload = event.payload;
+    const label = `CAW audit usage event ${event.eventId}`;
+    if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
+      errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
+    }
+    if (!optionalHex32(payload.policyDigest)) {
+      errors.push(`${label} requires policyDigest`);
+    }
+    if (!optionalHex32(payload.txHash)) {
+      errors.push(`${label} requires txHash`);
+    }
+    if (!optionalHex32(payload.auditLogHash)) {
+      errors.push(`${label} requires auditLogHash`);
+    }
+    if (payload.result !== "allowed" && payload.result !== "denied") {
+      errors.push(`${label} result must be allowed or denied`);
+    }
+    const auditEvent = eventsById.get(String(payload.auditEventId));
+    if (!auditEvent || auditEvent.kind !== "caw.live.audit.synced" || auditEvent.authority !== "proof") {
+      errors.push(`${label} references missing caw.live.audit.synced event`);
+    } else {
+      for (const [field, expected] of [
+        ["interactionId", payload.auditInteractionId],
+        ["requestHash", payload.auditRequestHash],
+        ["responseHash", payload.auditResponseHash],
+      ] as const) {
+        if ((auditEvent.payload[field] ?? null) !== expected) {
+          errors.push(`${label} audit event payload.${field} does not match usage proof`);
+        }
+      }
+    }
+    const contractEvent = eventsById.get(String(payload.cawContractCallEventId));
+    if (!contractEvent || contractEvent.kind !== "caw.live.contract_call.submitted" || contractEvent.authority !== "proof") {
+      errors.push(`${label} references missing CAW contract call event`);
+    } else {
+      for (const [field, expected] of [
+        ["interactionId", payload.interactionId],
+        ["operationKind", payload.operationKind],
+        ["txHash", payload.txHash],
+        ["requestHash", payload.requestHash],
+        ["responseHash", payload.responseHash],
+      ] as const) {
+        if (String(contractEvent.payload[field] ?? "").toLowerCase() !== String(expected ?? "").toLowerCase()) {
+          errors.push(`${label} contract call event payload.${field} does not match usage proof`);
+        }
+      }
+    }
+    const interactionId = typeof payload.interactionId === "string" ? payload.interactionId : null;
+    const interaction = interactionId
+      ? (ctx.db.sqlite
+          .prepare(
+            `SELECT request_hash, response_hash, request_json
+             FROM caw_live_interactions
+             WHERE session_id = ? AND interaction_id = ? AND kind = 'contract_call'
+             LIMIT 1`,
+          )
+          .get(sessionId, interactionId) as Row | undefined)
+      : undefined;
+    if (!interaction) {
+      errors.push(`${label} references missing CAW contract call interaction`);
+      continue;
+    }
+    if (String(interaction.request_hash) !== payload.requestHash || String(interaction.response_hash) !== payload.responseHash) {
+      errors.push(`${label} requestHash/responseHash do not match CAW contract call interaction`);
+    }
+    try {
+      const request = JSON.parse(String(interaction.request_json)) as Record<string, unknown>;
+      if (request.operation_kind !== payload.operationKind || request.request_id !== payload.cawRequestId) {
+        errors.push(`${label} request operation_kind/request_id do not match audit usage`);
+      }
+    } catch {
+      errors.push(`${label} CAW contract call interaction has invalid request_json`);
+    }
+  }
+  return errors;
+}
+
 function verifyCawAllowanceIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   const errors: string[] = [];
   const events = listEvents(ctx, sessionId, 0, 200);
@@ -8505,6 +8975,12 @@ function verifyCawAllowanceIntegrity(ctx: ServiceCtx, sessionId: string): string
     }
     if (!optionalHex32(payload.approveTxHash)) {
       errors.push(`${label} approveTxHash must be 32-byte hex`);
+    }
+    if (!optionalHex32(payload.auditPolicyDigest)) {
+      errors.push(`${label} auditPolicyDigest must be 32-byte hex`);
+    }
+    if (!optionalHex32(payload.auditLogHash)) {
+      errors.push(`${label} auditLogHash must be 32-byte hex`);
     }
     if (!optionalHex32(payload.approvalRawLogHash)) {
       errors.push(`${label} approvalRawLogHash must be 32-byte hex`);
@@ -8586,6 +9062,91 @@ function verifyCawAllowanceIntegrity(ctx: ServiceCtx, sessionId: string): string
         }
       }
     }
+    const auditUsageEvent = eventsById.get(String(payload.auditUsageEventId));
+    if (!auditUsageEvent || auditUsageEvent.kind !== "caw.live.audit.usage.verified" || auditUsageEvent.authority !== "proof") {
+      errors.push(`${label} references missing CAW live audit usage proof`);
+    } else {
+      for (const [field, expected] of [
+        ["interactionId", payload.approveInteractionId],
+        ["txHash", payload.approveTxHash],
+        ["operationKind", "approve"],
+        ["result", "allowed"],
+        ["policyDigest", payload.auditPolicyDigest],
+        ["auditLogHash", payload.auditLogHash],
+      ] as const) {
+        if (String(auditUsageEvent.payload[field] ?? "").toLowerCase() !== String(expected ?? "").toLowerCase()) {
+          errors.push(`${label} audit usage payload.${field} does not match allowance proof`);
+        }
+      }
+    }
+  }
+  return errors;
+}
+
+function verifyCawActivationIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  const errors: string[] = [];
+  const events = listEvents(ctx, sessionId, 0, 200);
+  const eventsById = new Map(events.map((event) => [event.eventId, event]));
+  for (const event of events.filter((candidate) => candidate.kind === "caw.activation.verified")) {
+    const payload = event.payload;
+    const label = `CAW activation event ${event.eventId}`;
+    if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
+      errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
+    }
+    if (!optionalHex32(payload.activateTxHash)) {
+      errors.push(`${label} activateTxHash must be 32-byte hex`);
+    }
+    if (!optionalHex32(payload.auditPolicyDigest)) {
+      errors.push(`${label} auditPolicyDigest must be 32-byte hex`);
+    }
+    if (!optionalHex32(payload.auditLogHash)) {
+      errors.push(`${label} auditLogHash must be 32-byte hex`);
+    }
+    const contractEvent = eventsById.get(String(payload.cawContractCallEventId));
+    if (!contractEvent || contractEvent.kind !== "caw.live.contract_call.submitted" || contractEvent.authority !== "proof") {
+      errors.push(`${label} references missing CAW activate contract call event`);
+    } else {
+      for (const [field, expected] of [
+        ["interactionId", payload.activateInteractionId],
+        ["operationKind", "activate_tool"],
+        ["txHash", payload.activateTxHash],
+        ["spendId", payload.spendId],
+        ["requestHash", payload.requestHash],
+        ["responseHash", payload.responseHash],
+      ] as const) {
+        if (String(contractEvent.payload[field] ?? "").toLowerCase() !== String(expected ?? "").toLowerCase()) {
+          errors.push(`${label} contract call event payload.${field} does not match activation proof`);
+        }
+      }
+    }
+    const auditUsageEvent = eventsById.get(String(payload.auditUsageEventId));
+    if (!auditUsageEvent || auditUsageEvent.kind !== "caw.live.audit.usage.verified" || auditUsageEvent.authority !== "proof") {
+      errors.push(`${label} references missing CAW audit usage proof`);
+    } else {
+      for (const [field, expected] of [
+        ["interactionId", payload.activateInteractionId],
+        ["operationKind", "activate_tool"],
+        ["result", "allowed"],
+        ["txHash", payload.activateTxHash],
+        ["policyDigest", payload.auditPolicyDigest],
+        ["auditLogHash", payload.auditLogHash],
+      ] as const) {
+        if (String(auditUsageEvent.payload[field] ?? "").toLowerCase() !== String(expected ?? "").toLowerCase()) {
+          errors.push(`${label} audit usage payload.${field} does not match activation proof`);
+        }
+      }
+    }
+    const settlementEvent = eventsById.get(String(payload.settlementEventId));
+    if (!settlementEvent || settlementEvent.kind !== "gate.spend_settled" || settlementEvent.authority !== "proof") {
+      errors.push(`${label} references missing finalized SpendSettled event`);
+    } else if (
+      settlementEvent.payload.finalityStatus !== "finalized" ||
+      settlementEvent.payload.proofAuthority !== true ||
+      String(settlementEvent.payload.txHash ?? "").toLowerCase() !== String(payload.activateTxHash ?? "").toLowerCase() ||
+      settlementEvent.payload.spendId !== payload.spendId
+    ) {
+      errors.push(`${label} settlement event does not match activation tx/spend`);
+    }
   }
   return errors;
 }
@@ -8602,7 +9163,14 @@ function verifyCawLiveInteractionIntegrity(ctx: ServiceCtx, sessionId: string): 
     )
     .all(sessionId) as Row[];
   const allEvents = listEvents(ctx, sessionId, 0, 200);
-  const events = allEvents.filter((event) => event.kind.startsWith("caw.live."));
+  const primaryLiveEventKinds = new Set([
+    "caw.live.pact.submitted",
+    "caw.live.pact.synced",
+    "caw.live.transfer.submitted",
+    "caw.live.contract_call.submitted",
+    "caw.live.audit.synced",
+  ]);
+  const events = allEvents.filter((event) => primaryLiveEventKinds.has(event.kind));
   const eventsByInteractionId = new Map(
     events
       .map((event) => {
@@ -8976,6 +9544,8 @@ function verifyGateFinalityIntegrity(ctx: ServiceCtx, sessionId: string): string
 
 function verifyTokenBalanceDeltaIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   const errors: string[] = [];
+  const allEvents = listEvents(ctx, sessionId, 0, 200);
+  const eventsById = new Map(allEvents.map((event) => [event.eventId, event]));
   const events = (
     ctx.db.sqlite
       .prepare(
@@ -9022,6 +9592,53 @@ function verifyTokenBalanceDeltaIntegrity(ctx: ServiceCtx, sessionId: string): s
     }
     if (String(spend.payer).toLowerCase() !== String(spend.agent_wallet).toLowerCase() || payload.payerAgentWalletSame !== true) {
       errors.push(`${label} requires payerAgentWalletSame=true until wallet ownership proof exists`);
+    }
+    const allowanceEvent = eventsById.get(String(payload.allowanceEventId));
+    if (
+      !allowanceEvent ||
+      allowanceEvent.kind !== "caw.allowance.verified" ||
+      allowanceEvent.authority !== "proof" ||
+      allowanceEvent.payload.proofAuthority !== true ||
+      allowanceEvent.payload.spendId !== spendId
+    ) {
+      errors.push(`${label} references missing proof-authority caw.allowance.verified allowanceEventId`);
+    } else {
+      for (const [field, expected] of [
+        ["approveInteractionId", allowanceEvent.payload.approveInteractionId],
+        ["approveTxHash", allowanceEvent.payload.approveTxHash],
+        ["paymentToken", allowanceEvent.payload.paymentToken],
+        ["payer", allowanceEvent.payload.payer],
+        ["agentWallet", allowanceEvent.payload.agentWallet],
+        ["amountAtomic", allowanceEvent.payload.amountAtomic],
+      ] as const) {
+        if (String(payload[field] ?? "").toLowerCase() !== String(expected ?? "").toLowerCase()) {
+          errors.push(`${label} payload.${field} does not match allowance proof`);
+        }
+      }
+    }
+    const activationEvent = eventsById.get(String(payload.activationEventId));
+    if (
+      !activationEvent ||
+      activationEvent.kind !== "caw.activation.verified" ||
+      activationEvent.authority !== "proof" ||
+      activationEvent.payload.proofAuthority !== true ||
+      activationEvent.payload.spendId !== spendId
+    ) {
+      errors.push(`${label} references missing proof-authority caw.activation.verified activationEventId`);
+    } else {
+      for (const [field, expected] of [
+        ["activateInteractionId", activationEvent.payload.activateInteractionId],
+        ["activateTxHash", activationEvent.payload.activateTxHash],
+        ["settlementEventId", activationEvent.payload.settlementEventId],
+        ["gateEventId", activationEvent.payload.gateEventId],
+      ] as const) {
+        if (String(payload[field] ?? "").toLowerCase() !== String(expected ?? "").toLowerCase()) {
+          errors.push(`${label} payload.${field} does not match activation proof`);
+        }
+      }
+      if (String(payload.txHash ?? "").toLowerCase() !== String(activationEvent.payload.activateTxHash ?? "").toLowerCase()) {
+        errors.push(`${label} activateTxHash must match settlement txHash`);
+      }
     }
     const settlementEventId = typeof payload.settlementEventId === "string" ? payload.settlementEventId : "";
     const settlementEvent = ctx.db.sqlite

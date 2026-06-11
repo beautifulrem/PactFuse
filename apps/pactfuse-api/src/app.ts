@@ -127,6 +127,10 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "approveInteractionId",
     "cawContractCallEventId",
     "approveTxHash",
+    "auditUsageEventId",
+    "auditInteractionId",
+    "auditPolicyDigest",
+    "auditLogHash",
     "paymentToken",
     "owner",
     "spender",
@@ -137,10 +141,24 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "proofAuthority",
     "winnerClaimAllowed",
   ],
-  "/api/v1/caw/live/audit/sync": ["interactionId", "requestHash", "responseHash", "proofAuthority", "winnerClaimAllowed"],
+  "/api/v1/caw/live/audit/sync": [
+    "interactionId",
+    "requestHash",
+    "responseHash",
+    "usageEventIds",
+    "usageCount",
+    "proofAuthority",
+    "winnerClaimAllowed",
+  ],
   "/api/v1/gate/events/ingest": ["finalityStatus", "confirmations", "finalityDepth", "proofAuthority", "winnerClaimAllowed"],
   "/api/v1/token/balance-deltas/verify": [
     "spendId",
+    "allowanceEventId",
+    "approveInteractionId",
+    "approveTxHash",
+    "activationEventId",
+    "activateInteractionId",
+    "activateTxHash",
     "settlementEventId",
     "txHash",
     "paymentToken",
@@ -843,6 +861,22 @@ function buildOpenApi(): Record<string, unknown> {
           properties: {
             spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             approveInteractionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+          },
+        },
+        CawLiveAuditSyncInput: sessionEnvelopeSchema("#/components/schemas/CawLiveAuditSyncPayload"),
+        CawLiveAuditSyncPayload: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            walletId: { type: "string", minLength: 1, maxLength: 160 },
+            principalId: { type: "string", minLength: 1, maxLength: 160 },
+            action: { type: "string", minLength: 1, maxLength: 160 },
+            result: { enum: ["allowed", "denied", "pending", "error"] },
+            startTime: { type: "string", format: "date-time" },
+            endTime: { type: "string", format: "date-time" },
+            after: { type: "string", minLength: 1, maxLength: 500 },
+            before: { type: "string", minLength: 1, maxLength: 500 },
+            limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
           },
         },
         TokenBalanceDeltaVerifyInput: sessionEnvelopeSchema("#/components/schemas/TokenBalanceDeltaVerifyPayload"),
@@ -1998,6 +2032,9 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   }
   if (path === "/api/v1/caw/live/allowances/verify") {
     return jsonRequestBody({ $ref: "#/components/schemas/CawAllowanceVerifyInput" });
+  }
+  if (path === "/api/v1/caw/live/audit/sync") {
+    return jsonRequestBody({ $ref: "#/components/schemas/CawLiveAuditSyncInput" });
   }
   if (path === "/api/v1/caw/receipts/ingest") {
     return jsonRequestBody({ $ref: "#/components/schemas/CawReceiptIngestInput" });

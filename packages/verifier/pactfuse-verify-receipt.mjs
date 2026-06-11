@@ -1205,6 +1205,76 @@ function verifyContractStateProofEvents(bundle, events, errors) {
   }
 }
 
+function verifyCawAuditUsageEvents(eventsById, interactionsById, errors) {
+  for (const event of eventsById.values()) {
+    if (!isObject(event) || event.kind !== "caw.live.audit.usage.verified") {
+      continue;
+    }
+    const payload = isObject(event.payload) ? event.payload : null;
+    const label = `CAW audit usage event ${event.eventId ?? "-"}`;
+    if (!payload) {
+      errors.push(`${label} requires payload`);
+      continue;
+    }
+    if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
+      errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
+    }
+    if (!isHex32(payload.policyDigest)) {
+      errors.push(`${label} requires policyDigest`);
+    }
+    if (!isHex32(payload.txHash)) {
+      errors.push(`${label} requires txHash`);
+    }
+    if (!isHex32(payload.auditLogHash)) {
+      errors.push(`${label} requires auditLogHash`);
+    }
+    if (payload.result !== "allowed" && payload.result !== "denied") {
+      errors.push(`${label} result must be allowed or denied`);
+    }
+    const auditEvent = eventsById.get(payload.auditEventId);
+    if (!isObject(auditEvent) || auditEvent.kind !== "caw.live.audit.synced" || auditEvent.authority !== "proof") {
+      errors.push(`${label} references missing caw.live.audit.synced event`);
+    } else {
+      for (const [field, expected] of [
+        ["interactionId", payload.auditInteractionId],
+        ["requestHash", payload.auditRequestHash],
+        ["responseHash", payload.auditResponseHash],
+      ]) {
+        if ((auditEvent.payload?.[field] ?? null) !== expected) {
+          errors.push(`${label} audit event payload.${field} does not match usage proof`);
+        }
+      }
+    }
+    const contractEvent = eventsById.get(payload.cawContractCallEventId);
+    if (!isObject(contractEvent) || contractEvent.kind !== "caw.live.contract_call.submitted" || contractEvent.authority !== "proof") {
+      errors.push(`${label} references missing CAW contract call event`);
+    } else {
+      for (const [field, expected] of [
+        ["interactionId", payload.interactionId],
+        ["operationKind", payload.operationKind],
+        ["txHash", payload.txHash],
+        ["requestHash", payload.requestHash],
+        ["responseHash", payload.responseHash],
+      ]) {
+        if (asText(contractEvent.payload?.[field]).toLowerCase() !== asText(expected).toLowerCase()) {
+          errors.push(`${label} contract call event payload.${field} does not match usage proof`);
+        }
+      }
+    }
+    const interaction = interactionsById.get(payload.interactionId);
+    if (!isObject(interaction) || interaction.kind !== "contract_call") {
+      errors.push(`${label} references missing CAW contract call interaction`);
+      continue;
+    }
+    if (interaction.requestHash !== payload.requestHash || interaction.responseHash !== payload.responseHash) {
+      errors.push(`${label} requestHash/responseHash do not match CAW contract call interaction`);
+    }
+    if (interaction.request?.operation_kind !== payload.operationKind || interaction.request?.request_id !== payload.cawRequestId) {
+      errors.push(`${label} request operation_kind/request_id do not match audit usage`);
+    }
+  }
+}
+
 function verifyCawAllowanceEvents(eventsById, spendsById, interactionsById, errors) {
   for (const event of eventsById.values()) {
     if (!isObject(event) || event.kind !== "caw.allowance.verified") {
@@ -1258,6 +1328,12 @@ function verifyCawAllowanceEvents(eventsById, spendsById, interactionsById, erro
     }
     if (!isHex32(payload.approveTxHash)) {
       errors.push(`${label} requires approveTxHash`);
+    }
+    if (!isHex32(payload.auditPolicyDigest)) {
+      errors.push(`${label} requires auditPolicyDigest`);
+    }
+    if (!isHex32(payload.auditLogHash)) {
+      errors.push(`${label} requires auditLogHash`);
     }
     if (!isHex32(payload.approvalRawLogHash)) {
       errors.push(`${label} requires approvalRawLogHash`);
@@ -1320,6 +1396,94 @@ function verifyCawAllowanceEvents(eventsById, spendsById, interactionsById, erro
       if (actual !== asText(expected).toLowerCase()) {
         errors.push(`${label} CAW approve request.${field} does not match allowance proof`);
       }
+    }
+    const auditUsageEvent = eventsById.get(payload.auditUsageEventId);
+    if (!isObject(auditUsageEvent) || auditUsageEvent.kind !== "caw.live.audit.usage.verified" || auditUsageEvent.authority !== "proof") {
+      errors.push(`${label} references missing CAW live audit usage proof`);
+    } else {
+      for (const [field, expected] of [
+        ["interactionId", payload.approveInteractionId],
+        ["txHash", payload.approveTxHash],
+        ["operationKind", "approve"],
+        ["result", "allowed"],
+        ["policyDigest", payload.auditPolicyDigest],
+        ["auditLogHash", payload.auditLogHash],
+      ]) {
+        if (asText(auditUsageEvent.payload?.[field]).toLowerCase() !== asText(expected).toLowerCase()) {
+          errors.push(`${label} audit usage payload.${field} does not match allowance proof`);
+        }
+      }
+    }
+  }
+}
+
+function verifyCawActivationEvents(eventsById, errors) {
+  for (const event of eventsById.values()) {
+    if (!isObject(event) || event.kind !== "caw.activation.verified") {
+      continue;
+    }
+    const payload = isObject(event.payload) ? event.payload : null;
+    const label = `CAW activation event ${event.eventId ?? "-"}`;
+    if (!payload) {
+      errors.push(`${label} requires payload`);
+      continue;
+    }
+    if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
+      errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
+    }
+    if (!isHex32(payload.activateTxHash)) {
+      errors.push(`${label} requires activateTxHash`);
+    }
+    if (!isHex32(payload.auditPolicyDigest)) {
+      errors.push(`${label} requires auditPolicyDigest`);
+    }
+    if (!isHex32(payload.auditLogHash)) {
+      errors.push(`${label} requires auditLogHash`);
+    }
+    const contractEvent = eventsById.get(payload.cawContractCallEventId);
+    if (!isObject(contractEvent) || contractEvent.kind !== "caw.live.contract_call.submitted" || contractEvent.authority !== "proof") {
+      errors.push(`${label} references missing CAW activate contract call event`);
+    } else {
+      for (const [field, expected] of [
+        ["interactionId", payload.activateInteractionId],
+        ["operationKind", "activate_tool"],
+        ["txHash", payload.activateTxHash],
+        ["spendId", payload.spendId],
+        ["requestHash", payload.requestHash],
+        ["responseHash", payload.responseHash],
+      ]) {
+        if (asText(contractEvent.payload?.[field]).toLowerCase() !== asText(expected).toLowerCase()) {
+          errors.push(`${label} contract call event payload.${field} does not match activation proof`);
+        }
+      }
+    }
+    const auditUsageEvent = eventsById.get(payload.auditUsageEventId);
+    if (!isObject(auditUsageEvent) || auditUsageEvent.kind !== "caw.live.audit.usage.verified" || auditUsageEvent.authority !== "proof") {
+      errors.push(`${label} references missing CAW audit usage proof`);
+    } else {
+      for (const [field, expected] of [
+        ["interactionId", payload.activateInteractionId],
+        ["operationKind", "activate_tool"],
+        ["result", "allowed"],
+        ["txHash", payload.activateTxHash],
+        ["policyDigest", payload.auditPolicyDigest],
+        ["auditLogHash", payload.auditLogHash],
+      ]) {
+        if (asText(auditUsageEvent.payload?.[field]).toLowerCase() !== asText(expected).toLowerCase()) {
+          errors.push(`${label} audit usage payload.${field} does not match activation proof`);
+        }
+      }
+    }
+    const settlementEvent = eventsById.get(payload.settlementEventId);
+    if (!isObject(settlementEvent) || settlementEvent.kind !== "gate.spend_settled" || settlementEvent.authority !== "proof") {
+      errors.push(`${label} references missing finalized SpendSettled event`);
+    } else if (
+      settlementEvent.payload?.finalityStatus !== "finalized" ||
+      settlementEvent.payload?.proofAuthority !== true ||
+      lowerHex(settlementEvent.payload?.txHash) !== lowerHex(payload.activateTxHash) ||
+      settlementEvent.payload?.spendId !== payload.spendId
+    ) {
+      errors.push(`${label} settlement event does not match activation tx/spend`);
     }
   }
 }
@@ -1384,6 +1548,32 @@ function verifyTokenBalanceDeltaEvents(eventsById, spendsById, errors) {
         if (lowerHex(payload[field]) !== lowerHex(expected)) {
           errors.push(`${label} payload.${field} does not match allowance proof`);
         }
+      }
+    }
+    const activationEvent = eventsById.get(payload.activationEventId);
+    const activationPayload = isObject(activationEvent?.payload) ? activationEvent.payload : null;
+    if (
+      !isObject(activationEvent) ||
+      activationEvent.kind !== "caw.activation.verified" ||
+      activationEvent.authority !== "proof" ||
+      !activationPayload ||
+      activationPayload.spendId !== payload.spendId ||
+      activationPayload.proofAuthority !== true
+    ) {
+      errors.push(`${label} references missing proof-authority caw.activation.verified activationEventId`);
+    } else {
+      for (const [field, expected] of [
+        ["activateInteractionId", activationPayload.activateInteractionId],
+        ["activateTxHash", activationPayload.activateTxHash],
+        ["settlementEventId", activationPayload.settlementEventId],
+        ["gateEventId", activationPayload.gateEventId],
+      ]) {
+        if (lowerHex(payload[field]) !== lowerHex(expected)) {
+          errors.push(`${label} payload.${field} does not match activation proof`);
+        }
+      }
+      if (lowerHex(payload.txHash) !== lowerHex(activationPayload.activateTxHash)) {
+        errors.push(`${label} activateTxHash must match settlement txHash`);
       }
     }
     const settlementEvent = eventsById.get(payload.settlementEventId);
@@ -1505,17 +1695,16 @@ function verifyCawLiveInteractions(interactions, spendsById, eventsById, errors)
     if (responseHash && responseHash !== lowerHex(interaction.responseHash)) {
       errors.push(`CAW live interaction ${interaction.interactionId ?? "-"} responseHash does not match response`);
     }
+    const expectedEventKind = cawLiveEventKindForInteraction(interaction.kind);
     const event = [...eventsById.values()].find(
       (candidate) =>
         isObject(candidate) &&
-        typeof candidate.kind === "string" &&
-        candidate.kind.startsWith("caw.live.") &&
+        candidate.kind === expectedEventKind &&
         candidate.payload?.interactionId === interaction.interactionId,
     );
     if (!event) {
       errors.push(`CAW live interaction ${interaction.interactionId ?? "-"} has no matching evidence event`);
     } else {
-      const expectedEventKind = cawLiveEventKindForInteraction(interaction.kind);
       if (expectedEventKind && event.kind !== expectedEventKind) {
         errors.push(`CAW live interaction ${interaction.interactionId ?? "-"} event kind does not match interaction kind`);
       }
@@ -2139,7 +2328,9 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   verifySourceIdentityBindings(bundle, errors);
   const spendsById = new Map(spends.filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]));
   const cawLiveInteractionsById = new Map(cawLiveInteractions.filter(isObject).map((interaction) => [interaction.interactionId, interaction]));
+  verifyCawAuditUsageEvents(eventsById, cawLiveInteractionsById, errors);
   verifyCawAllowanceEvents(eventsById, spendsById, cawLiveInteractionsById, errors);
+  verifyCawActivationEvents(eventsById, errors);
   verifyTokenBalanceDeltaEvents(eventsById, spendsById, errors);
   verifyCawLiveInteractions(cawLiveInteractions, spendsById, eventsById, errors);
   const preflightsById = new Map(preflights.filter(isObject).map((preflight) => [preflight.preflightId, preflight]));

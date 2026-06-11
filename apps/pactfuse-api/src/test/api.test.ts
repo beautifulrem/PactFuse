@@ -718,6 +718,12 @@ describe("pactfuse-api P0", () => {
     );
     expect(json.paths["/api/v1/token/balance-deltas/verify"].post["x-pactfuse-proof-fields"]).toEqual([
       "spendId",
+      "allowanceEventId",
+      "approveInteractionId",
+      "approveTxHash",
+      "activationEventId",
+      "activateInteractionId",
+      "activateTxHash",
       "settlementEventId",
       "txHash",
       "paymentToken",
@@ -1000,6 +1006,10 @@ describe("pactfuse-api P0", () => {
       "approveInteractionId",
       "cawContractCallEventId",
       "approveTxHash",
+      "auditUsageEventId",
+      "auditInteractionId",
+      "auditPolicyDigest",
+      "auditLogHash",
       "paymentToken",
       "owner",
       "spender",
@@ -1013,6 +1023,10 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/caw/live/allowances/verify"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/CawAllowanceVerifyInput",
     );
+    expect(json.paths["/api/v1/caw/live/audit/sync"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/CawLiveAuditSyncInput",
+    );
+    expect(json.components.schemas.CawLiveAuditSyncPayload.properties.result.enum).toEqual(["allowed", "denied", "pending", "error"]);
     expect(json.paths["/api/v1/caw/live/contracts/call"].post.parameters).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "x-pactfuse-caw-pact-api-key", in: "header", required: true }),
@@ -3365,7 +3379,7 @@ describe("pactfuse-api P0", () => {
     const sessionId = await createSession(app, "sess-token-delta-missing-transfer");
     const spendId = await registerSpend(app, sessionId);
     const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "token-delta-missing-transfer");
-    await verifyCawAllowanceForTest(app, logs, tokenBalances, sessionId, spendId, "token-delta-missing-transfer", {
+    await prepareCawProofsForTokenDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "token-delta-missing-transfer", finalized, {
       blockNumber: Number(finalized.blockNumber) - 1,
     });
     tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_PAYER_ADDRESS, 99)] = "5000";
@@ -3395,7 +3409,7 @@ describe("pactfuse-api P0", () => {
     const sessionId = await createSession(app, "sess-token-delta-wrong-transfer");
     const spendId = await registerSpend(app, sessionId);
     const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "token-delta-wrong-transfer");
-    await verifyCawAllowanceForTest(app, logs, tokenBalances, sessionId, spendId, "token-delta-wrong-transfer", {
+    await prepareCawProofsForTokenDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "token-delta-wrong-transfer", finalized, {
       blockNumber: Number(finalized.blockNumber) - 1,
     });
     tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_PAYER_ADDRESS, 99)] = "5000";
@@ -6052,6 +6066,7 @@ describe("pactfuse-api P0", () => {
     });
     expect(audit.status).toBe(202);
     expect(audit.json.data).toEqual(expect.objectContaining({ status: "live_synced", proofAuthority: true }));
+    expect(Number(audit.json.data.usageCount)).toBeGreaterThanOrEqual(2);
 
     const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
     const replayJson = await replay.json();
@@ -6091,6 +6106,7 @@ describe("pactfuse-api P0", () => {
         }),
       ]),
     );
+    expect(replayJson.data.events.filter((event: { kind: string }) => event.kind === "caw.live.audit.usage.verified")).toHaveLength(2);
     expect(replayJson.data.replayPageIndex.collections.cawLiveInteractions.totalRows).toBe(6);
   });
 
@@ -7053,7 +7069,7 @@ async function verifyTokenBalanceDeltaForTest(
   const amountAtomic = overrides.amountAtomic ?? "1000";
   const blockNumber = Number(finalized.blockNumber);
   const preBlockNumber = blockNumber - 1;
-  await verifyCawAllowanceForTest(app, logs, tokenBalances, sessionId, spendId, key, {
+  await prepareCawProofsForTokenDeltaForTest(app, logs, tokenBalances, sessionId, spendId, key, finalized, {
     paymentToken,
     agentWallet,
     amountAtomic,
@@ -7082,6 +7098,29 @@ async function verifyTokenBalanceDeltaForTest(
   });
   expect(verified.status).toBe(202);
   return verified.json.data as Record<string, unknown>;
+}
+
+async function prepareCawProofsForTokenDeltaForTest(
+  app: ReturnType<typeof createApp>,
+  logs: Array<Record<string, unknown>>,
+  tokenBalances: Record<string, string>,
+  sessionId: string,
+  spendId: string,
+  key: string,
+  finalized: Record<string, unknown>,
+  overrides: Partial<{
+    paymentToken: string;
+    agentWallet: string;
+    procurementGateAddress: string;
+    amountAtomic: string;
+    blockNumber: number;
+  }> = {},
+): Promise<{ allowance: Record<string, unknown>; activation: Record<string, unknown> }> {
+  const allowance = await verifyCawAllowanceForTest(app, logs, tokenBalances, sessionId, spendId, key, overrides);
+  const activation = await verifyCawActivationForTest(app, sessionId, spendId, key, finalized, {
+    procurementGateAddress: overrides.procurementGateAddress,
+  });
+  return { allowance, activation };
 }
 
 async function verifyCawAllowanceForTest(
@@ -7146,6 +7185,13 @@ async function verifyCawAllowanceForTest(
     { "x-pactfuse-caw-pact-api-key": pactKey },
   );
   expect(approve.status).toBe(202);
+  const approveAudit = await post(app, "/api/v1/caw/live/audit/sync", {
+    sessionId,
+    idempotencyKey: `${key}-caw-audit-after-approve`,
+    payload: { walletId, result: "allowed", limit: 20 },
+  });
+  expect(approveAudit.status).toBe(202);
+  expect(Number(approveAudit.json.data.usageCount)).toBeGreaterThan(0);
   const approveTxHash = String(approve.json.data.txHash);
   logs.push(
     erc20ApprovalLogForTest(key, {
@@ -7166,6 +7212,49 @@ async function verifyCawAllowanceForTest(
   });
   expect(allowance.status).toBe(202);
   return allowance.json.data as Record<string, unknown>;
+}
+
+async function verifyCawActivationForTest(
+  app: ReturnType<typeof createApp>,
+  sessionId: string,
+  spendId: string,
+  key: string,
+  finalized: Record<string, unknown>,
+  overrides: Partial<{ procurementGateAddress: string }> = {},
+): Promise<Record<string, unknown>> {
+  const walletId = "wallet-live-1";
+  const pactId = "pact-live-1";
+  const procurementGateAddress = overrides.procurementGateAddress ?? INDEXER_ADDRESS;
+  const activate = await post(
+    app,
+    "/api/v1/caw/live/contracts/call",
+    {
+      sessionId,
+      idempotencyKey: `${key}-caw-activate`,
+      payload: {
+        spendId,
+        operationKind: "activate_tool",
+        pactId,
+        walletId,
+        chainId: "84532",
+        contractAddress: procurementGateAddress,
+        procurementGateAddress,
+        calldata: cawActivateToolCalldataForTest(spendId),
+        requestId: String(finalized.txHash),
+        description: `PactFuse test activate ${key}`,
+      },
+    },
+    { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+  );
+  expect(activate.status).toBe(202);
+  const activateAudit = await post(app, "/api/v1/caw/live/audit/sync", {
+    sessionId,
+    idempotencyKey: `${key}-caw-audit-after-activate`,
+    payload: { walletId, result: "allowed", limit: 20 },
+  });
+  expect(activateAudit.status).toBe(202);
+  expect(Number(activateAudit.json.data.usageCount)).toBeGreaterThan(0);
+  return activate.json.data as Record<string, unknown>;
 }
 
 async function computeSpendIdForTest(
@@ -7369,6 +7458,7 @@ function cawReceiptFields(seed: string, overrides: Record<string, unknown> = {})
 }
 
 function createFakeCawLiveClient(): CawLiveClient {
+  const contractCalls: Array<{ input: Parameters<CawLiveClient["contractCall"]>[0]; txHash: `0x${string}` }> = [];
   return {
     async status() {
       return {
@@ -7416,6 +7506,10 @@ function createFakeCawLiveClient(): CawLiveClient {
       };
     },
     async contractCall(input) {
+      const txHash = /^0x[0-9a-fA-F]{64}$/.test(input.requestId ?? "")
+        ? (input.requestId as `0x${string}`)
+        : hex32(`caw-live-contract:${input.requestId ?? "default"}`);
+      contractCalls.push({ input, txHash });
       return {
         success: true,
         result: {
@@ -7423,21 +7517,27 @@ function createFakeCawLiveClient(): CawLiveClient {
           wallet_id: input.walletId,
           request_id: input.requestId,
           status: "submitted",
-          transaction_hash: hex32(`caw-live-contract:${input.requestId ?? "default"}`),
+          transaction_hash: txHash,
         },
       };
     },
     async listAuditLogs(input) {
+      const items = contractCalls
+        .filter((call) => !input.walletId || call.input.walletId === input.walletId)
+        .map((call) => ({
+          id: `audit-${call.input.requestId ?? call.txHash}`,
+          wallet_id: call.input.walletId,
+          pact_id: call.input.pactId,
+          action: input.action ?? `contract_call.${call.input.operationKind}`,
+          result: input.result ?? "allowed",
+          request_id: call.input.requestId,
+          transaction_hash: call.txHash,
+          policy_digest: hex32(`policy:${call.input.requestId ?? call.txHash}`),
+        }));
       return {
         success: true,
         result: {
-          items: [
-            {
-              wallet_id: input.walletId,
-              action: input.action ?? "transfer.initiate",
-              result: "allowed",
-            },
-          ],
+          items,
         },
       };
     },

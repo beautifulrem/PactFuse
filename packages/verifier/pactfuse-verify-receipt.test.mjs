@@ -845,7 +845,9 @@ function replayBundle() {
   sealReplayBundleForTest(bundle);
   const gateEvent = bundle.events.find((event) => event.kind === "gate.spend_settled");
   const cawCalls = appendCawLiveContractCallsForTest(bundle);
-  const allowanceEvent = appendCawAllowanceEventForTest(bundle, cawCalls.approve);
+  const auditUsage = appendCawLiveAuditUsageEventsForTest(bundle, cawCalls);
+  const allowanceEvent = appendCawAllowanceEventForTest(bundle, cawCalls.approve, auditUsage.approveUsage);
+  const activationEvent = appendCawActivationEventForTest(bundle, cawCalls.activate, auditUsage.activateUsage, gateEvent);
   bundle.events.push({
     eventSeq: bundle.events.length + 1,
     authority: "proof",
@@ -855,6 +857,9 @@ function replayBundle() {
       allowanceEventId: allowanceEvent.eventId,
       approveInteractionId: cawCalls.approve.interactionId,
       approveTxHash: cawCalls.approve.response.result.transaction_hash,
+      activationEventId: activationEvent.eventId,
+      activateInteractionId: cawCalls.activate.interactionId,
+      activateTxHash: cawCalls.activate.response.result.transaction_hash,
       settlementEventId: gateEvent.eventId,
       gateEventId: gateEvent.payload.gateEventId,
       txHash: gateEvent.payload.txHash,
@@ -1168,7 +1173,108 @@ function appendCawLiveContractCallsForTest(bundle) {
   return { pactSync, approve, activate };
 }
 
-function appendCawAllowanceEventForTest(bundle, approve) {
+function appendCawLiveAuditUsageEventsForTest(bundle, cawCalls) {
+  const createdAt = "2026-06-11T00:00:02.250Z";
+  const auditRequest = {
+    wallet_id: cawCalls.approve.walletId,
+    result: "allowed",
+    limit: 20,
+  };
+  const approveItem = cawLiveAuditItemForTest(cawCalls.approve, "contract_call.approve");
+  const activateItem = cawLiveAuditItemForTest(cawCalls.activate, "contract_call.activate_tool");
+  const auditResponse = {
+    items: [approveItem, activateItem],
+  };
+  const auditSync = {
+    interactionId: hex32("caw-live-audit-sync"),
+    sessionId: bundle.sessionId,
+    kind: "audit_sync",
+    walletId: cawCalls.approve.walletId,
+    pactId: null,
+    cawRequestId: null,
+    requestHash: hashJson(auditRequest),
+    request: auditRequest,
+    responseHash: hashJson(auditResponse),
+    response: auditResponse,
+    status: "live_synced",
+    authKeyHash: null,
+    proofAuthority: true,
+    winnerClaimAllowed: false,
+    createdAt,
+  };
+  bundle.cawLiveInteractions = [...bundle.cawLiveInteractions, auditSync];
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "proof",
+    kind: "caw.live.audit.synced",
+    payload: {
+      interactionId: auditSync.interactionId,
+      walletId: auditSync.walletId,
+      requestHash: auditSync.requestHash,
+      responseHash: auditSync.responseHash,
+      status: "live_synced",
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+    createdAt,
+  });
+  sealReplayBundleForTest(bundle);
+  const auditEvent = bundle.events.find((candidate) => candidate.kind === "caw.live.audit.synced" && candidate.payload.interactionId === auditSync.interactionId);
+  const approveUsage = appendCawAuditUsageEventForTest(bundle, auditSync, auditEvent, cawCalls.approve, approveItem, 0, createdAt);
+  const activateUsage = appendCawAuditUsageEventForTest(bundle, auditSync, auditEvent, cawCalls.activate, activateItem, 1, createdAt);
+  sealReplayBundleForTest(bundle);
+  return { auditSync, approveUsage, activateUsage };
+}
+
+function cawLiveAuditItemForTest(interaction, action) {
+  return {
+    id: `audit-${interaction.cawRequestId}`,
+    action,
+    result: "allowed",
+    request_id: interaction.cawRequestId,
+    transaction_hash: interaction.response.result.transaction_hash,
+    policy_digest: hex32(`policy-${interaction.cawRequestId}`),
+  };
+}
+
+function appendCawAuditUsageEventForTest(bundle, auditSync, auditEvent, interaction, auditItem, auditLogIndex, createdAt) {
+  const contractEvent = bundle.events.find((candidate) => candidate.kind === "caw.live.contract_call.submitted" && candidate.payload.interactionId === interaction.interactionId);
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "proof",
+    kind: "caw.live.audit.usage.verified",
+    payload: {
+      auditInteractionId: auditSync.interactionId,
+      auditEventId: auditEvent.eventId,
+      cawContractCallEventId: contractEvent.eventId,
+      interactionId: interaction.interactionId,
+      walletId: interaction.walletId,
+      pactId: interaction.pactId,
+      cawRequestId: interaction.cawRequestId,
+      operationKind: interaction.request.operation_kind,
+      action: auditItem.action,
+      result: "allowed",
+      policyDigest: auditItem.policy_digest,
+      txHash: auditItem.transaction_hash,
+      auditLogHash: hashJson(auditItem),
+      auditLogIndex,
+      auditLogId: auditItem.id,
+      requestHash: interaction.requestHash,
+      responseHash: interaction.responseHash,
+      auditRequestHash: auditSync.requestHash,
+      auditResponseHash: auditSync.responseHash,
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+    createdAt,
+  });
+  sealReplayBundleForTest(bundle);
+  return bundle.events.find(
+    (candidate) => candidate.kind === "caw.live.audit.usage.verified" && candidate.payload.interactionId === interaction.interactionId,
+  );
+}
+
+function appendCawAllowanceEventForTest(bundle, approve, auditUsage) {
   const spend = bundle.spends[0];
   const cawEvent = bundle.events.find((candidate) => candidate.payload?.interactionId === approve.interactionId);
   const gateAddress = approve.request.procurement_gate_addr.toLowerCase();
@@ -1184,6 +1290,10 @@ function appendCawAllowanceEventForTest(bundle, approve) {
       pactId: approve.pactId,
       cawRequestId: approve.cawRequestId,
       approveTxHash: approve.response.result.transaction_hash,
+      auditUsageEventId: auditUsage.eventId,
+      auditInteractionId: auditUsage.payload.auditInteractionId,
+      auditPolicyDigest: auditUsage.payload.policyDigest,
+      auditLogHash: auditUsage.payload.auditLogHash,
       chainId: approve.request.chain_id,
       blockNumber: 99,
       preBlockNumber: 98,
@@ -1217,6 +1327,39 @@ function appendCawAllowanceEventForTest(bundle, approve) {
   row.evidenceEventId = allowanceEvent.eventId;
   bundle.replayPageIndex = replayPageIndexForTest(bundle);
   return allowanceEvent;
+}
+
+function appendCawActivationEventForTest(bundle, activate, auditUsage, gateEvent) {
+  const cawEvent = bundle.events.find((candidate) => candidate.payload?.interactionId === activate.interactionId);
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "proof",
+    kind: "caw.activation.verified",
+    payload: {
+      spendId: activate.request.spend_id,
+      activateInteractionId: activate.interactionId,
+      cawContractCallEventId: cawEvent.eventId,
+      auditUsageEventId: auditUsage.eventId,
+      auditInteractionId: auditUsage.payload.auditInteractionId,
+      auditPolicyDigest: auditUsage.payload.policyDigest,
+      auditLogHash: auditUsage.payload.auditLogHash,
+      walletId: activate.walletId,
+      pactId: activate.pactId,
+      cawRequestId: activate.cawRequestId,
+      activateTxHash: activate.response.result.transaction_hash,
+      settlementEventId: gateEvent.eventId,
+      gateEventId: gateEvent.payload.gateEventId,
+      procurementGateAddress: activate.request.contract_addr,
+      chainId: activate.request.chain_id,
+      requestHash: activate.requestHash,
+      responseHash: activate.responseHash,
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+    createdAt: "2026-06-11T00:00:02.750Z",
+  });
+  sealReplayBundleForTest(bundle);
+  return bundle.events.find((candidate) => candidate.kind === "caw.activation.verified" && candidate.payload.activateInteractionId === activate.interactionId);
 }
 
 function cawLiveContractInteractionForTest({ seed, bundle, walletId, pactId, authKeyHash, request, createdAt }) {
