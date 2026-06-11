@@ -70,6 +70,17 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.schemaErrors).toEqual([]);
   });
 
+  it("accepts replay contract state proof markers while keeping final authority closed", () => {
+    const bundle = replayBundle();
+    appendContractProofEventsForTest(bundle);
+    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.schemaErrors).toEqual([]);
+  });
+
 	  it.each([
 	    [
 	      "raw bundle hash",
@@ -155,6 +166,30 @@ describe("pactfuse receipt verifier contract", () => {
 	      },
 	      "agentTranscriptHash must equal the hash of the replay MCP transcript snapshot",
 	    ],
+    [
+      "gate contract state proof marker",
+      (bundle) => {
+        const { gateEvent } = appendContractProofEventsForTest(bundle);
+        delete gateEvent.payload.contractStateVerified;
+      },
+      "requires contractStateVerified=true",
+    ],
+    [
+      "gate contract spend state",
+      (bundle) => {
+        const { gateEvent } = appendContractProofEventsForTest(bundle);
+        gateEvent.payload.contractSpendState = "Tripped";
+      },
+      "contractSpendState must be Settled",
+    ],
+    [
+      "source registry address",
+      (bundle) => {
+        const { sourceEvent } = appendContractProofEventsForTest(bundle);
+        delete sourceEvent.payload.sourceRegistryAddress;
+      },
+      "requires sourceRegistryAddress",
+    ],
 	  ])("rejects replay bundles with tampered %s", (_label, mutate, expected) => {
     const bundle = replayBundle();
     mutate(bundle);
@@ -600,6 +635,76 @@ function replayBundleWithLease() {
   leaseRow.reason = "MCP transcript recorded";
   leaseRow.evidenceEventId = leaseEvent.eventId;
   return bundle;
+}
+
+function appendContractProofEventsForTest(bundle) {
+  const gateEvent = {
+    eventId: hex32("contract-gate-event"),
+    sessionId: bundle.sessionId,
+    authority: "proof",
+    kind: "gate.spend_settled",
+    eventHash: hex32("contract-gate-event-hash"),
+    payload: {
+      gateEventId: hex32("contract-gate-event-id"),
+      event: "SpendSettled",
+      spendId: bundle.artifactAccessTokens[0].spendId,
+      txHash: hex32("contract-gate-tx"),
+      logIndex: 0,
+      chainId: "84532",
+      blockNumber: 100,
+      currentBlockNumber: 102,
+      rawLogHash: hex32("contract-gate-log"),
+      confirmations: 3,
+      finalityDepth: 2,
+      finalityStatus: "finalized",
+      observedEventId: hex32("contract-gate-observed"),
+      indexedLogId: hex32("contract-gate-indexed-log"),
+      cursorId: "gate:indexer",
+      indexedRawLogHash: hex32("contract-gate-indexed-raw"),
+      finalizedHeadBlock: 102,
+      latestHeadBlock: 102,
+      contractStateVerified: true,
+      contractAddress: "0x1111111111111111111111111111111111111111",
+      contractFunction: "registeredSpend",
+      contractSessionId: bundle.sessionId,
+      contractSourceSetHash: hex32("contract-source-set"),
+      contractSpendState: "Settled",
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+  };
+  const sourceEvent = {
+    eventId: hex32("contract-source-event"),
+    sessionId: bundle.sessionId,
+    authority: "proof",
+    kind: "source.challenge.confirmed",
+    eventHash: hex32("contract-source-event-hash"),
+    payload: {
+      challengeId: hex32("contract-source-challenge"),
+      sourceHash: hex32("contract-source"),
+      reasonHash: hex32("contract-source-reason"),
+      txHash: hex32("contract-source-tx"),
+      logIndex: 1,
+      chainId: "84532",
+      blockNumber: 101,
+      indexedLogId: hex32("contract-source-indexed-log"),
+      cursorId: "gate:indexer",
+      indexedRawLogHash: hex32("contract-source-indexed-raw"),
+      finalizedHeadBlock: 103,
+      latestHeadBlock: 103,
+      finalityStatus: "finalized",
+      contractStateVerified: true,
+      sourceRegistryAddress: "0x1111111111111111111111111111111111111111",
+      contractFunction: "sourceState",
+      contractSourceState: "Challenged",
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+  };
+  bundle.events = [...bundle.events, gateEvent, sourceEvent];
+  bundle.asOfEventSeq = bundle.events.length;
+  bundle.eventRoot = hashJson(bundle.events.map((event) => event.eventHash));
+  return { gateEvent, sourceEvent };
 }
 
 function mcpCallForTest({ callId, sessionId, auditNonce, toolName, request, response, createdAt }) {

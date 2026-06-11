@@ -3020,6 +3020,98 @@ describe("pactfuse-api P0", () => {
     expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("gate.spend_settled");
   });
 
+  it("blocks indexed SpendSettled proofs from cursors without a pinned gate address", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs }),
+    });
+    const sessionId = await createSession(app, "sess-indexer-unpinned-gate-address");
+    const spendId = await registerSpend(app, sessionId);
+    logs.push(
+      indexerLog("unpinned-gate-address", 100, {
+        eventName: "SpendSettled",
+        event: "SpendSettled",
+        sessionId,
+        spendId,
+        args: { sessionId, spendId },
+        transactionHash: hex32("unpinned-gate-address-tx"),
+        rawLogHash: hex32("unpinned-gate-address-log"),
+      }),
+    );
+
+    const result = await runIndexerWorkerOnce(ctx, {
+      leaseOwner: "test-indexer-unpinned-gate-address",
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 10 }],
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.reason).toContain("proof cursor is missing configured contract address");
+  });
+
+  it("blocks indexed SpendSettled logs whose address does not match the pinned gate cursor", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const wrongAddress = "0x2222222222222222222222222222222222222222";
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs, ignoreAddressFilter: true }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-indexer-wrong-gate-address");
+    const spendId = await registerSpend(app, sessionId);
+    logs.push(
+      indexerLog("wrong-gate-address", 100, {
+        address: wrongAddress,
+        eventName: "SpendSettled",
+        event: "SpendSettled",
+        sessionId,
+        spendId,
+        args: { sessionId, spendId },
+        transactionHash: hex32("wrong-gate-address-tx"),
+        rawLogHash: hex32("wrong-gate-address-log"),
+      }),
+    );
+
+    const result = await runIndexerWorkerOnce(ctx, {
+      leaseOwner: "test-indexer-wrong-gate-address",
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 10, address: INDEXER_ADDRESS }],
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.reason).toContain("indexed log address does not match proof cursor address");
+  });
+
+  it("blocks deterministic contract read failures instead of retrying forever", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({
+        currentBlockNumber: 103,
+        logs,
+        readContractError: new Error("execution reverted: function selector was not recognized"),
+      }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-indexer-contract-read-blocked");
+    const spendId = await registerSpend(app, sessionId);
+    logs.push(
+      indexerLog("contract-read-blocked", 100, {
+        eventName: "SpendSettled",
+        event: "SpendSettled",
+        sessionId,
+        spendId,
+        args: { sessionId, spendId },
+        transactionHash: hex32("contract-read-blocked-tx"),
+        rawLogHash: hex32("contract-read-blocked-log"),
+      }),
+    );
+
+    const result = await runIndexerWorkerOnce(ctx, {
+      leaseOwner: "test-indexer-contract-read-blocked",
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 10, address: INDEXER_ADDRESS }],
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.reason).toContain("failed to read ProcurementGate registeredSpend state");
+  });
+
   it("blocks indexed SourceChallenged logs when SourceStateRegistry state is not challenged", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const sourceStates: Record<string, number> = {};
@@ -5170,6 +5262,7 @@ function createFakeIndexerChainClient(config: {
   readContractError?: Error;
   contractSpendStates?: Record<string, number>;
   sourceStates?: Record<string, number>;
+  ignoreAddressFilter?: boolean;
 }): ChainClient {
   return {
     async status() {
@@ -5203,7 +5296,7 @@ function createFakeIndexerChainClient(config: {
       }
       const fromBlock = Number(query.fromBlock ?? query.blockNumber ?? 0);
       const toBlock = Number(query.toBlock ?? query.blockNumber ?? fromBlock);
-      const address = typeof query.address === "string" ? query.address.toLowerCase() : null;
+      const address = !config.ignoreAddressFilter && typeof query.address === "string" ? query.address.toLowerCase() : null;
       const txHash = typeof query.txHash === "string" ? query.txHash.toLowerCase() : null;
       const logIndex = query.logIndex === undefined ? null : Number(query.logIndex);
       const event = typeof query.event === "string" ? query.event : null;

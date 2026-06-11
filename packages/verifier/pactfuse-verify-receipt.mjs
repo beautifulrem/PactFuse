@@ -914,6 +914,88 @@ function verifyJudgeCheck(bundle, eventsById, errors) {
   }
 }
 
+function verifyContractStateProofEvents(bundle, events, errors) {
+  for (const event of events) {
+    if (!isObject(event)) {
+      continue;
+    }
+    if (event.kind === "gate.spend_tripped" || event.kind === "gate.spend_settled") {
+      verifyGateContractStateProofEvent(bundle, event, errors);
+    } else if (event.kind === "source.challenge.confirmed") {
+      verifySourceContractStateProofEvent(bundle, event, errors);
+    }
+  }
+}
+
+function verifyGateContractStateProofEvent(bundle, event, errors) {
+  const payload = isObject(event.payload) ? event.payload : null;
+  const label = `gate proof event ${event.eventId ?? "-"}`;
+  if (!payload) {
+    errors.push(`${label} requires payload`);
+    return;
+  }
+  if (event.authority !== "proof") {
+    errors.push(`${label} must carry proof authority`);
+  }
+  if (event.sessionId && event.sessionId !== bundle.sessionId) {
+    errors.push(`${label} sessionId is not bound to replay bundle session`);
+  }
+  if (payload.finalityStatus !== "finalized" || payload.proofAuthority !== true) {
+    errors.push(`${label} must be finalized proofAuthority=true`);
+  }
+  if (payload.contractStateVerified !== true) {
+    errors.push(`${label} requires contractStateVerified=true`);
+  }
+  if (!isEvmAddress(payload.contractAddress)) {
+    errors.push(`${label} requires contractAddress`);
+  }
+  if (payload.contractFunction !== "registeredSpend") {
+    errors.push(`${label} contractFunction must be registeredSpend`);
+  }
+  if (!isHex32(payload.contractSessionId)) {
+    errors.push(`${label} requires contractSessionId`);
+  } else if (lowerHex(payload.contractSessionId) !== lowerHex(bundle.sessionId)) {
+    errors.push(`${label} contractSessionId must match replay bundle sessionId`);
+  }
+  if (!isHex32(payload.contractSourceSetHash)) {
+    errors.push(`${label} requires contractSourceSetHash`);
+  }
+  const expectedState = event.kind === "gate.spend_tripped" ? "Tripped" : "Settled";
+  if (payload.contractSpendState !== expectedState) {
+    errors.push(`${label} contractSpendState must be ${expectedState}`);
+  }
+}
+
+function verifySourceContractStateProofEvent(bundle, event, errors) {
+  const payload = isObject(event.payload) ? event.payload : null;
+  const label = `source challenge proof event ${event.eventId ?? "-"}`;
+  if (!payload) {
+    errors.push(`${label} requires payload`);
+    return;
+  }
+  if (event.authority !== "proof") {
+    errors.push(`${label} must carry proof authority`);
+  }
+  if (event.sessionId && event.sessionId !== bundle.sessionId) {
+    errors.push(`${label} sessionId is not bound to replay bundle session`);
+  }
+  if (payload.finalityStatus !== "finalized" || payload.proofAuthority !== true) {
+    errors.push(`${label} must be finalized proofAuthority=true`);
+  }
+  if (payload.contractStateVerified !== true) {
+    errors.push(`${label} requires contractStateVerified=true`);
+  }
+  if (!isEvmAddress(payload.sourceRegistryAddress)) {
+    errors.push(`${label} requires sourceRegistryAddress`);
+  }
+  if (payload.contractFunction !== "sourceState") {
+    errors.push(`${label} contractFunction must be sourceState`);
+  }
+  if (payload.contractSourceState !== "Challenged") {
+    errors.push(`${label} contractSourceState must be Challenged`);
+  }
+}
+
 function sameNullableLowerHex(left, right) {
   const normalizedLeft = left == null ? null : asText(left).toLowerCase();
   const normalizedRight = right == null ? null : asText(right).toLowerCase();
@@ -1041,6 +1123,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   const callsByAuditNonce = verifyMcpAdapterCalls(bundle, mcpCalls, errors);
   verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors);
   verifyJudgeCheck(bundle, eventsById, errors);
+  verifyContractStateProofEvents(bundle, Array.isArray(bundle.events) ? bundle.events : [], errors);
   const preflightsById = new Map(preflights.filter(isObject).map((preflight) => [preflight.preflightId, preflight]));
   const quotesById = new Map(quotes.filter(isObject).map((quote) => [quote.quoteId, quote]));
   for (const preflight of preflights) {

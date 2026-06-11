@@ -1089,7 +1089,7 @@ export async function reconcileIndexedEvents(
   const limit = input.limit ?? 500;
   const rows = ctx.db.sqlite
     .prepare(
-      `SELECT l.*, c.latest_head_block, c.finalized_head_block, c.finality_depth
+      `SELECT l.*, c.address AS cursor_address, c.latest_head_block, c.finalized_head_block, c.finality_depth
        FROM chain_indexed_logs l
        JOIN chain_indexer_cursors c ON c.cursor_id = l.cursor_id
        WHERE (? IS NULL OR l.cursor_id = ?)
@@ -3683,9 +3683,7 @@ async function verifyGateContractState(
       blockNumber: Number(row.block_number),
     });
   } catch (error) {
-    throw Object.assign(new Error("failed to read ProcurementGate registeredSpend state"), {
-      apiError: proofPendingError(requestId, chainFailureMessage("failed to read ProcurementGate registeredSpend state", error)),
-    });
+    throw contractReadApiError("failed to read ProcurementGate registeredSpend state", error, requestId);
   }
 
   const contractSessionId = requiredContractHex32(contractTupleValue(result, 0, "sessionId"), "registeredSpend.sessionId", requestId);
@@ -3740,9 +3738,7 @@ async function verifySourceChallengeContractState(
       blockNumber: Number(row.block_number),
     });
   } catch (error) {
-    throw Object.assign(new Error("failed to read SourceStateRegistry sourceState"), {
-      apiError: proofPendingError(requestId, chainFailureMessage("failed to read SourceStateRegistry sourceState", error)),
-    });
+    throw contractReadApiError("failed to read SourceStateRegistry sourceState", error, requestId);
   }
   const contractState = contractStateNumber(result);
   if (contractState !== SOURCE_STATE_CHALLENGED) {
@@ -3768,7 +3764,35 @@ function indexedContractAddress(row: Row, requestId: string, contractName: strin
       apiError: proofBlockedError(requestId, `${contractName} indexed log is missing contract address`),
     });
   }
+  const cursorAddress = optionalHex(row.cursor_address);
+  if (!cursorAddress) {
+    throw Object.assign(new Error(`${contractName} proof cursor is missing configured contract address`), {
+      apiError: proofBlockedError(requestId, `${contractName} proof cursor is missing configured contract address`),
+    });
+  }
+  if (address.toLowerCase() !== cursorAddress.toLowerCase()) {
+    throw Object.assign(new Error(`${contractName} indexed log address does not match proof cursor address`), {
+      apiError: proofBlockedError(requestId, `${contractName} indexed log address does not match proof cursor address`, {
+        expected: cursorAddress,
+        actual: address,
+      }),
+    });
+  }
   return address;
+}
+
+function contractReadApiError(message: string, error: unknown, requestId: string): Error {
+  const detail = chainFailureMessage(message, error);
+  return Object.assign(new Error(message), {
+    apiError: isTransientContractReadError(error) ? proofPendingError(requestId, detail) : proofBlockedError(requestId, detail),
+  });
+}
+
+function isTransientContractReadError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return /(timeout|timed out|network|fetch|econn|etimedout|eai_again|429|rate limit|temporar|gateway|503|502|500|server error)/.test(
+    message,
+  );
 }
 
 function contractTupleValue(result: unknown, index: number, key: string): unknown {
