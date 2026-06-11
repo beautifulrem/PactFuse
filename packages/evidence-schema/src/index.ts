@@ -428,7 +428,7 @@ export const CawReceiptOperationViewSchema = z
     valueAtomic: DecimalStringSchema,
     request: JsonObjectSchema,
     receiptBundleHash: Hex32Schema.nullable(),
-    status: z.enum(["built_mocked", "fixture_manual_receipt", "raw_ingested_pending_proof"]),
+    status: z.enum(["built_mocked", "fixture_manual_receipt", "raw_ingested_pending_proof", "verified_policy_authority_structural"]),
     createdAt: IsoDateStringSchema,
   })
   .strict();

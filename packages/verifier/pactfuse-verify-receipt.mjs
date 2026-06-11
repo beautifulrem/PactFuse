@@ -1015,8 +1015,8 @@ function verifyCawOperationBinding(canonical, operation, rawBundle, errors) {
   if (!sameNullableLowerHex(operation.selector, canonical.selector)) {
     errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} selector is not bound to CAW operation selector`);
   }
-  if (operation.status !== "raw_ingested_pending_proof") {
-    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} requires raw-ingested CAW operation status`);
+  if (operation.status !== "verified_policy_authority_structural") {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} requires structurally verified CAW authority status`);
   }
   if (!operation.receiptBundleHash) {
     errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} requires CAW operation receiptBundleHash`);

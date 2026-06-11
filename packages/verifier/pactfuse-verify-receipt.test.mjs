@@ -122,7 +122,7 @@ describe("pactfuse receipt verifier contract", () => {
 	      (bundle) => {
 	        bundle.cawReceiptOperations[0].status = "built_mocked";
 	      },
-	      "requires raw-ingested CAW operation status",
+	      "requires structurally verified CAW authority status",
 	    ],
     [
       "missing raw bundle body",
@@ -460,7 +460,7 @@ function replayBundle() {
           valueAtomic: "0",
         },
         receiptBundleHash: rawCawReceiptBundle.rawBundleHash,
-        status: "raw_ingested_pending_proof",
+        status: "verified_policy_authority_structural",
         createdAt,
       },
     ],

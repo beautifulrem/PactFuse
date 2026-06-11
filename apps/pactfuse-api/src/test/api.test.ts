@@ -642,6 +642,7 @@ describe("pactfuse-api P0", () => {
     expect(cawIngestDataSchema.properties.status.enum).toEqual([
       "fixture_manual_receipt",
       "raw_ingested_pending_proof",
+      "verified_policy_authority_structural",
     ]);
     expect(cawIngestDataSchema.properties.rawReceiptBundleHash.type).toBe("string");
     expect(json.paths["/api/v1/gate/events/ingest"].post["x-pactfuse-proof-fields"]).toEqual([
@@ -1469,16 +1470,20 @@ describe("pactfuse-api P0", () => {
     expect(ingest.json.data.operationId).toBe(operation.json.data.operationId);
     expect(ingest.json.data.receiptCount).toBe(1);
     expect(ingest.json.data.canonicalReceiptCount).toBe(1);
-    expect(ingest.json.data.status).toBe("raw_ingested_pending_proof");
-    expect(ingest.json.data.proofAuthority).toBe(false);
+    expect(ingest.json.data.status).toBe("verified_policy_authority_structural");
+    expect(ingest.json.data.proofAuthority).toBe(true);
     expect(event.payload.operationId).toBe(operation.json.data.operationId);
     expect(event.payload.receiptCount).toBe(1);
     expect(event.payload.manual).toBe(false);
     expect(event.payload.rawReceiptBundleHash).toBe(ingest.json.data.rawReceiptBundleHash);
+    expect(event.payload.authorityProofHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(event.payload.authorityProofStatus).toBe("verified_policy_authority_structural");
+    expect(event.payload.proofAuthority).toBe(true);
+    expect(event.payload.finalVerifierComplete).toBe(false);
     expect(cawJudgeRow).toEqual(
       expect.objectContaining({
-        status: "pending",
-        authority: "delivery",
+        status: "pass",
+        authority: "proof",
         evidenceEventId: ingest.json.evidenceEventId,
       }),
     );
@@ -1486,7 +1491,7 @@ describe("pactfuse-api P0", () => {
       expect.objectContaining({
         operationId: operation.json.data.operationId,
         receiptBundleHash: ingest.json.data.rawReceiptBundleHash,
-        status: "raw_ingested_pending_proof",
+        status: "verified_policy_authority_structural",
       }),
     ]);
     expect(replayJson.data.rawCawReceiptBundles).toEqual([
@@ -1591,7 +1596,7 @@ describe("pactfuse-api P0", () => {
       expect.objectContaining({
         operationId: operation.json.data.operationId,
         receiptBundleHash: rawIngest.json.data.rawReceiptBundleHash,
-        status: "raw_ingested_pending_proof",
+        status: "verified_policy_authority_structural",
       }),
     );
   });

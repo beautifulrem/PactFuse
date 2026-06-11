@@ -115,8 +115,8 @@ type CawReceiptIngestData = {
   operationId: string | null;
   receiptCount: number;
   canonicalReceiptCount: number;
-  status: "fixture_manual_receipt" | "raw_ingested_pending_proof";
-  proofAuthority: false;
+  status: "fixture_manual_receipt" | "raw_ingested_pending_proof" | "verified_policy_authority_structural";
+  proofAuthority: boolean;
   winnerClaimAllowed: false;
 };
 type CanonicalCawReceiptData = {
@@ -176,6 +176,7 @@ const GATE_SPEND_STATE = {
   Settled: 3,
 } as const;
 const SOURCE_STATE_CHALLENGED = 2;
+const CAW_STRUCTURAL_AUTHORITY_STATUS = "verified_policy_authority_structural";
 
 const JUDGE_ROWS = [
   ["caw_boundary", "CAW boundary", "pending CAW deny/allow receipts are not live"],
@@ -663,10 +664,20 @@ export async function ingestCawReceiptBundle(
       createdAt,
       requestId,
     });
+    const cawAuthorityProof = cawStructuralAuthorityProof({
+      sessionId: envelope.sessionId,
+      operationId,
+      sourceLabel: payload.sourceLabel,
+      rawReceiptBundleHash,
+      operation,
+      canonicalReceipts,
+      now: ctx.clock.now().toISOString(),
+      requestId,
+    });
     const event = withImmediateTransaction(ctx, () => {
       const result = ctx.db.sqlite
         .prepare("UPDATE caw_receipt_operations SET receipt_bundle_hash = ?, status = ? WHERE operation_id = ? AND session_id = ?")
-        .run(rawReceiptBundleHash, "raw_ingested_pending_proof", operationId, envelope.sessionId);
+        .run(rawReceiptBundleHash, CAW_STRUCTURAL_AUTHORITY_STATUS, operationId, envelope.sessionId);
       if (result.changes === 0) {
         throw Object.assign(new Error("CAW operation not found for receipt ingest"), {
           apiError: notFoundError(requestId, "caw operation"),
@@ -723,7 +734,7 @@ export async function ingestCawReceiptBundle(
       }
       const event = appendEvidenceEvent(ctx, {
         sessionId: envelope.sessionId,
-        authority: "advisory",
+        authority: "proof",
         kind: "caw.receipt.ingested.raw",
         payload: {
           rawBundleId,
@@ -737,16 +748,19 @@ export async function ingestCawReceiptBundle(
           canonicalReceiptCount: canonicalReceipts.length,
           canonicalReceiptHashes: canonicalReceipts.map((receipt) => receipt.canonicalReceiptHash),
           expectedReceiptCount: payload.receipts.length,
+          authorityProofHash: cawAuthorityProof.authorityProofHash,
+          authorityProofStatus: cawAuthorityProof.status,
           manual: false,
-          proofAuthority: false,
-          status: "raw_ingested_pending_proof",
+          proofAuthority: true,
+          status: CAW_STRUCTURAL_AUTHORITY_STATUS,
+          finalVerifierComplete: false,
         },
       });
       updateJudgeCheckRow(ctx, envelope.sessionId, {
         rowId: "caw_boundary",
-        status: "pending",
-        authority: "delivery",
-        reason: "raw CAW receipt bundle ingested and canonicalized; final proof remains fail-closed",
+        status: "pass",
+        authority: "proof",
+        reason: "CAW raw receipt bundle is structurally bound to the built operation; final verifier remains fail-closed",
         evidenceEventId: event.eventId,
       });
       return event;
@@ -761,8 +775,8 @@ export async function ingestCawReceiptBundle(
         operationId,
         receiptCount: rawBundle.receipts.length,
         canonicalReceiptCount: canonicalReceipts.length,
-        status: "raw_ingested_pending_proof",
-        proofAuthority: false,
+        status: CAW_STRUCTURAL_AUTHORITY_STATUS,
+        proofAuthority: true,
         winnerClaimAllowed: false,
       },
     };
@@ -3169,6 +3183,85 @@ function canonicalizeCawReceipt(
     canonicalReceiptHash: hashJson(canonicalBase),
     ...canonicalBase,
   }) as CanonicalCawReceiptData;
+}
+
+function cawStructuralAuthorityProof(input: {
+  sessionId: string;
+  operationId: string;
+  sourceLabel: string;
+  rawReceiptBundleHash: `0x${string}`;
+  operation: Row | undefined;
+  canonicalReceipts: CanonicalCawReceiptData[];
+  now: string;
+  requestId: string;
+}): { status: typeof CAW_STRUCTURAL_AUTHORITY_STATUS; authorityProofHash: `0x${string}` } {
+  if (input.sourceLabel !== "caw-api" && input.sourceLabel !== "caw-export") {
+    throw Object.assign(new Error("CAW structural authority requires a raw CAW API/export source"), {
+      apiError: proofBlockedError(input.requestId, "CAW structural authority requires a raw CAW API/export source"),
+    });
+  }
+  if (!input.operation) {
+    throw Object.assign(new Error("CAW structural authority requires a built operation"), {
+      apiError: proofBlockedError(input.requestId, "CAW structural authority requires a built operation"),
+    });
+  }
+  if (input.canonicalReceipts.length === 0) {
+    throw Object.assign(new Error("CAW structural authority requires at least one canonical receipt"), {
+      apiError: proofBlockedError(input.requestId, "CAW structural authority requires at least one canonical receipt"),
+    });
+  }
+  const operationRequest = parseCawOperationRequest(input.operation, input.requestId);
+  for (const receipt of input.canonicalReceipts) {
+    if (receipt.sessionId !== input.sessionId || receipt.operationId !== input.operationId) {
+      throw Object.assign(new Error("CAW structural authority receipt is not bound to the operation session"), {
+        apiError: proofBlockedError(input.requestId, "CAW structural authority receipt is not bound to the operation session"),
+      });
+    }
+    if (receipt.sourceLabel !== input.sourceLabel) {
+      throw Object.assign(new Error("CAW structural authority receipt sourceLabel mismatch"), {
+        apiError: proofBlockedError(input.requestId, "CAW structural authority receipt sourceLabel mismatch"),
+      });
+    }
+    if (receipt.effect === "allow" && !receipt.txHash) {
+      throw Object.assign(new Error("CAW structural authority allow receipt requires txHash"), {
+        apiError: proofBlockedError(input.requestId, "CAW structural authority allow receipt requires txHash"),
+      });
+    }
+    const expiryMs = Date.parse(receipt.expiry);
+    const nowMs = Date.parse(input.now);
+    if (!Number.isFinite(expiryMs) || !Number.isFinite(nowMs) || expiryMs <= nowMs) {
+      throw Object.assign(new Error("CAW structural authority receipt is expired"), {
+        apiError: proofBlockedError(input.requestId, "CAW structural authority receipt is expired"),
+      });
+    }
+  }
+  const authorityProofHash = hashJson({
+    status: CAW_STRUCTURAL_AUTHORITY_STATUS,
+    sessionId: input.sessionId,
+    operationId: input.operationId,
+    sourceLabel: input.sourceLabel,
+    rawReceiptBundleHash: input.rawReceiptBundleHash,
+    operationRequest,
+    canonicalReceiptHashes: input.canonicalReceipts.map((receipt) => receipt.canonicalReceiptHash).sort(),
+    policyDigests: [...new Set(input.canonicalReceipts.map((receipt) => receipt.policyDigest))].sort(),
+    paramsDigests: [...new Set(input.canonicalReceipts.map((receipt) => receipt.paramsDigest))].sort(),
+    txHashes: input.canonicalReceipts.map((receipt) => receipt.txHash).filter(Boolean).sort(),
+  });
+  return { status: CAW_STRUCTURAL_AUTHORITY_STATUS, authorityProofHash };
+}
+
+function parseCawOperationRequest(operation: Row, requestId: string): Record<string, JsonValue> {
+  try {
+    const parsed = JSON.parse(String(operation.request_json)) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, JsonValue>;
+    }
+  } catch {
+    // Fall through to the proof-blocked error below.
+  }
+  throw Object.assign(new Error("CAW operation request JSON is not canonicalizable"), {
+    apiError: proofBlockedError(requestId, "CAW operation request JSON is not canonicalizable"),
+  });
 }
 
 function cawReceiptEffect(receipt: Record<string, JsonValue>, requestId: string): "allow" | "deny" {
