@@ -92,10 +92,10 @@ export async function runIndexerWorkerOnce(ctx: ServiceCtx, options: IndexerWork
   const parsedResult = ChainIndexerBackfillResultSchema.parse(result.data);
   let reconciledEventCount = 0;
   try {
-    reconciledEventCount = reconcileIndexedEvents(ctx, {
+    reconciledEventCount = (await reconcileIndexedEvents(ctx, {
       cursorId: parsedResult.cursor.cursorId,
       requestId: result.requestId,
-    }).reconciledEventCount;
+    })).reconciledEventCount;
   } catch (error) {
     const requestId = newRequestId("indexer_reconcile_error");
     const apiError = toApiError(error, requestId);

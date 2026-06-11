@@ -51,6 +51,13 @@ export type ChainClient = {
   getBlockNumber: () => Promise<number>;
   getTransactionReceipt: (txHash: string) => Promise<Record<string, unknown>>;
   getLogs: (input: Record<string, unknown>) => Promise<Record<string, unknown>[]>;
+  readContract: (input: {
+    address: string;
+    abi: readonly unknown[];
+    functionName: string;
+    args?: readonly unknown[];
+    blockNumber?: number;
+  }) => Promise<unknown>;
 };
 
 export type CawReceiptSource = {

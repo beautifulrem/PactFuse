@@ -63,6 +63,9 @@ export function createUnconfiguredChainClient(): ChainClient {
     async getLogs() {
       throw new Error("chain provider is unconfigured; cannot verify event logs");
     },
+    async readContract() {
+      throw new Error("chain provider is unconfigured; cannot verify contract state");
+    },
   };
 }
 
@@ -139,6 +142,40 @@ export function createViemChainClient(input: { rpcUrl: string; chainId?: string 
         params: [filter],
       });
       return logs.map((log: unknown) => normalizePactFuseChainLog(normalizeChainValue(log) as Record<string, unknown>));
+    },
+    async readContract(query: {
+      address: string;
+      abi: readonly unknown[];
+      functionName: string;
+      args?: readonly unknown[];
+      blockNumber?: number;
+    }) {
+      const readContract = client.readContract as (input: {
+        address: `0x${string}`;
+        abi: readonly unknown[];
+        functionName: string;
+        args?: readonly unknown[];
+        blockNumber?: bigint;
+      }) => Promise<unknown>;
+      const request: {
+        address: `0x${string}`;
+        abi: readonly unknown[];
+        functionName: string;
+        args?: readonly unknown[];
+        blockNumber?: bigint;
+      } = {
+        address: query.address as `0x${string}`,
+        abi: query.abi,
+        functionName: query.functionName,
+      };
+      if (query.args !== undefined) {
+        request.args = query.args;
+      }
+      if (query.blockNumber !== undefined) {
+        request.blockNumber = toBigIntBlock(query.blockNumber);
+      }
+      const result = await readContract(request);
+      return normalizeChainValue(result);
     },
   };
 }

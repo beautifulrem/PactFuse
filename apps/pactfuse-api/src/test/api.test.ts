@@ -1954,6 +1954,10 @@ describe("pactfuse-api P0", () => {
         indexedLogId: expect.stringMatching(/^0x[0-9a-f]{64}$/),
         cursorId: "gate:indexer",
         finalityStatus: "finalized",
+        contractStateVerified: true,
+        contractAddress: INDEXER_ADDRESS,
+        contractFunction: "registeredSpend",
+        contractSpendState: "Settled",
         proofAuthority: true,
         winnerClaimAllowed: false,
       }),
@@ -2941,6 +2945,10 @@ describe("pactfuse-api P0", () => {
           spendId,
           cursorId: "gate:indexer",
           indexedLogId: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+          contractStateVerified: true,
+          contractAddress: INDEXER_ADDRESS,
+          contractFunction: "registeredSpend",
+          contractSpendState: "Settled",
           proofAuthority: true,
           winnerClaimAllowed: false,
         }),
@@ -2953,6 +2961,10 @@ describe("pactfuse-api P0", () => {
           sourceHash: hex32("source"),
           reasonHash: challengeReasonHash,
           cursorId: "gate:indexer",
+          contractStateVerified: true,
+          sourceRegistryAddress: INDEXER_ADDRESS,
+          contractFunction: "sourceState",
+          contractSourceState: "Challenged",
           proofAuthority: true,
           winnerClaimAllowed: false,
         }),
@@ -2972,6 +2984,87 @@ describe("pactfuse-api P0", () => {
         evidenceEventId: proofEvent?.eventId,
       }),
     );
+  });
+
+  it("blocks indexed SpendSettled logs when ProcurementGate state is not settled", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const contractSpendStates: Record<string, number> = {};
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs, contractSpendStates }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-indexer-contract-spend-mismatch");
+    const spendId = await registerSpend(app, sessionId);
+    contractSpendStates[spendId.toLowerCase()] = 1;
+    logs.push(
+      indexerLog("contract-spend-mismatch", 100, {
+        eventName: "SpendSettled",
+        event: "SpendSettled",
+        sessionId,
+        spendId,
+        args: { sessionId, spendId },
+        transactionHash: hex32("contract-spend-mismatch-tx"),
+        rawLogHash: hex32("contract-spend-mismatch-log"),
+      }),
+    );
+
+    const result = await runIndexerWorkerOnce(ctx, {
+      leaseOwner: "test-indexer-contract-spend-mismatch",
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 10, address: INDEXER_ADDRESS }],
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(result.status).toBe("blocked");
+    expect(result.reason).toContain("does not match ProcurementGate spend state");
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("gate.spend_settled");
+  });
+
+  it("blocks indexed SourceChallenged logs when SourceStateRegistry state is not challenged", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const sourceStates: Record<string, number> = {};
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs, sourceStates }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-indexer-contract-source-mismatch");
+    await registerSpend(app, sessionId);
+    const sourceHash = hex32("source");
+    const reasonHash = hex32("contract-source-mismatch-reason");
+    sourceStates[sourceHash.toLowerCase()] = 1;
+    const challenge = await post(app, "/api/v1/sources/challenge", {
+      sessionId,
+      idempotencyKey: "contract-source-mismatch-challenge",
+      payload: {
+        sourceHash,
+        reasonHash,
+        evidenceRef: "https://example.com/contract-source-mismatch.json",
+      },
+    });
+    logs.push(
+      indexerLog("contract-source-mismatch", 100, {
+        eventName: "SourceChallenged",
+        event: "SourceChallenged",
+        sessionId,
+        sourceHash,
+        reasonHash,
+        args: { sessionId, sourceHash, reasonHash },
+        transactionHash: hex32("contract-source-mismatch-tx"),
+        rawLogHash: hex32("contract-source-mismatch-log"),
+      }),
+    );
+
+    const result = await runIndexerWorkerOnce(ctx, {
+      leaseOwner: "test-indexer-contract-source-mismatch",
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 10, address: INDEXER_ADDRESS }],
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(challenge.status).toBe(202);
+    expect(result.status).toBe("blocked");
+    expect(result.reason).toContain("does not match SourceStateRegistry state");
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("source.challenge.confirmed");
   });
 
   it("blocks indexed SourceChallenged logs for unregistered or unbound sources", async () => {
@@ -5074,6 +5167,9 @@ function createFakeIndexerChainClient(config: {
   ready?: boolean;
   reason?: string;
   getLogsError?: Error;
+  readContractError?: Error;
+  contractSpendStates?: Record<string, number>;
+  sourceStates?: Record<string, number>;
 }): ChainClient {
   return {
     async status() {
@@ -5130,6 +5226,60 @@ function createFakeIndexerChainClient(config: {
           (!spendId || logSpendId === spendId)
         );
       });
+    },
+    async readContract(input: {
+      address: string;
+      abi: readonly unknown[];
+      functionName: string;
+      args?: readonly unknown[];
+      blockNumber?: number;
+    }) {
+      void input.address;
+      void input.abi;
+      void input.blockNumber;
+      if (config.readContractError) {
+        throw config.readContractError;
+      }
+      const args = input.args ?? [];
+      if (input.functionName === "registeredSpend") {
+        const spendId = String(args[0] ?? "").toLowerCase();
+        const matchingLog = (config.logs ?? []).find((log) => {
+          const logArgs = log.args && typeof log.args === "object" && !Array.isArray(log.args) ? (log.args as Record<string, unknown>) : {};
+          const logSpendId =
+            typeof logArgs.spendId === "string" ? logArgs.spendId.toLowerCase() : typeof log.spendId === "string" ? log.spendId.toLowerCase() : null;
+          return logSpendId === spendId;
+        });
+        const logArgs =
+          matchingLog?.args && typeof matchingLog.args === "object" && !Array.isArray(matchingLog.args)
+            ? (matchingLog.args as Record<string, unknown>)
+            : {};
+        const event =
+          typeof matchingLog?.eventName === "string"
+            ? matchingLog.eventName
+            : typeof matchingLog?.event === "string"
+              ? matchingLog.event
+              : null;
+        const sessionId =
+          typeof logArgs.sessionId === "string" ? logArgs.sessionId : typeof matchingLog?.sessionId === "string" ? matchingLog.sessionId : hex32("contract-session");
+        const state = config.contractSpendStates?.[spendId] ?? (event === "SpendTripped" ? 2 : event === "SpendSettled" ? 3 : 1);
+        return [
+          sessionId,
+          hex32("contract-pact"),
+          hex32("contract-tool"),
+          hex32(`contract-source-set:${spendId}`),
+          INDEXER_ADDRESS,
+          INDEXER_ADDRESS,
+          "1000",
+          hex32("contract-artifact"),
+          INDEXER_ADDRESS,
+          state,
+        ];
+      }
+      if (input.functionName === "sourceState") {
+        const sourceHash = String(args[0] ?? "").toLowerCase();
+        return config.sourceStates?.[sourceHash] ?? 2;
+      }
+      throw new Error(`unsupported fake contract read: ${input.functionName}`);
     },
   };
 }
@@ -5208,6 +5358,25 @@ function createFakeGateChainClient(currentBlockNumber = 101, chainId = "84532"):
           rawLogHash: input.rawLogHash,
         },
       ];
+    },
+    async readContract(input: {
+      address: string;
+      abi: readonly unknown[];
+      functionName: string;
+      args?: readonly unknown[];
+      blockNumber?: number;
+    }) {
+      void input.address;
+      void input.abi;
+      void input.args;
+      void input.blockNumber;
+      if (input.functionName === "registeredSpend") {
+        return [hex32("direct-session"), hex32("direct-pact"), hex32("direct-tool"), hex32("direct-source-set"), INDEXER_ADDRESS, INDEXER_ADDRESS, "1000", hex32("direct-artifact"), INDEXER_ADDRESS, 3];
+      }
+      if (input.functionName === "sourceState") {
+        return 2;
+      }
+      throw new Error(`unsupported fake contract read: ${input.functionName}`);
     },
   };
 }

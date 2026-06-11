@@ -95,6 +95,20 @@ type IndexedLogProofRef = {
   finalizedHeadBlock: number;
   latestHeadBlock: number;
 };
+type GateContractStateProof = {
+  contractStateVerified: true;
+  contractAddress: string;
+  contractFunction: "registeredSpend";
+  contractSessionId: string;
+  contractSourceSetHash: string;
+  contractSpendState: "Tripped" | "Settled";
+};
+type SourceContractStateProof = {
+  contractStateVerified: true;
+  sourceRegistryAddress: string;
+  contractFunction: "sourceState";
+  contractSourceState: "Challenged";
+};
 type CawReceiptIngestData = {
   receiptBundleHash: `0x${string}`;
   rawReceiptBundleHash?: `0x${string}`;
@@ -127,6 +141,41 @@ type CanonicalCawReceiptData = {
   fetchedAt: string;
   createdAt: string;
 };
+
+const PROCUREMENT_GATE_STATE_ABI = [
+  {
+    type: "function",
+    name: "registeredSpend",
+    stateMutability: "view",
+    inputs: [{ name: "spendId", type: "bytes32" }],
+    outputs: [
+      { name: "sessionId", type: "bytes32" },
+      { name: "pactId", type: "bytes32" },
+      { name: "toolId", type: "bytes32" },
+      { name: "sourceSetHash", type: "bytes32" },
+      { name: "agentWallet", type: "address" },
+      { name: "paymentToken", type: "address" },
+      { name: "price", type: "uint256" },
+      { name: "artifactHash", type: "bytes32" },
+      { name: "market", type: "address" },
+      { name: "state", type: "uint8" },
+    ],
+  },
+] as const;
+const SOURCE_REGISTRY_STATE_ABI = [
+  {
+    type: "function",
+    name: "sourceState",
+    stateMutability: "view",
+    inputs: [{ name: "sourceHash", type: "bytes32" }],
+    outputs: [{ name: "state", type: "uint8" }],
+  },
+] as const;
+const GATE_SPEND_STATE = {
+  Tripped: 2,
+  Settled: 3,
+} as const;
+const SOURCE_STATE_CHALLENGED = 2;
 
 const JUDGE_ROWS = [
   ["caw_boundary", "CAW boundary", "pending CAW deny/allow receipts are not live"],
@@ -1032,10 +1081,10 @@ export async function indexChainWindow(input: ChainIndexerBackfillInput, ctx: Se
   );
 }
 
-export function reconcileIndexedEvents(
+export async function reconcileIndexedEvents(
   ctx: ServiceCtx,
   input: { cursorId?: string; requestId?: string; limit?: number } = {},
-): { reconciledEventCount: number } {
+): Promise<{ reconciledEventCount: number }> {
   const requestId = input.requestId ?? newRequestId("indexer_reconcile");
   const limit = input.limit ?? 500;
   const rows = ctx.db.sqlite
@@ -1055,9 +1104,9 @@ export function reconcileIndexedEvents(
       continue;
     }
     if (semantic.event === "SourceChallenged") {
-      reconciledEventCount += reconcileIndexedSourceChallenge(ctx, row, semantic, requestId);
+      reconciledEventCount += await reconcileIndexedSourceChallenge(ctx, row, semantic, requestId);
     } else {
-      reconciledEventCount += reconcileIndexedGateEvent(ctx, row, semantic, requestId);
+      reconciledEventCount += await reconcileIndexedGateEvent(ctx, row, semantic, requestId);
     }
   }
   return { reconciledEventCount };
@@ -3617,12 +3666,150 @@ function indexedLogProofRef(row: Row): IndexedLogProofRef {
   };
 }
 
-function reconcileIndexedGateEvent(
+async function verifyGateContractState(
   ctx: ServiceCtx,
   row: Row,
   semantic: { event: "SpendTripped" | "SpendSettled"; sessionId: `0x${string}`; spendId: `0x${string}` },
   requestId: string,
-): number {
+): Promise<GateContractStateProof> {
+  const contractAddress = indexedContractAddress(row, requestId, "ProcurementGate");
+  let result: unknown;
+  try {
+    result = await ctx.chain.readContract({
+      address: contractAddress,
+      abi: PROCUREMENT_GATE_STATE_ABI,
+      functionName: "registeredSpend",
+      args: [semantic.spendId],
+      blockNumber: Number(row.block_number),
+    });
+  } catch (error) {
+    throw Object.assign(new Error("failed to read ProcurementGate registeredSpend state"), {
+      apiError: proofPendingError(requestId, chainFailureMessage("failed to read ProcurementGate registeredSpend state", error)),
+    });
+  }
+
+  const contractSessionId = requiredContractHex32(contractTupleValue(result, 0, "sessionId"), "registeredSpend.sessionId", requestId);
+  const contractSourceSetHash = requiredContractHex32(
+    contractTupleValue(result, 3, "sourceSetHash"),
+    "registeredSpend.sourceSetHash",
+    requestId,
+  );
+  const contractState = contractStateNumber(contractTupleValue(result, 9, "state"));
+  const expectedState = semantic.event === "SpendTripped" ? GATE_SPEND_STATE.Tripped : GATE_SPEND_STATE.Settled;
+  if (contractSessionId.toLowerCase() !== semantic.sessionId.toLowerCase()) {
+    throw Object.assign(new Error("indexed gate event session does not match ProcurementGate state"), {
+      apiError: proofBlockedError(requestId, "indexed gate event session does not match ProcurementGate state", {
+        expected: semantic.sessionId,
+        actual: contractSessionId,
+      }),
+    });
+  }
+  if (contractState !== expectedState) {
+    throw Object.assign(new Error("indexed gate event does not match ProcurementGate spend state"), {
+      apiError: proofBlockedError(requestId, "indexed gate event does not match ProcurementGate spend state", {
+        event: semantic.event,
+        expectedState,
+        actualState: contractState,
+      }),
+    });
+  }
+  return {
+    contractStateVerified: true,
+    contractAddress,
+    contractFunction: "registeredSpend",
+    contractSessionId,
+    contractSourceSetHash,
+    contractSpendState: semantic.event === "SpendTripped" ? "Tripped" : "Settled",
+  };
+}
+
+async function verifySourceChallengeContractState(
+  ctx: ServiceCtx,
+  row: Row,
+  sourceHash: `0x${string}`,
+  requestId: string,
+): Promise<SourceContractStateProof> {
+  const sourceRegistryAddress = indexedContractAddress(row, requestId, "SourceStateRegistry");
+  let result: unknown;
+  try {
+    result = await ctx.chain.readContract({
+      address: sourceRegistryAddress,
+      abi: SOURCE_REGISTRY_STATE_ABI,
+      functionName: "sourceState",
+      args: [sourceHash],
+      blockNumber: Number(row.block_number),
+    });
+  } catch (error) {
+    throw Object.assign(new Error("failed to read SourceStateRegistry sourceState"), {
+      apiError: proofPendingError(requestId, chainFailureMessage("failed to read SourceStateRegistry sourceState", error)),
+    });
+  }
+  const contractState = contractStateNumber(result);
+  if (contractState !== SOURCE_STATE_CHALLENGED) {
+    throw Object.assign(new Error("indexed SourceChallenged event does not match SourceStateRegistry state"), {
+      apiError: proofBlockedError(requestId, "indexed SourceChallenged event does not match SourceStateRegistry state", {
+        expectedState: SOURCE_STATE_CHALLENGED,
+        actualState: contractState,
+      }),
+    });
+  }
+  return {
+    contractStateVerified: true,
+    sourceRegistryAddress,
+    contractFunction: "sourceState",
+    contractSourceState: "Challenged",
+  };
+}
+
+function indexedContractAddress(row: Row, requestId: string, contractName: string): string {
+  const address = optionalHex(row.address);
+  if (!address) {
+    throw Object.assign(new Error(`${contractName} indexed log is missing contract address`), {
+      apiError: proofBlockedError(requestId, `${contractName} indexed log is missing contract address`),
+    });
+  }
+  return address;
+}
+
+function contractTupleValue(result: unknown, index: number, key: string): unknown {
+  if (Array.isArray(result)) {
+    return result[index];
+  }
+  if (result && typeof result === "object") {
+    return (result as Record<string, unknown>)[key];
+  }
+  return undefined;
+}
+
+function contractStateNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value)) {
+    return value;
+  }
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  if (typeof value === "string" && /^[0-9]+$/.test(value)) {
+    return Number(value);
+  }
+  return null;
+}
+
+function requiredContractHex32(value: unknown, field: string, requestId: string): `0x${string}` {
+  const hex = optionalHex32(value);
+  if (!hex) {
+    throw Object.assign(new Error(`${field} must be 32-byte hex in contract state`), {
+      apiError: proofBlockedError(requestId, `${field} must be 32-byte hex in contract state`),
+    });
+  }
+  return hex;
+}
+
+async function reconcileIndexedGateEvent(
+  ctx: ServiceCtx,
+  row: Row,
+  semantic: { event: "SpendTripped" | "SpendSettled"; sessionId: `0x${string}`; spendId: `0x${string}` },
+  requestId: string,
+): Promise<number> {
   const session = requireSessionRow(ctx, semantic.sessionId, requestId);
   assertSpend(ctx, semantic.sessionId, semantic.spendId, requestId);
   const blockNumber = Number(row.block_number);
@@ -3652,6 +3839,7 @@ function reconcileIndexedGateEvent(
     chainId: gatePayload.chainId,
     rawLogHash: gatePayload.rawLogHash,
   });
+  const contractStateProof = await verifyGateContractState(ctx, row, semantic, requestId);
   return withImmediateTransaction(ctx, () => {
     const existing = ctx.db.sqlite
       .prepare(
@@ -3710,6 +3898,7 @@ function reconcileIndexedGateEvent(
       finalityDepth,
       confirmations,
       indexedLogProofRef(row),
+      contractStateProof,
     );
     const finalizeResult = ctx.db.sqlite
       .prepare(
@@ -3737,12 +3926,12 @@ function reconcileIndexedGateEvent(
   });
 }
 
-function reconcileIndexedSourceChallenge(
+async function reconcileIndexedSourceChallenge(
   ctx: ServiceCtx,
   row: Row,
   semantic: { event: "SourceChallenged"; sessionId: `0x${string}`; sourceHash: `0x${string}`; reasonHash: `0x${string}` },
   requestId: string,
-): number {
+): Promise<number> {
   requireSessionRow(ctx, semantic.sessionId, requestId);
   const sourceHash = semantic.sourceHash.toLowerCase() as `0x${string}`;
   const reasonHash = semantic.reasonHash.toLowerCase() as `0x${string}`;
@@ -3751,9 +3940,10 @@ function reconcileIndexedSourceChallenge(
     return 0;
   }
   assertChallengedSourceBound(ctx, semantic.sessionId, sourceHash, requestId);
-	  const pendingChallenge = requirePendingSourceChallenge(ctx, semantic.sessionId, sourceHash, reasonHash, requestId);
-	  return withImmediateTransaction(ctx, () => {
-	    const challengeId = String(pendingChallenge.challenge_id);
+  const pendingChallenge = requirePendingSourceChallenge(ctx, semantic.sessionId, sourceHash, reasonHash, requestId);
+  const contractStateProof = await verifySourceChallengeContractState(ctx, row, sourceHash, requestId);
+  return withImmediateTransaction(ctx, () => {
+    const challengeId = String(pendingChallenge.challenge_id);
     const proofEvent = appendEvidenceEvent(ctx, {
       sessionId: semantic.sessionId,
       authority: "proof",
@@ -3772,6 +3962,7 @@ function reconcileIndexedSourceChallenge(
         finalizedHeadBlock: Number(row.finalized_head_block),
         latestHeadBlock: Number(row.latest_head_block),
         finalityStatus: "finalized",
+        ...contractStateProof,
         proofAuthority: true,
         winnerClaimAllowed: false,
       },
@@ -4063,6 +4254,7 @@ function gateEventPayload(
   finalityStatus: "observed_finalizing" | "finalized",
   observedEventId: string | null,
   indexedLogRef?: IndexedLogProofRef,
+  contractStateProof?: GateContractStateProof | null,
 ): Record<string, JsonValue> {
   return {
     gateEventId,
@@ -4087,6 +4279,7 @@ function gateEventPayload(
           latestHeadBlock: indexedLogRef.latestHeadBlock,
         }
       : {}),
+    ...(contractStateProof ?? {}),
     proofAuthority: finalityStatus === "finalized",
     winnerClaimAllowed: false,
   };
@@ -4139,12 +4332,22 @@ function appendGateFinalizedEvent(
   finalityDepth: number,
   confirmations: number,
   indexedLogRef: IndexedLogProofRef,
+  contractStateProof: GateContractStateProof,
 ): EvidenceEvent {
   return appendEvidenceEvent(ctx, {
     sessionId,
     authority: "proof",
     kind: gateFinalizedKind(payload.event),
-    payload: gateEventPayload(payload, gateEventId, finalityDepth, confirmations, "finalized", observedEventId, indexedLogRef),
+    payload: gateEventPayload(
+      payload,
+      gateEventId,
+      finalityDepth,
+      confirmations,
+      "finalized",
+      observedEventId,
+      indexedLogRef,
+      contractStateProof,
+    ),
   });
 }
 
