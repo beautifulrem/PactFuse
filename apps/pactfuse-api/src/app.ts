@@ -43,6 +43,7 @@ import {
   submitCawLiveTransfer,
   syncCawLiveAudit,
   syncCawLivePact,
+  verifyTokenBalanceDelta,
   verifyEvidenceForSession,
 } from "./services/service.js";
 import { badRequestError, forbiddenError, newRequestId, rateLimitedError, toApiError } from "./util.js";
@@ -68,6 +69,7 @@ const ROUTES = [
   { method: "POST", path: "/api/v1/caw/live/audit/sync", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/receipts/ingest", okStatus: 202 },
   { method: "POST", path: "/api/v1/gate/events/ingest", okStatus: 202 },
+  { method: "POST", path: "/api/v1/token/balance-deltas/verify", okStatus: 202 },
   { method: "POST", path: "/api/v1/indexer/backfill", okStatus: 202 },
   { method: "POST", path: "/api/v1/artifacts/preflight", okStatus: 202 },
   { method: "POST", path: "/api/v1/quotes", okStatus: 201 },
@@ -119,6 +121,21 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   ],
   "/api/v1/caw/live/audit/sync": ["interactionId", "requestHash", "responseHash", "proofAuthority", "winnerClaimAllowed"],
   "/api/v1/gate/events/ingest": ["finalityStatus", "confirmations", "finalityDepth", "proofAuthority", "winnerClaimAllowed"],
+  "/api/v1/token/balance-deltas/verify": [
+    "spendId",
+    "settlementEventId",
+    "txHash",
+    "paymentToken",
+    "agentWallet",
+    "market",
+    "amountAtomic",
+    "agentWalletBefore",
+    "agentWalletAfter",
+    "marketBefore",
+    "marketAfter",
+    "proofAuthority",
+    "winnerClaimAllowed",
+  ],
   "/api/v1/indexer/backfill": ["cursor.status", "cursor.lastIndexedBlock", "insertedLogCount", "proofAuthority", "winnerClaimAllowed"],
   "/api/v1/artifacts/preflight": ["preflightId", "artifactHashPreview", "artifactCid", "priceDisclosureHash", "winnerClaimAllowed"],
   "/api/v1/quotes": ["preflightId", "artifactCid", "quoteSignedAfterPreflight", "priceDisclosureHash", "winnerClaimAllowed"],
@@ -299,6 +316,11 @@ export function createApp(ctx: ServiceCtx): Hono {
     const body = SessionScopedEnvelopeSchema.parse(await readJson(c));
     authorizeGateEventIngest(c, ctx, body);
     return send(c, await ingestGateEvent(body, ctx), 202);
+  });
+
+  app.post("/api/v1/token/balance-deltas/verify", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await verifyTokenBalanceDelta(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
   });
 
   app.post("/api/v1/indexer/backfill", async (c) => {
@@ -788,6 +810,16 @@ function buildOpenApi(): Record<string, unknown> {
             gasProvider: { type: "string", minLength: 1, maxLength: 120 },
             description: { type: "string", minLength: 1, maxLength: 240 },
             fee: { anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }] },
+          },
+        },
+        TokenBalanceDeltaVerifyInput: sessionEnvelopeSchema("#/components/schemas/TokenBalanceDeltaVerifyPayload"),
+        TokenBalanceDeltaVerifyPayload: {
+          type: "object",
+          required: ["spendId"],
+          additionalProperties: false,
+          properties: {
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            settlementEventId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
           },
         },
         ArtifactPreflightInput: sessionEnvelopeSchema("#/components/schemas/ArtifactPreflightPayload"),
@@ -1946,6 +1978,9 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   if (path === "/api/v1/gate/events/ingest") {
     return jsonRequestBody({ $ref: "#/components/schemas/GateEventIngestInput" });
   }
+  if (path === "/api/v1/token/balance-deltas/verify") {
+    return jsonRequestBody({ $ref: "#/components/schemas/TokenBalanceDeltaVerifyInput" });
+  }
   if (path === "/api/v1/indexer/backfill") {
     return jsonRequestBody({ $ref: "#/components/schemas/ChainIndexerBackfillInput" });
   }
@@ -2036,6 +2071,7 @@ function apiRoleForPath(path: string): ApiRole | null {
     case "/api/v1/caw/live/contracts/call":
     case "/api/v1/caw/live/audit/sync":
     case "/api/v1/indexer/backfill":
+    case "/api/v1/token/balance-deltas/verify":
     case "/api/v1/artifacts/preflight":
     case "/api/v1/evidence/verify":
       return "operator";

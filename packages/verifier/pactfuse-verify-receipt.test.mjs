@@ -11,6 +11,7 @@ const pendingReceiptFile = fileURLToPath(pendingReceiptPath);
 const verifierFile = fileURLToPath(verifierPath);
 const ZERO_HASH = `0x${"0".repeat(64)}`;
 const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
+const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 
 describe("pactfuse receipt verifier contract", () => {
@@ -304,7 +305,46 @@ describe("pactfuse receipt verifier contract", () => {
       },
       "does not match a finalized SpendSettled proof event by spendId and contractAddress",
     ],
-	    [
+    [
+      "token balance agent delta",
+      (bundle) => {
+        const tokenEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
+        tokenEvent.payload.agentWalletAfter = "3999";
+        resealTokenBalanceEventForTest(bundle);
+      },
+      "agent wallet balance delta does not match amountAtomic",
+    ],
+    [
+      "token balance transfer value",
+      (bundle) => {
+        const tokenEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
+        tokenEvent.payload.transferData = `0x${uint256Word("999")}`;
+        resealTokenBalanceEventForTest(bundle);
+      },
+      "transferData does not encode amountAtomic",
+    ],
+    [
+      "token balance settlement event link",
+      (bundle) => {
+        const tokenEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
+        tokenEvent.payload.settlementEventId = hex32("missing-token-settlement");
+        resealTokenBalanceEventForTest(bundle);
+      },
+      "references missing finalized proof-authority gate.spend_settled event",
+    ],
+    [
+      "c settlement pass row without token balance proof",
+      (bundle) => {
+        const gateEvent = bundle.events.find((event) => event.kind === "gate.spend_settled");
+        const row = bundle.judgeCheck.rows.find((candidate) => candidate.rowId === "c_settlement");
+        row.status = "pass";
+        row.authority = "proof";
+        row.evidenceEventId = gateEvent.eventId;
+        bundle.replayPageIndex = replayPageIndexForTest(bundle);
+      },
+      "judgeCheck pass row c_settlement must reference token.balance_delta.verified",
+    ],
+    [
 	      "agent transcript hash",
 	      (bundle) => {
 	        bundle.agentTranscriptHash = hex32("bad-agent-transcript");
@@ -609,6 +649,9 @@ function replayBundle() {
 	  const artifactCid = `sha256:${artifactHash}`;
 	  const priceDisclosureHash = hex32("price-disclosure");
 	  const sourceStateSnapshotHash = hex32("source-state");
+  const agentWallet = "0x1000000000000000000000000000000000000001";
+  const paymentToken = "0x4000000000000000000000000000000000000004";
+  const market = "0x5000000000000000000000000000000000000005";
 	  const quoteHash = hashJson({
 	    sessionId,
 	    spendId,
@@ -641,11 +684,11 @@ function replayBundle() {
         sessionId,
         pactId: hex32("pact-c"),
         toolId: hex32("code-scan"),
-        payer: "0x1234",
-        agentWallet: "0x1000000000000000000000000000000000000001",
-        paymentToken: "0x4000000000000000000000000000000000000004",
+        payer: agentWallet,
+        agentWallet,
+        paymentToken,
         artifactHash,
-        market: "0x5000000000000000000000000000000000000005",
+        market,
         sourceHashes: [hex32("source")],
         sourceSetHash: hex32("source-set"),
         sessionCommitment: hex32("session-commitment"),
@@ -693,7 +736,7 @@ function replayBundle() {
 	        tokenId,
 	        sessionId,
 	        spendId,
-	        payer: "0x1234",
+	        payer: agentWallet,
 	        quoteId,
 	        preflightId,
 	        artifactHash,
@@ -703,7 +746,7 @@ function replayBundle() {
 	        tokenHash: hex32("artifact-token-hash"),
 	        status: "active",
 	        issuedByVerifierRunId: hex32("verifier-run"),
-	        settlementEventId: hex32("settlement-event"),
+	        settlementEventId: ZERO_HASH,
 	        createdAt,
 	      },
     ],
@@ -799,6 +842,44 @@ function replayBundle() {
     },
   ];
   sealReplayBundleForTest(bundle);
+  const gateEvent = bundle.events.find((event) => event.kind === "gate.spend_settled");
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "proof",
+    kind: "token.balance_delta.verified",
+    payload: {
+      spendId,
+      settlementEventId: gateEvent.eventId,
+      gateEventId: gateEvent.payload.gateEventId,
+      txHash: gateEvent.payload.txHash,
+      chainId: gateEvent.payload.chainId,
+      blockNumber: gateEvent.payload.blockNumber,
+      preBlockNumber: gateEvent.payload.blockNumber - 1,
+      transferLogIndex: 2,
+      transferRawLogHash: hex32("base-token-transfer-log"),
+      transferTopics: [ERC20_TRANSFER_TOPIC, evmAddressTopic(agentWallet), evmAddressTopic(market)],
+      transferData: `0x${uint256Word("1000")}`,
+      paymentToken,
+      payer: agentWallet,
+      agentWallet,
+      payerAgentWalletSame: true,
+      market,
+      amountAtomic: "1000",
+      agentDeltaAtomic: "-1000",
+      marketDeltaAtomic: "1000",
+      agentWalletBefore: "5000",
+      agentWalletAfter: "4000",
+      marketBefore: "10",
+      marketAfter: "1010",
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+    createdAt,
+  });
+  sealReplayBundleForTest(bundle);
+  const tokenBalanceEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
+  bundle.artifactAccessTokens[0].settlementEventId = tokenBalanceEvent.eventId;
+  bundle.replayPageIndex = replayPageIndexForTest(bundle);
   return bundle;
 		}
 
@@ -1149,6 +1230,15 @@ function resealCawLiveContractCallForTest(bundle, interaction) {
   sealReplayBundleForTest(bundle);
 }
 
+function resealTokenBalanceEventForTest(bundle) {
+  sealReplayBundleForTest(bundle);
+  const tokenEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
+  if (bundle.artifactAccessTokens[0] && tokenEvent) {
+    bundle.artifactAccessTokens[0].settlementEventId = tokenEvent.eventId;
+  }
+  bundle.replayPageIndex = replayPageIndexForTest(bundle);
+}
+
 function expectedApproveCalldata(spender, amount) {
   return `${ERC20_APPROVE_SELECTOR}${evmAddressWord(spender)}${uint256Word(amount)}`;
 }
@@ -1159,6 +1249,10 @@ function expectedActivateToolCalldata(spendId) {
 
 function evmAddressWord(address) {
   return address.slice(2).toLowerCase().padStart(64, "0");
+}
+
+function evmAddressTopic(address) {
+  return `0x${evmAddressWord(address)}`;
 }
 
 function uint256Word(value) {

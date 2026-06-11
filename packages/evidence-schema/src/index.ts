@@ -302,6 +302,13 @@ export const GateEventIngestPayloadSchema = z
     path: ["currentBlockNumber"],
   });
 
+export const TokenBalanceDeltaVerifyPayloadSchema = z
+  .object({
+    spendId: Hex32Schema,
+    settlementEventId: Hex32Schema.optional(),
+  })
+  .strict();
+
 export const ChainIndexerBackfillPayloadSchema = z
   .object({
     cursorId: z.string().min(1).max(160).regex(/^[a-z][a-z0-9:_-]+$/),
@@ -414,6 +421,7 @@ export const EvidenceEventKindSchema = z.enum([
   "gate.spend_settled.observed",
   "gate.spend_tripped",
   "gate.spend_settled",
+  "token.balance_delta.verified",
   "reorg.invalidated",
   "lease.execution.blocked",
   "lease.execution.succeeded",
@@ -878,3 +886,4 @@ export type CawLivePactSyncPayload = z.infer<typeof CawLivePactSyncPayloadSchema
 export type CawLiveTransferSubmitPayload = z.infer<typeof CawLiveTransferSubmitPayloadSchema>;
 export type CawLiveContractCallSubmitPayload = z.infer<typeof CawLiveContractCallSubmitPayloadSchema>;
 export type CawLiveAuditSyncPayload = z.infer<typeof CawLiveAuditSyncPayloadSchema>;
+export type TokenBalanceDeltaVerifyPayload = z.infer<typeof TokenBalanceDeltaVerifyPayloadSchema>;

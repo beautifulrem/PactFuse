@@ -88,7 +88,8 @@ WINNER_CLAIM_ALLOWED: false
 | --- | --- | --- |
 | Cobo wallet identity | Pending probe | No |
 | Payment settlement | Mocked/local | No real-token claim |
-| Token delivery | Local mocked | No public token-settlement claim |
+| Token balance delta proof | Implemented with finalized `SpendSettled`, ERC20 `Transfer`, and block-level `balanceOf` checks in local mocked mode | No public token-settlement claim |
+| Token delivery | Local mocked | No public token-delivery claim |
 | Fusebox app | Fixture preview | No proof authority |
 | Receipt verifier | Fail-closed structural verifier | No public proof claim |
 | Contracts | Built and tested locally | Use as proof anchor only after live deployment evidence |
@@ -195,6 +196,7 @@ Important `/api/v1` routes:
 | `POST /api/v1/caw/operations/build` | Build CAW operation envelopes |
 | `POST /api/v1/caw/receipts/ingest` | Ingest raw CAW receipt exports |
 | `POST /api/v1/gate/events/ingest` | Ingest gate/indexer events |
+| `POST /api/v1/token/balance-deltas/verify` | Verify finalized settlement against ERC20 balance deltas and matching `Transfer` log |
 | `POST /api/v1/artifacts/preflight` | Preflight delivery before quote signing |
 | `POST /api/v1/quotes` | Sign mocked quotes after preflight |
 | `POST /api/v1/artifacts/access-token` | Issue bearer-bound artifact access tokens |

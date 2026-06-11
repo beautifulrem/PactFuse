@@ -81,7 +81,7 @@ Required winner inputs:
 - Raw CAW receipt ingest bundle links every CAW operation to API/export JSON; no CAW winner chip may depend on hand-entered receipt fields.
 - `SourceChallenged` is a real chain tx from an issuer key separate from owner/runner.
 - A and B have real `SpendTripped` events, canonical tx ordering, and no token movement.
-- C has a real `SpendSettled` event plus payer/market balance delta.
+- C has a real `SpendSettled` event plus ERC20 `Transfer` and balance delta from `agentWallet` to market; `payer` must equal `agentWallet` until wallet ownership proof exists.
 - Artifact quote was signed only after preflight passed, and the receipt pack includes matching `priceDisclosure` and `deliveryPreflight` hashes.
 - Agent Transcript includes raw MCP JSON-RPC `tools/list` and `tools/call` hashes, bounded to the pinned manifest, before any "agent used what it bought" chip is shown.
 - Lease target is an independent pinned public repo/commit for the external-workflow chip; team-owned target requires a visible downgrade.
@@ -125,7 +125,7 @@ Use this order in the live demo and README top links:
 1. CAW boundary: deny request id, approve tx, clean allow receipt, policy digest, tx-count/expiry.
 2. Source challenge: issuer key, `SourceChallenged` tx, reason hash, in-lane manifest delta, expanded full diff evidence.
 3. A/B trip: two `SpendTripped` events, no token delta, event-reconstructed affected set.
-4. C settlement: `SpendSettled` tx, balance delta, quote price.
+4. C settlement: `SpendSettled` tx, ERC20 `Transfer`, `agentWallet`/market balance delta, quote price.
 5. Artifact receipt: preflight proof, artifact hash, receipt pack hash, verifier output, Bearer-token access proof.
 6. Agent transcript: MCP `tools/list` + `tools/call` transcript hash, pinned-manifest tool set, independent target repo/commit.
 7. Lease execution: scan output on the pinned target repo + `leaseRunHash` (or honest `lease-execution-pending`).

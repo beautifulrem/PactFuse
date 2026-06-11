@@ -94,7 +94,7 @@ Purpose: keep implementation aligned with the proof gates. This checklist is not
 - CAW clean allow receipt.
 - `SourceChallenged` tx hash.
 - A/B `SpendTripped` tx hashes.
-- C `SpendSettled` tx hash plus balance delta.
+- C `SpendSettled` tx hash plus ERC20 `Transfer` and `agentWallet`/market balance delta.
 - Receipt-pack verifier output.
 - Artifact Bearer-token access proof.
 - Artifact preflight output and price/source disclosure hash.

@@ -9,6 +9,7 @@ const INACTIVE_BRANCH_NULL_PATHS = new Set(["paymentProof.permit", "paymentProof
 const HEX32_RE = /^0x[0-9a-fA-F]{64}$/;
 const ZERO_HASH = `0x${"0".repeat(64)}`;
 const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
+const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 const REQUIRED_LEASE_TOOL_ARGUMENTS = ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"];
 const DANGEROUS_TOOL_NAME_PATTERN =
@@ -630,7 +631,7 @@ const JUDGE_ROW_EVENT_KINDS = {
   ]),
   source_challenge: new Set(["source.challenge.confirmed"]),
   ab_trip: new Set(["gate.spend_tripped", "reorg.invalidated"]),
-  c_settlement: new Set(["gate.spend_settled", "reorg.invalidated"]),
+  c_settlement: new Set(["gate.spend_settled", "token.balance_delta.verified", "reorg.invalidated"]),
   artifact_access: new Set(["artifact.access_token.issued"]),
   lease_execution: new Set(["lease.execution.succeeded", "lease.execution.blocked"]),
 };
@@ -1180,6 +1181,9 @@ function verifyJudgeCheck(bundle, eventsById, errors) {
     if (row.status === "pass" && row.authority === "delivery" && event.authority && event.authority !== "delivery") {
       errors.push(`judgeCheck delivery pass row ${row.rowId} references non-delivery event ${row.evidenceEventId}`);
     }
+    if (row.rowId === "c_settlement" && row.status === "pass" && event.kind !== "token.balance_delta.verified") {
+      errors.push("judgeCheck pass row c_settlement must reference token.balance_delta.verified");
+    }
   }
 }
 
@@ -1192,6 +1196,99 @@ function verifyContractStateProofEvents(bundle, events, errors) {
       verifyGateContractStateProofEvent(bundle, event, errors);
     } else if (event.kind === "source.challenge.confirmed") {
       verifySourceContractStateProofEvent(bundle, event, errors);
+    }
+  }
+}
+
+function verifyTokenBalanceDeltaEvents(eventsById, spendsById, errors) {
+  for (const event of eventsById.values()) {
+    if (!isObject(event) || event.kind !== "token.balance_delta.verified") {
+      continue;
+    }
+    const payload = isObject(event.payload) ? event.payload : null;
+    const label = `token balance delta event ${event.eventId ?? "-"}`;
+    if (!payload) {
+      errors.push(`${label} requires payload`);
+      continue;
+    }
+    if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
+      errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
+    }
+    const spend = spendsById.get(lowerHex(payload.spendId));
+    if (!spend) {
+      errors.push(`${label} references missing registered spend`);
+      continue;
+    }
+    const amount = decimal(payload.amountAtomic);
+    const spendAmount = decimal(spend.maxPriceAtomic);
+    if (amount === null || spendAmount === null || amount !== spendAmount) {
+      errors.push(`${label} amountAtomic does not match registered spend price`);
+    }
+    for (const [field, expected] of [
+      ["paymentToken", spend.paymentToken],
+      ["payer", spend.payer],
+      ["agentWallet", spend.agentWallet],
+      ["market", spend.market],
+    ]) {
+      if (lowerHex(payload[field]) !== lowerHex(expected)) {
+        errors.push(`${label} payload.${field} does not match registered spend`);
+      }
+    }
+    if (lowerHex(spend.payer) !== lowerHex(spend.agentWallet) || payload.payerAgentWalletSame !== true) {
+      errors.push(`${label} requires payerAgentWalletSame=true until wallet ownership proof exists`);
+    }
+    const settlementEvent = eventsById.get(payload.settlementEventId);
+    const settlementPayload = isObject(settlementEvent?.payload) ? settlementEvent.payload : null;
+    if (
+      !isObject(settlementEvent) ||
+      settlementEvent.kind !== "gate.spend_settled" ||
+      settlementEvent.authority !== "proof" ||
+      !settlementPayload ||
+      settlementPayload.finalityStatus !== "finalized" ||
+      settlementPayload.proofAuthority !== true
+    ) {
+      errors.push(`${label} references missing finalized proof-authority gate.spend_settled event`);
+    } else {
+      for (const field of ["gateEventId", "spendId", "txHash", "chainId", "blockNumber"]) {
+        if (payload[field] !== settlementPayload[field]) {
+          errors.push(`${label} payload.${field} does not match settlement event`);
+        }
+      }
+    }
+    if (Number(payload.preBlockNumber) !== Number(payload.blockNumber) - 1) {
+      errors.push(`${label} preBlockNumber must equal blockNumber - 1`);
+    }
+    if (amount !== null) {
+      const agentBefore = decimal(payload.agentWalletBefore);
+      const agentAfter = decimal(payload.agentWalletAfter);
+      const marketBefore = decimal(payload.marketBefore);
+      const marketAfter = decimal(payload.marketAfter);
+      if (agentBefore === null || agentAfter === null || agentBefore - agentAfter !== amount) {
+        errors.push(`${label} agent wallet balance delta does not match amountAtomic`);
+      }
+      if (marketBefore === null || marketAfter === null || marketAfter - marketBefore !== amount) {
+        errors.push(`${label} market balance delta does not match amountAtomic`);
+      }
+      if (payload.agentDeltaAtomic !== `-${amount.toString()}` || payload.marketDeltaAtomic !== amount.toString()) {
+        errors.push(`${label} signed delta fields do not match amountAtomic`);
+      }
+      const topics = Array.isArray(payload.transferTopics) ? payload.transferTopics.map((topic) => asText(topic).toLowerCase()) : [];
+      if (
+        topics[0] !== ERC20_TRANSFER_TOPIC ||
+        topics[1] !== evmAddressTopic(spend.agentWallet) ||
+        topics[2] !== evmAddressTopic(spend.market)
+      ) {
+        errors.push(`${label} transferTopics do not bind ERC20 Transfer(from=agentWallet,to=market)`);
+      }
+      if (asText(payload.transferData).toLowerCase() !== `0x${uint256Word(amount)}`) {
+        errors.push(`${label} transferData does not encode amountAtomic`);
+      }
+    }
+    if (!Number.isInteger(Number(payload.transferLogIndex)) || Number(payload.transferLogIndex) < 0) {
+      errors.push(`${label} requires transferLogIndex`);
+    }
+    if (!isHex32(payload.transferRawLogHash)) {
+      errors.push(`${label} requires transferRawLogHash`);
     }
   }
 }
@@ -1487,6 +1584,11 @@ function expectedActivateToolCalldata(spendId) {
 
 function evmAddressWord(address) {
   return isEvmAddress(address) ? address.slice(2).toLowerCase().padStart(64, "0") : null;
+}
+
+function evmAddressTopic(address) {
+  const word = evmAddressWord(address);
+  return word ? `0x${word}` : null;
 }
 
 function uint256Word(value) {
@@ -1880,6 +1982,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   verifyContractStateProofEvents(bundle, Array.isArray(bundle.events) ? bundle.events : [], errors);
   verifySourceIdentityBindings(bundle, errors);
   const spendsById = new Map(spends.filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]));
+  verifyTokenBalanceDeltaEvents(eventsById, spendsById, errors);
   verifyCawLiveInteractions(cawLiveInteractions, spendsById, eventsById, errors);
   const preflightsById = new Map(preflights.filter(isObject).map((preflight) => [preflight.preflightId, preflight]));
   const quotesById = new Map(quotes.filter(isObject).map((quote) => [quote.quoteId, quote]));
@@ -1993,6 +2096,18 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
       if (typeof spend.payer === "string" && token.payer !== spend.payer) {
         errors.push(`artifact access token ${token.tokenId ?? "-"} payer does not match registered spend payer`);
       }
+    }
+    const settlementEvent = eventsById.get(token.settlementEventId);
+    const settlementPayload = isObject(settlementEvent?.payload) ? settlementEvent.payload : null;
+    if (
+      !isObject(settlementEvent) ||
+      settlementEvent.kind !== "token.balance_delta.verified" ||
+      settlementEvent.authority !== "proof" ||
+      !settlementPayload ||
+      settlementPayload.spendId !== token.spendId ||
+      settlementPayload.proofAuthority !== true
+    ) {
+      errors.push(`artifact access token ${token.tokenId ?? "-"} must reference token.balance_delta.verified settlementEventId`);
     }
   }
   const rawReceiptsByHash = new Map();

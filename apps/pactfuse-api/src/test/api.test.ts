@@ -31,6 +31,7 @@ const GATE_INGEST_TOKEN = "test-gate-ingest-token";
 const CAW_INGEST_TOKEN = "test-caw-ingest-token";
 const ZERO_HASH = `0x${"0".repeat(64)}`;
 const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
+const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 const ERC20_APPROVE_ABI = [
   {
@@ -709,6 +710,32 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/gate/events/ingest"].post.responses["202"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/GateEventIngestResponse",
     );
+    expect(json.paths["/api/v1/token/balance-deltas/verify"].post["x-pactfuse-proof-fields"]).toEqual([
+      "spendId",
+      "settlementEventId",
+      "txHash",
+      "paymentToken",
+      "agentWallet",
+      "market",
+      "amountAtomic",
+      "agentWalletBefore",
+      "agentWalletAfter",
+      "marketBefore",
+      "marketAfter",
+      "proofAuthority",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/token/balance-deltas/verify"].post.parameters).toEqual([
+      expect.objectContaining({
+        name: "authorization",
+        in: "header",
+        required: false,
+      }),
+    ]);
+    expect(json.paths["/api/v1/token/balance-deltas/verify"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/TokenBalanceDeltaVerifyInput",
+    );
+    expect(json.components.schemas.TokenBalanceDeltaVerifyPayload.required).toEqual(["spendId"]);
     expect(json.paths["/api/v1/indexer/backfill"].post["x-pactfuse-proof-fields"]).toEqual([
       "cursor.status",
       "cursor.lastIndexedBlock",
@@ -2343,7 +2370,8 @@ describe("pactfuse-api P0", () => {
 
   it("keeps artifact reads bearer-bound and validates path parameters", async () => {
     const logs: Array<Record<string, unknown>> = [];
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-artifact");
     const spendId = await registerSpend(app, sessionId);
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact");
@@ -2357,7 +2385,8 @@ describe("pactfuse-api P0", () => {
     const pendingJson = await pending.json();
     const invalidPayer = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/not-a-hex/${artifactHash}`);
     const invalidJson = await invalidPayer.json();
-    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-settlement");
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-settlement");
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "artifact-settlement", finalized);
     const issued = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
       idempotencyKey: "issue-artifact-token",
@@ -2522,13 +2551,15 @@ describe("pactfuse-api P0", () => {
 
   it("blocks artifact access issuance when the requested artifact diverges from the quote", async () => {
     const logs: Array<Record<string, unknown>> = [];
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-artifact-quote-mismatch");
     const spendId = await registerSpend(app, sessionId);
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact-quote-bound");
     const differentPayload = artifactPayloadForTest("artifact-quote-tampered");
     const differentHash = hashForTestJson(differentPayload);
-    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-quote-mismatch");
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-quote-mismatch");
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "artifact-quote-mismatch", finalized);
 
     const issue = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
@@ -2549,7 +2580,8 @@ describe("pactfuse-api P0", () => {
 
   it("blocks artifact access issuance for overpriced or expired quotes", async () => {
     const logs: Array<Record<string, unknown>> = [];
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const overpricedSessionId = await createSession(app, "sess-artifact-overpriced-quote");
     const overpricedSpendId = await registerSpend(app, overpricedSessionId);
     const overpricedPreflight = await post(app, "/api/v1/artifacts/preflight", {
@@ -2580,7 +2612,8 @@ describe("pactfuse-api P0", () => {
     const expiredSessionId = await createSession(app, "sess-artifact-expired-quote");
     const expiredSpendId = await registerSpend(app, expiredSessionId);
     const expired = await quoteArtifactForTest(app, expiredSessionId, expiredSpendId, "artifact-expired", { validUntilBlock: "99" });
-    await finalizeSpendSettlement(app, ctx, logs, expiredSessionId, expiredSpendId, "artifact-expired");
+    const expiredFinalized = await finalizeSpendSettlement(app, ctx, logs, expiredSessionId, expiredSpendId, "artifact-expired");
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, expiredSessionId, expiredSpendId, "artifact-expired", expiredFinalized);
     const expiredIssue = await post(app, "/api/v1/artifacts/access-token", {
       sessionId: expiredSessionId,
       idempotencyKey: "issue-expired-artifact",
@@ -2604,13 +2637,15 @@ describe("pactfuse-api P0", () => {
 
   it("blocks oversized artifact payloads before issuing bearer access", async () => {
     const logs: Array<Record<string, unknown>> = [];
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-artifact-large-payload");
     const artifactPayload = { artifactType: "source-bound-code-scan-mcp-lease", content: "x".repeat(300 * 1024) };
     const artifactHash = hashForTestJson(artifactPayload);
     const spendId = await registerSpend(app, sessionId, defaultSourceCapabilityForTest(), { artifactHash });
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact-large-payload", { artifactPayload });
-    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-large-payload", { artifactHash });
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-large-payload", { artifactHash });
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "artifact-large-payload", finalized);
 
     const issue = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
@@ -2631,11 +2666,13 @@ describe("pactfuse-api P0", () => {
 
   it("keeps artifact token issuance live when replay rows exceed the summary page", async () => {
     const logs: Array<Record<string, unknown>> = [];
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-artifact-summary-cap");
     const spendId = await registerSpend(app, sessionId);
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact-summary-cap");
-    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-summary-cap");
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-summary-cap");
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "artifact-summary-cap", finalized);
     const countRow = ctx.db.sqlite.prepare("SELECT COUNT(*) AS count FROM evidence_events WHERE session_id = ?").get(sessionId) as { count: number };
     for (let i = Number(countRow.count); i < 200; i += 1) {
 	      appendEvidenceEvent(ctx, {
@@ -2947,7 +2984,8 @@ describe("pactfuse-api P0", () => {
 
   it("keeps artifact access issuance and refund evidence mutually exclusive", async () => {
     const logs: Array<Record<string, unknown>> = [];
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-refund-token-exclusive");
     const artifactPayload = artifactPayloadForTest("refund-token-artifact");
     const artifactHash = hashForTestJson(artifactPayload);
@@ -2976,7 +3014,8 @@ describe("pactfuse-api P0", () => {
         validUntilBlock: "123",
       },
     });
-    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "exclusive-token-first", { artifactHash });
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "exclusive-token-first", { artifactHash });
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "exclusive-token-first", finalized);
     const issue = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
       idempotencyKey: "exclusive-issue-token",
@@ -3035,7 +3074,10 @@ describe("pactfuse-api P0", () => {
         reason: "delivery timeout",
       },
     });
-    await finalizeSpendSettlement(app, ctx, logs, secondSessionId, secondSpendId, "exclusive-refund-first", { artifactHash: secondArtifactHash });
+    const secondFinalized = await finalizeSpendSettlement(app, ctx, logs, secondSessionId, secondSpendId, "exclusive-refund-first", {
+      artifactHash: secondArtifactHash,
+    });
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, secondSessionId, secondSpendId, "exclusive-refund-first", secondFinalized);
     const issueAfterRefund = await post(app, "/api/v1/artifacts/access-token", {
       sessionId: secondSessionId,
       idempotencyKey: "exclusive-issue-after-refund",
@@ -3229,11 +3271,118 @@ describe("pactfuse-api P0", () => {
     );
     expect(settlementRow).toEqual(
       expect.objectContaining({
-        status: "pass",
+        status: "pending",
         authority: "proof",
         evidenceEventId: proofEvent?.eventId,
       }),
     );
+  });
+
+  it("verifies ERC20 balance deltas only when the finalized SpendSettled tx contains the matching Transfer log", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
+    });
+    const sessionId = await createSession(app, "sess-token-balance-delta");
+    const spendId = await registerSpend(app, sessionId);
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "token-balance-delta");
+
+    const verified = await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "token-balance-delta", finalized);
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const tokenEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "token.balance_delta.verified");
+    const judge = await app.request(`/api/v1/evidence/judge-check?sessionId=${sessionId}`);
+    const judgeJson = await judge.json();
+    const settlementRow = judgeJson.data.rows.find((row: { rowId: string }) => row.rowId === "c_settlement");
+    const verify = await app.request(`/api/v1/evidence/${sessionId}/verify`);
+    const verifyJson = await verify.json();
+
+    expect(verified).toEqual(
+      expect.objectContaining({
+        spendId,
+        settlementEventId: finalized.finalizedEventId,
+        txHash: finalized.txHash,
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        payerAgentWalletSame: true,
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      }),
+    );
+    expect(tokenEvent).toEqual(expect.objectContaining({ authority: "proof", payload: expect.objectContaining({ transferLogIndex: 20 }) }));
+    expect(settlementRow).toEqual(
+      expect.objectContaining({
+        status: "pass",
+        authority: "proof",
+        evidenceEventId: tokenEvent?.eventId,
+      }),
+    );
+    expect(verify.status).toBe(200);
+    expect(verifyJson.data.schemaOk).toBe(true);
+  });
+
+  it("blocks ERC20 balance delta verification when the settlement tx has no matching Transfer log", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs, tokenBalances }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-token-delta-missing-transfer");
+    const spendId = await registerSpend(app, sessionId);
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "token-delta-missing-transfer");
+    tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_PAYER_ADDRESS, 99)] = "5000";
+    tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_PAYER_ADDRESS, 100)] = "4000";
+    tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_MARKET_ADDRESS, 99)] = "10";
+    tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_MARKET_ADDRESS, 100)] = "1010";
+
+    const verified = await post(app, "/api/v1/token/balance-deltas/verify", {
+      sessionId,
+      idempotencyKey: "token-delta-missing-transfer",
+      payload: { spendId, settlementEventId: finalized.finalizedEventId },
+    });
+
+    expect(verified.status).toBe(422);
+    expect(verified.json.error.code).toBe("proof_blocked");
+    expect(verified.json.error.message).toContain("matching ERC20 Transfer log");
+  });
+
+  it("blocks ERC20 balance delta verification when the Transfer value does not match the registered price", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs, tokenBalances }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-token-delta-wrong-transfer");
+    const spendId = await registerSpend(app, sessionId);
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "token-delta-wrong-transfer");
+    tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_PAYER_ADDRESS, 99)] = "5000";
+    tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_PAYER_ADDRESS, 100)] = "4000";
+    tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_MARKET_ADDRESS, 99)] = "10";
+    tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_MARKET_ADDRESS, 100)] = "1010";
+    logs.push(
+      erc20TransferLogForTest("token-delta-wrong-transfer", {
+        txHash: String(finalized.txHash),
+        blockNumber: Number(finalized.blockNumber),
+        value: "999",
+      }),
+    );
+
+    const verified = await post(app, "/api/v1/token/balance-deltas/verify", {
+      sessionId,
+      idempotencyKey: "token-delta-wrong-transfer",
+      payload: { spendId, settlementEventId: finalized.finalizedEventId },
+    });
+
+    expect(verified.status).toBe(422);
+    expect(verified.json.error.code).toBe("proof_blocked");
+    expect(verified.json.error.message).toContain("matching ERC20 Transfer log");
   });
 
   it("blocks indexed SpendSettled logs when ProcurementGate state is not settled", async () => {
@@ -4473,14 +4622,16 @@ describe("pactfuse-api P0", () => {
 
   it("requires a matching bearer-bound artifact token before lease execution", async () => {
     const logs: Array<Record<string, unknown>> = [];
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-lease-bearer-bound");
     const spendId = await registerSpend(app, sessionId);
     const payer = "0x1000000000000000000000000000000000000001";
     const wrongPayer = "0x2000000000000000000000000000000000000002";
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-artifact-active");
     const { artifactHash, artifactPayload, quoteId } = quoted;
-    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-settlement");
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-settlement");
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "lease-settlement", finalized);
     const issued = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
       idempotencyKey: "issue-lease-artifact-token",
@@ -4629,8 +4780,9 @@ describe("pactfuse-api P0", () => {
 
   it("executes a clean lease through MCP JSON-RPC and binds the transcript into replay evidence", async () => {
     const logs: Array<Record<string, unknown>> = [];
+    const tokenBalances: Record<string, string> = {};
     const { app, ctx } = makeApp(":memory:", {
-      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
       mcpLease: createFakeMcpLeaseClient(),
     });
     const sessionId = await createSession(app, "sess-lease-transcript-success");
@@ -4638,7 +4790,8 @@ describe("pactfuse-api P0", () => {
     const payer = "0x1000000000000000000000000000000000000001";
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-artifact-transcript");
     const { artifactHash, artifactPayload, quoteId } = quoted;
-    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-transcript-settlement");
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-transcript-settlement");
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "lease-transcript-settlement", finalized);
     const issued = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
       idempotencyKey: "issue-transcript-lease-token",
@@ -5033,15 +5186,17 @@ describe("pactfuse-api P0", () => {
     });
     try {
       const logs: Array<Record<string, unknown>> = [];
+      const tokenBalances: Record<string, string> = {};
       const { app, ctx } = makeApp(":memory:", {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
       });
       const sessionId = await createSession(app, "sess-lease-http-mcp-success");
       const spendId = await registerSpend(app, sessionId);
       const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-http-mcp-success");
-      await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-http-mcp-success");
+      const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-http-mcp-success");
+      await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "lease-http-mcp-success", finalized);
       const issued = await post(app, "/api/v1/artifacts/access-token", {
         sessionId,
         idempotencyKey: "issue-http-mcp-success-token",
@@ -5100,15 +5255,17 @@ describe("pactfuse-api P0", () => {
     });
     try {
       const logs: Array<Record<string, unknown>> = [];
+      const tokenBalances: Record<string, string> = {};
       const { app, ctx } = makeApp(":memory:", {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
       });
       const sessionId = await createSession(app, "sess-lease-pinned-manifest-mismatch");
       const spendId = await registerSpend(app, sessionId, defaultSourceCapabilityForTest("pactfuse_other_scan"));
       const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-pinned-manifest-mismatch");
-      await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-pinned-manifest-mismatch");
+      const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-pinned-manifest-mismatch");
+      await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "lease-pinned-manifest-mismatch", finalized);
       const issued = await post(app, "/api/v1/artifacts/access-token", {
         sessionId,
         idempotencyKey: "issue-pinned-manifest-mismatch-token",
@@ -5171,15 +5328,17 @@ describe("pactfuse-api P0", () => {
     });
     try {
       const logs: Array<Record<string, unknown>> = [];
+      const tokenBalances: Record<string, string> = {};
       const { app, ctx } = makeApp(":memory:", {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
       });
       const sessionId = await createSession(app, "sess-lease-call-failure-blocks-token");
       const spendId = await registerSpend(app, sessionId);
       const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-call-failure-blocks-token");
-      await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-call-failure-blocks-token");
+      const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-call-failure-blocks-token");
+      await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "lease-call-failure-blocks-token", finalized);
       const issued = await post(app, "/api/v1/artifacts/access-token", {
         sessionId,
         idempotencyKey: "issue-call-failure-token",
@@ -5227,6 +5386,7 @@ describe("pactfuse-api P0", () => {
 
   it("reconciles expired consuming lease claims into blocked evidence instead of leaving permanent half-state", async () => {
     const logs: Array<Record<string, unknown>> = [];
+    const tokenBalances: Record<string, string> = {};
     let executeCalls = 0;
     const mcpLease: McpLeaseClient = {
       async status() {
@@ -5238,14 +5398,15 @@ describe("pactfuse-api P0", () => {
       },
     };
     const { app, ctx } = makeApp(":memory:", {
-      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
       mcpLease,
     });
     const sessionId = await createSession(app, "sess-lease-expired-consuming");
     const spendId = await registerSpend(app, sessionId);
     const payer = "0x1000000000000000000000000000000000000001";
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-expired-consuming");
-    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-expired-consuming");
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-expired-consuming");
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "lease-expired-consuming", finalized);
     const issued = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
       idempotencyKey: "issue-expired-consuming-token",
@@ -5339,15 +5500,17 @@ describe("pactfuse-api P0", () => {
     });
     try {
       const logs: Array<Record<string, unknown>> = [];
+      const tokenBalances: Record<string, string> = {};
       const { app, ctx } = makeApp(":memory:", {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
       });
       const sessionId = await createSession(app, "sess-lease-dangerous-tools");
       const spendId = await registerSpend(app, sessionId);
       const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-dangerous-tools");
-      await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-dangerous-tools");
+      const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-dangerous-tools");
+      await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "lease-dangerous-tools", finalized);
       const issued = await post(app, "/api/v1/artifacts/access-token", {
         sessionId,
         idempotencyKey: "issue-dangerous-tools-token",
@@ -5409,15 +5572,17 @@ describe("pactfuse-api P0", () => {
     });
     try {
       const logs: Array<Record<string, unknown>> = [];
+      const tokenBalances: Record<string, string> = {};
       const { app, ctx } = makeApp(":memory:", {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
       });
       const sessionId = await createSession(app, "sess-lease-missing-tool-metadata");
       const spendId = await registerSpend(app, sessionId);
       const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-missing-tool-metadata");
-      await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-missing-tool-metadata");
+      const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-missing-tool-metadata");
+      await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "lease-missing-tool-metadata", finalized);
       const issued = await post(app, "/api/v1/artifacts/access-token", {
         sessionId,
         idempotencyKey: "issue-missing-tool-metadata-token",
@@ -5458,6 +5623,7 @@ describe("pactfuse-api P0", () => {
 
   it("serializes concurrent lease executions for the same artifact token before external MCP side effects", async () => {
     const logs: Array<Record<string, unknown>> = [];
+    const tokenBalances: Record<string, string> = {};
     let executeCalls = 0;
     let releaseLease!: () => void;
     let markStarted!: () => void;
@@ -5485,14 +5651,15 @@ describe("pactfuse-api P0", () => {
       },
     };
     const { app, ctx } = makeApp(":memory:", {
-      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
       mcpLease,
     });
     const sessionId = await createSession(app, "sess-lease-token-race");
     const spendId = await registerSpend(app, sessionId);
     const payer = "0x1000000000000000000000000000000000000001";
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-token-race");
-    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-token-race");
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-token-race");
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "lease-token-race", finalized);
     const issued = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
       idempotencyKey: "issue-lease-race-token",
@@ -5540,6 +5707,7 @@ describe("pactfuse-api P0", () => {
     const dbPath = join(dir, "pactfuse.sqlite");
     try {
       const logs: Array<Record<string, unknown>> = [];
+      const tokenBalances: Record<string, string> = {};
       let executeCalls = 0;
       let releaseLease!: () => void;
       let markStarted!: () => void;
@@ -5562,14 +5730,15 @@ describe("pactfuse-api P0", () => {
         },
       };
       const first = makeApp(dbPath, {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease,
       });
       const sessionId = await createSession(first.app, "sess-cross-instance-lease-claim");
       const spendId = await registerSpend(first.app, sessionId);
       const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(first.app, sessionId, spendId, "cross-instance-lease-claim");
-      await finalizeSpendSettlement(first.app, first.ctx, logs, sessionId, spendId, "cross-instance-lease-claim");
+      const finalized = await finalizeSpendSettlement(first.app, first.ctx, logs, sessionId, spendId, "cross-instance-lease-claim");
+      await verifyTokenBalanceDeltaForTest(first.app, logs, tokenBalances, sessionId, spendId, "cross-instance-lease-claim", finalized);
       const issued = await post(first.app, "/api/v1/artifacts/access-token", {
         sessionId,
         idempotencyKey: "issue-cross-instance-token",
@@ -5582,7 +5751,7 @@ describe("pactfuse-api P0", () => {
         },
       });
       const second = makeApp(dbPath, {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createFakeMcpLeaseClient(),
       });
       const body = (idempotencyKey: string) => ({
@@ -6365,6 +6534,7 @@ function createFakeIndexerChainClient(config: {
     market: string;
   }>;
   sourceStates?: Record<string, number>;
+  tokenBalances?: Record<string, string>;
   ignoreAddressFilter?: boolean;
 }): ChainClient {
   return {
@@ -6404,12 +6574,14 @@ function createFakeIndexerChainClient(config: {
       const logIndex = query.logIndex === undefined ? null : Number(query.logIndex);
       const event = typeof query.event === "string" ? query.event : null;
       const spendId = typeof query.spendId === "string" ? query.spendId.toLowerCase() : null;
+      const topics = Array.isArray(query.topics) ? query.topics.map((topic) => (typeof topic === "string" ? topic.toLowerCase() : null)) : [];
       return (config.logs ?? []).filter((log) => {
         const blockNumber = Number(log.blockNumber);
         const logAddress = typeof log.address === "string" ? log.address.toLowerCase() : null;
         const logTxHash = typeof log.transactionHash === "string" ? log.transactionHash.toLowerCase() : null;
         const logIndexValue = log.logIndex === undefined ? null : Number(log.logIndex);
         const logEvent = typeof log.eventName === "string" ? log.eventName : typeof log.event === "string" ? log.event : null;
+        const logTopics = Array.isArray(log.topics) ? log.topics.map((topic) => (typeof topic === "string" ? topic.toLowerCase() : null)) : [];
         const args = log.args && typeof log.args === "object" && !Array.isArray(log.args) ? (log.args as Record<string, unknown>) : {};
         const logSpendId = typeof args.spendId === "string" ? args.spendId.toLowerCase() : typeof log.spendId === "string" ? log.spendId.toLowerCase() : null;
         return (
@@ -6419,7 +6591,8 @@ function createFakeIndexerChainClient(config: {
           (!txHash || logTxHash === txHash) &&
           (logIndex === null || logIndexValue === logIndex) &&
           (!event || logEvent === event) &&
-          (!spendId || logSpendId === spendId)
+          (!spendId || logSpendId === spendId) &&
+          topics.every((topic, index) => topic === null || logTopics[index] === topic)
         );
       });
     },
@@ -6483,6 +6656,16 @@ function createFakeIndexerChainClient(config: {
         const sourceHash = String(args[0] ?? "").toLowerCase();
         return config.sourceStates?.[sourceHash] ?? 2;
       }
+      if (input.functionName === "balanceOf") {
+        const token = input.address.toLowerCase();
+        const account = String(args[0] ?? "").toLowerCase();
+        const blockNumber = input.blockNumber ?? 0;
+        const balance = config.tokenBalances?.[`${token}:${account}:${blockNumber}`];
+        if (balance === undefined) {
+          throw new Error(`missing fake balanceOf for ${token}:${account}:${blockNumber}`);
+        }
+        return balance;
+      }
       throw new Error(`unsupported fake contract read: ${input.functionName}`);
     },
   };
@@ -6500,6 +6683,47 @@ function indexerLog(seed: string, blockNumber: number, overrides: Record<string,
     rawLogHash: hex32(`indexer:${seed}:raw`),
     ...overrides,
   };
+}
+
+function erc20TransferLogForTest(
+  seed: string,
+  input: {
+    txHash: string;
+    blockNumber: number;
+    logIndex?: number;
+    token?: string;
+    from?: string;
+    to?: string;
+    value?: string;
+  },
+): Record<string, unknown> {
+  const value = input.value ?? "1000";
+  return {
+    transactionHash: input.txHash,
+    logIndex: input.logIndex ?? 20,
+    chainId: "84532",
+    blockNumber: input.blockNumber,
+    address: input.token ?? TEST_PAYMENT_TOKEN_ADDRESS,
+    topics: [
+      ERC20_TRANSFER_TOPIC,
+      evmAddressTopicForTest(input.from ?? TEST_PAYER_ADDRESS),
+      evmAddressTopicForTest(input.to ?? TEST_MARKET_ADDRESS),
+    ],
+    data: uint256DataForTest(value),
+    rawLogHash: hex32(`erc20-transfer:${seed}:raw`),
+  };
+}
+
+function evmAddressTopicForTest(address: string): `0x${string}` {
+  return `0x${address.toLowerCase().replace(/^0x/, "").padStart(64, "0")}`;
+}
+
+function uint256DataForTest(value: string): `0x${string}` {
+  return `0x${BigInt(value).toString(16).padStart(64, "0")}`;
+}
+
+function balanceKeyForTest(token: string, account: string, blockNumber: number): string {
+  return `${token.toLowerCase()}:${account.toLowerCase()}:${blockNumber}`;
 }
 
 function insertCaughtUpIndexerCursor(
@@ -6694,6 +6918,54 @@ async function finalizeSpendSettlement(
     finalizedEventId: proofEvent.eventId,
     observedEventId: observed.json.data.observedEventId,
   };
+}
+
+async function verifyTokenBalanceDeltaForTest(
+  app: ReturnType<typeof createApp>,
+  logs: Array<Record<string, unknown>>,
+  tokenBalances: Record<string, string>,
+  sessionId: string,
+  spendId: string,
+  key: string,
+  finalized: Record<string, unknown>,
+  overrides: Partial<{
+    paymentToken: string;
+    agentWallet: string;
+    market: string;
+    amountAtomic: string;
+    agentWalletBefore: string;
+    marketBefore: string;
+  }> = {},
+): Promise<Record<string, unknown>> {
+  const paymentToken = overrides.paymentToken ?? TEST_PAYMENT_TOKEN_ADDRESS;
+  const agentWallet = overrides.agentWallet ?? TEST_PAYER_ADDRESS;
+  const market = overrides.market ?? TEST_MARKET_ADDRESS;
+  const amountAtomic = overrides.amountAtomic ?? "1000";
+  const blockNumber = Number(finalized.blockNumber);
+  const preBlockNumber = blockNumber - 1;
+  const agentWalletBefore = BigInt(overrides.agentWalletBefore ?? "5000");
+  const marketBefore = BigInt(overrides.marketBefore ?? "10");
+  tokenBalances[balanceKeyForTest(paymentToken, agentWallet, preBlockNumber)] = agentWalletBefore.toString();
+  tokenBalances[balanceKeyForTest(paymentToken, agentWallet, blockNumber)] = (agentWalletBefore - BigInt(amountAtomic)).toString();
+  tokenBalances[balanceKeyForTest(paymentToken, market, preBlockNumber)] = marketBefore.toString();
+  tokenBalances[balanceKeyForTest(paymentToken, market, blockNumber)] = (marketBefore + BigInt(amountAtomic)).toString();
+  logs.push(
+    erc20TransferLogForTest(key, {
+      txHash: String(finalized.txHash),
+      blockNumber,
+      token: paymentToken,
+      from: agentWallet,
+      to: market,
+      value: amountAtomic,
+    }),
+  );
+  const verified = await post(app, "/api/v1/token/balance-deltas/verify", {
+    sessionId,
+    idempotencyKey: `${key}-token-delta`,
+    payload: { spendId, settlementEventId: finalized.finalizedEventId },
+  });
+  expect(verified.status).toBe(202);
+  return verified.json.data as Record<string, unknown>;
 }
 
 async function computeSpendIdForTest(

@@ -44,6 +44,7 @@ import {
   SourceRegisterPayloadSchema,
   SpendViewSchema,
   SpendRegisterPayloadSchema,
+  TokenBalanceDeltaVerifyPayloadSchema,
   VerifierRunViewSchema,
   VerifyEvidencePayloadSchema,
   canonicalizeJson,
@@ -60,6 +61,7 @@ import {
   type CawLiveContractCallSubmitPayload,
   type CawLivePactSubmitPayload,
   type CawLiveTransferSubmitPayload,
+  type TokenBalanceDeltaVerifyPayload,
   type VerifierRunView,
 } from "@pactfuse/evidence-schema";
 import { encodeAbiParameters, encodeFunctionData, keccak256, recoverMessageAddress } from "viem";
@@ -120,6 +122,7 @@ const REPLAY_COLLECTION_NAMES: ReplayCollectionName[] = [
 ];
 const ARTIFACT_PAYLOAD_REPLAY_MAX_BYTES = 256 * 1024;
 const ARTIFACT_TOKEN_LEASE_CLAIM_TTL_MS = 5 * 60 * 1000;
+const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 type ChainIndexerBackfillPayload = ChainIndexerBackfillInput["payload"];
 type NormalizedIndexedChainLog = {
   logId: `0x${string}`;
@@ -226,6 +229,15 @@ const ERC20_APPROVE_ABI = [
       { name: "amount", type: "uint256" },
     ],
     outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
+const ERC20_BALANCE_OF_ABI = [
+  {
+    type: "function",
+    name: "balanceOf",
+    stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
   },
 ] as const;
 const PROCUREMENT_GATE_ACTIVATE_TOOL_ABI = [
@@ -2097,6 +2109,126 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
   });
 }
 
+export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(TokenBalanceDeltaVerifyPayloadSchema, envelope.payload);
+  return withIdempotency(
+    ctx,
+    scoped("token:balance-delta:verify", envelope.sessionId),
+    envelope.idempotencyKey,
+    envelope,
+    async (requestId) => {
+      assertSession(ctx, envelope.sessionId, requestId);
+      const spend = requireSpendForBalanceDelta(ctx, envelope.sessionId, payload.spendId, requestId);
+      const settlement = requireSettlementForBalanceDelta(ctx, envelope.sessionId, payload, requestId);
+      if (spend.payer !== spend.agentWallet) {
+        throw Object.assign(new Error("token balance delta requires payer to match agentWallet until wallet ownership proof exists"), {
+          apiError: proofBlockedError(requestId, "token balance delta requires payer to match agentWallet until wallet ownership proof exists", {
+            payer: spend.payer,
+            agentWallet: spend.agentWallet,
+          }),
+        });
+      }
+      await requireChainReadyForBalanceDelta(ctx, settlement.chainId, requestId);
+      if (settlement.blockNumber <= 0) {
+        throw Object.assign(new Error("token balance delta proof requires a non-genesis settlement block"), {
+          apiError: proofBlockedError(requestId, "token balance delta proof requires a non-genesis settlement block", {
+            blockNumber: settlement.blockNumber,
+          }),
+        });
+      }
+      const agentWalletBefore = await readErc20Balance(ctx, spend.paymentToken, spend.agentWallet, settlement.blockNumber - 1, requestId);
+      const agentWalletAfter = await readErc20Balance(ctx, spend.paymentToken, spend.agentWallet, settlement.blockNumber, requestId);
+      const marketBefore = await readErc20Balance(ctx, spend.paymentToken, spend.market, settlement.blockNumber - 1, requestId);
+      const marketAfter = await readErc20Balance(ctx, spend.paymentToken, spend.market, settlement.blockNumber, requestId);
+      const amount = BigInt(spend.maxPriceAtomic);
+      if (agentWalletBefore - agentWalletAfter !== amount || marketAfter - marketBefore !== amount) {
+        throw Object.assign(new Error("ERC20 balance delta does not match registered SpendSettled price"), {
+          apiError: proofBlockedError(requestId, "ERC20 balance delta does not match registered SpendSettled price", {
+            spendId: payload.spendId,
+            expectedAmount: amount.toString(),
+            agentWalletBefore: agentWalletBefore.toString(),
+            agentWalletAfter: agentWalletAfter.toString(),
+            marketBefore: marketBefore.toString(),
+            marketAfter: marketAfter.toString(),
+          }),
+        });
+      }
+      const transferLog = await requireErc20TransferLogForBalanceDelta(ctx, settlement, spend, amount, requestId);
+      const event = appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "proof",
+        kind: "token.balance_delta.verified",
+        payload: {
+          spendId: payload.spendId,
+          settlementEventId: settlement.finalizedEventId,
+          gateEventId: settlement.gateEventId,
+          txHash: settlement.txHash,
+          chainId: settlement.chainId,
+          blockNumber: settlement.blockNumber,
+          preBlockNumber: settlement.blockNumber - 1,
+          transferLogIndex: transferLog.logIndex,
+          transferRawLogHash: transferLog.rawLogHash,
+          transferTopics: transferLog.topics,
+          transferData: transferLog.data,
+          paymentToken: spend.paymentToken,
+          payer: spend.payer,
+          agentWallet: spend.agentWallet,
+          payerAgentWalletSame: true,
+          market: spend.market,
+          amountAtomic: amount.toString(),
+          agentDeltaAtomic: `-${amount.toString()}`,
+          marketDeltaAtomic: amount.toString(),
+          agentWalletBefore: agentWalletBefore.toString(),
+          agentWalletAfter: agentWalletAfter.toString(),
+          marketBefore: marketBefore.toString(),
+          marketAfter: marketAfter.toString(),
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        },
+      });
+      updateJudgeCheckRow(ctx, envelope.sessionId, {
+        rowId: "c_settlement",
+        status: "pass",
+        authority: "proof",
+        reason: "finalized SpendSettled log plus ERC20 balance delta verified",
+        evidenceEventId: event.eventId,
+      });
+      return {
+        ok: true,
+        requestId,
+        evidenceEventId: event.eventId,
+        data: {
+          spendId: payload.spendId,
+          settlementEventId: settlement.finalizedEventId,
+          txHash: settlement.txHash,
+          chainId: settlement.chainId,
+          blockNumber: settlement.blockNumber,
+          preBlockNumber: settlement.blockNumber - 1,
+          transferLogIndex: transferLog.logIndex,
+          transferRawLogHash: transferLog.rawLogHash,
+          transferTopics: transferLog.topics,
+          transferData: transferLog.data,
+          paymentToken: spend.paymentToken,
+          payer: spend.payer,
+          agentWallet: spend.agentWallet,
+          payerAgentWalletSame: true,
+          market: spend.market,
+          amountAtomic: amount.toString(),
+          agentDeltaAtomic: `-${amount.toString()}`,
+          marketDeltaAtomic: amount.toString(),
+          agentWalletBefore: agentWalletBefore.toString(),
+          agentWalletAfter: agentWalletAfter.toString(),
+          marketBefore: marketBefore.toString(),
+          marketAfter: marketAfter.toString(),
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        },
+      };
+    },
+  );
+}
+
 export async function indexChainWindow(input: ChainIndexerBackfillInput, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
   const parsed = parseStrict(ChainIndexerBackfillInputSchema, input);
   return withProcessLock(`indexer:cursor:${parsed.payload.cursorId}`, () =>
@@ -2493,7 +2625,7 @@ export async function issueArtifactAccessToken(input: SessionScopedEnvelope, ctx
     const payer = requireSpendPayer(spend, payload.payer, requestId);
     const artifactHash = payload.artifactHash.toLowerCase();
     assertSpendArtifactHash(spend, artifactHash, "artifact access", requestId);
-    const settlement = requireFinalizedSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
+    const settlement = requireVerifiedTokenSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
     assertNoArtifactRefundPending(ctx, envelope.sessionId, payload.spendId, requestId);
     return withProcessLock(`artifact-token:${envelope.sessionId}:${payload.spendId}`, async () => {
       assertNoActiveArtifactToken(ctx, envelope.sessionId, payload.spendId, requestId);
@@ -2567,7 +2699,7 @@ export async function issueArtifactAccessToken(input: SessionScopedEnvelope, ctx
             artifactPayloadJson,
             tokenHash,
             verifierRunId,
-            settlement.finalizedEventId,
+            settlement.tokenBalanceEventId,
             ctx.clock.now().toISOString(),
           );
         const issued = appendEvidenceEvent(ctx, {
@@ -2585,7 +2717,8 @@ export async function issueArtifactAccessToken(input: SessionScopedEnvelope, ctx
             artifactPayloadHash,
             tokenHash,
             verifierRunId,
-            settlementEventId: settlement.finalizedEventId,
+            settlementEventId: settlement.tokenBalanceEventId,
+            gateSettlementEventId: settlement.finalizedEventId,
             status: "active_demo_verifier_gated",
             accessProofLevel: "delivery_access_only",
             proofChipAllowed: false,
@@ -2598,7 +2731,7 @@ export async function issueArtifactAccessToken(input: SessionScopedEnvelope, ctx
           rowId: "artifact_access",
           status: "pass",
           authority: "delivery",
-          reason: "bearer token issued after finalized settlement, quote binding, and replay-clean verifier run",
+          reason: "bearer token issued after finalized settlement, ERC20 balance delta proof, quote binding, and replay-clean verifier run",
           evidenceEventId: issued.eventId,
         });
         return issued;
@@ -2620,7 +2753,8 @@ export async function issueArtifactAccessToken(input: SessionScopedEnvelope, ctx
           artifactCid: quoteBinding.artifactCid,
           artifactPayloadHash,
           verifierRunId,
-          settlementEventId: settlement.finalizedEventId,
+          settlementEventId: settlement.tokenBalanceEventId,
+          gateSettlementEventId: settlement.finalizedEventId,
           bearerBound: true,
           status: "active_demo_verifier_gated",
           accessProofLevel: "delivery_access_only",
@@ -2652,7 +2786,7 @@ export async function executeLease(
       const payer = requireSpendPayer(spend, payload.payer, requestId);
       const artifactHash = payload.artifactHash.toLowerCase();
       assertSpendArtifactHash(spend, artifactHash, "lease execution", requestId);
-      const settlement = requireFinalizedSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
+      const settlement = requireVerifiedTokenSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
       assertNoArtifactRefundPending(ctx, envelope.sessionId, payload.spendId, requestId);
       const activeToken = requireActiveArtifactAccess(
         ctx,
@@ -2682,7 +2816,7 @@ export async function executeLease(
             artifactHash,
             targetRepo: payload.targetRepo,
             targetCommit: payload.targetCommit,
-            settlementEventId: settlement.finalizedEventId,
+            settlementEventId: settlement.tokenBalanceEventId,
           },
           requestId,
         );
@@ -2714,7 +2848,7 @@ export async function executeLease(
             targetRepo: payload.targetRepo,
             targetCommit: payload.targetCommit,
             leaseRunId,
-            settlementEventId: settlement.finalizedEventId,
+            settlementEventId: settlement.tokenBalanceEventId,
             artifactTokenId,
             status: error instanceof Error && !error.message.includes("unconfigured") ? "blocked_mcp_execution_failed" : "blocked_missing_runner_execution",
             reason: error instanceof Error ? error.message : "lease MCP execution failed",
@@ -2774,7 +2908,7 @@ export async function executeLease(
           artifactHash,
           targetRepo: payload.targetRepo,
           targetCommit: payload.targetCommit,
-          settlementEventId: settlement.finalizedEventId,
+          settlementEventId: settlement.tokenBalanceEventId,
           artifactTokenId,
           transcriptHash,
           outputHash,
@@ -2802,7 +2936,7 @@ export async function executeLease(
               toolsCallHash,
               outputHash,
               leaseRunHash,
-              settlement.finalizedEventId,
+              settlement.tokenBalanceEventId,
               artifactTokenId,
               now,
               now,
@@ -2818,7 +2952,8 @@ export async function executeLease(
               artifactHash,
               targetRepo: payload.targetRepo,
               targetCommit: payload.targetCommit,
-              settlementEventId: settlement.finalizedEventId,
+              settlementEventId: settlement.tokenBalanceEventId,
+              gateSettlementEventId: settlement.finalizedEventId,
               artifactTokenId,
               transcriptHash,
               toolsListHash,
@@ -2874,7 +3009,8 @@ export async function executeLease(
             leaseRunHash,
             boundedToPinnedManifest: true,
             manifestBindingHash,
-            settlementEventId: settlement.finalizedEventId,
+            settlementEventId: settlement.tokenBalanceEventId,
+            gateSettlementEventId: settlement.finalizedEventId,
             status: "succeeded_live_mcp_transcript",
             winnerClaimAllowed: false,
           },
@@ -3056,6 +3192,7 @@ async function buildVerifierRunView(
     ...verifyMcpAdapterCallIntegrity(ctx, sessionId),
     ...verifyCawLiveInteractionIntegrity(ctx, sessionId),
     ...verifyGateFinalityIntegrity(ctx, sessionId),
+    ...verifyTokenBalanceDeltaIntegrity(ctx, sessionId),
     ...verifyArtifactAccessTokenIntegrity(ctx, sessionId),
     ...verifyLeaseRunIntegrity(ctx, sessionId),
     ...(await verifyIndexerCursorIntegrity(ctx, proofProviders)),
@@ -3734,6 +3871,7 @@ export function appendEvidenceEvent(
       | "gate.spend_settled.observed"
       | "gate.spend_tripped"
       | "gate.spend_settled"
+      | "token.balance_delta.verified"
       | "reorg.invalidated"
       | "lease.execution.blocked"
       | "lease.execution.succeeded"
@@ -4988,6 +5126,320 @@ function requireFinalizedSettlement(
   };
 }
 
+function requireVerifiedTokenSettlement(
+  ctx: ServiceCtx,
+  sessionId: string,
+  spendId: string,
+  requestId: string,
+): { tokenBalanceEventId: string; finalizedEventId: string; observedEventId: string; blockNumber: number } {
+  const settlement = requireFinalizedSettlement(ctx, sessionId, spendId, requestId);
+  const integrityErrors = verifyTokenBalanceDeltaIntegrity(ctx, sessionId);
+  if (integrityErrors.length > 0) {
+    throw Object.assign(new Error("token balance delta proof is internally inconsistent"), {
+      apiError: proofBlockedError(requestId, "token balance delta proof is internally inconsistent", { errors: integrityErrors }),
+    });
+  }
+  const tokenEvents = ctx.db.sqlite
+    .prepare(
+      `SELECT event_id, payload_json
+       FROM evidence_events
+       WHERE session_id = ? AND kind = 'token.balance_delta.verified' AND authority = 'proof'
+       ORDER BY event_seq DESC`,
+    )
+    .all(sessionId) as Row[];
+  for (const tokenEvent of tokenEvents) {
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(String(tokenEvent.payload_json)) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (payload.spendId === spendId && payload.settlementEventId === settlement.finalizedEventId && payload.proofAuthority === true) {
+      return {
+        ...settlement,
+        tokenBalanceEventId: String(tokenEvent.event_id),
+        blockNumber: Number(payload.blockNumber),
+      };
+    }
+  }
+  throw Object.assign(new Error("ERC20 balance delta proof is required before artifact access"), {
+    apiError: proofPendingError(requestId, "ERC20 balance delta proof is required before artifact access"),
+  });
+}
+
+type BalanceDeltaSpend = {
+  spendId: string;
+  payer: `0x${string}`;
+  agentWallet: `0x${string}`;
+  paymentToken: `0x${string}`;
+  market: `0x${string}`;
+  maxPriceAtomic: string;
+};
+
+type BalanceDeltaSettlement = {
+  gateEventId: string;
+  finalizedEventId: string;
+  txHash: string;
+  chainId: string;
+  blockNumber: number;
+};
+
+function requireSpendForBalanceDelta(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): BalanceDeltaSpend {
+  const row = ctx.db.sqlite
+    .prepare(
+      `SELECT spend_id, payer, agent_wallet, payment_token, market, max_price_atomic
+       FROM spends
+       WHERE session_id = ? AND spend_id = ?`,
+    )
+    .get(sessionId, spendId) as Row | undefined;
+  if (!row) {
+    throw Object.assign(new Error("token balance delta references missing registered spend"), {
+      apiError: notFoundError(requestId, "token balance delta references missing registered spend"),
+    });
+  }
+  const maxPriceAtomic = requiredContractUintString(row.max_price_atomic, "spend.maxPriceAtomic", requestId);
+  if (BigInt(maxPriceAtomic) <= 0n) {
+    throw Object.assign(new Error("token balance delta requires a positive spend price"), {
+      apiError: proofBlockedError(requestId, "token balance delta requires a positive spend price"),
+    });
+  }
+  return {
+    spendId: String(row.spend_id),
+    payer: requiredContractAddress(row.payer, "spend.payer", requestId),
+    agentWallet: requiredContractAddress(row.agent_wallet, "spend.agentWallet", requestId),
+    paymentToken: requiredContractAddress(row.payment_token, "spend.paymentToken", requestId),
+    market: requiredContractAddress(row.market, "spend.market", requestId),
+    maxPriceAtomic,
+  };
+}
+
+function requireSettlementForBalanceDelta(
+  ctx: ServiceCtx,
+  sessionId: string,
+  payload: TokenBalanceDeltaVerifyPayload,
+  requestId: string,
+): BalanceDeltaSettlement {
+  const row = payload.settlementEventId
+    ? (ctx.db.sqlite
+        .prepare(
+          `SELECT gate_event_id, finalized_event_id, tx_hash, chain_id, block_number, status
+           FROM gate_chain_events
+           WHERE session_id = ? AND spend_id = ? AND event_kind = 'SpendSettled' AND finalized_event_id = ?
+           LIMIT 1`,
+        )
+        .get(sessionId, payload.spendId, payload.settlementEventId) as Row | undefined)
+    : (ctx.db.sqlite
+        .prepare(
+          `SELECT gate_event_id, finalized_event_id, tx_hash, chain_id, block_number, status
+           FROM gate_chain_events
+           WHERE session_id = ? AND spend_id = ? AND event_kind = 'SpendSettled'
+           ORDER BY block_number DESC, log_index DESC
+           LIMIT 1`,
+        )
+        .get(sessionId, payload.spendId) as Row | undefined);
+  if (!row || row.status !== "finalized" || typeof row.finalized_event_id !== "string") {
+    throw Object.assign(new Error("token balance delta requires a finalized SpendSettled proof event"), {
+      apiError: proofPendingError(requestId, "token balance delta requires a finalized SpendSettled proof event"),
+    });
+  }
+  const eventRow = ctx.db.sqlite
+    .prepare("SELECT kind, authority, payload_json FROM evidence_events WHERE session_id = ? AND event_id = ?")
+    .get(sessionId, row.finalized_event_id) as Row | undefined;
+  if (!eventRow || eventRow.kind !== "gate.spend_settled" || eventRow.authority !== "proof") {
+    throw Object.assign(new Error("token balance delta settlement event is not a proof-authority SpendSettled event"), {
+      apiError: proofBlockedError(requestId, "token balance delta settlement event is not a proof-authority SpendSettled event"),
+    });
+  }
+  let settlementPayload: Record<string, unknown>;
+  try {
+    settlementPayload = JSON.parse(String(eventRow.payload_json)) as Record<string, unknown>;
+  } catch {
+    throw Object.assign(new Error("token balance delta settlement event payload is invalid JSON"), {
+      apiError: proofBlockedError(requestId, "token balance delta settlement event payload is invalid JSON"),
+    });
+  }
+  if (
+    settlementPayload.spendId !== payload.spendId ||
+    settlementPayload.finalityStatus !== "finalized" ||
+    settlementPayload.proofAuthority !== true
+  ) {
+    throw Object.assign(new Error("token balance delta settlement event payload is not finalized for this spend"), {
+      apiError: proofBlockedError(requestId, "token balance delta settlement event payload is not finalized for this spend"),
+    });
+  }
+  return {
+    gateEventId: String(row.gate_event_id),
+    finalizedEventId: String(row.finalized_event_id),
+    txHash: String(row.tx_hash),
+    chainId: String(row.chain_id),
+    blockNumber: Number(row.block_number),
+  };
+}
+
+async function requireChainReadyForBalanceDelta(ctx: ServiceCtx, chainId: string, requestId: string): Promise<void> {
+  let status;
+  try {
+    status = await ctx.chain.status();
+  } catch (error) {
+    throw Object.assign(new Error("chain proof provider readiness check failed"), {
+      apiError: proofPendingError(requestId, chainFailureMessage("chain proof provider readiness check failed", error)),
+    });
+  }
+  if (!status.ready) {
+    throw Object.assign(new Error("chain proof provider is not ready"), {
+      apiError: proofPendingError(requestId, `chain proof provider is not ready: ${status.reason}`),
+    });
+  }
+  assertProviderChainMatchesPayload(status, chainId, requestId, "token balance delta proof");
+}
+
+async function requireErc20TransferLogForBalanceDelta(
+  ctx: ServiceCtx,
+  settlement: BalanceDeltaSettlement,
+  spend: BalanceDeltaSpend,
+  amount: bigint,
+  requestId: string,
+): Promise<{ logIndex: number; rawLogHash: `0x${string}`; topics: string[]; data: string }> {
+  const fromTopic = evmAddressTopic(spend.agentWallet);
+  const toTopic = evmAddressTopic(spend.market);
+  let logs: Record<string, unknown>[];
+  try {
+    logs = await ctx.chain.getLogs({
+      chainId: settlement.chainId,
+      blockNumber: settlement.blockNumber,
+      txHash: settlement.txHash,
+      address: spend.paymentToken,
+      topics: [ERC20_TRANSFER_TOPIC, fromTopic, toTopic],
+    });
+  } catch (error) {
+    throw Object.assign(new Error("failed to fetch ERC20 Transfer logs for token balance delta"), {
+      apiError: proofPendingError(requestId, chainFailureMessage("failed to fetch ERC20 Transfer logs for token balance delta", error)),
+    });
+  }
+  const matching = logs.filter((log) => erc20TransferLogMatchesBalanceDelta(log, settlement, spend, amount, requestId));
+  if (matching.length !== 1) {
+    throw Object.assign(new Error("token balance delta requires exactly one matching ERC20 Transfer log in the SpendSettled transaction"), {
+      apiError: proofBlockedError(requestId, "token balance delta requires exactly one matching ERC20 Transfer log in the SpendSettled transaction", {
+        txHash: settlement.txHash,
+        paymentToken: spend.paymentToken,
+        from: spend.agentWallet,
+        to: spend.market,
+        amountAtomic: amount.toString(),
+        matchingTransferLogCount: matching.length,
+      }),
+    });
+  }
+  const log = matching[0];
+  if (!log) {
+    throw Object.assign(new Error("token balance delta matching Transfer log disappeared during validation"), {
+      apiError: proofBlockedError(requestId, "token balance delta matching Transfer log disappeared during validation"),
+    });
+  }
+  const logIndex = optionalChainNumber(log.logIndex ?? log.index);
+  if (logIndex === null) {
+    throw Object.assign(new Error("matching ERC20 Transfer log is missing logIndex"), {
+      apiError: proofBlockedError(requestId, "matching ERC20 Transfer log is missing logIndex"),
+    });
+  }
+  return {
+    logIndex,
+    rawLogHash: rawLogHashForChainLog(log),
+    topics: chainLogTopics(log.topics, requestId).map((topic) => topic.toLowerCase()),
+    data: (optionalHex(log.data) ?? "0x").toLowerCase(),
+  };
+}
+
+function erc20TransferLogMatchesBalanceDelta(
+  log: Record<string, unknown>,
+  settlement: BalanceDeltaSettlement,
+  spend: BalanceDeltaSpend,
+  amount: bigint,
+  requestId: string,
+): boolean {
+  const txHash = optionalHex(log.transactionHash ?? log.txHash ?? log.hash);
+  if (!txHash || txHash.toLowerCase() !== settlement.txHash.toLowerCase()) {
+    return false;
+  }
+  const blockNumber = optionalChainNumber(log.blockNumber);
+  if (blockNumber === null || blockNumber !== settlement.blockNumber) {
+    return false;
+  }
+  const address = optionalHex(log.address);
+  if (!address || address.toLowerCase() !== spend.paymentToken.toLowerCase()) {
+    return false;
+  }
+  const topics = chainLogTopics(log.topics, requestId).map((topic) => topic.toLowerCase());
+  if (
+    topics[0] !== ERC20_TRANSFER_TOPIC ||
+    topics[1] !== evmAddressTopic(spend.agentWallet) ||
+    topics[2] !== evmAddressTopic(spend.market)
+  ) {
+    return false;
+  }
+  const transferAmount = erc20TransferAmount(log);
+  return transferAmount !== null && transferAmount === amount;
+}
+
+function erc20TransferAmount(log: Record<string, unknown>): bigint | null {
+  const args = log.args && typeof log.args === "object" && !Array.isArray(log.args) ? (log.args as Record<string, unknown>) : {};
+  const decodedValue = args.value ?? args.amount;
+  if (typeof decodedValue === "bigint" && decodedValue >= 0n) {
+    return decodedValue;
+  }
+  if (typeof decodedValue === "number" && Number.isSafeInteger(decodedValue) && decodedValue >= 0) {
+    return BigInt(decodedValue);
+  }
+  if (typeof decodedValue === "string" && /^(0|[1-9][0-9]*)$/.test(decodedValue)) {
+    return BigInt(decodedValue);
+  }
+  const data = optionalHex(log.data);
+  if (!data || !/^0x[0-9a-fA-F]{64}$/.test(data)) {
+    return null;
+  }
+  return BigInt(data);
+}
+
+function evmAddressTopic(address: string): string {
+  return `0x${address.toLowerCase().replace(/^0x/, "").padStart(64, "0")}`;
+}
+
+async function readErc20Balance(
+  ctx: ServiceCtx,
+  paymentToken: `0x${string}`,
+  account: `0x${string}`,
+  blockNumber: number,
+  requestId: string,
+): Promise<bigint> {
+  let result: unknown;
+  try {
+    result = await ctx.chain.readContract({
+      address: paymentToken,
+      abi: ERC20_BALANCE_OF_ABI,
+      functionName: "balanceOf",
+      args: [account],
+      blockNumber,
+    });
+  } catch (error) {
+    throw contractReadApiError("failed to read ERC20 balanceOf for token balance delta", error, requestId);
+  }
+  return contractUintBigInt(result, "ERC20.balanceOf", requestId);
+}
+
+function contractUintBigInt(value: unknown, field: string, requestId: string): bigint {
+  if (typeof value === "bigint" && value >= 0n) {
+    return value;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    return BigInt(value);
+  }
+  if (typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value)) {
+    return BigInt(value);
+  }
+  throw Object.assign(new Error(`${field} must be a non-negative uint value`), {
+    apiError: proofBlockedError(requestId, `${field} must be a non-negative uint value`),
+  });
+}
+
 async function verifyGateEventWithChain(
   ctx: ServiceCtx,
   payload: {
@@ -5557,13 +6009,23 @@ async function reconcileIndexedGateEvent(
     ctx.db.sqlite
       .prepare("UPDATE spends SET status = ? WHERE session_id = ? AND spend_id = ?")
       .run(gateSpendStatus(semantic.event, "finalized"), semantic.sessionId, semantic.spendId);
-    updateJudgeCheckRow(ctx, semantic.sessionId, {
-      rowId: semantic.event === "SpendTripped" ? "ab_trip" : "c_settlement",
-      status: "pass",
-      authority: "proof",
-      reason: `indexed public-chain ${semantic.event} log finalized from cursor ${row.cursor_id}`,
-      evidenceEventId: proofEvent.eventId,
-    });
+    if (semantic.event === "SpendTripped") {
+      updateJudgeCheckRow(ctx, semantic.sessionId, {
+        rowId: "ab_trip",
+        status: "pass",
+        authority: "proof",
+        reason: `indexed public-chain ${semantic.event} log finalized from cursor ${row.cursor_id}`,
+        evidenceEventId: proofEvent.eventId,
+      });
+    } else {
+      updateJudgeCheckRow(ctx, semantic.sessionId, {
+        rowId: "c_settlement",
+        status: "pending",
+        authority: "proof",
+        reason: `indexed public-chain ${semantic.event} log finalized from cursor ${row.cursor_id}; awaiting ERC20 balance delta proof`,
+        evidenceEventId: proofEvent.eventId,
+      });
+    }
     return 1;
   });
 }
@@ -7845,6 +8307,146 @@ function verifyGateFinalityIntegrity(ctx: ServiceCtx, sessionId: string): string
   return errors;
 }
 
+function verifyTokenBalanceDeltaIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  const errors: string[] = [];
+  const events = (
+    ctx.db.sqlite
+      .prepare(
+        `SELECT *
+         FROM evidence_events
+         WHERE session_id = ? AND kind = 'token.balance_delta.verified'
+         ORDER BY event_seq ASC`,
+      )
+      .all(sessionId) as Row[]
+  ).map(evidenceEventFromRow);
+  for (const event of events) {
+    const payload = event.payload;
+    const label = `token balance delta event ${event.eventId}`;
+    if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
+      errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
+    }
+    const spendId = typeof payload.spendId === "string" ? payload.spendId : "";
+    const spend = ctx.db.sqlite
+      .prepare(
+        `SELECT spend_id, payer, agent_wallet, payment_token, market, max_price_atomic
+         FROM spends
+         WHERE session_id = ? AND spend_id = ?`,
+      )
+      .get(sessionId, spendId) as Row | undefined;
+    if (!spend) {
+      errors.push(`${label} references missing registered spend`);
+      continue;
+    }
+    const amount = eventDecimalBigInt(payload.amountAtomic);
+    const spendAmount = eventDecimalBigInt(spend.max_price_atomic);
+    if (amount === null || spendAmount === null || amount !== spendAmount) {
+      errors.push(`${label} amountAtomic does not match registered spend price`);
+    }
+    const expectedFields = [
+      ["paymentToken", spend.payment_token],
+      ["payer", spend.payer],
+      ["agentWallet", spend.agent_wallet],
+      ["market", spend.market],
+    ] as const;
+    for (const [field, expected] of expectedFields) {
+      if (typeof payload[field] !== "string" || String(payload[field]).toLowerCase() !== String(expected).toLowerCase()) {
+        errors.push(`${label} payload.${field} does not match registered spend`);
+      }
+    }
+    if (String(spend.payer).toLowerCase() !== String(spend.agent_wallet).toLowerCase() || payload.payerAgentWalletSame !== true) {
+      errors.push(`${label} requires payerAgentWalletSame=true until wallet ownership proof exists`);
+    }
+    const settlementEventId = typeof payload.settlementEventId === "string" ? payload.settlementEventId : "";
+    const settlementEvent = ctx.db.sqlite
+      .prepare("SELECT kind, authority, payload_json FROM evidence_events WHERE session_id = ? AND event_id = ?")
+      .get(sessionId, settlementEventId) as Row | undefined;
+    if (!settlementEvent || settlementEvent.kind !== "gate.spend_settled" || settlementEvent.authority !== "proof") {
+      errors.push(`${label} references missing proof-authority gate.spend_settled event`);
+    } else {
+      let settlementPayload: Record<string, unknown> | null = null;
+      try {
+        settlementPayload = JSON.parse(String(settlementEvent.payload_json)) as Record<string, unknown>;
+      } catch {
+        errors.push(`${label} settlement event payload is invalid JSON`);
+      }
+      if (settlementPayload) {
+        const settlementFields = ["gateEventId", "spendId", "txHash", "chainId", "blockNumber"] as const;
+        for (const field of settlementFields) {
+          if (payload[field] !== settlementPayload[field]) {
+            errors.push(`${label} payload.${field} does not match settlement event`);
+          }
+        }
+        if (settlementPayload.finalityStatus !== "finalized" || settlementPayload.proofAuthority !== true) {
+          errors.push(`${label} settlement event is not finalized proof authority`);
+        }
+      }
+    }
+    const gateRow = ctx.db.sqlite
+      .prepare(
+        `SELECT spend_id, event_kind, status, tx_hash, chain_id, block_number, finalized_event_id
+         FROM gate_chain_events
+         WHERE session_id = ? AND finalized_event_id = ?`,
+      )
+      .get(sessionId, settlementEventId) as Row | undefined;
+    if (!gateRow || gateRow.event_kind !== "SpendSettled" || gateRow.status !== "finalized" || gateRow.spend_id !== spendId) {
+      errors.push(`${label} is not bound to a finalized SpendSettled gate row`);
+    }
+    if (Number(payload.preBlockNumber) !== Number(payload.blockNumber) - 1) {
+      errors.push(`${label} preBlockNumber must equal blockNumber - 1`);
+    }
+    if (amount !== null) {
+      const agentBefore = eventDecimalBigInt(payload.agentWalletBefore);
+      const agentAfter = eventDecimalBigInt(payload.agentWalletAfter);
+      const marketBefore = eventDecimalBigInt(payload.marketBefore);
+      const marketAfter = eventDecimalBigInt(payload.marketAfter);
+      if (agentBefore === null || agentAfter === null || agentBefore - agentAfter !== amount) {
+        errors.push(`${label} agent wallet balance delta does not match amountAtomic`);
+      }
+      if (marketBefore === null || marketAfter === null || marketAfter - marketBefore !== amount) {
+        errors.push(`${label} market balance delta does not match amountAtomic`);
+      }
+      if (payload.agentDeltaAtomic !== `-${amount.toString()}` || payload.marketDeltaAtomic !== amount.toString()) {
+        errors.push(`${label} signed delta fields do not match amountAtomic`);
+      }
+      const topics = Array.isArray(payload.transferTopics) ? payload.transferTopics.map((topic) => String(topic).toLowerCase()) : [];
+      if (
+        topics[0] !== ERC20_TRANSFER_TOPIC ||
+        topics[1] !== evmAddressTopic(String(spend.agent_wallet)) ||
+        topics[2] !== evmAddressTopic(String(spend.market))
+      ) {
+        errors.push(`${label} transferTopics do not bind ERC20 Transfer(from=agentWallet,to=market)`);
+      }
+      if (String(payload.transferData ?? "").toLowerCase() !== uint256Data(amount)) {
+        errors.push(`${label} transferData does not encode amountAtomic`);
+      }
+    }
+    if (!Number.isInteger(Number(payload.transferLogIndex)) || Number(payload.transferLogIndex) < 0) {
+      errors.push(`${label} requires transferLogIndex`);
+    }
+    if (typeof payload.transferRawLogHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(payload.transferRawLogHash)) {
+      errors.push(`${label} requires transferRawLogHash`);
+    }
+  }
+  return errors;
+}
+
+function eventDecimalBigInt(value: unknown): bigint | null {
+  if (typeof value === "bigint" && value >= 0n) {
+    return value;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    return BigInt(value);
+  }
+  if (typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value)) {
+    return BigInt(value);
+  }
+  return null;
+}
+
+function uint256Data(value: bigint): string {
+  return `0x${value.toString(16).padStart(64, "0")}`;
+}
+
 function verifyArtifactAccessTokenIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   const errors: string[] = [];
   const rows = ctx.db.sqlite
@@ -7944,20 +8546,26 @@ function verifyArtifactAccessTokenIntegrity(ctx: ServiceCtx, sessionId: string):
     ) {
       errors.push(`artifact token ${tokenId} is not bound to its quote artifact commitment`);
     }
-    const settlement = ctx.db.sqlite
-      .prepare(
-        `SELECT spend_id, event_kind, status, finalized_event_id
-         FROM gate_chain_events
-         WHERE session_id = ? AND finalized_event_id = ?`,
-      )
+    const settlementEvent = ctx.db.sqlite
+      .prepare("SELECT kind, authority, payload_json FROM evidence_events WHERE session_id = ? AND event_id = ?")
       .get(sessionId, settlementEventId) as Row | undefined;
-    if (
-      !settlement ||
-      settlement.spend_id !== row.spend_id ||
-      settlement.event_kind !== "SpendSettled" ||
-      settlement.status !== "finalized"
-    ) {
-      errors.push(`artifact token ${tokenId} is not bound to a finalized SpendSettled event`);
+    let tokenSettlementPayload: Record<string, unknown> | null = null;
+    if (!settlementEvent || settlementEvent.kind !== "token.balance_delta.verified" || settlementEvent.authority !== "proof") {
+      errors.push(`artifact token ${tokenId} is not bound to a token balance delta proof event`);
+    } else {
+      try {
+        tokenSettlementPayload = JSON.parse(String(settlementEvent.payload_json)) as Record<string, unknown>;
+      } catch {
+        errors.push(`artifact token ${tokenId} token balance delta payload is invalid JSON`);
+      }
+      if (
+        !tokenSettlementPayload ||
+        tokenSettlementPayload.spendId !== row.spend_id ||
+        tokenSettlementPayload.proofAuthority !== true ||
+        tokenSettlementPayload.winnerClaimAllowed !== false
+      ) {
+        errors.push(`artifact token ${tokenId} token balance delta proof is not bound to the token spend`);
+      }
     }
     const event = issuedByTokenId.get(tokenId);
     if (!event) {
@@ -7981,6 +8589,9 @@ function verifyArtifactAccessTokenIntegrity(ctx: ServiceCtx, sessionId: string):
       if (event.payload[field] !== expected) {
         errors.push(`artifact access token event ${event.eventId} payload.${field} does not match active token row`);
       }
+    }
+    if (tokenSettlementPayload && event.payload.gateSettlementEventId !== tokenSettlementPayload.settlementEventId) {
+      errors.push(`artifact access token event ${event.eventId} gateSettlementEventId does not match token balance delta proof`);
     }
     if (event.authority !== "delivery" || event.payload.proofAuthority !== false || event.payload.winnerClaimAllowed !== false) {
       errors.push(`artifact access token event ${event.eventId} does not carry delivery-only fail-closed payload`);
