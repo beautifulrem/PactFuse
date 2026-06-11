@@ -3,6 +3,10 @@ import {
   ArtifactPreflightPayloadSchema,
   ArtifactRefundPayloadSchema,
   CawOperationBuildPayloadSchema,
+  ChainIndexedLogViewSchema,
+  ChainIndexerBackfillInputSchema,
+  ChainIndexerBackfillResultSchema,
+  ChainIndexerStatusViewSchema,
   CanonicalCawReceiptViewSchema,
   CawReceiptIngestPayloadSchema,
   CawReceiptOperationViewSchema,
@@ -36,6 +40,7 @@ import {
   type ReplayBundleView,
   type SessionScopedEnvelope,
   type SessionView,
+  type ChainIndexerBackfillInput,
   type VerifierRunView,
 } from "@pactfuse/evidence-schema";
 import type { ProofProviderStatus, ServiceCtx, ServiceResult } from "../types.js";
@@ -56,6 +61,21 @@ import {
 } from "../util.js";
 
 type Row = Record<string, unknown>;
+type ChainIndexerBackfillPayload = ChainIndexerBackfillInput["payload"];
+type NormalizedIndexedChainLog = {
+  logId: `0x${string}`;
+  cursorId: string;
+  chainId: string;
+  blockNumber: number;
+  txHash: `0x${string}`;
+  logIndex: number;
+  address: string | null;
+  topics: string[];
+  data: string | null;
+  rawLogHash: `0x${string}`;
+  createdAt: string;
+  raw: JsonValue;
+};
 type CawReceiptIngestData = {
   receiptBundleHash: `0x${string}`;
   rawReceiptBundleHash?: `0x${string}`;
@@ -698,6 +718,30 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
 
       if (confirmations < finalityDepth) {
         if (existing) {
+          if (existing.status === "finalized") {
+            if (typeof existing.finalized_event_id !== "string") {
+              throw Object.assign(new Error("finalized gate event is missing its proof event id"), {
+                apiError: proofBlockedError(requestId, "finalized gate event is missing its proof event id"),
+              });
+            }
+            return {
+              ok: true,
+              requestId,
+              evidenceEventId: existing.finalized_event_id,
+              data: {
+                gateEventId,
+                spendId: gatePayload.spendId,
+                event: gatePayload.event,
+                finalityStatus: "finalized",
+                confirmations: Number(existing.confirmations),
+                finalityDepth: Number(existing.finality_depth),
+                observedEventId,
+                finalizedEventId: existing.finalized_event_id,
+                proofAuthority: true,
+                winnerClaimAllowed: false,
+              },
+            };
+          }
           ctx.db.sqlite
             .prepare(
               `UPDATE gate_chain_events
@@ -763,6 +807,148 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
       };
     });
   });
+}
+
+export async function indexChainWindow(input: ChainIndexerBackfillInput, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
+  const parsed = parseStrict(ChainIndexerBackfillInputSchema, input);
+  return withProcessLock(`indexer:cursor:${parsed.payload.cursorId}`, () =>
+    withIdempotency(ctx, `indexer:backfill:${parsed.payload.cursorId}`, parsed.idempotencyKey, parsed, async (requestId) => {
+      const payload = parsed.payload;
+      const cursor = readIndexerCursor(ctx, payload.cursorId);
+      assertIndexerCursorMatchesPayload(cursor, payload, requestId);
+      const lastIndexedBlock = optionalChainNumber(cursor?.last_indexed_block);
+      const provider = await safeChainProviderStatus(ctx);
+      if (!provider.ready) {
+        markIndexerCursorDegraded(ctx, payload, 0, 0, lastIndexedBlock, requestId, `chain indexer provider is not ready: ${provider.reason}`);
+        throw Object.assign(new Error("chain indexer provider is not ready"), {
+          apiError: proofPendingError(requestId, `chain indexer provider is not ready: ${provider.reason}`),
+        });
+      }
+      assertProviderChainMatchesPayload(provider, payload.chainId, requestId, "chain indexer");
+      let latestHeadBlock: number;
+      try {
+        latestHeadBlock = await ctx.chain.getBlockNumber();
+      } catch (error) {
+        markIndexerCursorDegraded(ctx, payload, 0, 0, lastIndexedBlock, requestId, chainFailureMessage("failed to read chain head", error));
+        throw Object.assign(new Error("failed to read chain head for indexer backfill"), {
+          apiError: proofPendingError(requestId, chainFailureMessage("failed to read chain head for indexer backfill", error)),
+        });
+      }
+      if (!Number.isInteger(latestHeadBlock) || latestHeadBlock < 0) {
+        markIndexerCursorDegraded(ctx, payload, 0, 0, lastIndexedBlock, requestId, "chain provider returned an invalid head block");
+        throw Object.assign(new Error("chain provider returned an invalid head block"), {
+          apiError: proofBlockedError(requestId, "chain provider returned an invalid head block", { latestHeadBlock }),
+        });
+      }
+
+      const finalizedHeadBlock = Math.max(0, latestHeadBlock - payload.finalityDepth + 1);
+      const { fromBlock, cappedToBlock } = resolveIndexerWindow(payload, lastIndexedBlock, finalizedHeadBlock, requestId);
+      if (cappedToBlock < fromBlock) {
+        const cursorView = upsertIndexerCursor(ctx, {
+          payload,
+          lastIndexedBlock,
+          latestHeadBlock,
+          finalizedHeadBlock,
+          reason: "indexer cursor is already at or ahead of the finalized head",
+          requestId,
+        });
+        return {
+          ok: true,
+          requestId,
+          data: ChainIndexerBackfillResultSchema.parse({
+            cursor: cursorView,
+            fromBlock,
+            toBlock: fromBlock,
+            indexedLogCount: 0,
+            insertedLogCount: 0,
+            proofAuthority: false,
+            winnerClaimAllowed: false,
+          }),
+        };
+      }
+
+      let logs: Record<string, unknown>[];
+      try {
+        logs = await ctx.chain.getLogs({
+          chainId: payload.chainId,
+          fromBlock,
+          toBlock: cappedToBlock,
+          address: payload.address,
+          topics: payload.topics,
+        });
+      } catch (error) {
+        markIndexerCursorDegraded(
+          ctx,
+          payload,
+          latestHeadBlock,
+          finalizedHeadBlock,
+          lastIndexedBlock,
+          requestId,
+          chainFailureMessage("chain log backfill failed", error),
+        );
+        throw Object.assign(new Error("chain log backfill failed"), {
+          apiError: proofPendingError(requestId, chainFailureMessage("chain log backfill failed", error)),
+        });
+      }
+
+      let insertedLogCount = 0;
+      const createdAt = ctx.clock.now().toISOString();
+      const normalizedLogs = logs.map((log) => normalizeIndexedChainLog(payload.cursorId, payload.chainId, log, requestId, createdAt));
+      const cursorView = withImmediateTransaction(ctx, () => {
+        assertIndexerCursorMatchesPayload(readIndexerCursor(ctx, payload.cursorId), payload, requestId);
+        for (const log of normalizedLogs) {
+          insertedLogCount += insertIndexedChainLogExactOnce(ctx, log, requestId);
+        }
+        return upsertIndexerCursor(ctx, {
+          payload,
+          lastIndexedBlock: cappedToBlock,
+          latestHeadBlock,
+          finalizedHeadBlock,
+          reason:
+            cappedToBlock < finalizedHeadBlock
+              ? "indexer backfilled a capped window and remains behind finalized head"
+              : "indexer cursor caught up to finalized head",
+          requestId,
+        });
+      });
+      return {
+        ok: true,
+        requestId,
+        data: ChainIndexerBackfillResultSchema.parse({
+          cursor: cursorView,
+          fromBlock,
+          toBlock: cappedToBlock,
+          indexedLogCount: normalizedLogs.length,
+          insertedLogCount,
+          proofAuthority: false,
+          winnerClaimAllowed: false,
+        }),
+      };
+    }),
+  );
+}
+
+export async function readChainIndexerStatus(ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
+  const requestId = newRequestId("indexer_status");
+  const provider = await safeChainProviderStatus(ctx);
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM chain_indexer_cursors
+       ORDER BY updated_at DESC, cursor_id ASC
+       LIMIT 50`,
+    )
+    .all() as Row[];
+  return {
+    ok: true,
+    requestId,
+    data: {
+      provider,
+      cursors: rows.map(indexerCursorViewFromRow),
+      proofAuthority: false,
+      winnerClaimAllowed: false,
+    },
+  };
 }
 
 export async function runArtifactPreflight(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
@@ -1104,6 +1290,7 @@ async function buildVerifierRunView(
     ...verifyEventLogIntegrity(ctx, sessionId),
     ...verifyMcpAdapterCallIntegrity(ctx, sessionId),
     ...verifyGateFinalityIntegrity(ctx, sessionId),
+    ...verifyIndexerCursorIntegrity(ctx),
     ...verifyReplayBundleBindings(ctx, sessionId, payload),
   ];
   const rawErrors = toStringArray(raw.errors);
@@ -1770,6 +1957,267 @@ function isInTransaction(ctx: ServiceCtx): boolean {
   return Boolean((ctx.db.sqlite as unknown as { isTransaction?: boolean }).isTransaction);
 }
 
+async function safeChainProviderStatus(ctx: ServiceCtx): Promise<ProofProviderStatus> {
+  try {
+    return await ctx.chain.status();
+  } catch (error) {
+    return {
+      name: "chain",
+      mode: "live",
+      ready: false,
+      reason: error instanceof Error ? error.message : "chain proof provider readiness check failed",
+    };
+  }
+}
+
+function readIndexerCursor(ctx: ServiceCtx, cursorId: string): Row | undefined {
+  return ctx.db.sqlite.prepare("SELECT * FROM chain_indexer_cursors WHERE cursor_id = ?").get(cursorId) as Row | undefined;
+}
+
+function assertProviderChainMatchesPayload(status: ProofProviderStatus, expectedChainId: string, requestId: string, purpose: string): void {
+  if (!status.chainId) {
+    throw Object.assign(new Error(`${purpose} provider did not report a chainId`), {
+      apiError: proofPendingError(requestId, `${purpose} provider did not report a chainId`),
+    });
+  }
+  if (status.chainId !== expectedChainId) {
+    throw Object.assign(new Error(`${purpose} chainId mismatch`), {
+      apiError: proofBlockedError(requestId, `${purpose} chainId mismatch`, {
+        expected: expectedChainId,
+        actual: status.chainId,
+      }),
+    });
+  }
+}
+
+function assertIndexerCursorMatchesPayload(cursor: Row | undefined, payload: ChainIndexerBackfillPayload, requestId: string): void {
+  if (!cursor) {
+    return;
+  }
+  const expectedTopics = canonicalizeJson(payload.topics);
+  const cursorAddress = typeof cursor.address === "string" ? cursor.address.toLowerCase() : null;
+  const payloadAddress = payload.address ? payload.address.toLowerCase() : null;
+  const mismatches: Record<string, JsonValue> = {};
+  if (String(cursor.chain_id) !== payload.chainId) {
+    mismatches.chainId = { existing: String(cursor.chain_id), requested: payload.chainId };
+  }
+  if (cursorAddress !== payloadAddress) {
+    mismatches.address = { existing: cursor.address === null ? null : String(cursor.address), requested: payload.address ?? null };
+  }
+  if (String(cursor.topics_json) !== expectedTopics) {
+    mismatches.topics = { existing: JSON.parse(String(cursor.topics_json)) as JsonValue, requested: payload.topics };
+  }
+  if (Number(cursor.finality_depth) !== payload.finalityDepth) {
+    mismatches.finalityDepth = { existing: Number(cursor.finality_depth), requested: payload.finalityDepth };
+  }
+  if (Object.keys(mismatches).length > 0) {
+    throw Object.assign(new Error("chain indexer cursor configuration cannot change without a new cursorId"), {
+      apiError: proofBlockedError(requestId, "chain indexer cursor configuration cannot change without a new cursorId", mismatches),
+    });
+  }
+}
+
+function resolveIndexerWindow(
+  payload: ChainIndexerBackfillPayload,
+  lastIndexedBlock: number | null,
+  finalizedHeadBlock: number,
+  requestId: string,
+): { fromBlock: number; cappedToBlock: number } {
+  const requestedToBlock = payload.toBlock ?? finalizedHeadBlock;
+  if (lastIndexedBlock !== null && payload.fromBlock !== undefined) {
+    const expectedNextBlock = lastIndexedBlock + 1;
+    if (payload.fromBlock > expectedNextBlock) {
+      throw Object.assign(new Error("chain indexer backfill cannot skip a cursor gap"), {
+        apiError: proofBlockedError(requestId, "chain indexer backfill cannot skip a cursor gap", {
+          cursorId: payload.cursorId,
+          lastIndexedBlock,
+          requestedFromBlock: payload.fromBlock,
+          expectedNextBlock,
+        }),
+      });
+    }
+    if (payload.fromBlock < expectedNextBlock && requestedToBlock > lastIndexedBlock) {
+      throw Object.assign(new Error("chain indexer overlapping backfill cannot advance the cursor"), {
+        apiError: proofBlockedError(requestId, "chain indexer overlapping backfill cannot advance the cursor", {
+          cursorId: payload.cursorId,
+          lastIndexedBlock,
+          requestedFromBlock: payload.fromBlock,
+          requestedToBlock,
+          expectedNextBlock,
+        }),
+      });
+    }
+  }
+  const fromBlock = payload.fromBlock ?? (lastIndexedBlock === null ? 0 : lastIndexedBlock + 1);
+  return {
+    fromBlock,
+    cappedToBlock: Math.min(requestedToBlock, finalizedHeadBlock, fromBlock + payload.maxWindowBlocks - 1),
+  };
+}
+
+function insertIndexedChainLogExactOnce(ctx: ServiceCtx, log: NormalizedIndexedChainLog, requestId: string): number {
+  const rawLogJson = canonicalizeJson(log.raw);
+  const existing = ctx.db.sqlite
+    .prepare(
+      `SELECT log_id, raw_log_hash, raw_log_json
+       FROM chain_indexed_logs
+       WHERE chain_id = ? AND tx_hash = ? AND log_index = ?`,
+    )
+    .get(log.chainId, log.txHash, log.logIndex) as Row | undefined;
+  if (existing) {
+    if (String(existing.log_id).toLowerCase() !== log.logId.toLowerCase()) {
+      throw Object.assign(new Error("indexed chain log id conflict"), {
+        apiError: proofBlockedError(requestId, "indexed chain log id conflict", {
+          expected: log.logId,
+          actual: String(existing.log_id),
+        }),
+      });
+    }
+    if (String(existing.raw_log_hash).toLowerCase() !== log.rawLogHash.toLowerCase()) {
+      throw Object.assign(new Error("indexed chain log rawLogHash conflict"), {
+        apiError: proofBlockedError(requestId, "indexed chain log rawLogHash conflict", {
+          chainId: log.chainId,
+          txHash: log.txHash,
+          logIndex: log.logIndex,
+          expected: String(existing.raw_log_hash),
+          actual: log.rawLogHash,
+        }),
+      });
+    }
+    if (String(existing.raw_log_json) !== rawLogJson) {
+      throw Object.assign(new Error("indexed chain log raw JSON conflict"), {
+        apiError: proofBlockedError(requestId, "indexed chain log raw JSON conflict", {
+          chainId: log.chainId,
+          txHash: log.txHash,
+          logIndex: log.logIndex,
+        }),
+      });
+    }
+    return 0;
+  }
+  const result = ctx.db.sqlite
+    .prepare(
+      `INSERT INTO chain_indexed_logs
+        (log_id, cursor_id, chain_id, block_number, tx_hash, log_index, address, topics_json, data, raw_log_hash, raw_log_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      log.logId,
+      log.cursorId,
+      log.chainId,
+      log.blockNumber,
+      log.txHash,
+      log.logIndex,
+      log.address,
+      canonicalizeJson(log.topics),
+      log.data,
+      log.rawLogHash,
+      rawLogJson,
+      log.createdAt,
+    );
+  return Number(result.changes);
+}
+
+function markIndexerCursorDegraded(
+  ctx: ServiceCtx,
+  payload: ChainIndexerBackfillPayload,
+  latestHeadBlock: number,
+  finalizedHeadBlock: number,
+  lastIndexedBlock: number | null,
+  requestId: string,
+  reason: string,
+): void {
+  upsertIndexerCursor(ctx, {
+    payload,
+    lastIndexedBlock,
+    latestHeadBlock,
+    finalizedHeadBlock,
+    reason,
+    requestId,
+    forceStatus: "degraded",
+  });
+}
+
+function upsertIndexerCursor(
+  ctx: ServiceCtx,
+  input: {
+    payload: ChainIndexerBackfillPayload;
+    lastIndexedBlock: number | null;
+    latestHeadBlock: number;
+    finalizedHeadBlock: number;
+    reason: string;
+    requestId: string;
+    forceStatus?: "degraded" | undefined;
+  },
+) {
+  const existing = readIndexerCursor(ctx, input.payload.cursorId);
+  assertIndexerCursorMatchesPayload(existing, input.payload, input.requestId);
+  const createdAt = typeof existing?.created_at === "string" ? existing.created_at : ctx.clock.now().toISOString();
+  const updatedAt = ctx.clock.now().toISOString();
+  const existingLastIndexedBlock = optionalChainNumber(existing?.last_indexed_block);
+  const nextLastIndexedBlock =
+    existingLastIndexedBlock === null
+      ? input.lastIndexedBlock
+      : input.lastIndexedBlock === null
+        ? existingLastIndexedBlock
+        : Math.max(existingLastIndexedBlock, input.lastIndexedBlock);
+  const lagBlocks =
+    nextLastIndexedBlock === null ? input.finalizedHeadBlock + 1 : Math.max(0, input.finalizedHeadBlock - nextLastIndexedBlock);
+  const status = input.forceStatus ?? (lagBlocks === 0 ? "caught_up" : "degraded");
+  ctx.db.sqlite
+    .prepare(
+      `INSERT INTO chain_indexer_cursors
+        (cursor_id, chain_id, address, topics_json, last_indexed_block, latest_head_block, finalized_head_block,
+         finality_depth, lag_blocks, status, reason, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(cursor_id) DO UPDATE SET
+         chain_id = excluded.chain_id,
+         address = excluded.address,
+         topics_json = excluded.topics_json,
+         last_indexed_block = excluded.last_indexed_block,
+         latest_head_block = excluded.latest_head_block,
+         finalized_head_block = excluded.finalized_head_block,
+         finality_depth = excluded.finality_depth,
+         lag_blocks = excluded.lag_blocks,
+         status = excluded.status,
+         reason = excluded.reason,
+         updated_at = excluded.updated_at`,
+    )
+    .run(
+      input.payload.cursorId,
+      input.payload.chainId,
+      input.payload.address ?? null,
+      canonicalizeJson(input.payload.topics),
+      nextLastIndexedBlock,
+      input.latestHeadBlock,
+      input.finalizedHeadBlock,
+      input.payload.finalityDepth,
+      lagBlocks,
+      status,
+      input.reason,
+      createdAt,
+      updatedAt,
+    );
+  return indexerCursorViewFromRow(readIndexerCursor(ctx, input.payload.cursorId) as Row);
+}
+
+function indexerCursorViewFromRow(row: Row) {
+  return ChainIndexerStatusViewSchema.parse({
+    cursorId: row.cursor_id,
+    chainId: row.chain_id,
+    address: row.address ?? null,
+    topics: JSON.parse(String(row.topics_json)),
+    lastIndexedBlock: row.last_indexed_block ?? null,
+    latestHeadBlock: Number(row.latest_head_block),
+    finalizedHeadBlock: Number(row.finalized_head_block),
+    finalityDepth: Number(row.finality_depth),
+    lagBlocks: Number(row.lag_blocks),
+    status: row.status,
+    reason: row.reason,
+    updatedAt: row.updated_at,
+  });
+}
+
 function getSessionRow(ctx: ServiceCtx, sessionId: string): Row | undefined {
   return ctx.db.sqlite.prepare("SELECT * FROM sessions WHERE session_id = ?").get(sessionId) as Row | undefined;
 }
@@ -2328,6 +2776,7 @@ async function verifyGateEventWithChain(
       apiError: proofPendingError(requestId, `chain proof provider is not ready: ${status.reason}`),
     });
   }
+  assertProviderChainMatchesPayload(status, payload.chainId, requestId, "gate proof");
 
   let currentBlockNumber: number;
   try {
@@ -2402,6 +2851,87 @@ async function verifyGateEventWithChain(
     currentBlockNumber,
     confirmations: currentBlockNumber - payload.blockNumber + 1,
   };
+}
+
+function normalizeIndexedChainLog(
+  cursorId: string,
+  chainId: string,
+  log: Record<string, unknown>,
+  requestId: string,
+  createdAt: string,
+): NormalizedIndexedChainLog {
+  const blockNumber = optionalChainNumber(log.blockNumber);
+  if (blockNumber === null) {
+    throw Object.assign(new Error("indexed chain log is missing blockNumber"), {
+      apiError: proofBlockedError(requestId, "indexed chain log is missing blockNumber"),
+    });
+  }
+  const txHash = requiredChainHex32(log.transactionHash ?? log.txHash ?? log.hash, "transactionHash", requestId);
+  const logIndex = optionalChainNumber(log.logIndex ?? log.index);
+  if (logIndex === null) {
+    throw Object.assign(new Error("indexed chain log is missing logIndex"), {
+      apiError: proofBlockedError(requestId, "indexed chain log is missing logIndex"),
+    });
+  }
+  const logChainId = optionalString(log.chainId);
+  if (logChainId && logChainId !== chainId) {
+    throw Object.assign(new Error("indexed chain log chainId mismatch"), {
+      apiError: proofBlockedError(requestId, "indexed chain log chainId mismatch", { expected: chainId, actual: logChainId }),
+    });
+  }
+  const topics = chainLogTopics(log.topics, requestId);
+  const data = optionalHex(log.data) ?? null;
+  const address = optionalHex(log.address) ?? null;
+  const raw = normalizeChainJson(log);
+  const view = ChainIndexedLogViewSchema.parse({
+    logId: hashJson({ chainId, txHash, logIndex }),
+    cursorId,
+    chainId,
+    blockNumber,
+    txHash,
+    logIndex,
+    address,
+    topics,
+    data,
+    rawLogHash: rawLogHashForChainLog(log),
+    createdAt,
+  }) as Omit<NormalizedIndexedChainLog, "raw">;
+  return {
+    ...view,
+    raw,
+  };
+}
+
+function chainLogTopics(value: unknown, requestId: string): string[] {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw Object.assign(new Error("indexed chain log topics must be an array"), {
+      apiError: proofBlockedError(requestId, "indexed chain log topics must be an array"),
+    });
+  }
+  return value.map((topic) => requiredChainHex(topic, "topic", requestId));
+}
+
+function requiredChainHex(value: unknown, field: string, requestId: string): string {
+  const hex = optionalHex(value);
+  if (!hex) {
+    throw Object.assign(new Error(`indexed chain log ${field} must be hex`), {
+      apiError: proofBlockedError(requestId, `indexed chain log ${field} must be hex`),
+    });
+  }
+  return hex;
+}
+
+function requiredChainHex32(value: unknown, field: string, requestId: string): `0x${string}` {
+  const hex = requiredChainHex(value, field, requestId);
+  if (!Hex32Schema.safeParse(hex).success) {
+    throw Object.assign(new Error(`indexed chain log ${field} must be 32-byte hex`), {
+      apiError: proofBlockedError(requestId, `indexed chain log ${field} must be 32-byte hex`),
+    });
+  }
+  return hex as `0x${string}`;
 }
 
 function assertReceiptMatchesGatePayload(
@@ -3236,6 +3766,26 @@ function verifyGateFinalityIntegrity(ctx: ServiceCtx, sessionId: string): string
     }
     if (payload.finalityStatus !== "finalized" || payload.proofAuthority !== true) {
       errors.push(`gate proof event ${event.eventId} does not carry finalized proof authority payload`);
+    }
+  }
+  return errors;
+}
+
+function verifyIndexerCursorIntegrity(ctx: ServiceCtx): string[] {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT cursor_id, last_indexed_block, finalized_head_block, lag_blocks, status, reason
+       FROM chain_indexer_cursors
+       ORDER BY cursor_id ASC`,
+    )
+    .all() as Row[];
+  const errors: string[] = [];
+  for (const row of rows) {
+    const lagBlocks = Number(row.lag_blocks);
+    if (row.status !== "caught_up" || lagBlocks > 0) {
+      errors.push(
+        `chain indexer cursor ${row.cursor_id} is ${row.status} with lagBlocks=${lagBlocks}; proof path is fail-closed: ${row.reason}`,
+      );
     }
   }
   return errors;

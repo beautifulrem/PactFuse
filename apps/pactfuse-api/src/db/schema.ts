@@ -133,6 +133,43 @@ export const gateChainEvents = sqliteTable(
   }),
 );
 
+export const chainIndexerCursors = sqliteTable("chain_indexer_cursors", {
+  cursorId: text("cursor_id").primaryKey(),
+  chainId: text("chain_id").notNull(),
+  address: text("address"),
+  topicsJson: text("topics_json").notNull(),
+  lastIndexedBlock: integer("last_indexed_block"),
+  latestHeadBlock: integer("latest_head_block").notNull(),
+  finalizedHeadBlock: integer("finalized_head_block").notNull(),
+  finalityDepth: integer("finality_depth").notNull(),
+  lagBlocks: integer("lag_blocks").notNull(),
+  status: text("status").notNull(),
+  reason: text("reason").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const chainIndexedLogs = sqliteTable(
+  "chain_indexed_logs",
+  {
+    logId: text("log_id").primaryKey(),
+    cursorId: text("cursor_id").notNull(),
+    chainId: text("chain_id").notNull(),
+    blockNumber: integer("block_number").notNull(),
+    txHash: text("tx_hash").notNull(),
+    logIndex: integer("log_index").notNull(),
+    address: text("address"),
+    topicsJson: text("topics_json").notNull(),
+    data: text("data"),
+    rawLogHash: text("raw_log_hash").notNull(),
+    rawLogJson: text("raw_log_json").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => ({
+    chainTxLog: uniqueIndex("chain_indexed_logs_chain_tx_log").on(table.chainId, table.txHash, table.logIndex),
+  }),
+);
+
 export const operatorKeys = sqliteTable("operator_keys", {
   keyId: text("key_id").primaryKey(),
   role: text("role").notNull(),

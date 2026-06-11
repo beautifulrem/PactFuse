@@ -149,6 +149,8 @@ describe("pactfuse-api P0", () => {
     const allowedChallengeAuth = await post(app, "/api/v1/sources/challenge", {}, { authorization: "Bearer challenge-test-token" });
     const missingArtifactSigner = await post(app, "/api/v1/quotes", {});
     const allowedArtifactAuth = await post(app, "/api/v1/quotes", {}, { authorization: "Bearer artifact-test-token" });
+    const missingIndexer = await post(app, "/api/v1/indexer/backfill", {});
+    const allowedIndexerAuth = await post(app, "/api/v1/indexer/backfill", {}, { authorization: "Bearer operator-test-token" });
     const invalidJsonWithoutAuth = await rawPost(app, "/api/v1/sources/challenge", "{", {});
     const invalidJsonWithAuth = await rawPost(app, "/api/v1/sources/challenge", "{", { authorization: "Bearer challenge-test-token" });
 
@@ -159,6 +161,8 @@ describe("pactfuse-api P0", () => {
     expect(allowedChallengeAuth.status).toBe(400);
     expect(missingArtifactSigner.status).toBe(403);
     expect(allowedArtifactAuth.status).toBe(400);
+    expect(missingIndexer.status).toBe(403);
+    expect(allowedIndexerAuth.status).toBe(400);
     expect(invalidJsonWithoutAuth.status).toBe(403);
     expect(invalidJsonWithAuth.status).toBe(400);
   });
@@ -423,6 +427,37 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/gate/events/ingest"].post.responses["202"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/GateEventIngestResponse",
     );
+    expect(json.paths["/api/v1/indexer/backfill"].post["x-pactfuse-proof-fields"]).toEqual([
+      "cursor.status",
+      "cursor.lastIndexedBlock",
+      "insertedLogCount",
+      "proofAuthority",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/indexer/backfill"].post.parameters).toEqual([
+      expect.objectContaining({
+        name: "authorization",
+        in: "header",
+        required: false,
+      }),
+    ]);
+    expect(json.paths["/api/v1/indexer/backfill"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ChainIndexerBackfillInput",
+    );
+    expect(json.paths["/api/v1/indexer/backfill"].post.responses["202"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ChainIndexerBackfillResponse",
+    );
+    expect(json.paths["/api/v1/evidence/indexer-status"].get["x-pactfuse-proof-fields"]).toEqual([
+      "provider.ready",
+      "cursors.status",
+      "cursors.lagBlocks",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/evidence/indexer-status"].get.responses["200"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ChainIndexerStatusResponse",
+    );
+    expect(json.components.schemas.ChainIndexerBackfillPayload.required).toEqual(["cursorId", "chainId"]);
+    expect(json.components.schemas.ChainIndexerBackfillResponse.oneOf[0].properties.data.properties.proofAuthority.const).toBe(false);
     expect(json.components.schemas.GateEventIngestPayload.required).toEqual([
       "event",
       "spendId",
@@ -1387,6 +1422,11 @@ describe("pactfuse-api P0", () => {
 
     const observed = await postSignedGateEvent(app, observedBody);
     const finalized = await postSignedGateEvent(app, finalizedBody);
+    const staleReplay = await postSignedGateEvent(app, {
+      ...observedBody,
+      idempotencyKey: "gate-finalized-stale-replay",
+      payload: { ...observedBody.payload, currentBlockNumber: 100 },
+    });
     const row = ctx.db.sqlite
       .prepare("SELECT * FROM gate_chain_events WHERE session_id = ? AND spend_id = ?")
       .get(sessionId, spendId) as Record<string, unknown>;
@@ -1408,7 +1448,11 @@ describe("pactfuse-api P0", () => {
     expect(finalized.json.data.finalityStatus).toBe("finalized");
     expect(finalized.json.data.confirmations).toBe(2);
     expect(finalized.json.data.proofAuthority).toBe(true);
+    expect(staleReplay.status).toBe(202);
+    expect(staleReplay.json.data.finalityStatus).toBe("finalized");
+    expect(staleReplay.json.data.confirmations).toBe(2);
     expect(row.status).toBe("finalized");
+    expect(row.confirmations).toBe(2);
     expect(row.observed_event_id).toBe(observed.json.data.observedEventId);
     expect(row.finalized_event_id).toBe(finalized.json.data.finalizedEventId);
     expect(proofEvent).toEqual(
@@ -1460,6 +1504,44 @@ describe("pactfuse-api P0", () => {
     expect(mutated.json.error.code).toBe("proof_blocked");
     expect(kinds).toContain("gate.spend_settled.observed");
     expect(kinds).not.toContain("gate.spend_settled");
+  });
+
+  it("blocks gate and indexer payloads when provider chainId differs", async () => {
+    const gateApp = makeApp(":memory:", { chain: createFakeGateChainClient(101, "1") }).app;
+    const sessionId = await createSession(gateApp, "sess-gate-chain-mismatch", { finalityDepth: 2 });
+    const spendId = await registerSpend(gateApp, sessionId);
+    const observedBody = gateEventEnvelope(sessionId, spendId, "gate-chain-mismatch-observed", {
+      txHash: hex32("gate-chain-mismatch-tx"),
+      rawLogHash: hex32("gate-chain-mismatch-log"),
+      blockNumber: 100,
+      currentBlockNumber: 100,
+    });
+    const finalizedBody = {
+      ...observedBody,
+      idempotencyKey: "gate-chain-mismatch-finalized",
+      payload: { ...observedBody.payload, currentBlockNumber: 101 },
+    };
+    const observed = await postSignedGateEvent(gateApp, observedBody);
+    const finalized = await postSignedGateEvent(gateApp, finalizedBody);
+    const indexerApp = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({
+        chainId: "1",
+        currentBlockNumber: 101,
+        logs: [indexerLog("chain-mismatch", 100)],
+      }),
+    }).app;
+    const backfill = await post(indexerApp, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-chain-mismatch",
+      payload: { cursorId: "gate:indexer", chainId: "84532", fromBlock: 100, toBlock: 100 },
+    });
+
+    expect(observed.status).toBe(202);
+    expect(finalized.status).toBe(422);
+    expect(finalized.json.error.code).toBe("proof_blocked");
+    expect(finalized.json.error.message).toContain("chainId mismatch");
+    expect(backfill.status).toBe(422);
+    expect(backfill.json.error.code).toBe("proof_blocked");
+    expect(backfill.json.error.message).toContain("chainId mismatch");
   });
 
   it("blocks verifier and same-log revival after a finalized gate reorg", async () => {
@@ -1931,6 +2013,242 @@ describe("pactfuse-api P0", () => {
     expect(currentLease?.leaseToken).not.toBe(staleLease?.leaseToken);
     expect(() => completeJob(ctx, job.jobId, staleLease?.leaseToken ?? "", "succeeded")).toThrow(/lease token/);
     expect(completeJob(ctx, job.jobId, currentLease?.leaseToken ?? "", "succeeded").status).toBe("succeeded");
+  });
+
+  it("backfills indexed chain logs in capped windows and replays duplicate windows exactly once", async () => {
+    const logs = [100, 101, 102, 103, 104].map((block) => indexerLog(`window-${block}`, block));
+    const firstLogTxHash = String(logs[0]?.transactionHash);
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 105, logs }),
+    });
+    const first = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-window-first",
+      payload: {
+        cursorId: "gate:indexer",
+        chainId: "84532",
+        fromBlock: 100,
+        toBlock: 104,
+        finalityDepth: 2,
+        maxWindowBlocks: 2,
+        address: INDEXER_ADDRESS,
+        topics: [],
+      },
+    });
+    const replay = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-window-replay",
+      payload: {
+        cursorId: "gate:indexer",
+        chainId: "84532",
+        fromBlock: 100,
+        toBlock: 101,
+        finalityDepth: 2,
+        maxWindowBlocks: 2,
+        address: INDEXER_ADDRESS,
+        topics: [],
+      },
+    });
+    const second = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-window-second",
+      payload: { cursorId: "gate:indexer", chainId: "84532", toBlock: 104, finalityDepth: 2, maxWindowBlocks: 2, address: INDEXER_ADDRESS },
+    });
+    const third = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-window-third",
+      payload: { cursorId: "gate:indexer", chainId: "84532", toBlock: 104, finalityDepth: 2, maxWindowBlocks: 2, address: INDEXER_ADDRESS },
+    });
+    const status = await app.request("/api/v1/evidence/indexer-status");
+    const statusJson = await status.json();
+    const row = ctx.db.sqlite
+      .prepare("SELECT raw_log_json FROM chain_indexed_logs WHERE tx_hash = ?")
+      .get(firstLogTxHash) as Record<string, unknown>;
+    const count = ctx.db.sqlite.prepare("SELECT COUNT(*) AS count FROM chain_indexed_logs").get() as Record<string, unknown>;
+
+    expect(first.status).toBe(202);
+    expect(first.json.data.fromBlock).toBe(100);
+    expect(first.json.data.toBlock).toBe(101);
+    expect(first.json.data.insertedLogCount).toBe(2);
+    expect(first.json.data.cursor.lastIndexedBlock).toBe(101);
+    expect(first.json.data.cursor.status).toBe("degraded");
+    expect(first.json.data.cursor.lagBlocks).toBe(3);
+    expect(first.json.data.proofAuthority).toBe(false);
+    expect(first.json.data.winnerClaimAllowed).toBe(false);
+    expect(replay.status).toBe(202);
+    expect(replay.json.data.insertedLogCount).toBe(0);
+    expect(second.status).toBe(202);
+    expect(second.json.data.cursor.lastIndexedBlock).toBe(103);
+    expect(second.json.data.cursor.status).toBe("degraded");
+    expect(third.status).toBe(202);
+    expect(third.json.data.cursor.lastIndexedBlock).toBe(104);
+    expect(third.json.data.cursor.status).toBe("caught_up");
+    expect(third.json.data.cursor.lagBlocks).toBe(0);
+    expect(status.status).toBe(200);
+    expect(statusJson.data.winnerClaimAllowed).toBe(false);
+    expect(statusJson.data.cursors[0]).toEqual(expect.objectContaining({ cursorId: "gate:indexer", status: "caught_up", lagBlocks: 0 }));
+    expect(JSON.parse(String(row.raw_log_json))).toEqual(expect.objectContaining({ transactionHash: firstLogTxHash, blockNumber: 100 }));
+    expect(Number(count.count)).toBe(5);
+  });
+
+  it("persists indexer cursors across database reopen and resumes from the stored block", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-indexer-"));
+    const dbPath = join(dir, "pactfuse.sqlite");
+    const logs = [indexerLog("persist-100", 100), indexerLog("persist-101", 101)];
+    try {
+      const first = makeApp(dbPath, {
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 102, logs }),
+      });
+      const firstBackfill = await post(first.app, "/api/v1/indexer/backfill", {
+        idempotencyKey: "indexer-persist-first",
+        payload: { cursorId: "gate:indexer", chainId: "84532", fromBlock: 100, toBlock: 100, finalityDepth: 2 },
+      });
+      first.ctx.db.sqlite.close();
+
+      const second = makeApp(dbPath, {
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 102, logs }),
+      });
+      const status = await second.app.request("/api/v1/evidence/indexer-status");
+      const statusJson = await status.json();
+      const resumed = await post(second.app, "/api/v1/indexer/backfill", {
+        idempotencyKey: "indexer-persist-resume",
+        payload: { cursorId: "gate:indexer", chainId: "84532", toBlock: 101, finalityDepth: 2 },
+      });
+      const count = second.ctx.db.sqlite.prepare("SELECT COUNT(*) AS count FROM chain_indexed_logs").get() as Record<string, unknown>;
+
+      expect(firstBackfill.status).toBe(202);
+      expect(firstBackfill.json.data.cursor.lastIndexedBlock).toBe(100);
+      expect(status.status).toBe(200);
+      expect(statusJson.data.cursors[0].lastIndexedBlock).toBe(100);
+      expect(resumed.status).toBe(202);
+      expect(resumed.json.data.fromBlock).toBe(101);
+      expect(resumed.json.data.cursor.lastIndexedBlock).toBe(101);
+      expect(Number(count.count)).toBe(2);
+      second.ctx.db.sqlite.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes same-cursor concurrent backfills so the cursor does not regress", async () => {
+    const logs = Array.from({ length: 101 }, (_, index) => indexerLog(`concurrent-${index}`, 100 + index));
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 201, logs }),
+    });
+    const seed = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-concurrent-seed",
+      payload: { cursorId: "gate:indexer", chainId: "84532", fromBlock: 100, toBlock: 100, finalityDepth: 2, maxWindowBlocks: 1 },
+    });
+    const [first, second] = await Promise.all([
+      post(app, "/api/v1/indexer/backfill", {
+        idempotencyKey: "indexer-concurrent-a",
+        payload: { cursorId: "gate:indexer", chainId: "84532", toBlock: 200, finalityDepth: 2, maxWindowBlocks: 50 },
+      }),
+      post(app, "/api/v1/indexer/backfill", {
+        idempotencyKey: "indexer-concurrent-b",
+        payload: { cursorId: "gate:indexer", chainId: "84532", toBlock: 200, finalityDepth: 2, maxWindowBlocks: 50 },
+      }),
+    ]);
+    const final = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-concurrent-final",
+      payload: { cursorId: "gate:indexer", chainId: "84532", toBlock: 200, finalityDepth: 2, maxWindowBlocks: 50 },
+    });
+    const cursor = ctx.db.sqlite.prepare("SELECT last_indexed_block, lag_blocks, status FROM chain_indexer_cursors WHERE cursor_id = ?").get(
+      "gate:indexer",
+    ) as Record<string, unknown>;
+    const count = ctx.db.sqlite.prepare("SELECT COUNT(*) AS count FROM chain_indexed_logs").get() as Record<string, unknown>;
+
+    expect(seed.status).toBe(202);
+    expect(first.status).toBe(202);
+    expect(second.status).toBe(202);
+    expect(final.status).toBe(202);
+    expect(cursor).toEqual(expect.objectContaining({ last_indexed_block: 200, lag_blocks: 0, status: "caught_up" }));
+    expect(Number(count.count)).toBe(101);
+  });
+
+  it("rejects indexer gaps, cursor config drift, and mutated raw logs without advancing the cursor", async () => {
+    const originalConflictLog = indexerLog("conflict", 100, { rawLogHash: hex32("indexer-conflict-raw-a") });
+    const mutableLogs = [originalConflictLog];
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs: mutableLogs }),
+    });
+    const first = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-guard-first",
+      payload: { cursorId: "gate:indexer", chainId: "84532", fromBlock: 100, toBlock: 100, finalityDepth: 2, address: INDEXER_ADDRESS },
+    });
+
+    mutableLogs[0] = { ...originalConflictLog, rawLogHash: hex32("indexer-conflict-raw-b") };
+    const conflict = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-guard-conflict",
+      payload: { cursorId: "gate:indexer", chainId: "84532", fromBlock: 100, toBlock: 100, finalityDepth: 2, address: INDEXER_ADDRESS },
+    });
+    const gap = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-guard-gap",
+      payload: { cursorId: "gate:indexer", chainId: "84532", fromBlock: 102, toBlock: 102, finalityDepth: 2, address: INDEXER_ADDRESS },
+    });
+    const drift = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-guard-drift",
+      payload: {
+        cursorId: "gate:indexer",
+        chainId: "84532",
+        fromBlock: 101,
+        toBlock: 101,
+        finalityDepth: 2,
+        address: "0x2222222222222222222222222222222222222222",
+      },
+    });
+    const cursor = ctx.db.sqlite.prepare("SELECT last_indexed_block, status FROM chain_indexer_cursors WHERE cursor_id = ?").get("gate:indexer") as
+      | Record<string, unknown>
+      | undefined;
+
+    expect(first.status).toBe(202);
+    expect(conflict.status).toBe(422);
+    expect(conflict.json.error.message).toContain("rawLogHash conflict");
+    expect(gap.status).toBe(422);
+    expect(gap.json.error.message).toContain("cannot skip");
+    expect(drift.status).toBe(422);
+    expect(drift.json.error.message).toContain("configuration cannot change");
+    expect(cursor).toEqual(expect.objectContaining({ last_indexed_block: 100, status: "caught_up" }));
+  });
+
+  it("marks indexer provider failures degraded and keeps verifier output fail-closed", async () => {
+    const offline = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ ready: false, reason: "rpc offline" }),
+    }).app;
+    const offlineBackfill = await post(offline, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-provider-offline",
+      payload: { cursorId: "gate:indexer", chainId: "84532", fromBlock: 100, toBlock: 100, finalityDepth: 2 },
+    });
+    const offlineStatus = await offline.request("/api/v1/evidence/indexer-status");
+    const offlineStatusJson = await offlineStatus.json();
+    const { app } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({
+        currentBlockNumber: 105,
+        logs: [indexerLog("provider-failure", 100)],
+        getLogsError: new Error("rpc unavailable"),
+      }),
+    });
+    const backfill = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-provider-failure",
+      payload: { cursorId: "gate:indexer", chainId: "84532", fromBlock: 100, toBlock: 104, finalityDepth: 2 },
+    });
+    const status = await app.request("/api/v1/evidence/indexer-status");
+    const statusJson = await status.json();
+    const sessionId = await createSession(app, "sess-indexer-fail-closed");
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-indexer-degraded",
+      payload: { schemaOnly: true, receipt: schemaValidWinnerRequestedReceipt() },
+    });
+
+    expect(offlineBackfill.status).toBe(423);
+    expect(offlineStatusJson.data.cursors[0]).toEqual(expect.objectContaining({ cursorId: "gate:indexer", status: "degraded" }));
+    expect(offlineStatusJson.data.cursors[0].reason).toContain("provider is not ready");
+    expect(backfill.status).toBe(423);
+    expect(backfill.json.error.code).toBe("proof_pending");
+    expect(status.status).toBe(200);
+    expect(statusJson.data.cursors[0]).toEqual(expect.objectContaining({ cursorId: "gate:indexer", status: "degraded" }));
+    expect(statusJson.data.cursors[0].reason).toContain("chain log backfill failed");
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.schemaOk).toBe(false);
+    expect(verify.json.data.errors.some((error: string) => error.includes("chain indexer cursor gate:indexer"))).toBe(true);
+    expect(verify.json.data.winnerClaimAllowed).toBe(false);
   });
 
   it("records MCP adapter calls with request and response hashes", async () => {
@@ -2694,7 +3012,67 @@ async function registerSpend(app: ReturnType<typeof createApp>, sessionId: strin
   return spendId;
 }
 
-function createFakeGateChainClient(currentBlockNumber = 101): ChainClient {
+const INDEXER_ADDRESS = "0x1111111111111111111111111111111111111111";
+
+function createFakeIndexerChainClient(config: {
+  chainId?: string;
+  currentBlockNumber?: number;
+  logs?: Array<Record<string, unknown>>;
+  ready?: boolean;
+  reason?: string;
+  getLogsError?: Error;
+}): ChainClient {
+  return {
+    async status() {
+      return {
+        name: "chain",
+        mode: "fixture",
+        ready: config.ready ?? true,
+        reason: config.reason ?? "test chain indexer provider",
+        chainId: config.chainId ?? "84532",
+      };
+    },
+    async getBlockNumber() {
+      return config.currentBlockNumber ?? 101;
+    },
+    async getTransactionReceipt(txHash: string) {
+      return {
+        transactionHash: txHash,
+        blockNumber: config.currentBlockNumber ?? 101,
+        status: "success",
+      };
+    },
+    async getLogs(query: Record<string, unknown>) {
+      if (config.getLogsError) {
+        throw config.getLogsError;
+      }
+      const fromBlock = Number(query.fromBlock ?? query.blockNumber ?? 0);
+      const toBlock = Number(query.toBlock ?? query.blockNumber ?? fromBlock);
+      const address = typeof query.address === "string" ? query.address.toLowerCase() : null;
+      return (config.logs ?? []).filter((log) => {
+        const blockNumber = Number(log.blockNumber);
+        const logAddress = typeof log.address === "string" ? log.address.toLowerCase() : null;
+        return blockNumber >= fromBlock && blockNumber <= toBlock && (!address || logAddress === address);
+      });
+    },
+  };
+}
+
+function indexerLog(seed: string, blockNumber: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    transactionHash: hex32(`indexer:${seed}:tx`),
+    logIndex: blockNumber - 100,
+    chainId: "84532",
+    blockNumber,
+    address: INDEXER_ADDRESS,
+    topics: [hex32(`indexer:${seed}:topic`)],
+    data: "0x01",
+    rawLogHash: hex32(`indexer:${seed}:raw`),
+    ...overrides,
+  };
+}
+
+function createFakeGateChainClient(currentBlockNumber = 101, chainId = "84532"): ChainClient {
   return {
     async status() {
       return {
@@ -2702,7 +3080,7 @@ function createFakeGateChainClient(currentBlockNumber = 101): ChainClient {
         mode: "fixture",
         ready: true,
         reason: "test chain provider",
-        chainId: "84532",
+        chainId,
       };
     },
     async getBlockNumber() {

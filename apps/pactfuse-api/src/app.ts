@@ -4,6 +4,7 @@ import { streamSSE } from "hono/streaming";
 import {
   HexSchema,
   Hex32Schema,
+  ChainIndexerBackfillInputSchema,
   McpAdapterAuditPayloadSchema,
   SessionScopedEnvelopeSchema,
   CreateSessionInputSchema,
@@ -20,9 +21,11 @@ import {
   getSession,
   ingestGateEvent,
   ingestCawReceiptBundle,
+  indexChainWindow,
   listEventsAfterEventId,
   readAgentTranscript,
   readArtifactAccess,
+  readChainIndexerStatus,
   readJudgeCheck,
   readProofProviderStatus,
   readRunnerHeartbeat,
@@ -52,6 +55,7 @@ const ROUTES = [
   { method: "POST", path: "/api/v1/caw/operations/build", okStatus: 201 },
   { method: "POST", path: "/api/v1/caw/receipts/ingest", okStatus: 202 },
   { method: "POST", path: "/api/v1/gate/events/ingest", okStatus: 202 },
+  { method: "POST", path: "/api/v1/indexer/backfill", okStatus: 202 },
   { method: "POST", path: "/api/v1/artifacts/preflight", okStatus: 202 },
   { method: "POST", path: "/api/v1/quotes", okStatus: 201 },
   { method: "GET", path: "/api/v1/artifacts/{sessionId}/{spendId}/{payer}/{artifactHash}", okStatus: 200 },
@@ -62,6 +66,7 @@ const ROUTES = [
   { method: "GET", path: "/api/v1/evidence/{sessionId}/verify", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/judge-check", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/replay-bundle", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/indexer-status", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/runner-heartbeat", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/agent-transcript", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/stream", okStatus: 200 },
@@ -70,6 +75,7 @@ const ROUTES = [
 const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/caw/receipts/ingest": ["proofAuthority", "winnerClaimAllowed"],
   "/api/v1/gate/events/ingest": ["finalityStatus", "confirmations", "finalityDepth", "proofAuthority", "winnerClaimAllowed"],
+  "/api/v1/indexer/backfill": ["cursor.status", "cursor.lastIndexedBlock", "insertedLogCount", "proofAuthority", "winnerClaimAllowed"],
   "/api/v1/artifacts/preflight": ["preflightId", "artifactHashPreview", "priceDisclosureHash", "winnerClaimAllowed"],
   "/api/v1/quotes": ["preflightId", "quoteSignedAfterPreflight", "priceDisclosureHash", "winnerClaimAllowed"],
   "/api/v1/artifacts/refund": ["spendId", "quoteId", "status", "winnerClaimAllowed"],
@@ -86,6 +92,7 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "canonicalCawReceipts",
     "judgeCheck",
   ],
+  "/api/v1/evidence/indexer-status": ["provider.ready", "cursors.status", "cursors.lagBlocks", "winnerClaimAllowed"],
   "/api/v1/evidence/agent-transcript": ["transcriptHash", "toolsCallHash", "boundedToPinnedManifest", "winnerClaimAllowed"],
 };
 
@@ -191,6 +198,11 @@ export function createApp(ctx: ServiceCtx): Hono {
     return send(c, await ingestGateEvent(body, ctx), 202);
   });
 
+  app.post("/api/v1/indexer/backfill", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await indexChainWindow(ChainIndexerBackfillInputSchema.parse(await readJson(c)), ctx), 202);
+  });
+
   app.post("/api/v1/artifacts/preflight", async (c) => {
     authorizeApiRole(c, ctx, "operator");
     return send(c, await runArtifactPreflight(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
@@ -238,6 +250,8 @@ export function createApp(ctx: ServiceCtx): Hono {
     const sessionId = requiredQuery(c, "sessionId");
     return send(c, await assembleReplayBundle(sessionId, ctx));
   });
+
+  app.get("/api/v1/evidence/indexer-status", async (c) => send(c, await readChainIndexerStatus(ctx)));
 
   app.get("/api/v1/evidence/runner-heartbeat", async (c) => {
     const sessionId = requiredQuery(c, "sessionId");
@@ -556,6 +570,69 @@ function buildOpenApi(): Record<string, unknown> {
             reorged: { type: "boolean", default: false },
           },
         },
+        ChainIndexerBackfillInput: {
+          type: "object",
+          required: ["idempotencyKey", "payload"],
+          additionalProperties: false,
+          properties: {
+            idempotencyKey: { type: "string", minLength: 4, maxLength: 160, pattern: "^[a-z][a-z0-9:_-]+$" },
+            payload: { $ref: "#/components/schemas/ChainIndexerBackfillPayload" },
+          },
+        },
+        ChainIndexerBackfillPayload: {
+          type: "object",
+          required: ["cursorId", "chainId"],
+          additionalProperties: false,
+          properties: {
+            cursorId: { type: "string", minLength: 1, maxLength: 160, pattern: "^[a-z][a-z0-9:_-]+$" },
+            chainId: { type: "string", pattern: "^(0|[1-9][0-9]*)$" },
+            fromBlock: { type: "integer", minimum: 0 },
+            toBlock: { type: "integer", minimum: 0 },
+            finalityDepth: { type: "integer", minimum: 1, maximum: 128, default: 2 },
+            maxWindowBlocks: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
+            address: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+            topics: {
+              type: "array",
+              maxItems: 4,
+              items: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]+$" }, { type: "null" }] },
+            },
+          },
+        },
+        ChainIndexerCursor: {
+          type: "object",
+          required: [
+            "cursorId",
+            "chainId",
+            "address",
+            "topics",
+            "lastIndexedBlock",
+            "latestHeadBlock",
+            "finalizedHeadBlock",
+            "finalityDepth",
+            "lagBlocks",
+            "status",
+            "reason",
+            "updatedAt",
+          ],
+          properties: {
+            cursorId: { type: "string" },
+            chainId: { type: "string", pattern: "^(0|[1-9][0-9]*)$" },
+            address: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]+$" }, { type: "null" }] },
+            topics: {
+              type: "array",
+              maxItems: 4,
+              items: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]+$" }, { type: "null" }] },
+            },
+            lastIndexedBlock: { anyOf: [{ type: "integer", minimum: 0 }, { type: "null" }] },
+            latestHeadBlock: { type: "integer", minimum: 0 },
+            finalizedHeadBlock: { type: "integer", minimum: 0 },
+            finalityDepth: { type: "integer", minimum: 1, maximum: 128 },
+            lagBlocks: { type: "integer", minimum: 0 },
+            status: { enum: ["unconfigured", "degraded", "caught_up"] },
+            reason: { type: "string" },
+            updatedAt: { type: "string", format: "date-time" },
+          },
+        },
         McpAdapterAuditPayload: {
           type: "object",
           required: ["auditNonce", "toolName", "request", "response", "status"],
@@ -673,6 +750,32 @@ function buildOpenApi(): Record<string, unknown> {
             reorgEventId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
             invalidatedEventId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
             proofAuthority: { type: "boolean" },
+            winnerClaimAllowed: { const: false },
+          },
+        }),
+        ChainIndexerBackfillResponse: serviceResponseSchema({
+          type: "object",
+          required: ["cursor", "fromBlock", "toBlock", "indexedLogCount", "insertedLogCount", "proofAuthority", "winnerClaimAllowed"],
+          properties: {
+            cursor: { $ref: "#/components/schemas/ChainIndexerCursor" },
+            fromBlock: { type: "integer", minimum: 0 },
+            toBlock: { type: "integer", minimum: 0 },
+            indexedLogCount: { type: "integer", minimum: 0 },
+            insertedLogCount: { type: "integer", minimum: 0 },
+            proofAuthority: { const: false },
+            winnerClaimAllowed: { const: false },
+          },
+        }),
+        ChainIndexerStatusResponse: serviceResponseSchema({
+          type: "object",
+          required: ["provider", "cursors", "proofAuthority", "winnerClaimAllowed"],
+          properties: {
+            provider: { type: "object", additionalProperties: true },
+            cursors: {
+              type: "array",
+              items: { $ref: "#/components/schemas/ChainIndexerCursor" },
+            },
+            proofAuthority: { const: false },
             winnerClaimAllowed: { const: false },
           },
         }),
@@ -1045,6 +1148,9 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   if (path === "/api/v1/gate/events/ingest") {
     return jsonRequestBody({ $ref: "#/components/schemas/GateEventIngestInput" });
   }
+  if (path === "/api/v1/indexer/backfill") {
+    return jsonRequestBody({ $ref: "#/components/schemas/ChainIndexerBackfillInput" });
+  }
   if (path === "/api/v1/artifacts/refund") {
     return jsonRequestBody({ $ref: "#/components/schemas/ArtifactRefundInput" });
   }
@@ -1111,6 +1217,7 @@ function apiRoleForPath(path: string): ApiRole | null {
     case "/api/v1/sources/register":
     case "/api/v1/spends/register-batch":
     case "/api/v1/caw/operations/build":
+    case "/api/v1/indexer/backfill":
     case "/api/v1/artifacts/preflight":
     case "/api/v1/evidence/verify":
       return "operator";
@@ -1183,6 +1290,8 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/CawReceiptIngestResponse" };
     case "/api/v1/gate/events/ingest":
       return { $ref: "#/components/schemas/GateEventIngestResponse" };
+    case "/api/v1/indexer/backfill":
+      return { $ref: "#/components/schemas/ChainIndexerBackfillResponse" };
     case "/api/v1/artifacts/preflight":
       return { $ref: "#/components/schemas/ArtifactPreflightResponse" };
     case "/api/v1/quotes":
@@ -1195,6 +1304,8 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/McpAuditResponse" };
     case "/api/v1/evidence/replay-bundle":
       return { $ref: "#/components/schemas/ReplayBundleResponse" };
+    case "/api/v1/evidence/indexer-status":
+      return { $ref: "#/components/schemas/ChainIndexerStatusResponse" };
     case "/api/v1/evidence/agent-transcript":
       return { $ref: "#/components/schemas/AgentTranscriptResponse" };
     default:

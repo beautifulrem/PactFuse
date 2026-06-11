@@ -220,6 +220,38 @@ CREATE TABLE IF NOT EXISTS gate_chain_events (
   UNIQUE(session_id, tx_hash, log_index, event_kind)
 );
 
+CREATE TABLE IF NOT EXISTS chain_indexer_cursors (
+  cursor_id TEXT PRIMARY KEY,
+  chain_id TEXT NOT NULL,
+  address TEXT,
+  topics_json TEXT NOT NULL,
+  last_indexed_block INTEGER,
+  latest_head_block INTEGER NOT NULL,
+  finalized_head_block INTEGER NOT NULL,
+  finality_depth INTEGER NOT NULL,
+  lag_blocks INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chain_indexed_logs (
+  log_id TEXT PRIMARY KEY,
+  cursor_id TEXT NOT NULL,
+  chain_id TEXT NOT NULL,
+  block_number INTEGER NOT NULL,
+  tx_hash TEXT NOT NULL,
+  log_index INTEGER NOT NULL,
+  address TEXT,
+  topics_json TEXT NOT NULL,
+  data TEXT,
+  raw_log_hash TEXT NOT NULL,
+  raw_log_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(chain_id, tx_hash, log_index)
+);
+
 CREATE TABLE IF NOT EXISTS mcp_adapter_calls (
   call_id TEXT PRIMARY KEY,
   session_id TEXT,

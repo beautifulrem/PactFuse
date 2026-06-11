@@ -39,13 +39,24 @@ export function createViemChainClient(input: { rpcUrl: string; chainId?: string 
     async status() {
       try {
         const [, chainId] = await Promise.all([client.getBlockNumber(), client.getChainId()]);
+        const actualChainId = String(chainId);
+        if (configuredChainId !== undefined && actualChainId !== configuredChainId) {
+          return {
+            name: "chain",
+            mode: "live",
+            ready: false,
+            reason: `configured chainId ${configuredChainId} does not match RPC chainId ${actualChainId}`,
+            endpoint: input.rpcUrl,
+            chainId: actualChainId,
+          };
+        }
         return {
           name: "chain",
           mode: "live",
           ready: true,
           reason: "chain RPC endpoint is configured",
           endpoint: input.rpcUrl,
-          chainId: String(chainId),
+          chainId: actualChainId,
         };
       } catch (error) {
         const failedStatus: ProofProviderStatus = {
@@ -69,12 +80,31 @@ export function createViemChainClient(input: { rpcUrl: string; chainId?: string 
       return normalizeChainValue(receipt) as Record<string, unknown>;
     },
     async getLogs(query: Record<string, unknown>) {
-      const blockNumber = toBigIntBlock(query.blockNumber);
-      const logs = await client.getLogs({
-        fromBlock: blockNumber,
-        toBlock: blockNumber,
+      if (configuredChainId !== undefined && typeof query.chainId === "string" && query.chainId !== configuredChainId) {
+        throw new Error(`requested chainId ${query.chainId} does not match configured chainId ${configuredChainId}`);
+      }
+      const fromBlock = toBigIntBlock(query.fromBlock ?? query.blockNumber);
+      const toBlock = toBigIntBlock(query.toBlock ?? query.blockNumber ?? query.fromBlock);
+      const filter: Record<string, unknown> = {
+        fromBlock: toRpcBlock(fromBlock),
+        toBlock: toRpcBlock(toBlock),
+      };
+      const address = optionalHex(query.address);
+      if (address) {
+        filter.address = address;
+      }
+      const topics = Array.isArray(query.topics)
+        ? query.topics.map((topic) => (typeof topic === "string" && topic.length > 0 ? (topic as `0x${string}`) : null))
+        : undefined;
+      if (topics) {
+        filter.topics = topics;
+      }
+      const requestLogs = client.request as (args: { method: "eth_getLogs"; params: [Record<string, unknown>] }) => Promise<unknown[]>;
+      const logs = await requestLogs({
+        method: "eth_getLogs",
+        params: [filter],
       });
-      return logs.map((log) => normalizeChainValue(log) as Record<string, unknown>);
+      return logs.map((log: unknown) => normalizeChainValue(log) as Record<string, unknown>);
     },
   };
 }
@@ -250,6 +280,14 @@ function extractCawReceiptItems(body: Record<string, unknown>): unknown[] {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function optionalHex(value: unknown): string | undefined {
+  return typeof value === "string" && /^0x[0-9a-fA-F]+$/.test(value) ? value : undefined;
+}
+
+function toRpcBlock(value: bigint): `0x${string}` {
+  return `0x${value.toString(16)}`;
 }
 
 function toBigIntBlock(value: unknown): bigint {

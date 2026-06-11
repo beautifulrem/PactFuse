@@ -212,6 +212,75 @@ export const GateEventIngestPayloadSchema = z
     path: ["currentBlockNumber"],
   });
 
+export const ChainIndexerBackfillPayloadSchema = z
+  .object({
+    cursorId: z.string().min(1).max(160).regex(/^[a-z][a-z0-9:_-]+$/),
+    chainId: DecimalStringSchema,
+    fromBlock: z.number().int().min(0).optional(),
+    toBlock: z.number().int().min(0).optional(),
+    finalityDepth: z.number().int().min(1).max(128).default(2),
+    maxWindowBlocks: z.number().int().min(1).max(10_000).default(2_000),
+    address: HexSchema.optional(),
+    topics: z.array(HexSchema.nullable()).max(4).default([]),
+  })
+  .strict()
+  .refine((payload) => payload.fromBlock === undefined || payload.toBlock === undefined || payload.toBlock >= payload.fromBlock, {
+    message: "toBlock must be >= fromBlock",
+    path: ["toBlock"],
+  });
+
+export const ChainIndexerBackfillInputSchema = z
+  .object({
+    idempotencyKey: IdempotencyKeySchema,
+    payload: ChainIndexerBackfillPayloadSchema,
+  })
+  .strict();
+
+export const ChainIndexerStatusViewSchema = z
+  .object({
+    cursorId: z.string().min(1).max(160),
+    chainId: DecimalStringSchema,
+    address: HexSchema.nullable(),
+    topics: z.array(HexSchema.nullable()).max(4),
+    lastIndexedBlock: z.number().int().min(0).nullable(),
+    latestHeadBlock: z.number().int().min(0),
+    finalizedHeadBlock: z.number().int().min(0),
+    finalityDepth: z.number().int().min(1).max(128),
+    lagBlocks: z.number().int().min(0),
+    status: z.enum(["unconfigured", "degraded", "caught_up"]),
+    reason: z.string().min(1).max(500),
+    updatedAt: IsoDateStringSchema,
+  })
+  .strict();
+
+export const ChainIndexedLogViewSchema = z
+  .object({
+    logId: Hex32Schema,
+    cursorId: z.string().min(1).max(160),
+    chainId: DecimalStringSchema,
+    blockNumber: z.number().int().min(0),
+    txHash: Hex32Schema,
+    logIndex: z.number().int().min(0),
+    address: HexSchema.nullable(),
+    topics: z.array(HexSchema).max(8),
+    data: HexSchema.nullable(),
+    rawLogHash: Hex32Schema,
+    createdAt: IsoDateStringSchema,
+  })
+  .strict();
+
+export const ChainIndexerBackfillResultSchema = z
+  .object({
+    cursor: ChainIndexerStatusViewSchema,
+    fromBlock: z.number().int().min(0),
+    toBlock: z.number().int().min(0),
+    indexedLogCount: z.number().int().min(0),
+    insertedLogCount: z.number().int().min(0),
+    proofAuthority: z.literal(false),
+    winnerClaimAllowed: z.literal(false),
+  })
+  .strict();
+
 export const VerifyEvidencePayloadSchema = z
   .object({
     receipt: JsonObjectSchema.optional(),
@@ -518,3 +587,4 @@ export type SessionView = z.infer<typeof SessionViewSchema>;
 export type JudgeCheckView = z.infer<typeof JudgeCheckViewSchema>;
 export type VerifierRunView = z.infer<typeof VerifierRunViewSchema>;
 export type ReplayBundleView = z.infer<typeof ReplayBundleViewSchema>;
+export type ChainIndexerBackfillInput = z.infer<typeof ChainIndexerBackfillInputSchema>;
