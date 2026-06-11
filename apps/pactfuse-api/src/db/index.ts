@@ -86,6 +86,9 @@ CREATE TABLE IF NOT EXISTS spends (
   payer TEXT NOT NULL,
   agent_wallet TEXT NOT NULL,
   source_hashes_json TEXT NOT NULL,
+  source_set_hash TEXT NOT NULL DEFAULT '${ZERO_HASH}',
+  session_commitment TEXT NOT NULL DEFAULT '${ZERO_HASH}',
+  spend_preimage_json TEXT NOT NULL DEFAULT '{}',
   max_price_atomic TEXT NOT NULL,
   nonce TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -216,6 +219,9 @@ CREATE TABLE IF NOT EXISTS judge_check_rows (
   ensureColumn(sqlite, "mcp_adapter_calls", "audit_nonce", "TEXT");
   ensureColumn(sqlite, "mcp_adapter_calls", "request_json", "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(sqlite, "mcp_adapter_calls", "response_json", "TEXT NOT NULL DEFAULT '{}'");
+  ensureColumn(sqlite, "spends", "source_set_hash", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
+  ensureColumn(sqlite, "spends", "session_commitment", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
+  ensureColumn(sqlite, "spends", "spend_preimage_json", "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(sqlite, "quotes", "preflight_id", "TEXT");
   ensureColumn(sqlite, "quotes", "price_disclosure_hash", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
   ensureColumn(sqlite, "quotes", "source_state_snapshot_hash", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);

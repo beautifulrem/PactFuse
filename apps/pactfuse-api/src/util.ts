@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ZodError, type ZodType } from "zod";
+import { keccak256, toBytes } from "viem";
 import { canonicalizeJson, type ApiError } from "@pactfuse/evidence-schema";
 
 export const ZERO_HASH = `0x${"0".repeat(64)}` as const;
@@ -10,6 +11,10 @@ export function sha256Hex(input: string | Buffer): `0x${string}` {
 
 export function hashJson(value: unknown): `0x${string}` {
   return sha256Hex(canonicalizeJson(value));
+}
+
+export function keccakJson(value: unknown): `0x${string}` {
+  return keccak256(toBytes(canonicalizeJson(value)));
 }
 
 export function newRequestId(prefix = "req"): string {

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
+import { keccak256, toBytes } from "viem";
 import { canonicalizeJson } from "@pactfuse/evidence-schema";
 import { createApp } from "../app.js";
 import { openPactFuseDb } from "../db/index.js";
@@ -143,10 +144,37 @@ describe("pactfuse-api P0", () => {
     });
 
     expect(res.status).toBe(200);
+    expect(res.json.data.proofLevel).toBe("fail_closed_no_claim");
+    expect(res.json.data.claimMode).toBe("simulated");
+    expect(res.json.data.paymentMode).toBe("mocked");
+    expect(res.json.data.tokenMode).toBe("local-mocked");
+    expect(res.json.data.identityMode).toBe("pending");
     expect(res.json.data.schemaOk).toBe(false);
     expect(res.json.data.proofChipAllowed).toBe(false);
     expect(res.json.data.finalVerifierComplete).toBe(false);
     expect(res.json.data.winnerClaimAllowed).toBe(false);
+  });
+
+  it("keeps schema-only verifier success from authorizing proof or winner claims", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-verify-schema-only");
+
+    const res = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-schema-only",
+      payload: {
+        schemaOnly: true,
+        receipt: schemaValidWinnerRequestedReceipt(),
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.json.data.proofLevel).toBe("schema_only_no_claim");
+    expect(res.json.data.schemaOk).toBe(true);
+    expect(res.json.data.requestedWinnerClaimAllowed).toBe(true);
+    expect(res.json.data.proofChipAllowed).toBe(false);
+    expect(res.json.data.winnerClaimAllowed).toBe(false);
+    expect(res.json.data.finalVerifierComplete).toBe(false);
   });
 
   it("does not expose MCP audit secrets or derived token hashes in health output", async () => {
@@ -364,6 +392,12 @@ describe("pactfuse-api P0", () => {
     expect(json.components.schemas.FailClosedProofState.properties.proofChipAllowed.const).toBe(false);
     expect(json.components.schemas.FailClosedProofState.properties.winnerClaimAllowed.const).toBe(false);
     expect(json.components.schemas.FailClosedProofState.properties.finalVerifierComplete.const).toBe(false);
+    expect(json.components.schemas.FailClosedProofState.properties.proofLevel.enum).toEqual([
+      "schema_only_no_claim",
+      "fail_closed_no_claim",
+    ]);
+    expect(json.components.schemas.FailClosedProofState.properties.claimMode.const).toBe("simulated");
+    expect(json.components.schemas.FailClosedProofState.properties.paymentMode.const).toBe("mocked");
     expect(serialized).not.toContain('"verified"');
   });
 
@@ -383,6 +417,66 @@ describe("pactfuse-api P0", () => {
     expect(json.data.agentTranscriptHash).toMatch(/^0x[0-9a-f]{64}$/);
     expect(json.data.asOfEventSeq).toBe(3);
     expect(json.data.asOfMcpAdapterCallCount).toBe(0);
+  });
+
+  it("rejects source-bound spends whose spendId is not the W8.1 preimage hash", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-spend-binding-mismatch");
+    await registerSource(app, sessionId);
+
+    const res = await post(app, "/api/v1/spends/register-batch", {
+      sessionId,
+      idempotencyKey: "spend-register-mismatch",
+      payload: {
+        spends: [
+          {
+            spendId: hex32("wrong-spend-id"),
+            pactId: "pact-c",
+            toolId: "code-scan",
+            payer: "0x1234",
+            agentWallet: "0xabcd",
+            sourceHashes: [hex32("source")],
+            maxPriceAtomic: "1000",
+            nonce: "nonce-1",
+          },
+        ],
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(res.status).toBe(422);
+    expect(res.json.error.code).toBe("proof_blocked");
+    expect(res.json.error.details.expectedSpendId).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("spend.registered");
+  });
+
+  it("requires spend source hashes to be registered before spend binding", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-spend-missing-source");
+    const spendId = await computeSpendIdForTest(app, sessionId, [hex32("missing-source")]);
+
+    const res = await post(app, "/api/v1/spends/register-batch", {
+      sessionId,
+      idempotencyKey: "spend-register-missing-source",
+      payload: {
+        spends: [
+          {
+            spendId,
+            pactId: "pact-c",
+            toolId: "code-scan",
+            payer: "0x1234",
+            agentWallet: "0xabcd",
+            sourceHashes: [hex32("missing-source")],
+            maxPriceAtomic: "1000",
+            nonce: "nonce-1",
+          },
+        ],
+      },
+    });
+
+    expect(res.status).toBe(423);
+    expect(res.json.error.code).toBe("proof_pending");
   });
 
   it("resumes the SSE stream after an event id", async () => {
@@ -1558,7 +1652,9 @@ async function registerSource(app: ReturnType<typeof createApp>, sessionId: stri
 }
 
 async function registerSpend(app: ReturnType<typeof createApp>, sessionId: string): Promise<string> {
-  const spendId = hex32("spend");
+  await registerSource(app, sessionId);
+  const sourceHashes = [hex32("source")];
+  const spendId = await computeSpendIdForTest(app, sessionId, sourceHashes);
   const res = await post(app, "/api/v1/spends/register-batch", {
     sessionId,
     idempotencyKey: "spend-register",
@@ -1570,7 +1666,7 @@ async function registerSpend(app: ReturnType<typeof createApp>, sessionId: strin
           toolId: "code-scan",
           payer: "0x1234",
           agentWallet: "0xabcd",
-          sourceHashes: [hex32("source")],
+          sourceHashes,
           maxPriceAtomic: "1000",
           nonce: "nonce-1",
         },
@@ -1579,6 +1675,81 @@ async function registerSpend(app: ReturnType<typeof createApp>, sessionId: strin
   });
   expect(res.status).toBe(201);
   return spendId;
+}
+
+async function computeSpendIdForTest(
+  app: ReturnType<typeof createApp>,
+  sessionId: string,
+  sourceHashes: string[],
+): Promise<`0x${string}`> {
+  const session = await app.request(`/api/v1/sessions/${sessionId}`);
+  const sessionJson = await session.json();
+  expect(session.status).toBe(200);
+  const normalizedSourceHashes = [...sourceHashes].map((sourceHash) => sourceHash.toLowerCase()).sort();
+  const runConfigHash = sessionJson.data.runConfigHash as string;
+  const sourceSetHash = keccakJsonForTest(normalizedSourceHashes);
+  const sessionCommitment = keccakJsonForTest({ sessionId: sessionId.toLowerCase(), runConfigHash });
+  return keccakJsonForTest({
+    runConfigHash,
+    sessionCommitment,
+    pactId: "pact-c",
+    toolId: "code-scan",
+    sourceSetHash,
+    agentWallet: "0xabcd",
+    nonce: "nonce-1",
+  });
+}
+
+function schemaValidWinnerRequestedReceipt(): Record<string, unknown> {
+  return {
+    artifactType: "paid-code-scan",
+    pactId: "pact-c",
+    spendId: hex32("receipt-spend"),
+    toolId: "code-scan",
+    winnerClaimAllowed: true,
+    statusFields: {
+      isRealEvidence: true,
+      winnerClaimAllowed: true,
+    },
+    payment: {
+      mode: "gate-paid-artifact-real",
+    },
+    paymentProof: {
+      mode: "gate-paid-artifact-real",
+      permit: null,
+      gatePaid: {
+        approveTxHash: hex32("approve-tx"),
+        allowanceBefore: "0",
+        allowanceAfter: "1000",
+        approvedAmount: "1000",
+        quotePrice: "1000",
+        policyTxCount: "2",
+        approveBeforeActivate: true,
+      },
+    },
+    checks: {
+      recommendedCawPolicy: {
+        txCount: "2",
+        allowedCalls: [
+          {
+            target: "PUBLIC_TESTNET_MOCK_ERC20",
+            selector: "approve",
+            constraints: {
+              spender: "ProcurementGate",
+              amountMax: "1000",
+            },
+          },
+          {
+            target: "ProcurementGate",
+            selector: "activateTool",
+            constraints: {
+              paymentAuth: "empty",
+            },
+          },
+        ],
+      },
+    },
+  };
 }
 
 async function post(
@@ -1601,6 +1772,10 @@ function hex32(seed: string): `0x${string}` {
 
 function hashForTestJson(value: unknown): `0x${string}` {
   return `0x${createHash("sha256").update(canonicalizeJson(value)).digest("hex")}`;
+}
+
+function keccakJsonForTest(value: unknown): `0x${string}` {
+  return keccak256(toBytes(canonicalizeJson(value)));
 }
 
 function signAuditPayload(secret: string, payload: unknown): `0x${string}` {

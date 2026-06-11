@@ -359,6 +359,11 @@ export const AgentTranscriptViewSchema = z
 export const VerifierRunViewSchema = z
   .object({
     sessionId: Hex32Schema.optional(),
+    proofLevel: z.enum(["schema_only_no_claim", "fail_closed_no_claim"]),
+    claimMode: RuntimeModesSchema.shape.CLAIM_MODE,
+    paymentMode: RuntimeModesSchema.shape.PAYMENT_MODE,
+    tokenMode: RuntimeModesSchema.shape.TOKEN_MODE,
+    identityMode: RuntimeModesSchema.shape.IDENTITY_MODE,
     schemaOk: z.boolean(),
     proofChipAllowed: z.literal(false),
     winnerClaimAllowed: z.literal(false),

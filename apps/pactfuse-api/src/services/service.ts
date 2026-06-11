@@ -38,6 +38,7 @@ import {
   badRequestError,
   conflictError,
   hashJson,
+  keccakJson,
   newRequestId,
   notFoundError,
   nowIso,
@@ -227,33 +228,71 @@ export async function registerSourceBoundSpends(
   return withIdempotency(ctx, scoped("spends:register-batch", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
     const createdAt = ctx.clock.now().toISOString();
+    const registeredSpends: Array<{
+      spendId: string;
+      sourceSetHash: string;
+      sessionCommitment: string;
+      spendPreimage: Record<string, JsonValue>;
+    }> = [];
     const event = withImmediateTransaction(ctx, () => {
+      const session = requireSessionRow(ctx, envelope.sessionId, requestId);
       for (const spend of payload.spends) {
+        const sourceHashes = normalizedSourceHashes(spend.sourceHashes);
+        requireRegisteredSources(ctx, envelope.sessionId, sourceHashes, requestId);
+        const binding = spendBindingFor(session, envelope.sessionId, {
+          pactId: spend.pactId,
+          toolId: spend.toolId,
+          sourceHashes,
+          agentWallet: spend.agentWallet,
+          nonce: spend.nonce,
+        });
+        if (spend.spendId.toLowerCase() !== binding.spendId) {
+          throw Object.assign(new Error("spendId does not match the W8.1 source-bound spend preimage"), {
+            apiError: proofBlockedError(requestId, "spendId does not match the W8.1 source-bound spend preimage", {
+              expectedSpendId: binding.spendId,
+              sourceSetHash: binding.sourceSetHash,
+            }),
+          });
+        }
         ctx.db.sqlite
           .prepare(
             `INSERT OR REPLACE INTO spends
-              (spend_id, session_id, pact_id, tool_id, payer, agent_wallet, source_hashes_json, max_price_atomic, nonce, status, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered_pending_chain_log', ?)`,
+              (spend_id, session_id, pact_id, tool_id, payer, agent_wallet, source_hashes_json, source_set_hash, session_commitment,
+               spend_preimage_json, max_price_atomic, nonce, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered_pending_chain_log', ?)`,
           )
           .run(
-            spend.spendId,
+            binding.spendId,
             envelope.sessionId,
             spend.pactId,
             spend.toolId,
             spend.payer,
             spend.agentWallet,
-            canonicalizeJson(spend.sourceHashes),
+            canonicalizeJson(sourceHashes),
+            binding.sourceSetHash,
+            binding.sessionCommitment,
+            canonicalizeJson(binding.spendPreimage),
             spend.maxPriceAtomic,
             spend.nonce,
             createdAt,
           );
+        registeredSpends.push({
+          spendId: binding.spendId,
+          sourceSetHash: binding.sourceSetHash,
+          sessionCommitment: binding.sessionCommitment,
+          spendPreimage: binding.spendPreimage,
+        });
       }
       return appendEvidenceEvent(ctx, {
         sessionId: envelope.sessionId,
         authority: "operator",
         kind: "spend.registered",
         payload: {
-          spendIds: payload.spends.map((spend) => spend.spendId),
+          spendIds: registeredSpends.map((spend) => spend.spendId),
+          sourceSetHashes: registeredSpends.map((spend) => spend.sourceSetHash),
+          sessionCommitment: registeredSpends[0]?.sessionCommitment ?? null,
+          spendIdBinding: "w8.1-keccak-jcs-v1",
+          spendPreimages: registeredSpends.map((spend) => spend.spendPreimage),
           status: "registered_pending_chain_log",
         },
       });
@@ -263,7 +302,10 @@ export async function registerSourceBoundSpends(
       requestId,
       evidenceEventId: event.eventId,
       data: {
-        spendIds: payload.spends.map((spend) => spend.spendId),
+        spendIds: registeredSpends.map((spend) => spend.spendId),
+        sourceSetHashes: registeredSpends.map((spend) => spend.sourceSetHash),
+        sessionCommitment: registeredSpends[0]?.sessionCommitment ?? null,
+        spendIdBinding: "w8.1-keccak-jcs-v1",
         status: "registered_pending_chain_log",
         winnerClaimAllowed: false,
       },
@@ -661,6 +703,11 @@ export async function verifyEvidenceForSession(
     const rawErrors = toStringArray(raw.errors);
     const view = VerifierRunViewSchema.parse({
       sessionId: envelope.sessionId,
+      proofLevel: payload.schemaOnly ? "schema_only_no_claim" : "fail_closed_no_claim",
+      claimMode: ctx.config.claimMode,
+      paymentMode: ctx.config.paymentMode,
+      tokenMode: ctx.config.tokenMode,
+      identityMode: ctx.config.identityMode,
       schemaOk: Boolean(raw.schemaOk) && eventLogErrors.length === 0,
       proofChipAllowed: false,
       winnerClaimAllowed: false,
@@ -1320,10 +1367,16 @@ function getSessionRow(ctx: ServiceCtx, sessionId: string): Row | undefined {
   return ctx.db.sqlite.prepare("SELECT * FROM sessions WHERE session_id = ?").get(sessionId) as Row | undefined;
 }
 
-function assertSession(ctx: ServiceCtx, sessionId: string, requestId: string): void {
-  if (!getSessionRow(ctx, sessionId)) {
+function requireSessionRow(ctx: ServiceCtx, sessionId: string, requestId: string): Row {
+  const session = getSessionRow(ctx, sessionId);
+  if (!session) {
     throw Object.assign(new Error("session not found"), { apiError: notFoundError(requestId, "session") });
   }
+  return session;
+}
+
+function assertSession(ctx: ServiceCtx, sessionId: string, requestId: string): void {
+  requireSessionRow(ctx, sessionId, requestId);
 }
 
 function assertSpend(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): Row {
@@ -1344,6 +1397,54 @@ function requireSpendPayer(spend: Row, payer: string, requestId: string): string
     });
   }
   return registeredPayer;
+}
+
+function normalizedSourceHashes(sourceHashes: string[]): string[] {
+  return [...sourceHashes].map((sourceHash) => sourceHash.toLowerCase()).sort();
+}
+
+function requireRegisteredSources(ctx: ServiceCtx, sessionId: string, sourceHashes: string[], requestId: string): void {
+  const missing = sourceHashes.filter((sourceHash) => {
+    const row = ctx.db.sqlite
+      .prepare("SELECT source_hash FROM sources WHERE session_id = ? AND LOWER(source_hash) = ?")
+      .get(sessionId, sourceHash) as Row | undefined;
+    return !row;
+  });
+  if (missing.length > 0) {
+    throw Object.assign(new Error("spend references unregistered source hashes"), {
+      apiError: proofPendingError(requestId, "spend registration requires all source hashes to be registered first"),
+    });
+  }
+}
+
+function spendBindingFor(
+  session: Row,
+  sessionId: string,
+  spend: { pactId: string; toolId: string; sourceHashes: string[]; agentWallet: string; nonce: string },
+): {
+  spendId: string;
+  sourceSetHash: string;
+  sessionCommitment: string;
+  spendPreimage: Record<string, JsonValue>;
+} {
+  const runConfigHash = String(session.run_config_hash);
+  const sourceSetHash = keccakJson(spend.sourceHashes);
+  const sessionCommitment = keccakJson({ sessionId: sessionId.toLowerCase(), runConfigHash });
+  const spendPreimage: Record<string, JsonValue> = {
+    runConfigHash,
+    sessionCommitment,
+    pactId: spend.pactId,
+    toolId: spend.toolId,
+    sourceSetHash,
+    agentWallet: spend.agentWallet.toLowerCase(),
+    nonce: spend.nonce,
+  };
+  return {
+    spendId: keccakJson(spendPreimage),
+    sourceSetHash,
+    sessionCommitment,
+    spendPreimage,
+  };
 }
 
 function requireActiveArtifactAccess(

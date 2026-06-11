@@ -443,8 +443,22 @@ function buildOpenApi(): Record<string, unknown> {
         },
         FailClosedProofState: {
           type: "object",
-          required: ["proofChipAllowed", "winnerClaimAllowed", "finalVerifierComplete"],
+          required: [
+            "proofLevel",
+            "claimMode",
+            "paymentMode",
+            "tokenMode",
+            "identityMode",
+            "proofChipAllowed",
+            "winnerClaimAllowed",
+            "finalVerifierComplete",
+          ],
           properties: {
+            proofLevel: { enum: ["schema_only_no_claim", "fail_closed_no_claim"] },
+            claimMode: { const: "simulated" },
+            paymentMode: { const: "mocked" },
+            tokenMode: { const: "local-mocked" },
+            identityMode: { const: "pending" },
             schemaOk: { type: "boolean" },
             proofAuthority: { const: false },
             proofChipAllowed: { const: false },
