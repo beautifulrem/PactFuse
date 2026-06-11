@@ -6,7 +6,7 @@ P0 includes one reusable verification artifact: a receipt-pack verifier command.
 pactfuse verify receipt.json
 ```
 
-Current local schema-only scaffold:
+Receipt-pack structural preflight:
 
 ```bash
 node packages/verifier/pactfuse-verify-receipt.mjs --schema-only docs/evidence/receipt-pack.pending.example.json
@@ -18,7 +18,7 @@ The verifier is intentionally conservative. It exports `verifyEvidence(input, op
 
 `POST /api/v1/evidence/verify` persists the verifier result exactly as returned by the fail-closed view. It appends `verifier.fail_closed` while final proof is incomplete and `verifier.final_replay_claim` only when `finalVerifierComplete`, `proofChipAllowed`, and the persisted booleans are actually true.
 
-W1 `rootMode` rule (spec §13): receipts carry `rootMode: "none" | "published"`. In `"none"` (P0 default — no `BlastRadiusRoot` published) the verifier does not require top-level `affectedSpendIdsRoot` or per-spend `membershipBranch` fields; it reconstructs the affected set (and computes the deterministic root) from `SpendRegistered` logs. In `"published"` (P1) all root/branch/publisher fields are required and validated. The scaffold script already gates these structural requirements on `rootMode`.
+W1 `rootMode` rule (spec §13): receipts carry `rootMode: "none" | "published"`. In `"none"` (P0 default, no `BlastRadiusRoot` published) the verifier does not require top-level `affectedSpendIdsRoot` or per-spend `membershipBranch` fields; it reconstructs the affected set and computes the deterministic root from `SpendRegistered` logs. In `"published"` (P1) all root/branch/publisher fields are required and validated. The verifier gates these structural requirements on `rootMode`.
 
 Final winner-grade verifier checks:
 
@@ -42,4 +42,4 @@ Final winner-grade verifier checks:
 - fail proof-chip eligibility if any included proof chip is `pending`, `fixture`, `manual`, `blocked`, placeholder, or unexpected null evidence
 - fail winner proof-chip eligibility if the app-level Judge Check row for that chip is missing or not `pass`
 
-This can be a local `tsx`/`node` command in P0. It does not need a published SDK. The current script implements structural and fail-closed proof-chip eligibility checks above the final checklist; before a winner claim, it must be extended or paired with the app verifier to perform the full recomputation list and then stop refusing `winnerClaimAllowed: true`.
+This can be a local `tsx`/`node` command in P0. It does not need a published SDK. Receipt-pack mode remains conservative and refuses direct winner authority; the `PACTFUSE_EVIDENCE_V1` replay-bundle mode performs the final gate above and only returns `finalVerifierComplete`, `proofChipAllowed`, and `winnerClaimAllowed` when every blocker is clear and the bundle explicitly requests the claim.

@@ -92,7 +92,7 @@ WINNER_CLAIM_ALLOWED: false
 | Token balance delta proof | Implemented with finalized `SpendSettled`, prior `caw.allowance.verified`, active Pact policy digest/snapshot binding, CAW `activate_tool` audit usage bound to the settlement tx, ERC20 `Transfer`, and block-level `balanceOf` checks in local mocked mode | No public token-settlement claim |
 | Token delivery | Local mocked | No public token-delivery claim |
 | Fusebox app | Fixture preview | No proof authority |
-| Receipt verifier | Fail-closed structural verifier | No public proof claim |
+| Receipt verifier | Fail-closed verifier with conservative receipt-pack mode and final replay-bundle gates | No public proof claim until live evidence passes |
 | Contracts | Built and tested locally | Use as proof anchor only after live deployment evidence |
 
 See [Claim Mode Rules](docs/evidence/claim-mode.md) and [Live vs Fixture Rules](docs/evidence/live-vs-fixture.md) before upgrading any public claim.
