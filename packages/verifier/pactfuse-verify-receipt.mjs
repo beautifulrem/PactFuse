@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
@@ -20,6 +21,38 @@ function readJson(path) {
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function canonicalizeJson(value) {
+  if (value === null) return "null";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("JCS canonicalization rejects non-finite numbers");
+    return JSON.stringify(value);
+  }
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalizeJson(item)).join(",")}]`;
+  if (isObject(value)) {
+    return `{${Object.keys(value)
+      .filter((key) => value[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalizeJson(value[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error(`JCS canonicalization rejects ${typeof value}`);
+}
+
+function hashJson(value) {
+  return `0x${createHash("sha256").update(canonicalizeJson(value)).digest("hex")}`;
+}
+
+function safeHashJson(value, label, errors) {
+  try {
+    return hashJson(value);
+  } catch (error) {
+    errors.push(`${label} cannot be canonicalized: ${error instanceof Error ? error.message : "unknown error"}`);
+    return null;
+  }
 }
 
 function at(root, path) {
@@ -544,7 +577,7 @@ function checkProofChipCompleteness(root, errors, options = {}) {
   }
 
   errors.push(
-    "current scaffold is not a final proof-chip verifier; it has not recomputed chain events, CAW typed-data hashes, recovered signers, canonical receipt hashes, priceDisclosure/displayed hash, delivery preflight hash, raw CAW receipt bundle membership, MCP Agent Transcript hashes, Judge Check rows, the PACTFUSE_EVIDENCE_V1 replay bundle, or rootMode-vs-BlastRadiusRoot on-chain consistency (incl. publisher validation in published mode)",
+    "current scaffold is not a final proof-chip verifier; it has not recomputed chain events, CAW typed-data hashes, recovered signers, CAW policy authority, priceDisclosure/displayed hash, delivery preflight hash, MCP Agent Transcript hashes, Judge Check rows, or rootMode-vs-BlastRadiusRoot on-chain consistency (incl. publisher validation in published mode)",
   );
 }
 
@@ -569,7 +602,111 @@ function checkPactTemplateBinding(root, errors, options) {
   }
 }
 
+function verifyReplayBundleEvidence(bundle, options = {}) {
+  const errors = [];
+  const warnings = [];
+  for (const field of [
+    "bundleType",
+    "sessionId",
+    "summaryMode",
+    "asOfEventSeq",
+    "eventRoot",
+    "agentTranscriptHash",
+    "events",
+    "mcpAdapterCalls",
+    "cawReceiptOperations",
+    "rawCawReceiptBundles",
+    "canonicalCawReceipts",
+    "judgeCheck",
+  ]) {
+    requirePath(bundle, [field], errors);
+  }
+  if (bundle.bundleType !== "PACTFUSE_EVIDENCE_V1") {
+    errors.push("bundleType must be PACTFUSE_EVIDENCE_V1");
+  }
+  if (!Array.isArray(bundle.events)) {
+    errors.push("events must be an array");
+  } else {
+    const eventRoot = safeHashJson(
+      bundle.events.map((event) => (isObject(event) ? event.eventHash : undefined)),
+      "eventRoot",
+      errors,
+    );
+    if (eventRoot && bundle.eventRoot !== eventRoot) {
+      errors.push("eventRoot must equal the hash of ordered event hashes");
+    }
+  }
+  const rawBundles = Array.isArray(bundle.rawCawReceiptBundles) ? bundle.rawCawReceiptBundles : [];
+  const canonicalReceipts = Array.isArray(bundle.canonicalCawReceipts) ? bundle.canonicalCawReceipts : [];
+  const rawReceiptsByHash = new Map();
+  for (const rawBundle of rawBundles) {
+    if (!isObject(rawBundle)) {
+      errors.push("rawCawReceiptBundles entries must be objects");
+      continue;
+    }
+    const rawBundleHash = safeHashJson(rawBundle.rawBundle, `rawCawReceiptBundle ${rawBundle.bundleId ?? "-"} rawBundle`, errors);
+    if (rawBundleHash && rawBundle.rawBundleHash !== rawBundleHash) {
+      errors.push(`rawCawReceiptBundle ${rawBundle.bundleId ?? "-"} rawBundleHash does not match rawBundle`);
+    }
+    const receipts = Array.isArray(rawBundle.rawBundle?.receipts) ? rawBundle.rawBundle.receipts : [];
+    for (const receipt of receipts) {
+      const receiptHash = safeHashJson(receipt, "raw CAW receipt", errors);
+      if (receiptHash) {
+        rawReceiptsByHash.set(receiptHash, { rawBundle, receipt });
+      }
+    }
+  }
+  for (const canonical of canonicalReceipts) {
+    if (!isObject(canonical)) {
+      errors.push("canonicalCawReceipts entries must be objects");
+      continue;
+    }
+    const rawMatch = rawReceiptsByHash.get(canonical.rawReceiptHash);
+    if (!rawMatch) {
+      errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} does not match any raw receipt hash`);
+      continue;
+    }
+    const { rawReceiptHash, canonicalReceiptHash, ...canonicalBase } = canonical;
+    const recomputedRawReceiptHash = safeHashJson(rawMatch.receipt, `canonical CAW receipt ${canonicalReceiptHash ?? "-"} raw receipt`, errors);
+    if (recomputedRawReceiptHash && rawReceiptHash !== recomputedRawReceiptHash) {
+      errors.push(`canonical CAW receipt ${canonicalReceiptHash ?? "-"} rawReceiptHash does not recompute`);
+    }
+    const recomputedCanonicalReceiptHash = safeHashJson(canonicalBase, `canonical CAW receipt ${canonicalReceiptHash ?? "-"} canonical body`, errors);
+    if (recomputedCanonicalReceiptHash && canonicalReceiptHash !== recomputedCanonicalReceiptHash) {
+      errors.push(`canonical CAW receipt ${canonicalReceiptHash ?? "-"} canonicalReceiptHash does not recompute`);
+    }
+    if (canonical.bundleId !== rawMatch.rawBundle.bundleId || canonical.operationId !== rawMatch.rawBundle.operationId) {
+      errors.push(`canonical CAW receipt ${canonicalReceiptHash ?? "-"} is not bound to its raw bundle operation`);
+    }
+    if (canonical.effect === "allow" && !canonical.txHash) {
+      errors.push(`canonical CAW allow receipt ${canonicalReceiptHash ?? "-"} requires txHash`);
+    }
+  }
+  errors.push(
+    "current replay verifier preflight is structural-only; final chain, signature, CAW policy authority, tx/log, and Judge Check recomputation is incomplete",
+  );
+  return {
+    schemaOk: errors.length === 1,
+    proofChipAllowed: false,
+    winnerClaimAllowed: false,
+    requestedWinnerClaimAllowed: bundle.winnerClaimAllowed === true,
+    finalVerifierComplete: false,
+    file: options.file ?? null,
+    cliMode: options.cliMode ?? null,
+    paymentProofMode: null,
+    warnings,
+    schemaErrors: errors.filter((error) => !error.startsWith("current replay verifier preflight")),
+    proofCompletenessErrors: errors.filter((error) => error.startsWith("current replay verifier preflight")),
+    proofChipErrors: errors,
+    winnerClaimErrors: [],
+    errors,
+  };
+}
+
 export function verifyEvidence(receipt, options = {}) {
+  if (isObject(receipt) && receipt.bundleType === "PACTFUSE_EVIDENCE_V1") {
+    return verifyReplayBundleEvidence(receipt, options);
+  }
   const schemaErrors = [];
   const winnerClaimErrors = [];
   const warnings = [];

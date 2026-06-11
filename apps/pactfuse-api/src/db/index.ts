@@ -123,6 +123,30 @@ CREATE TABLE IF NOT EXISTS caw_raw_receipt_bundles (
   UNIQUE(session_id, operation_id, raw_bundle_hash)
 );
 
+CREATE TABLE IF NOT EXISTS caw_canonical_receipts (
+  raw_receipt_hash TEXT PRIMARY KEY,
+  canonical_receipt_hash TEXT NOT NULL,
+  bundle_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  operation_kind TEXT NOT NULL,
+  source_label TEXT NOT NULL,
+  wallet_address TEXT NOT NULL,
+  target TEXT,
+  selector TEXT,
+  request_id TEXT NOT NULL,
+  effect TEXT NOT NULL,
+  status TEXT NOT NULL,
+  policy_digest TEXT NOT NULL,
+  params_digest TEXT NOT NULL,
+  tx_hash TEXT,
+  tx_count TEXT NOT NULL,
+  expiry TEXT NOT NULL,
+  fetched_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(session_id, operation_id, canonical_receipt_hash)
+);
+
 CREATE TABLE IF NOT EXISTS artifact_preflights (
   preflight_id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,

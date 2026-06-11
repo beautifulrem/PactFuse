@@ -68,6 +68,7 @@ export type ServiceCtx = {
   caw: CawReceiptSource;
   templates: PactTemplateRegistry;
   mcpAuditSecret: string | null;
+  cawIngestToken: string | null;
   clock: Clock;
   logger: Logger;
   config: LockedRuntimeConfig;

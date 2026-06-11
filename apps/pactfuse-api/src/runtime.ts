@@ -2,12 +2,34 @@ import pino from "pino";
 import { openPactFuseDb } from "./db/index.js";
 import {
   createLocalTemplateRegistry,
+  createHttpsCawReceiptSource,
   createUnconfiguredCawReceiptSource,
   createUnconfiguredChainClient,
   createViemChainClient,
 } from "./services/providers.js";
 import { createVerifierAdapter } from "./services/verifier.js";
 import type { Clock, Logger, ServiceCtx } from "./types.js";
+
+function createRuntimeCawSource() {
+  if (!process.env.PACTFUSE_CAW_EXPORT_URL) {
+    return createUnconfiguredCawReceiptSource();
+  }
+  const input: Parameters<typeof createHttpsCawReceiptSource>[0] = {
+    exportUrl: process.env.PACTFUSE_CAW_EXPORT_URL,
+  };
+  const apiKey = process.env.PACTFUSE_CAW_API_KEY ?? process.env.AGENT_WALLET_API_KEY;
+  const walletId = process.env.PACTFUSE_CAW_WALLET_ID ?? process.env.AGENT_WALLET_WALLET_ID;
+  if (apiKey) {
+    input.apiKey = apiKey;
+  }
+  if (walletId) {
+    input.walletId = walletId;
+  }
+  if (process.env.PACTFUSE_CAW_EXPORT_LIMIT) {
+    input.limit = Number(process.env.PACTFUSE_CAW_EXPORT_LIMIT);
+  }
+  return createHttpsCawReceiptSource(input);
+}
 
 export function createServiceCtx(options: {
   dbPath: string;
@@ -23,9 +45,10 @@ export function createServiceCtx(options: {
           ...(process.env.PACTFUSE_CHAIN_ID ? { chainId: process.env.PACTFUSE_CHAIN_ID } : {}),
         })
       : createUnconfiguredChainClient(),
-    caw: createUnconfiguredCawReceiptSource(),
+    caw: createRuntimeCawSource(),
     templates: createLocalTemplateRegistry(),
     mcpAuditSecret: process.env.PACTFUSE_MCP_AUDIT_TOKEN ?? null,
+    cawIngestToken: process.env.PACTFUSE_CAW_INGEST_TOKEN ?? null,
     clock: options.clock ?? { now: () => new Date() },
     logger: options.logger ?? pino({ name: "pactfuse-api" }),
     config: {

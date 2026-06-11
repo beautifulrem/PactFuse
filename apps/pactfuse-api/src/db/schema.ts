@@ -68,6 +68,39 @@ export const cawRawReceiptBundles = sqliteTable(
   }),
 );
 
+export const cawCanonicalReceipts = sqliteTable(
+  "caw_canonical_receipts",
+  {
+    rawReceiptHash: text("raw_receipt_hash").primaryKey(),
+    canonicalReceiptHash: text("canonical_receipt_hash").notNull(),
+    bundleId: text("bundle_id").notNull(),
+    sessionId: text("session_id").notNull(),
+    operationId: text("operation_id").notNull(),
+    operationKind: text("operation_kind").notNull(),
+    sourceLabel: text("source_label").notNull(),
+    walletAddress: text("wallet_address").notNull(),
+    target: text("target"),
+    selector: text("selector"),
+    requestId: text("request_id").notNull(),
+    effect: text("effect").notNull(),
+    status: text("status").notNull(),
+    policyDigest: text("policy_digest").notNull(),
+    paramsDigest: text("params_digest").notNull(),
+    txHash: text("tx_hash"),
+    txCount: text("tx_count").notNull(),
+    expiry: text("expiry").notNull(),
+    fetchedAt: text("fetched_at").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => ({
+    sessionOperationCanonical: uniqueIndex("caw_canonical_receipts_session_operation_canonical").on(
+      table.sessionId,
+      table.operationId,
+      table.canonicalReceiptHash,
+    ),
+  }),
+);
+
 export const gateChainEvents = sqliteTable(
   "gate_chain_events",
   {

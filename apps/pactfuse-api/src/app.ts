@@ -27,6 +27,7 @@ import {
   readProofProviderStatus,
   readRunnerHeartbeat,
   recordMcpAdapterAudit,
+  previewVerifyEvidenceForSession,
   refundUndeliveredArtifact,
   registerSignedSource,
   registerSourceBoundSpends,
@@ -59,6 +60,7 @@ const ROUTES = [
   { method: "POST", path: "/api/v1/lease/execute", okStatus: 202 },
   { method: "POST", path: "/api/v1/mcp/audit", okStatus: 202 },
   { method: "POST", path: "/api/v1/evidence/verify", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/{sessionId}/verify", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/judge-check", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/replay-bundle", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/runner-heartbeat", okStatus: 200 },
@@ -76,7 +78,15 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/mcp/audit": ["proofAuthority", "winnerClaimAllowed", "requestHash", "responseHash"],
   "/api/v1/evidence/verify": ["schemaOk", "proofChipAllowed", "winnerClaimAllowed", "finalVerifierComplete"],
   "/api/v1/evidence/judge-check": ["winnerClaimAllowed", "rows.status", "rows.authority"],
-  "/api/v1/evidence/replay-bundle": ["winnerClaimAllowed", "eventRoot", "mcpAdapterCalls", "cawReceiptOperations", "rawCawReceiptBundles", "judgeCheck"],
+  "/api/v1/evidence/replay-bundle": [
+    "winnerClaimAllowed",
+    "eventRoot",
+    "mcpAdapterCalls",
+    "cawReceiptOperations",
+    "rawCawReceiptBundles",
+    "canonicalCawReceipts",
+    "judgeCheck",
+  ],
   "/api/v1/evidence/agent-transcript": ["transcriptHash", "toolsCallHash", "boundedToPinnedManifest", "winnerClaimAllowed"],
 };
 
@@ -155,9 +165,10 @@ export function createApp(ctx: ServiceCtx): Hono {
     send(c, await buildCawOperation(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201),
   );
 
-  app.post("/api/v1/caw/receipts/ingest", async (c) =>
-    send(c, await ingestCawReceiptBundle(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202),
-  );
+  app.post("/api/v1/caw/receipts/ingest", async (c) => {
+    authorizeCawReceiptIngest(c, ctx);
+    return send(c, await ingestCawReceiptBundle(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
+  });
 
   app.post("/api/v1/gate/events/ingest", async (c) => {
     const body = SessionScopedEnvelopeSchema.parse(await readJson(c));
@@ -196,6 +207,8 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.post("/api/v1/evidence/verify", async (c) =>
     send(c, await verifyEvidenceForSession(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 200),
   );
+
+  app.get("/api/v1/evidence/:sessionId/verify", async (c) => send(c, await previewVerifyEvidenceForSession(c.req.param("sessionId"), ctx)));
 
   app.get("/api/v1/evidence/judge-check", async (c) => {
     const sessionId = requiredQuery(c, "sessionId");
@@ -305,8 +318,28 @@ function authorizeGateEventIngest(c: Context, ctx: ServiceCtx, payload: unknown)
   }
 }
 
+function authorizeCawReceiptIngest(c: Context, ctx: ServiceCtx): void {
+  const token = ctx.cawIngestToken;
+  if (!token) {
+    return;
+  }
+  const requestId = newRequestId("caw_ingest_auth");
+  const bearer = bearerTokenFor(c);
+  if (!bearer || !secureEqualText(bearer, token)) {
+    throw Object.assign(new Error("CAW receipt ingest token is invalid"), {
+      apiError: forbiddenError(requestId, "CAW receipt ingest token is invalid"),
+    });
+  }
+}
+
 function signMcpAuditPayload(secret: string, payload: unknown): `0x${string}` {
   return `0x${createHmac("sha256", secret).update(canonicalizeJson(payload)).digest("hex")}`;
+}
+
+function secureEqualText(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function secureEqualHex(left: string, right: string): boolean {
@@ -543,12 +576,21 @@ function buildOpenApi(): Record<string, unknown> {
         }),
         CawReceiptIngestResponse: serviceResponseSchema({
           type: "object",
-          required: ["receiptBundleHash", "operationId", "receiptCount", "status", "proofAuthority", "winnerClaimAllowed"],
+          required: [
+            "receiptBundleHash",
+            "operationId",
+            "receiptCount",
+            "canonicalReceiptCount",
+            "status",
+            "proofAuthority",
+            "winnerClaimAllowed",
+          ],
           properties: {
             receiptBundleHash: { type: "string" },
             rawReceiptBundleHash: { type: "string" },
             operationId: { anyOf: [{ type: "string" }, { type: "null" }] },
             receiptCount: { type: "integer", minimum: 1, maximum: 64 },
+            canonicalReceiptCount: { type: "integer", minimum: 0, maximum: 64 },
             status: { enum: ["fixture_manual_receipt", "raw_ingested_pending_proof"] },
             proofAuthority: { const: false },
             winnerClaimAllowed: { const: false },
@@ -692,6 +734,7 @@ function buildOpenApi(): Record<string, unknown> {
             "mcpAdapterCalls",
             "cawReceiptOperations",
             "rawCawReceiptBundles",
+            "canonicalCawReceipts",
             "judgeCheck",
           ],
           properties: {
@@ -825,6 +868,56 @@ function buildOpenApi(): Record<string, unknown> {
                 },
               },
             },
+            canonicalCawReceipts: {
+              type: "array",
+              items: {
+                type: "object",
+                required: [
+                  "rawReceiptHash",
+                  "canonicalReceiptHash",
+                  "bundleId",
+                  "sessionId",
+                  "operationId",
+                  "operationKind",
+                  "sourceLabel",
+                  "walletAddress",
+                  "target",
+                  "selector",
+                  "requestId",
+                  "effect",
+                  "status",
+                  "policyDigest",
+                  "paramsDigest",
+                  "txHash",
+                  "txCount",
+                  "expiry",
+                  "fetchedAt",
+                  "createdAt",
+                ],
+                properties: {
+                  rawReceiptHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  canonicalReceiptHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  bundleId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  operationId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  operationKind: { enum: ["deny_probe", "approve", "activate_tool"] },
+                  sourceLabel: { type: "string" },
+                  walletAddress: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+                  target: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]+$" }, { type: "null" }] },
+                  selector: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{8}$" }, { type: "null" }] },
+                  requestId: { type: "string" },
+                  effect: { enum: ["allow", "deny"] },
+                  status: { type: "string" },
+                  policyDigest: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  paramsDigest: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  txHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  txCount: { type: "string", pattern: "^(0|[1-9][0-9]*)$" },
+                  expiry: { type: "string", format: "date-time" },
+                  fetchedAt: { type: "string", format: "date-time" },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
             judgeCheck: { $ref: "#/components/schemas/JudgeCheckData" },
           },
         }),
@@ -928,6 +1021,15 @@ function parameterSchemaFor(path: string): Record<string, unknown>[] {
       description: "HMAC-SHA256 over the canonical JSON gate ingest payload using the internal gate ingest token.",
     });
   }
+  if (path === "/api/v1/caw/receipts/ingest") {
+    parameters.push({
+      name: "authorization",
+      in: "header",
+      required: false,
+      schema: { type: "string", pattern: "^Bearer .+" },
+      description: "Required when PACTFUSE_CAW_INGEST_TOKEN is configured; protects raw/manual CAW receipt ingest writes.",
+    });
+  }
   if (path === "/api/v1/lease/execute" || path === "/api/v1/artifacts/{sessionId}/{spendId}/{payer}/{artifactHash}") {
     parameters.push({
       name: "authorization",
@@ -981,6 +1083,7 @@ function jsonRequestBody(schema: Record<string, unknown>): Record<string, unknow
 function responseSchemaFor(path: string): Record<string, unknown> {
   switch (path) {
     case "/api/v1/evidence/verify":
+    case "/api/v1/evidence/{sessionId}/verify":
       return { $ref: "#/components/schemas/VerifierRunResponse" };
     case "/api/v1/evidence/judge-check":
       return { $ref: "#/components/schemas/JudgeCheckResponse" };

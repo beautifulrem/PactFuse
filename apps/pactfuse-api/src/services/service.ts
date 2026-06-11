@@ -3,12 +3,15 @@ import {
   ArtifactPreflightPayloadSchema,
   ArtifactRefundPayloadSchema,
   CawOperationBuildPayloadSchema,
+  CanonicalCawReceiptViewSchema,
   CawReceiptIngestPayloadSchema,
   CawReceiptOperationViewSchema,
   CreateSessionInputSchema,
   EvidenceEventSchema,
   GateEventIngestPayloadSchema,
   Hex32Schema,
+  HexSchema,
+  IsoDateStringSchema,
   JudgeCheckViewSchema,
   LeaseExecutePayloadSchema,
   LOCKED_RUNTIME_MODES,
@@ -58,9 +61,32 @@ type CawReceiptIngestData = {
   rawReceiptBundleHash?: `0x${string}`;
   operationId: string | null;
   receiptCount: number;
+  canonicalReceiptCount: number;
   status: "fixture_manual_receipt" | "raw_ingested_pending_proof";
   proofAuthority: false;
   winnerClaimAllowed: false;
+};
+type CanonicalCawReceiptData = {
+  rawReceiptHash: `0x${string}`;
+  canonicalReceiptHash: `0x${string}`;
+  bundleId: `0x${string}`;
+  sessionId: `0x${string}`;
+  operationId: `0x${string}`;
+  operationKind: "deny_probe" | "approve" | "activate_tool";
+  sourceLabel: string;
+  walletAddress: string;
+  target: string | null;
+  selector: string | null;
+  requestId: string;
+  effect: "allow" | "deny";
+  status: string;
+  policyDigest: `0x${string}`;
+  paramsDigest: `0x${string}`;
+  txHash: `0x${string}` | null;
+  txCount: string;
+  expiry: string;
+  fetchedAt: string;
+  createdAt: string;
 };
 
 const JUDGE_ROWS = [
@@ -443,6 +469,7 @@ export async function ingestCawReceiptBundle(
             operationId: payload.operationId ?? null,
             sourceLabel: payload.sourceLabel,
             receiptCount: payload.receipts.length,
+            canonicalReceiptCount: 0,
             manual: true,
             proofAuthority: false,
             status: "fixture_manual_receipt",
@@ -457,6 +484,7 @@ export async function ingestCawReceiptBundle(
           receiptBundleHash,
           operationId: payload.operationId ?? null,
           receiptCount: payload.receipts.length,
+          canonicalReceiptCount: 0,
           status: "fixture_manual_receipt",
           proofAuthority: false,
           winnerClaimAllowed: false,
@@ -476,6 +504,17 @@ export async function ingestCawReceiptBundle(
     const createdAt = ctx.clock.now().toISOString();
     const rawReceiptBundleHash = hashJson(rawBundle.bundle);
     const rawBundleId = hashJson({ sessionId: envelope.sessionId, operationId, rawReceiptBundleHash });
+    const canonicalReceipts = buildCanonicalCawReceipts({
+      bundleId: rawBundleId,
+      sessionId: envelope.sessionId,
+      operationId,
+      sourceLabel: payload.sourceLabel,
+      operation,
+      receipts: rawBundle.receipts,
+      fetchedAt: rawBundle.fetchedAt,
+      createdAt,
+      requestId,
+    });
     const event = withImmediateTransaction(ctx, () => {
       const result = ctx.db.sqlite
         .prepare("UPDATE caw_receipt_operations SET receipt_bundle_hash = ?, status = ? WHERE operation_id = ? AND session_id = ?")
@@ -502,6 +541,38 @@ export async function ingestCawReceiptBundle(
           rawBundle.receipts.length,
           createdAt,
         );
+      for (const receipt of canonicalReceipts) {
+        ctx.db.sqlite
+          .prepare(
+            `INSERT INTO caw_canonical_receipts
+              (raw_receipt_hash, canonical_receipt_hash, bundle_id, session_id, operation_id, operation_kind, source_label,
+               wallet_address, target, selector, request_id, effect, status, policy_digest, params_digest, tx_hash,
+               tx_count, expiry, fetched_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            receipt.rawReceiptHash,
+            receipt.canonicalReceiptHash,
+            receipt.bundleId,
+            receipt.sessionId,
+            receipt.operationId,
+            receipt.operationKind,
+            receipt.sourceLabel,
+            receipt.walletAddress,
+            receipt.target,
+            receipt.selector,
+            receipt.requestId,
+            receipt.effect,
+            receipt.status,
+            receipt.policyDigest,
+            receipt.paramsDigest,
+            receipt.txHash,
+            receipt.txCount,
+            receipt.expiry,
+            receipt.fetchedAt,
+            receipt.createdAt,
+          );
+      }
       return appendEvidenceEvent(ctx, {
         sessionId: envelope.sessionId,
         authority: "advisory",
@@ -515,6 +586,8 @@ export async function ingestCawReceiptBundle(
           rawSource: rawBundle.source,
           fetchedAt: rawBundle.fetchedAt,
           receiptCount: rawBundle.receipts.length,
+          canonicalReceiptCount: canonicalReceipts.length,
+          canonicalReceiptHashes: canonicalReceipts.map((receipt) => receipt.canonicalReceiptHash),
           expectedReceiptCount: payload.receipts.length,
           manual: false,
           proofAuthority: false,
@@ -531,6 +604,7 @@ export async function ingestCawReceiptBundle(
         rawReceiptBundleHash,
         operationId,
         receiptCount: rawBundle.receipts.length,
+        canonicalReceiptCount: canonicalReceipts.length,
         status: "raw_ingested_pending_proof",
         proofAuthority: false,
         winnerClaimAllowed: false,
@@ -956,51 +1030,7 @@ export async function verifyEvidenceForSession(
   const payload = parseStrict(VerifyEvidencePayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("evidence:verify", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
-    const proofProviders = await readProofProviderStatus(ctx);
-    const verifierInput = payload.receipt ?? payload.replayBundle ?? {};
-    const raw =
-      payload.receipt || payload.replayBundle
-        ? await ctx.verifier.verify(verifierInput, {
-            cliMode: payload.schemaOnly ? "schema-only" : "proof-chip",
-            proofProviders,
-            pactTemplates: ctx.templates.list(),
-          })
-        : {
-            schemaOk: false,
-            proofChipAllowed: false,
-            winnerClaimAllowed: false,
-            requestedWinnerClaimAllowed: false,
-            finalVerifierComplete: false,
-            warnings: [],
-            errors: ["missing receipt or replayBundle; fail closed"],
-          };
-    const eventLogErrors = [
-      ...verifyEventLogIntegrity(ctx, envelope.sessionId),
-      ...verifyMcpAdapterCallIntegrity(ctx, envelope.sessionId),
-      ...verifyGateFinalityIntegrity(ctx, envelope.sessionId),
-      ...verifyReplayBundleBindings(ctx, envelope.sessionId, payload),
-    ];
-    const rawErrors = toStringArray(raw.errors);
-    const view = VerifierRunViewSchema.parse({
-      sessionId: envelope.sessionId,
-      proofLevel: payload.schemaOnly ? "schema_only_no_claim" : "fail_closed_no_claim",
-      claimMode: ctx.config.claimMode,
-      paymentMode: ctx.config.paymentMode,
-      tokenMode: ctx.config.tokenMode,
-      identityMode: ctx.config.identityMode,
-      schemaOk: Boolean(raw.schemaOk) && eventLogErrors.length === 0,
-      proofChipAllowed: false,
-      winnerClaimAllowed: false,
-      requestedWinnerClaimAllowed: Boolean(raw.requestedWinnerClaimAllowed),
-      finalVerifierComplete: false,
-      errors: [...rawErrors, ...eventLogErrors],
-      warnings: [
-        ...toStringArray(raw.warnings),
-        ...proofProviderWarnings(proofProviders),
-        "P0 route wraps the structural verifier fail-closed; final chain/signature/hash verifier is incomplete",
-      ],
-      raw: jsonRecord({ ...raw, proofProviders, pactTemplates: ctx.templates.list() }),
-    });
+    const { view, verifierInput } = await buildVerifierRunView(ctx, envelope.sessionId, payload);
     const inputHash = hashJson(verifierInput);
     const verifierRunId = hashJson({ sessionId: envelope.sessionId, inputHash, requestId });
     ctx.db.sqlite
@@ -1031,6 +1061,75 @@ export async function verifyEvidenceForSession(
   });
 }
 
+export async function previewVerifyEvidenceForSession(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<VerifierRunView>> {
+  const requestId = newRequestId("verify_preview");
+  const parsedSessionId = parseStrict(Hex32Schema, sessionId);
+  assertSession(ctx, parsedSessionId, requestId);
+  const replayBundle = assembleReplayBundleData(parsedSessionId, ctx);
+  const { view } = await buildVerifierRunView(ctx, parsedSessionId, {
+    replayBundle: replayBundle as unknown as Record<string, JsonValue>,
+    schemaOnly: false,
+  });
+  return { ok: true, requestId, data: view };
+}
+
+async function buildVerifierRunView(
+  ctx: ServiceCtx,
+  sessionId: string,
+  payload: {
+    receipt?: Record<string, JsonValue> | undefined;
+    replayBundle?: Record<string, JsonValue> | undefined;
+    schemaOnly?: boolean | undefined;
+  },
+): Promise<{ view: VerifierRunView; verifierInput: unknown }> {
+  const proofProviders = await readProofProviderStatus(ctx);
+  const verifierInput = payload.receipt ?? payload.replayBundle ?? {};
+  const raw =
+    payload.receipt || payload.replayBundle
+      ? await ctx.verifier.verify(verifierInput, {
+          cliMode: payload.schemaOnly ? "schema-only" : "proof-chip",
+          proofProviders,
+          pactTemplates: ctx.templates.list(),
+        })
+      : {
+          schemaOk: false,
+          proofChipAllowed: false,
+          winnerClaimAllowed: false,
+          requestedWinnerClaimAllowed: false,
+          finalVerifierComplete: false,
+          warnings: [],
+          errors: ["missing receipt or replayBundle; fail closed"],
+        };
+  const eventLogErrors = [
+    ...verifyEventLogIntegrity(ctx, sessionId),
+    ...verifyMcpAdapterCallIntegrity(ctx, sessionId),
+    ...verifyGateFinalityIntegrity(ctx, sessionId),
+    ...verifyReplayBundleBindings(ctx, sessionId, payload),
+  ];
+  const rawErrors = toStringArray(raw.errors);
+  const view = VerifierRunViewSchema.parse({
+    sessionId,
+    proofLevel: payload.schemaOnly ? "schema_only_no_claim" : "fail_closed_no_claim",
+    claimMode: ctx.config.claimMode,
+    paymentMode: ctx.config.paymentMode,
+    tokenMode: ctx.config.tokenMode,
+    identityMode: ctx.config.identityMode,
+    schemaOk: Boolean(raw.schemaOk) && eventLogErrors.length === 0,
+    proofChipAllowed: false,
+    winnerClaimAllowed: false,
+    requestedWinnerClaimAllowed: Boolean(raw.requestedWinnerClaimAllowed),
+    finalVerifierComplete: false,
+    errors: [...rawErrors, ...eventLogErrors],
+    warnings: [
+      ...toStringArray(raw.warnings),
+      ...proofProviderWarnings(proofProviders),
+      "P0 route wraps the structural verifier fail-closed; final chain/signature/hash verifier is incomplete",
+    ],
+    raw: jsonRecord({ ...raw, proofProviders, pactTemplates: ctx.templates.list() }),
+  });
+  return { view, verifierInput };
+}
+
 export async function readProofProviderStatus(ctx: ServiceCtx): Promise<ProofProviderStatus[]> {
   const [chain, caw] = await Promise.all([ctx.chain.status(), ctx.caw.status()]);
   return [chain, caw];
@@ -1048,14 +1147,32 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
   const requestId = newRequestId("replay_bundle");
   const parsedSessionId = parseStrict(Hex32Schema, sessionId);
   assertSession(ctx, parsedSessionId, requestId);
-  const events = listEvents(ctx, parsedSessionId, 0, 200);
-  const mcpAdapterCalls = listMcpAdapterCalls(ctx, parsedSessionId, 200);
-  const cawReceiptOperations = listCawReceiptOperations(ctx, parsedSessionId, 200);
-  const rawCawReceiptBundles = listRawCawReceiptBundles(ctx, parsedSessionId, 200);
-  const agentTranscript = buildAgentTranscriptData(parsedSessionId, ctx, mcpAdapterCalls.length);
-  const data = ReplayBundleViewSchema.parse({
+  const data = assembleReplayBundleData(parsedSessionId, ctx);
+  const bundleBytes = Buffer.byteLength(canonicalizeJson(data), "utf8");
+  if (bundleBytes > MAX_REPLAY_BUNDLE_BYTES) {
+    return {
+      ok: false,
+      requestId,
+      error: proofBlockedError(requestId, "replay bundle exceeds the 2 MiB response cap", {
+        bundleBytes,
+        maxBytes: MAX_REPLAY_BUNDLE_BYTES,
+        eventCount: data.events.length,
+      }),
+    };
+  }
+  return { ok: true, requestId, data };
+}
+
+function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBundleView {
+  const events = listEvents(ctx, sessionId, 0, 200);
+  const mcpAdapterCalls = listMcpAdapterCalls(ctx, sessionId, 200);
+  const cawReceiptOperations = listCawReceiptOperations(ctx, sessionId, 200);
+  const rawCawReceiptBundles = listRawCawReceiptBundles(ctx, sessionId, 200);
+  const canonicalCawReceipts = listCanonicalCawReceipts(ctx, sessionId, 200);
+  const agentTranscript = buildAgentTranscriptData(sessionId, ctx, mcpAdapterCalls.length);
+  return ReplayBundleViewSchema.parse({
     bundleType: "PACTFUSE_EVIDENCE_V1",
-    sessionId: parsedSessionId,
+    sessionId,
     summaryMode: true,
     asOfEventSeq: events.at(-1)?.eventSeq ?? 0,
     asOfMcpAdapterCallCount: mcpAdapterCalls.length,
@@ -1066,21 +1183,9 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
     mcpAdapterCalls,
     cawReceiptOperations,
     rawCawReceiptBundles,
-    judgeCheck: readJudgeCheckData(parsedSessionId, ctx),
+    canonicalCawReceipts,
+    judgeCheck: readJudgeCheckData(sessionId, ctx),
   });
-  const bundleBytes = Buffer.byteLength(canonicalizeJson(data), "utf8");
-  if (bundleBytes > MAX_REPLAY_BUNDLE_BYTES) {
-    return {
-      ok: false,
-      requestId,
-      error: proofBlockedError(requestId, "replay bundle exceeds the 2 MiB response cap", {
-        bundleBytes,
-        maxBytes: MAX_REPLAY_BUNDLE_BYTES,
-        eventCount: events.length,
-      }),
-    };
-  }
-  return { ok: true, requestId, data };
 }
 
 export async function readRunnerHeartbeat(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
@@ -1833,29 +1938,7 @@ function assertCawOperationMembership(
     operation: Row | undefined;
   },
 ): void {
-  const matching = receipts.find((receipt) => {
-    const operationId = asOptionalString(receipt.operationId ?? receipt.cawOperationId ?? receipt.requestId);
-    if (!operationId || operationId !== input.operationId) {
-      return false;
-    }
-    const sessionId = asOptionalString(receipt.sessionId);
-    if (!sessionId || sessionId !== input.sessionId) {
-      return false;
-    }
-    const operationKind = asOptionalString(receipt.operationKind ?? receipt.kind);
-    if (!operationKind || operationKind !== String(input.operation?.operation_kind)) {
-      return false;
-    }
-    const target = asOptionalString(receipt.target);
-    if (input.operation?.target && (!target || target.toLowerCase() !== String(input.operation.target).toLowerCase())) {
-      return false;
-    }
-    const selector = asOptionalString(receipt.selector);
-    if (input.operation?.selector && (!selector || selector.toLowerCase() !== String(input.operation.selector).toLowerCase())) {
-      return false;
-    }
-    return true;
-  });
+  const matching = receipts.find((receipt) => cawReceiptMatchesOperation(receipt, input));
   if (!matching) {
     throw Object.assign(new Error("raw CAW receipt bundle does not contain the requested operation"), {
       apiError: proofBlockedError(input.requestId, "raw CAW receipt bundle does not contain the requested operation", {
@@ -1863,6 +1946,237 @@ function assertCawOperationMembership(
       }),
     });
   }
+}
+
+function cawReceiptMatchesOperation(
+  receipt: Record<string, JsonValue>,
+  input: { sessionId: string; operationId: string; operation: Row | undefined },
+): boolean {
+  const operationId = asOptionalString(receipt.operationId ?? receipt.cawOperationId ?? receipt.requestId);
+  if (!operationId || operationId !== input.operationId) {
+    return false;
+  }
+  const sessionId = asOptionalString(receipt.sessionId);
+  if (!sessionId || sessionId !== input.sessionId) {
+    return false;
+  }
+  const operationKind = asOptionalString(receipt.operationKind ?? receipt.kind);
+  if (!operationKind || operationKind !== String(input.operation?.operation_kind)) {
+    return false;
+  }
+  const target = asOptionalString(receipt.target);
+  if (input.operation?.target && (!target || target.toLowerCase() !== String(input.operation.target).toLowerCase())) {
+    return false;
+  }
+  const selector = asOptionalString(receipt.selector);
+  if (input.operation?.selector && (!selector || selector.toLowerCase() !== String(input.operation.selector).toLowerCase())) {
+    return false;
+  }
+  return true;
+}
+
+function buildCanonicalCawReceipts(input: {
+  bundleId: `0x${string}`;
+  sessionId: string;
+  operationId: string;
+  sourceLabel: string;
+  operation: Row | undefined;
+  receipts: Array<Record<string, JsonValue>>;
+  fetchedAt: string;
+  createdAt: string;
+  requestId: string;
+}): CanonicalCawReceiptData[] {
+  const matching = input.receipts.filter((receipt) => cawReceiptMatchesOperation(receipt, input));
+  if (matching.length === 0) {
+    throw Object.assign(new Error("raw CAW receipt bundle has no canonicalizable receipt for the requested operation"), {
+      apiError: proofBlockedError(input.requestId, "raw CAW receipt bundle has no canonicalizable receipt for the requested operation", {
+        operationId: input.operationId,
+      }),
+    });
+  }
+  const rawHashes = matching.map((receipt) => hashJson(receipt));
+  if (new Set(rawHashes).size !== rawHashes.length) {
+    throw Object.assign(new Error("raw CAW receipt bundle contains duplicate canonical receipt rows"), {
+      apiError: proofBlockedError(input.requestId, "raw CAW receipt bundle contains duplicate canonical receipt rows", {
+        operationId: input.operationId,
+      }),
+    });
+  }
+  return matching.map((receipt) => canonicalizeCawReceipt(receipt, input));
+}
+
+function canonicalizeCawReceipt(
+  receipt: Record<string, JsonValue>,
+  input: {
+    bundleId: `0x${string}`;
+    sessionId: string;
+    operationId: string;
+    sourceLabel: string;
+    operation: Row | undefined;
+    fetchedAt: string;
+    createdAt: string;
+    requestId: string;
+  },
+): CanonicalCawReceiptData {
+  const effect = cawReceiptEffect(receipt, input.requestId);
+  const status = cawRequiredText(receipt.status ?? receipt.statusDisplay ?? receipt.status_display ?? receipt.result ?? receipt.effect, "status", input.requestId);
+  const walletAddress = cawRequiredHex(
+    receipt.walletAddress ?? receipt.wallet_address ?? receipt.wallet ?? receipt.owner ?? receipt.payer ?? receipt.agentWallet,
+    "walletAddress",
+    input.requestId,
+  );
+  const policyDigest = cawRequiredHex32(receipt.policyDigest ?? receipt.policy_digest ?? receipt.cawPolicyDigest, "policyDigest", input.requestId);
+  const paramsDigest = cawRequiredHex32(
+    receipt.paramsDigest ?? receipt.params_digest ?? receipt.requestDigest ?? receipt.request_digest ?? receipt.typedDataHash,
+    "paramsDigest",
+    input.requestId,
+  );
+  const requestId = cawRequiredText(receipt.cawRequestId ?? receipt.requestId ?? receipt.request_id ?? receipt.id, "requestId", input.requestId);
+  const txCount = cawRequiredDecimal(receipt.txCount ?? receipt.tx_count ?? receipt.policyTxCount ?? receipt.policy_tx_count, "txCount", input.requestId);
+  const expiry = cawRequiredIso(receipt.expiry ?? receipt.expiresAt ?? receipt.expires_at ?? receipt.expiration, "expiry", input.requestId);
+  const target = input.operation?.target ? cawRequiredHex(receipt.target, "target", input.requestId) : cawOptionalHex(receipt.target, "target", input.requestId);
+  const selector = input.operation?.selector
+    ? cawRequiredSelector(receipt.selector, "selector", input.requestId)
+    : cawOptionalSelector(receipt.selector, "selector", input.requestId);
+  const txHash = cawOptionalHex32(receipt.txHash ?? receipt.tx_hash ?? receipt.transactionHash ?? receipt.transaction_hash, "txHash", input.requestId);
+  if (effect === "allow" && !txHash) {
+    throw Object.assign(new Error("canonical CAW allow receipt requires txHash"), {
+      apiError: proofBlockedError(input.requestId, "canonical CAW allow receipt requires txHash"),
+    });
+  }
+  const operationKind = String(input.operation?.operation_kind);
+  const canonicalBase = {
+    bundleId: input.bundleId,
+    sessionId: Hex32Schema.parse(input.sessionId),
+    operationId: Hex32Schema.parse(input.operationId),
+    operationKind: CawOperationBuildPayloadSchema.shape.operationKind.parse(operationKind),
+    sourceLabel: input.sourceLabel,
+    walletAddress,
+    target,
+    selector,
+    requestId,
+    effect,
+    status,
+    policyDigest,
+    paramsDigest,
+    txHash,
+    txCount,
+    expiry,
+    fetchedAt: IsoDateStringSchema.parse(input.fetchedAt),
+    createdAt: IsoDateStringSchema.parse(input.createdAt),
+  };
+  return CanonicalCawReceiptViewSchema.parse({
+    rawReceiptHash: hashJson(receipt),
+    canonicalReceiptHash: hashJson(canonicalBase),
+    ...canonicalBase,
+  }) as CanonicalCawReceiptData;
+}
+
+function cawReceiptEffect(receipt: Record<string, JsonValue>, requestId: string): "allow" | "deny" {
+  const raw = asOptionalString(receipt.effect ?? receipt.result ?? receipt.status)?.toLowerCase();
+  if (raw && ["allow", "allowed", "success", "succeeded", "executed", "confirmed", "completed"].includes(raw)) {
+    return "allow";
+  }
+  if (raw && ["deny", "denied", "blocked", "rejected", "policy_denied", "policydenied", "failed"].includes(raw)) {
+    return "deny";
+  }
+  throw Object.assign(new Error("canonical CAW receipt requires effect/result/status allow or deny"), {
+    apiError: proofBlockedError(requestId, "canonical CAW receipt requires effect/result/status allow or deny"),
+  });
+}
+
+function cawRequiredText(value: unknown, field: string, requestId: string): string {
+  const text = asOptionalString(value);
+  if (!text) {
+    throw Object.assign(new Error(`canonical CAW receipt missing ${field}`), {
+      apiError: proofBlockedError(requestId, `canonical CAW receipt missing ${field}`),
+    });
+  }
+  return text;
+}
+
+function cawRequiredHex(value: unknown, field: string, requestId: string): string {
+  const text = cawRequiredText(value, field, requestId);
+  if (!HexSchema.safeParse(text).success) {
+    throw Object.assign(new Error(`canonical CAW receipt ${field} must be hex`), {
+      apiError: proofBlockedError(requestId, `canonical CAW receipt ${field} must be hex`),
+    });
+  }
+  return text;
+}
+
+function cawOptionalHex(value: unknown, field: string, requestId: string): string | null {
+  const text = asOptionalString(value);
+  if (!text) {
+    return null;
+  }
+  if (!HexSchema.safeParse(text).success) {
+    throw Object.assign(new Error(`canonical CAW receipt ${field} must be hex`), {
+      apiError: proofBlockedError(requestId, `canonical CAW receipt ${field} must be hex`),
+    });
+  }
+  return text;
+}
+
+function cawRequiredHex32(value: unknown, field: string, requestId: string): `0x${string}` {
+  const text = cawRequiredText(value, field, requestId);
+  if (!Hex32Schema.safeParse(text).success) {
+    throw Object.assign(new Error(`canonical CAW receipt ${field} must be 32-byte hex`), {
+      apiError: proofBlockedError(requestId, `canonical CAW receipt ${field} must be 32-byte hex`),
+    });
+  }
+  return text as `0x${string}`;
+}
+
+function cawOptionalHex32(value: unknown, field: string, requestId: string): `0x${string}` | null {
+  const text = asOptionalString(value);
+  if (!text) {
+    return null;
+  }
+  if (!Hex32Schema.safeParse(text).success) {
+    throw Object.assign(new Error(`canonical CAW receipt ${field} must be 32-byte hex`), {
+      apiError: proofBlockedError(requestId, `canonical CAW receipt ${field} must be 32-byte hex`),
+    });
+  }
+  return text as `0x${string}`;
+}
+
+function cawRequiredSelector(value: unknown, field: string, requestId: string): string {
+  const text = cawRequiredText(value, field, requestId);
+  if (!/^0x[0-9a-fA-F]{8}$/.test(text)) {
+    throw Object.assign(new Error(`canonical CAW receipt ${field} must be a 4-byte selector`), {
+      apiError: proofBlockedError(requestId, `canonical CAW receipt ${field} must be a 4-byte selector`),
+    });
+  }
+  return text;
+}
+
+function cawOptionalSelector(value: unknown, field: string, requestId: string): string | null {
+  const text = asOptionalString(value);
+  if (!text) {
+    return null;
+  }
+  return cawRequiredSelector(text, field, requestId);
+}
+
+function cawRequiredDecimal(value: unknown, field: string, requestId: string): string {
+  const text = cawRequiredText(value, field, requestId);
+  if (!/^(0|[1-9][0-9]*)$/.test(text)) {
+    throw Object.assign(new Error(`canonical CAW receipt ${field} must be a decimal string`), {
+      apiError: proofBlockedError(requestId, `canonical CAW receipt ${field} must be a decimal string`),
+    });
+  }
+  return text;
+}
+
+function cawRequiredIso(value: unknown, field: string, requestId: string): string {
+  const text = cawRequiredText(value, field, requestId);
+  if (!IsoDateStringSchema.safeParse(text).success) {
+    throw Object.assign(new Error(`canonical CAW receipt ${field} must be an ISO datetime`), {
+      apiError: proofBlockedError(requestId, `canonical CAW receipt ${field} must be an ISO datetime`),
+    });
+  }
+  return text;
 }
 
 function assertExpectedCawReceipts(
@@ -2746,6 +3060,42 @@ function listRawCawReceiptBundles(ctx: ServiceCtx, sessionId: string, limit: num
   );
 }
 
+function listCanonicalCawReceipts(ctx: ServiceCtx, sessionId: string, limit: number) {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM caw_canonical_receipts
+       WHERE session_id = ?
+       ORDER BY created_at ASC, raw_receipt_hash ASC
+       LIMIT ?`,
+    )
+    .all(sessionId, limit) as Row[];
+  return rows.map((row) =>
+    CanonicalCawReceiptViewSchema.parse({
+      rawReceiptHash: row.raw_receipt_hash,
+      canonicalReceiptHash: row.canonical_receipt_hash,
+      bundleId: row.bundle_id,
+      sessionId: row.session_id,
+      operationId: row.operation_id,
+      operationKind: row.operation_kind,
+      sourceLabel: row.source_label,
+      walletAddress: row.wallet_address,
+      target: row.target ?? null,
+      selector: row.selector ?? null,
+      requestId: row.request_id,
+      effect: row.effect,
+      status: row.status,
+      policyDigest: row.policy_digest,
+      paramsDigest: row.params_digest,
+      txHash: row.tx_hash ?? null,
+      txCount: row.tx_count,
+      expiry: row.expiry,
+      fetchedAt: row.fetched_at,
+      createdAt: row.created_at,
+    }),
+  );
+}
+
 function verifyEventLogIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   const events = listEvents(ctx, sessionId, 0, 200);
   const errors: string[] = [];
@@ -2927,6 +3277,7 @@ function verifyReplayBundleBindings(
   compareReplaySnapshot(errors, "replayBundle.mcpAdapterCalls", bundle.mcpAdapterCalls, listMcpAdapterCalls(ctx, sessionId, asOfCount));
   compareReplaySnapshot(errors, "replayBundle.cawReceiptOperations", bundle.cawReceiptOperations, listCawReceiptOperations(ctx, sessionId, 200));
   compareReplaySnapshot(errors, "replayBundle.rawCawReceiptBundles", bundle.rawCawReceiptBundles, listRawCawReceiptBundles(ctx, sessionId, 200));
+  compareReplaySnapshot(errors, "replayBundle.canonicalCawReceipts", bundle.canonicalCawReceipts, listCanonicalCawReceipts(ctx, sessionId, 200));
   compareReplaySnapshot(errors, "replayBundle.judgeCheck", bundle.judgeCheck, readJudgeCheckData(sessionId, ctx));
   return errors;
 }

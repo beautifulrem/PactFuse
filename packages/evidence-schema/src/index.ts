@@ -363,6 +363,31 @@ export const RawCawReceiptBundleViewSchema = z
   })
   .strict();
 
+export const CanonicalCawReceiptViewSchema = z
+  .object({
+    rawReceiptHash: Hex32Schema,
+    canonicalReceiptHash: Hex32Schema,
+    bundleId: Hex32Schema,
+    sessionId: Hex32Schema,
+    operationId: Hex32Schema,
+    operationKind: z.enum(["deny_probe", "approve", "activate_tool"]),
+    sourceLabel: z.string().min(1).max(120),
+    walletAddress: HexSchema,
+    target: HexSchema.nullable(),
+    selector: z.string().regex(/^0x[0-9a-fA-F]{8}$/).nullable(),
+    requestId: z.string().min(1).max(200),
+    effect: z.enum(["allow", "deny"]),
+    status: z.string().min(1).max(120),
+    policyDigest: Hex32Schema,
+    paramsDigest: Hex32Schema,
+    txHash: Hex32Schema.nullable(),
+    txCount: DecimalStringSchema,
+    expiry: IsoDateStringSchema,
+    fetchedAt: IsoDateStringSchema,
+    createdAt: IsoDateStringSchema,
+  })
+  .strict();
+
 export const ReplayBundleViewSchema = z
   .object({
     bundleType: z.literal("PACTFUSE_EVIDENCE_V1"),
@@ -377,6 +402,7 @@ export const ReplayBundleViewSchema = z
     mcpAdapterCalls: z.array(McpAdapterCallViewSchema).max(200),
     cawReceiptOperations: z.array(CawReceiptOperationViewSchema).max(200),
     rawCawReceiptBundles: z.array(RawCawReceiptBundleViewSchema).max(200),
+    canonicalCawReceipts: z.array(CanonicalCawReceiptViewSchema).max(200),
     judgeCheck: JudgeCheckViewSchema,
   })
   .strict();
