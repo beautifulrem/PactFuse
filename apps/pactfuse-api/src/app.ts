@@ -29,6 +29,7 @@ import {
   readChainIndexerStatus,
   readJudgeCheck,
   readProofProviderStatus,
+  readReplayPage,
   readRunnerHeartbeat,
   recordMcpAdapterAudit,
   previewVerifyEvidenceForSession,
@@ -68,6 +69,7 @@ const ROUTES = [
   { method: "GET", path: "/api/v1/evidence/{sessionId}/verify", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/judge-check", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/replay-bundle", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/replay-page", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/indexer-status", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/runner-heartbeat", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/agent-transcript", okStatus: 200 },
@@ -287,6 +289,13 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.get("/api/v1/evidence/replay-bundle", async (c) => {
     const sessionId = requiredQuery(c, "sessionId");
     return send(c, await assembleReplayBundle(sessionId, ctx));
+  });
+
+  app.get("/api/v1/evidence/replay-page", async (c) => {
+    const sessionId = requiredQuery(c, "sessionId");
+    const collection = requiredQuery(c, "collection");
+    const page = requiredQuery(c, "page");
+    return send(c, await readReplayPage({ sessionId, collection, page }, ctx));
   });
 
   app.get("/api/v1/evidence/indexer-status", async (c) => send(c, await readChainIndexerStatus(ctx)));
@@ -1228,6 +1237,7 @@ function buildOpenApi(): Record<string, unknown> {
             "canonicalCawReceipts",
             "leaseRuns",
             "judgeCheck",
+            "replayPageIndex",
           ],
           properties: {
             bundleType: { const: "PACTFUSE_EVIDENCE_V1" },
@@ -1631,6 +1641,61 @@ function buildOpenApi(): Record<string, unknown> {
               },
             },
             judgeCheck: { $ref: "#/components/schemas/JudgeCheckData" },
+            replayPageIndex: {
+              type: "object",
+              required: ["pageSize", "pageRoot", "collections"],
+              properties: {
+                pageSize: { const: 200 },
+                pageRoot: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                collections: {
+                  type: "object",
+                  additionalProperties: {
+                    type: "object",
+                    required: ["totalRows", "pageCount", "orderBy", "firstPageHash", "pageRoot", "pageHashes"],
+                    properties: {
+                      totalRows: { type: "integer", minimum: 0 },
+                      pageCount: { type: "integer", minimum: 0 },
+                      orderBy: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 4 },
+                      firstPageHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                      pageRoot: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                      pageHashes: {
+                        type: "array",
+                        items: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                        maxItems: 5000,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        }),
+        ReplayPageResponse: serviceResponseSchema({
+          type: "object",
+          required: ["bundleType", "sessionId", "collection", "pageIndex", "pageSize", "orderBy", "rows", "pageHash"],
+          properties: {
+            bundleType: { const: "PACTFUSE_REPLAY_PAGE_V1" },
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            collection: {
+              enum: [
+                "events",
+                "sources",
+                "spends",
+                "artifactPreflights",
+                "quotes",
+                "artifactAccessTokens",
+                "mcpAdapterCalls",
+                "cawReceiptOperations",
+                "rawCawReceiptBundles",
+                "canonicalCawReceipts",
+                "leaseRuns",
+              ],
+            },
+            pageIndex: { type: "integer", minimum: 0 },
+            pageSize: { const: 200 },
+            orderBy: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 4 },
+            rows: { type: "array", maxItems: 200, items: { type: "object", additionalProperties: true } },
+            pageHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
           },
         }),
         AgentTranscriptResponse: serviceResponseSchema({
@@ -1905,6 +1970,8 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/McpAuditResponse" };
     case "/api/v1/evidence/replay-bundle":
       return { $ref: "#/components/schemas/ReplayBundleResponse" };
+    case "/api/v1/evidence/replay-page":
+      return { $ref: "#/components/schemas/ReplayPageResponse" };
     case "/api/v1/evidence/indexer-status":
       return { $ref: "#/components/schemas/ChainIndexerStatusResponse" };
     case "/api/v1/evidence/runner-heartbeat":

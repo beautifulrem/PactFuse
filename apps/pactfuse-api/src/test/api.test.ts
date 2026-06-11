@@ -900,11 +900,25 @@ describe("pactfuse-api P0", () => {
       "canonicalCawReceipts",
       "leaseRuns",
       "judgeCheck",
+      "replayPageIndex",
     ]);
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("mcpAdapterCalls");
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("rawCawReceiptBundles");
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("canonicalCawReceipts");
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("leaseRuns");
+    expect(json.paths["/api/v1/evidence/replay-page"].get.responses["200"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ReplayPageResponse",
+    );
+    expect(json.components.schemas.ReplayPageResponse.oneOf[0].properties.data.required).toEqual([
+      "bundleType",
+      "sessionId",
+      "collection",
+      "pageIndex",
+      "pageSize",
+      "orderBy",
+      "rows",
+      "pageHash",
+    ]);
     expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.sources.items.required).toEqual([
       "sourceId",
       "sessionId",
@@ -2455,7 +2469,7 @@ describe("pactfuse-api P0", () => {
     expect(issue.json.error.message).toContain("payload exceeds");
   });
 
-  it("blocks artifact token issuance that would exceed the replay summary cap", async () => {
+  it("keeps artifact token issuance live when replay rows exceed the summary page", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-artifact-summary-cap");
@@ -2484,9 +2498,8 @@ describe("pactfuse-api P0", () => {
       },
     });
 
-    expect(issue.status).toBe(422);
-    expect(issue.json.error.code).toBe("proof_blocked");
-    expect(issue.json.error.message).toContain("replay summary cap");
+    expect(issue.status).toBe(202);
+    expect(issue.json.data.winnerClaimAllowed).toBe(false);
 
     appendEvidenceEvent(ctx, {
       sessionId,
@@ -2496,9 +2509,10 @@ describe("pactfuse-api P0", () => {
     });
     const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
     const replayJson = await replay.json();
-    expect(replay.status).toBe(422);
-    expect(replayJson.error.code).toBe("proof_blocked");
-    expect(replayJson.error.message).toContain("replay summary cap");
+    expect(replay.status).toBe(200);
+    expect(replayJson.data.events).toHaveLength(200);
+    expect(replayJson.data.replayPageIndex.collections.events.totalRows).toBeGreaterThan(200);
+    expect(replayJson.data.replayPageIndex.collections.events.pageHashes.length).toBeGreaterThan(1);
   });
 
   it("requires registered spends before artifact preflight", async () => {
@@ -3734,9 +3748,9 @@ describe("pactfuse-api P0", () => {
 	    expect(verify.json.data.winnerClaimAllowed).toBe(false);
 	  });
 
-	  it("fails verifier replay cleanliness when summary snapshots exceed the cap", async () => {
-	    const { app, ctx } = makeApp();
-	    const sessionId = await createSession(app, "sess-replay-summary-cap");
+		  it("indexes replay pages when summary snapshots exceed the first page", async () => {
+		    const { app, ctx } = makeApp();
+		    const sessionId = await createSession(app, "sess-replay-summary-cap");
 	    for (let i = 0; i < 200; i += 1) {
 	      appendEvidenceEvent(ctx, {
 	        sessionId,
@@ -3745,21 +3759,38 @@ describe("pactfuse-api P0", () => {
 	        payload: { i, winnerClaimAllowed: false },
 	      });
 	    }
-	    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
-	    const replayJson = await replay.json();
-	    const verify = await post(app, "/api/v1/evidence/verify", {
-	      sessionId,
-	      idempotencyKey: "verify-replay-summary-cap",
-	      payload: { schemaOnly: true },
-	    });
+		    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+		    const replayJson = await replay.json();
+    const eventPage0 = await app.request(`/api/v1/evidence/replay-page?sessionId=${sessionId}&collection=events&page=0`);
+    const eventPage0Json = await eventPage0.json();
+    const eventPage1 = await app.request(`/api/v1/evidence/replay-page?sessionId=${sessionId}&collection=events&page=1`);
+    const eventPage1Json = await eventPage1.json();
+    const outOfRange = await app.request(`/api/v1/evidence/replay-page?sessionId=${sessionId}&collection=events&page=99`);
+    const outOfRangeJson = await outOfRange.json();
+		    const verify = await post(app, "/api/v1/evidence/verify", {
+		      sessionId,
+		      idempotencyKey: "verify-replay-summary-cap",
+		      payload: { replayBundle: replayJson.data },
+		    });
 
-	    expect(replay.status).toBe(422);
-	    expect(replayJson.error.code).toBe("proof_blocked");
-	    expect(replayJson.error.message).toContain("replay summary cap");
-	    expect(verify.status).toBe(200);
-	    expect(verify.json.data.schemaOk).toBe(false);
-	    expect(verify.json.data.errors.some((error: string) => error.includes("exceeding replay summary cap"))).toBe(true);
-	  });
+		    expect(replay.status).toBe(200);
+		    expect(replayJson.data.events).toHaveLength(200);
+		    expect(replayJson.data.replayPageIndex.collections.events.totalRows).toBeGreaterThan(200);
+		    expect(replayJson.data.replayPageIndex.collections.events.pageHashes.length).toBeGreaterThan(1);
+    expect(eventPage0.status).toBe(200);
+    expect(eventPage0Json.data.bundleType).toBe("PACTFUSE_REPLAY_PAGE_V1");
+    expect(eventPage0Json.data.collection).toBe("events");
+    expect(eventPage0Json.data.rows).toHaveLength(200);
+    expect(eventPage0Json.data.pageHash).toBe(replayJson.data.replayPageIndex.collections.events.pageHashes[0]);
+    expect(eventPage1.status).toBe(200);
+    expect(eventPage1Json.data.pageIndex).toBe(1);
+    expect(eventPage1Json.data.rows.length).toBeGreaterThan(0);
+    expect(eventPage1Json.data.pageHash).toBe(replayJson.data.replayPageIndex.collections.events.pageHashes[1]);
+    expect(outOfRange.status).toBe(400);
+    expect(outOfRangeJson.error.code).toBe("bad_request");
+		    expect(verify.status).toBe(200);
+		    expect(verify.json.data.schemaOk).toBe(true);
+		  });
 
 	  it("records MCP adapter calls with request and response hashes", async () => {
     const { app, ctx } = makeApp();
@@ -4616,6 +4647,187 @@ describe("pactfuse-api P0", () => {
     expect(verifyTamperedLease.status).toBe(200);
     expect(verifyTamperedLease.json.data.schemaOk).toBe(false);
     expect(verifyTamperedLease.json.data.errors).toContain("replayBundle.leaseRuns does not match the server snapshot");
+
+    const extraAuditPayload = {
+      sessionId,
+      auditNonce: "audit-extra-after-lease",
+      toolName: "pactfuse_get_replay_bundle",
+      request: { sessionId },
+      response: { ok: true, data: { sessionId, winnerClaimAllowed: false } },
+      status: "succeeded",
+    };
+    const extraAudit = await post(app, "/api/v1/mcp/audit", extraAuditPayload, {
+      "x-pactfuse-audit-signature": signAuditPayload(MCP_AUDIT_TOKEN, extraAuditPayload),
+    });
+    const pollutedTranscript = await app.request(`/api/v1/evidence/agent-transcript?sessionId=${sessionId}`);
+    const pollutedTranscriptJson = await pollutedTranscript.json();
+    const pollutedReplay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const pollutedReplayJson = await pollutedReplay.json();
+    const verifyPollutedReplay = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-lease-transcript-polluted",
+      payload: { replayBundle: pollutedReplayJson.data },
+    });
+
+    expect(extraAudit.status).toBe(202);
+    expect(pollutedTranscriptJson.data.callCount).toBe(3);
+    expect(pollutedTranscriptJson.data.boundedToPinnedManifest).toBe(false);
+    expect(verifyPollutedReplay.status).toBe(200);
+    expect(verifyPollutedReplay.json.data.schemaOk).toBe(false);
+    expect(verifyPollutedReplay.json.data.errors).toContain(
+      "agentTranscript with succeeded leases must contain only pinned manifest MCP transcript frames",
+    );
+  });
+
+  it("does not mark lease transcripts bounded when an extra MCP frame lands after the first summary page", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-lease-boundary-extra-mcp-page");
+    const spendId = await registerSpend(app, sessionId);
+    const payer = "0x1234";
+    const artifactHash = hex32("lease-boundary-artifact");
+    const pinnedTool = leaseToolDefinitionForTest();
+    const leaseInsert = ctx.db.sqlite.prepare(
+      `INSERT INTO lease_runs
+        (lease_run_id, session_id, spend_id, payer, artifact_hash, target_repo, target_commit, status, transcript_hash,
+         tools_list_hash, tools_call_hash, output_hash, lease_run_hash, settlement_event_id, artifact_token_id, completed_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'succeeded_live_mcp_transcript', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+
+    for (let index = 0; index < 100; index += 1) {
+      const leaseRunId = hex32(`lease-boundary-run-${index}`);
+      const auditPrefix = leaseRunId.slice(2, 22);
+      const targetRepo = "https://github.com/example/boundary-target";
+      const targetCommit = `commit-${index}`;
+      const listRequest = { jsonrpc: "2.0", id: `lease-tools-list-${index}`, method: "tools/list", params: {} };
+      const listResponse = { jsonrpc: "2.0", id: `lease-tools-list-${index}`, result: { tools: [pinnedTool] } };
+      const callRequest = {
+        jsonrpc: "2.0",
+        id: `lease-tools-call-${index}`,
+        method: "tools/call",
+        params: {
+          name: "pactfuse_code_scan",
+          arguments: {
+            sessionId,
+            leaseRunId,
+            spendId,
+            payer,
+            artifactHash,
+            targetRepo,
+            targetCommit,
+          },
+        },
+      };
+      const callResponse = {
+        jsonrpc: "2.0",
+        id: `lease-tools-call-${index}`,
+        result: { content: [{ type: "text", text: `scan:${index}` }], structuredContent: { findingCount: 0 } },
+      };
+      const listCall = recordMcpAdapterCall(
+        {
+          sessionId,
+          auditNonce: `lease_${auditPrefix}_tools_list`,
+          toolName: "tools/list",
+          request: listRequest,
+          response: listResponse,
+          status: "succeeded",
+        },
+        ctx,
+      );
+      const toolCall = recordMcpAdapterCall(
+        {
+          sessionId,
+          auditNonce: `lease_${auditPrefix}_tools_call`,
+          toolName: "tools/call",
+          request: callRequest,
+          response: callResponse,
+          status: "succeeded",
+        },
+        ctx,
+      );
+      const toolsListHash = hashForTestJson({ requestHash: listCall.requestHash, responseHash: listCall.responseHash });
+      const toolsCallHash = hashForTestJson({ requestHash: toolCall.requestHash, responseHash: toolCall.responseHash });
+      const transcriptHash = hashForTestJson({
+        format: "mcp-json-rpc",
+        sessionId,
+        leaseRunId,
+        frameCallIds: [listCall.callId, toolCall.callId],
+        frames: [
+          { method: "tools/list", requestHash: listCall.requestHash, responseHash: listCall.responseHash },
+          { method: "tools/call", requestHash: toolCall.requestHash, responseHash: toolCall.responseHash },
+        ],
+      });
+      const outputHash = hashForTestJson(callResponse);
+      const settlementEventId = hex32(`lease-boundary-settlement-${index}`);
+      const artifactTokenId = hex32(`lease-boundary-token-${index}`);
+      const leaseRunHash = hashForTestJson({
+        sessionId,
+        leaseRunId,
+        spendId,
+        payer,
+        artifactHash,
+        targetRepo,
+        targetCommit,
+        settlementEventId,
+        artifactTokenId,
+        transcriptHash,
+        outputHash,
+      });
+      const createdAt = new Date(Date.UTC(2026, 5, 11, 0, 0, index)).toISOString();
+      leaseInsert.run(
+        leaseRunId,
+        sessionId,
+        spendId,
+        payer,
+        artifactHash,
+        targetRepo,
+        targetCommit,
+        transcriptHash,
+        toolsListHash,
+        toolsCallHash,
+        outputHash,
+        leaseRunHash,
+        settlementEventId,
+        artifactTokenId,
+        createdAt,
+        createdAt,
+      );
+    }
+
+    const cleanTranscript = await app.request(`/api/v1/evidence/agent-transcript?sessionId=${sessionId}`);
+    const cleanTranscriptJson = await cleanTranscript.json();
+    const extraAuditPayload = {
+      sessionId,
+      auditNonce: "audit-extra-page-boundary",
+      toolName: "pactfuse_get_replay_bundle",
+      request: { sessionId },
+      response: { ok: true, data: { sessionId, winnerClaimAllowed: false } },
+      status: "succeeded",
+    };
+    const extraAudit = await post(app, "/api/v1/mcp/audit", extraAuditPayload, {
+      "x-pactfuse-audit-signature": signAuditPayload(MCP_AUDIT_TOKEN, extraAuditPayload),
+    });
+    const pollutedTranscript = await app.request(`/api/v1/evidence/agent-transcript?sessionId=${sessionId}`);
+    const pollutedTranscriptJson = await pollutedTranscript.json();
+    const pollutedReplay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const pollutedReplayJson = await pollutedReplay.json();
+    const verifyPollutedReplay = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-lease-transcript-page-boundary-polluted",
+      payload: { replayBundle: pollutedReplayJson.data },
+    });
+
+    expect(cleanTranscript.status).toBe(200);
+    expect(cleanTranscriptJson.data.callCount).toBe(200);
+    expect(cleanTranscriptJson.data.boundedToPinnedManifest).toBe(true);
+    expect(extraAudit.status).toBe(202);
+    expect(pollutedTranscriptJson.data.callCount).toBe(200);
+    expect(pollutedTranscriptJson.data.boundedToPinnedManifest).toBe(false);
+    expect(pollutedReplayJson.data.replayPageIndex.collections.mcpAdapterCalls.totalRows).toBe(201);
+    expect(verifyPollutedReplay.status).toBe(200);
+    expect(verifyPollutedReplay.json.data.schemaOk).toBe(false);
+    expect(verifyPollutedReplay.json.data.errors).toContain(
+      "agentTranscript with succeeded leases must contain only pinned manifest MCP transcript frames",
+    );
   });
 
   it("executes live HTTP MCP lease only when tools/list exposes the unique read-only PactFuse tool", async () => {

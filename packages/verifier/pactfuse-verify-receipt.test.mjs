@@ -9,6 +9,7 @@ const pendingReceiptPath = new URL("../../docs/evidence/receipt-pack.pending.exa
 const verifierPath = new URL("./pactfuse-verify-receipt.mjs", import.meta.url);
 const pendingReceiptFile = fileURLToPath(pendingReceiptPath);
 const verifierFile = fileURLToPath(verifierPath);
+const ZERO_HASH = `0x${"0".repeat(64)}`;
 
 describe("pactfuse receipt verifier contract", () => {
   it("keeps schema-only separate from proof-chip authority", () => {
@@ -236,6 +237,7 @@ describe("pactfuse receipt verifier contract", () => {
 	    bundle.artifactAccessTokens[0].artifactHash = uppercaseHexBody(bundle.artifactAccessTokens[0].artifactHash);
 	    bundle.artifactAccessTokens[0].artifactCid = `sha256:${uppercaseHexBody(bundle.artifactAccessTokens[0].artifactHash)}`;
 	    bundle.artifactAccessTokens[0].artifactPayloadHash = uppercaseHexBody(bundle.artifactAccessTokens[0].artifactPayloadHash);
+    bundle.replayPageIndex = replayPageIndexForTest(bundle);
 
 	    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
 
@@ -275,6 +277,16 @@ describe("pactfuse receipt verifier contract", () => {
 	      },
 	      "payload.outputHash does not match lease run",
 	    ],
+    [
+      "self-consistent lease event payload",
+      (bundle) => {
+        const event = bundle.events.find((candidate) => candidate.kind === "lease.execution.succeeded");
+        event.payload.outputHash = hex32("self-consistent-bad-event-output");
+        sealReplayBundleForTest(bundle);
+        bundle.judgeCheck.rows.find((row) => row.rowId === "lease_execution").evidenceEventId = event.eventId;
+      },
+      "payload.outputHash does not match lease run",
+    ],
 	    [
 	      "judge row event reference",
 	      (bundle) => {
@@ -297,6 +309,42 @@ describe("pactfuse receipt verifier contract", () => {
 	      },
 	      "tools/list is not bounded to pinned source manifest",
 	    ],
+    [
+      "self-consistent non-read-only pinned tool metadata",
+      (bundle) => {
+        const badTool = { name: "pactfuse_code_scan" };
+        bundle.sources[0].capabilityVector.mcpTools = [badTool];
+        bundle.mcpAdapterCalls[0].response.result.tools = [badTool];
+        rehashLeaseTranscriptForTest(bundle);
+      },
+      "must advertise annotations.readOnlyHint=true",
+    ],
+    [
+      "extra MCP frame mixed into a bounded lease transcript",
+      (bundle) => {
+        bundle.mcpAdapterCalls.push(
+          mcpCallForTest({
+            callId: hex32("extra-mcp-call"),
+            sessionId: bundle.sessionId,
+            auditNonce: "audit-extra-frame",
+            toolName: "tools/list",
+            request: { jsonrpc: "2.0", id: "extra", method: "tools/list", params: {} },
+            response: { jsonrpc: "2.0", id: "extra", result: { tools: [leaseToolDefinitionForTest()] } },
+            createdAt: "2026-06-11T00:00:03.000Z",
+          }),
+        );
+        bundle.asOfMcpAdapterCallCount = bundle.mcpAdapterCalls.length;
+        rehashLeaseTranscriptForTest(bundle, false);
+      },
+      "agentTranscript with succeeded leases must contain only pinned manifest MCP transcript frames",
+    ],
+    [
+      "post-summary MCP frame hidden behind replay page index",
+      (bundle) => {
+        bundle.replayPageIndex.collections.mcpAdapterCalls.totalRows = bundle.mcpAdapterCalls.length + 1;
+      },
+      "agentTranscript with succeeded leases must contain only pinned manifest MCP transcript frames",
+    ],
 	  ])("rejects replay bundles with tampered %s", (_label, mutate, expected) => {
 	    const bundle = replayBundleWithLease();
 	    mutate(bundle);
@@ -384,9 +432,15 @@ function replayBundle() {
   };
 	  const events = [
     {
-      seq: 1,
-      type: "caw.receipt.ingested.raw",
-      eventHash: hex32("event-1"),
+      eventSeq: 1,
+      authority: "delivery",
+      kind: "caw.receipt.ingested.raw",
+      payload: {
+        operationId,
+        rawBundleHash: rawCawReceiptBundle.rawBundleHash,
+        winnerClaimAllowed: false,
+      },
+      createdAt,
     },
 	  ];
 	  const spendId = hex32("spend-artifact");
@@ -413,14 +467,14 @@ function replayBundle() {
 	    modes: lockedRuntimeModes(),
 	  });
 
-	  return {
+		  const bundle = {
     bundleType: "PACTFUSE_EVIDENCE_V1",
     sessionId,
     summaryMode: true,
     asOfEventSeq: 1,
     asOfMcpAdapterCallCount: 0,
     winnerClaimAllowed: false,
-    eventRoot: hashJson(events.map((event) => event.eventHash)),
+    eventRoot: ZERO_HASH,
     agentTranscriptHash: hashJson(agentTranscriptForTest(sessionId, [])),
     events,
     sources: [],
@@ -521,8 +575,10 @@ function replayBundle() {
         evidenceUrl: null,
       })),
     },
-  };
-	}
+	  };
+  sealReplayBundleForTest(bundle);
+  return bundle;
+		}
 
 function replayBundleWithLease() {
   const bundle = replayBundle();
@@ -665,12 +721,11 @@ function replayBundleWithLease() {
     transcriptHash,
     outputHash,
   });
+  const manifestBinding = leaseManifestBindingForTest(bundle, leaseRun, toolsListHash, toolsCallHash);
   const leaseEvent = {
-    eventId: hex32("lease-event-1"),
-    sessionId: bundle.sessionId,
+    eventSeq: bundle.events.length + 1,
     authority: "delivery",
     kind: "lease.execution.succeeded",
-    eventHash: hex32("lease-event-hash-1"),
     payload: {
       leaseRunId,
       spendId: leaseRun.spendId,
@@ -685,18 +740,24 @@ function replayBundleWithLease() {
       toolsCallHash,
       outputHash,
       leaseRunHash: leaseRun.leaseRunHash,
+      mcpToolName: "pactfuse_code_scan",
+      boundedToPinnedManifest: true,
+      pinnedManifestToolsHash: manifestBinding.pinnedManifestToolsHash,
+      pinnedManifestHashes: manifestBinding.manifestHashes,
+      manifestBindingHash: manifestBinding.manifestBindingHash,
+      bearerBound: true,
       status: "succeeded_live_mcp_transcript",
       proofAuthority: false,
       winnerClaimAllowed: false,
     },
+    createdAt,
   };
   bundle.mcpAdapterCalls = mcpAdapterCalls;
   bundle.asOfMcpAdapterCallCount = mcpAdapterCalls.length;
   bundle.leaseRuns = [leaseRun];
   bundle.agentTranscriptHash = hashJson(agentTranscriptForTest(bundle.sessionId, mcpAdapterCalls, true));
   bundle.events = [...bundle.events, leaseEvent];
-  bundle.asOfEventSeq = bundle.events.length;
-  bundle.eventRoot = hashJson(bundle.events.map((event) => event.eventHash));
+  sealReplayBundleForTest(bundle);
   const leaseRow = bundle.judgeCheck.rows.find((row) => row.rowId === "lease_execution");
   leaseRow.status = "pass";
   leaseRow.authority = "delivery";
@@ -770,8 +831,7 @@ function appendContractProofEventsForTest(bundle) {
     },
   };
   bundle.events = [...bundle.events, gateEvent, sourceEvent];
-  bundle.asOfEventSeq = bundle.events.length;
-  bundle.eventRoot = hashJson(bundle.events.map((event) => event.eventHash));
+  sealReplayBundleForTest(bundle);
   return { gateEvent, sourceEvent };
 }
 
@@ -799,6 +859,7 @@ function appendSignedSourceForTest(bundle) {
     createdAt: "2026-06-11T00:00:03.000Z",
   };
   bundle.sources = [...bundle.sources, source];
+  bundle.replayPageIndex = replayPageIndexForTest(bundle);
   return source;
 }
 
@@ -829,6 +890,131 @@ function leaseToolDefinitionForTest(name = "pactfuse_code_scan") {
   };
 }
 
+function sealReplayBundleForTest(bundle) {
+  let previousProofEventHash = ZERO_HASH;
+  bundle.events.forEach((event, index) => {
+    const eventSeq = Number.isInteger(event.eventSeq) ? event.eventSeq : index + 1;
+    const authority = event.authority ?? "operator";
+    const kind = event.kind ?? event.type;
+    const payload = event.payload ?? { winnerClaimAllowed: false };
+    const prevProofEventHash = authority === "proof" ? previousProofEventHash : null;
+    const payloadHash = hashJson(payload);
+    const eventHash = hashJson({
+      sessionId: bundle.sessionId,
+      eventSeq,
+      authority,
+      kind,
+      payloadHash,
+      prevProofEventHash,
+    });
+    delete event.seq;
+    delete event.type;
+    Object.assign(event, {
+      eventId: eventHash,
+      sessionId: bundle.sessionId,
+      eventSeq,
+      eventHash,
+      prevProofEventHash,
+      authority,
+      kind,
+      payloadHash,
+      payload,
+      createdAt: event.createdAt ?? `2026-06-11T00:00:${String(index + 1).padStart(2, "0")}.000Z`,
+    });
+    if (authority === "proof") {
+      previousProofEventHash = eventHash;
+    }
+  });
+  bundle.asOfEventSeq = bundle.events.length;
+  bundle.eventRoot = hashJson(bundle.events.map((event) => event.eventHash));
+  bundle.replayPageIndex = replayPageIndexForTest(bundle);
+}
+
+function leaseManifestBindingForTest(bundle, leaseRun, toolsListHash, toolsCallHash) {
+  const sourceHashes = [...bundle.spends.find((spend) => spend.spendId === leaseRun.spendId).sourceHashes]
+    .map((sourceHash) => sourceHash.toLowerCase())
+    .sort();
+  const sourcesByHash = new Map(bundle.sources.map((source) => [source.sourceHash.toLowerCase(), source]));
+  const manifestHashes = [];
+  const tools = [];
+  for (const sourceHash of sourceHashes) {
+    const source = sourcesByHash.get(sourceHash);
+    manifestHashes.push(source.manifestHash.toLowerCase());
+    tools.push(...source.capabilityVector.mcpTools);
+  }
+  const pinnedManifestToolsHash = hashJson(tools);
+  const manifestBindingHash = hashJson({
+    sessionId: bundle.sessionId,
+    leaseRunId: leaseRun.leaseRunId,
+    spendId: leaseRun.spendId,
+    sourceHashes,
+    manifestHashes,
+    pinnedManifestToolsHash,
+    toolsListHash,
+    toolsCallHash,
+  });
+  return { sourceHashes, manifestHashes, pinnedManifestToolsHash, manifestBindingHash };
+}
+
+function replayPageIndexForTest(bundle) {
+  const collections = Object.fromEntries(
+    [
+      "artifactAccessTokens",
+      "artifactPreflights",
+      "canonicalCawReceipts",
+      "cawReceiptOperations",
+      "events",
+      "leaseRuns",
+      "mcpAdapterCalls",
+      "quotes",
+      "rawCawReceiptBundles",
+      "sources",
+      "spends",
+    ].map((name) => [name, replayPageCollectionForTest(bundle.sessionId, name, bundle[name] ?? [])]),
+  );
+  return {
+    pageSize: 200,
+    pageRoot: hashJson(Object.entries(collections).map(([name, collection]) => ({ name, pageRoot: collection.pageRoot }))),
+    collections,
+  };
+}
+
+function replayPageCollectionForTest(sessionId, collection, rows) {
+  const pageHashes = [];
+  const orderBy = replayCollectionOrderByForTest(collection);
+  for (let offset = 0; offset < rows.length; offset += 200) {
+    pageHashes.push(replayPageHashForTest(sessionId, collection, offset / 200, orderBy, rows.slice(offset, offset + 200)));
+  }
+  return {
+    totalRows: rows.length,
+    pageCount: pageHashes.length,
+    orderBy,
+    firstPageHash: pageHashes[0] ?? replayPageHashForTest(sessionId, collection, 0, orderBy, []),
+    pageRoot: hashJson(pageHashes),
+    pageHashes,
+  };
+}
+
+function replayPageHashForTest(sessionId, collection, pageIndex, orderBy, rows) {
+  return hashJson({ sessionId, collection, pageIndex, pageSize: 200, orderBy, rows });
+}
+
+function replayCollectionOrderByForTest(collection) {
+  return {
+    artifactAccessTokens: ["createdAt ASC", "tokenId ASC"],
+    artifactPreflights: ["createdAt ASC", "preflightId ASC"],
+    canonicalCawReceipts: ["createdAt ASC", "rawReceiptHash ASC"],
+    cawReceiptOperations: ["createdAt ASC", "operationId ASC"],
+    events: ["eventSeq ASC"],
+    leaseRuns: ["createdAt DESC", "leaseRunId ASC"],
+    mcpAdapterCalls: ["createdAt ASC", "toolName tools/list before tools/call", "callId ASC"],
+    quotes: ["createdAt ASC", "quoteId ASC"],
+    rawCawReceiptBundles: ["createdAt ASC", "bundleId ASC"],
+    sources: ["createdAt ASC", "sourceHash ASC"],
+    spends: ["createdAt ASC", "spendId ASC"],
+  }[collection];
+}
+
 function mcpCallForTest({ callId, sessionId, auditNonce, toolName, request, response, createdAt }) {
   return {
     callId,
@@ -845,7 +1031,7 @@ function mcpCallForTest({ callId, sessionId, auditNonce, toolName, request, resp
   };
 }
 
-function rehashLeaseTranscriptForTest(bundle) {
+function rehashLeaseTranscriptForTest(bundle, boundedToPinnedManifest = true) {
   for (const call of bundle.mcpAdapterCalls) {
     call.requestHash = hashJson(call.request);
     call.responseHash = hashJson(call.response);
@@ -880,12 +1066,21 @@ function rehashLeaseTranscriptForTest(bundle) {
     outputHash: leaseRun.outputHash,
   });
   const event = bundle.events.find((candidate) => candidate.kind === "lease.execution.succeeded");
+  const manifestBinding = leaseManifestBindingForTest(bundle, leaseRun, leaseRun.toolsListHash, leaseRun.toolsCallHash);
   event.payload.transcriptHash = leaseRun.transcriptHash;
   event.payload.toolsListHash = leaseRun.toolsListHash;
   event.payload.toolsCallHash = leaseRun.toolsCallHash;
   event.payload.outputHash = leaseRun.outputHash;
   event.payload.leaseRunHash = leaseRun.leaseRunHash;
-  bundle.agentTranscriptHash = hashJson(agentTranscriptForTest(bundle.sessionId, bundle.mcpAdapterCalls, true));
+  event.payload.pinnedManifestToolsHash = manifestBinding.pinnedManifestToolsHash;
+  event.payload.pinnedManifestHashes = manifestBinding.manifestHashes;
+  event.payload.manifestBindingHash = manifestBinding.manifestBindingHash;
+  bundle.agentTranscriptHash = hashJson(agentTranscriptForTest(bundle.sessionId, bundle.mcpAdapterCalls, boundedToPinnedManifest));
+  sealReplayBundleForTest(bundle);
+  const leaseRow = bundle.judgeCheck.rows.find((row) => row.rowId === "lease_execution");
+  if (leaseRow) {
+    leaseRow.evidenceEventId = event.eventId;
+  }
 }
 
 function agentTranscriptForTest(sessionId, calls, boundedToPinnedManifest = false) {

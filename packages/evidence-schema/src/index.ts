@@ -604,6 +604,48 @@ export const ReplayBundleViewSchema = z
     canonicalCawReceipts: z.array(CanonicalCawReceiptViewSchema).max(200),
     leaseRuns: z.array(LeaseRunViewSchema).max(200),
     judgeCheck: JudgeCheckViewSchema,
+    replayPageIndex: z
+      .object({
+        pageSize: z.literal(200),
+        pageRoot: Hex32Schema,
+        collections: z.record(
+          z.string(),
+          z.object({
+            totalRows: z.number().int().min(0),
+            pageCount: z.number().int().min(0),
+            orderBy: z.array(z.string().min(1)).min(1).max(4),
+            firstPageHash: Hex32Schema,
+            pageRoot: Hex32Schema,
+            pageHashes: z.array(Hex32Schema).max(5000),
+          }),
+        ),
+      })
+      .strict(),
+  })
+  .strict();
+
+export const ReplayPageViewSchema = z
+  .object({
+    bundleType: z.literal("PACTFUSE_REPLAY_PAGE_V1"),
+    sessionId: Hex32Schema,
+    collection: z.enum([
+      "events",
+      "sources",
+      "spends",
+      "artifactPreflights",
+      "quotes",
+      "artifactAccessTokens",
+      "mcpAdapterCalls",
+      "cawReceiptOperations",
+      "rawCawReceiptBundles",
+      "canonicalCawReceipts",
+      "leaseRuns",
+    ]),
+    pageIndex: z.number().int().min(0),
+    pageSize: z.literal(200),
+    orderBy: z.array(z.string().min(1)).min(1).max(4),
+    rows: z.array(JsonValueSchema).max(200),
+    pageHash: Hex32Schema,
   })
   .strict();
 

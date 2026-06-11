@@ -29,6 +29,7 @@ import {
   QuotePayloadSchema,
   RawCawReceiptBundleViewSchema,
   ReplayBundleViewSchema,
+  ReplayPageViewSchema,
   RunnerHeartbeatViewSchema,
   SessionScopedEnvelopeSchema,
   SessionViewSchema,
@@ -77,7 +78,32 @@ type PinnedMcpManifest = {
   tools: Array<Record<string, unknown>>;
   toolsHash: string;
 };
+type ReplayCollectionName =
+  | "events"
+  | "sources"
+  | "spends"
+  | "artifactPreflights"
+  | "quotes"
+  | "artifactAccessTokens"
+  | "mcpAdapterCalls"
+  | "cawReceiptOperations"
+  | "rawCawReceiptBundles"
+  | "canonicalCawReceipts"
+  | "leaseRuns";
 const REPLAY_SUMMARY_LIMIT = 200;
+const REPLAY_COLLECTION_NAMES: ReplayCollectionName[] = [
+  "artifactAccessTokens",
+  "artifactPreflights",
+  "canonicalCawReceipts",
+  "cawReceiptOperations",
+  "events",
+  "leaseRuns",
+  "mcpAdapterCalls",
+  "quotes",
+  "rawCawReceiptBundles",
+  "sources",
+  "spends",
+];
 const ARTIFACT_PAYLOAD_REPLAY_MAX_BYTES = 256 * 1024;
 const ARTIFACT_TOKEN_LEASE_CLAIM_TTL_MS = 5 * 60 * 1000;
 type ChainIndexerBackfillPayload = ChainIndexerBackfillInput["payload"];
@@ -2006,9 +2032,9 @@ async function buildVerifierRunView(
           warnings: [],
           errors: ["missing receipt or replayBundle; fail closed"],
         };
-	  const eventLogErrors = [
-	    ...verifyReplaySummaryCapIntegrity(ctx, sessionId),
-	    ...verifyEventLogIntegrity(ctx, sessionId),
+  const eventLogErrors = [
+    ...verifyReplaySummaryCapIntegrity(ctx, sessionId),
+    ...verifyEventLogIntegrity(ctx, sessionId),
     ...verifySpendBindingIntegrity(ctx, sessionId),
     ...verifyMcpAdapterCallIntegrity(ctx, sessionId),
     ...verifyGateFinalityIntegrity(ctx, sessionId),
@@ -2109,6 +2135,7 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBun
     canonicalCawReceipts,
     leaseRuns,
     judgeCheck: readJudgeCheckData(sessionId, ctx),
+    replayPageIndex: replayPageIndexFor(ctx, sessionId),
   });
 }
 
@@ -2195,7 +2222,23 @@ function agentTranscriptBoundedToPinnedManifest(
   calls: ReturnType<typeof listMcpAdapterCalls>,
 ): boolean {
   const successfulLeases = listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT).filter((lease) => lease.status === "succeeded_live_mcp_transcript");
-  if (successfulLeases.length === 0) {
+  const successfulLeaseCount = countRows(ctx, "lease_runs", "session_id = ? AND status = 'succeeded_live_mcp_transcript'", [sessionId]);
+  if (successfulLeaseCount === 0) {
+    return false;
+  }
+  if (successfulLeaseCount !== successfulLeases.length) {
+    return false;
+  }
+  const expectedAuditNonces = new Set<string>();
+  for (const lease of successfulLeases) {
+    const prefix = lease.leaseRunId.slice(2, 22);
+    expectedAuditNonces.add(`lease_${prefix}_tools_list`);
+    expectedAuditNonces.add(`lease_${prefix}_tools_call`);
+  }
+  if (replayCollectionRowCount(ctx, sessionId, "mcpAdapterCalls") !== expectedAuditNonces.size) {
+    return false;
+  }
+  if (calls.length !== expectedAuditNonces.size || calls.some((call) => !expectedAuditNonces.has(call.auditNonce))) {
     return false;
   }
   const callsByAuditNonce = new Map(calls.map((call) => [call.auditNonce, call]));
@@ -2236,6 +2279,166 @@ function mcpToolsFromToolsListResponse(response: Record<string, JsonValue>): Arr
     return null;
   }
   return tools as Array<Record<string, unknown>>;
+}
+
+function replayPageIndexFor(ctx: ServiceCtx, sessionId: string) {
+  const collections = Object.fromEntries(
+    REPLAY_COLLECTION_NAMES.map((collection) => [collection, replayPageCollection(ctx, sessionId, collection)]),
+  );
+  return {
+    pageSize: REPLAY_SUMMARY_LIMIT,
+    pageRoot: hashJson(Object.entries(collections).map(([name, collection]) => ({ name, pageRoot: collection.pageRoot }))),
+    collections,
+  };
+}
+
+function replayPageCollection(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName) {
+  const totalRows = replayCollectionRowCount(ctx, sessionId, collection);
+  const pageCount = Math.ceil(totalRows / REPLAY_SUMMARY_LIMIT);
+  const pageHashes: string[] = [];
+  const orderBy = replayCollectionOrderBy(collection);
+  for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+    const rows = replayCollectionRows(ctx, sessionId, collection, pageIndex);
+    pageHashes.push(replayPageHash(sessionId, collection, pageIndex, orderBy, rows));
+  }
+  return {
+    totalRows,
+    pageCount,
+    orderBy,
+    firstPageHash: pageHashes[0] ?? replayPageHash(sessionId, collection, 0, orderBy, []),
+    pageRoot: hashJson(pageHashes),
+    pageHashes,
+  };
+}
+
+export async function readReplayPage(
+  input: { sessionId: string; collection: string; page: string | number },
+  ctx: ServiceCtx,
+): Promise<ServiceResult<unknown>> {
+  const requestId = newRequestId("replay_page");
+  const sessionId = parseStrict(Hex32Schema, input.sessionId);
+  assertSession(ctx, sessionId, requestId);
+  if (!isReplayCollectionName(input.collection)) {
+    return { ok: false, requestId, error: badRequestError(requestId, "replay collection is not supported") };
+  }
+  const pageIndex = typeof input.page === "number" ? input.page : Number(input.page);
+  if (!Number.isInteger(pageIndex) || pageIndex < 0) {
+    return { ok: false, requestId, error: badRequestError(requestId, "replay page must be a non-negative integer") };
+  }
+  const totalRows = replayCollectionRowCount(ctx, sessionId, input.collection);
+  const pageCount = Math.ceil(totalRows / REPLAY_SUMMARY_LIMIT);
+  if (pageIndex >= Math.max(pageCount, 1)) {
+    return { ok: false, requestId, error: badRequestError(requestId, "replay page is out of range") };
+  }
+  const orderBy = replayCollectionOrderBy(input.collection);
+  const rows = replayCollectionRows(ctx, sessionId, input.collection, pageIndex);
+  const data = ReplayPageViewSchema.parse({
+    bundleType: "PACTFUSE_REPLAY_PAGE_V1",
+    sessionId,
+    collection: input.collection,
+    pageIndex,
+    pageSize: REPLAY_SUMMARY_LIMIT,
+    orderBy,
+    rows,
+    pageHash: replayPageHash(sessionId, input.collection, pageIndex, orderBy, rows),
+  });
+  return { ok: true, requestId, data };
+}
+
+function replayPageHash(sessionId: string, collection: ReplayCollectionName, pageIndex: number, orderBy: string[], rows: unknown[]): string {
+  return hashJson({ sessionId, collection, pageIndex, pageSize: REPLAY_SUMMARY_LIMIT, orderBy, rows });
+}
+
+function isReplayCollectionName(value: string): value is ReplayCollectionName {
+  return (REPLAY_COLLECTION_NAMES as string[]).includes(value);
+}
+
+function replayCollectionRows(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName, pageIndex: number) {
+  const offset = pageIndex * REPLAY_SUMMARY_LIMIT;
+  switch (collection) {
+    case "events":
+      return listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT, offset);
+    case "sources":
+      return listSources(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+    case "spends":
+      return listSpends(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+    case "artifactPreflights":
+      return listArtifactPreflights(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+    case "quotes":
+      return listQuotes(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+    case "artifactAccessTokens":
+      return listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+    case "mcpAdapterCalls":
+      return listMcpAdapterCalls(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+    case "cawReceiptOperations":
+      return listCawReceiptOperations(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+    case "rawCawReceiptBundles":
+      return listRawCawReceiptBundles(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+    case "canonicalCawReceipts":
+      return listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+    case "leaseRuns":
+      return listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+  }
+}
+
+function replayCollectionRowCount(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName): number {
+  const table = replayCollectionTable(collection);
+  const row = ctx.db.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE session_id = ?`).get(sessionId) as Row;
+  return Number(row.count ?? 0);
+}
+
+function replayCollectionTable(collection: ReplayCollectionName): string {
+  switch (collection) {
+    case "events":
+      return "evidence_events";
+    case "sources":
+      return "sources";
+    case "spends":
+      return "spends";
+    case "artifactPreflights":
+      return "artifact_preflights";
+    case "quotes":
+      return "quotes";
+    case "artifactAccessTokens":
+      return "artifact_access_tokens";
+    case "mcpAdapterCalls":
+      return "mcp_adapter_calls";
+    case "cawReceiptOperations":
+      return "caw_receipt_operations";
+    case "rawCawReceiptBundles":
+      return "caw_raw_receipt_bundles";
+    case "canonicalCawReceipts":
+      return "caw_canonical_receipts";
+    case "leaseRuns":
+      return "lease_runs";
+  }
+}
+
+function replayCollectionOrderBy(collection: ReplayCollectionName): string[] {
+  switch (collection) {
+    case "events":
+      return ["eventSeq ASC"];
+    case "sources":
+      return ["createdAt ASC", "sourceHash ASC"];
+    case "spends":
+      return ["createdAt ASC", "spendId ASC"];
+    case "artifactPreflights":
+      return ["createdAt ASC", "preflightId ASC"];
+    case "quotes":
+      return ["createdAt ASC", "quoteId ASC"];
+    case "artifactAccessTokens":
+      return ["createdAt ASC", "tokenId ASC"];
+    case "mcpAdapterCalls":
+      return ["createdAt ASC", "toolName tools/list before tools/call", "callId ASC"];
+    case "cawReceiptOperations":
+      return ["createdAt ASC", "operationId ASC"];
+    case "rawCawReceiptBundles":
+      return ["createdAt ASC", "bundleId ASC"];
+    case "canonicalCawReceipts":
+      return ["createdAt ASC", "rawReceiptHash ASC"];
+    case "leaseRuns":
+      return ["createdAt DESC", "leaseRunId ASC"];
+  }
 }
 
 export async function readArtifactAccess(
@@ -5427,29 +5630,29 @@ function evidenceEventFromRow(row: Row): EvidenceEvent {
   });
 }
 
-function listEvents(ctx: ServiceCtx, sessionId: string, afterSeq: number, limit: number): EvidenceEvent[] {
+function listEvents(ctx: ServiceCtx, sessionId: string, afterSeq: number, limit: number, offset = 0): EvidenceEvent[] {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
        FROM evidence_events
        WHERE session_id = ? AND event_seq > ?
        ORDER BY event_seq ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(sessionId, afterSeq, limit) as Row[];
+    .all(sessionId, afterSeq, limit, offset) as Row[];
   return rows.map(evidenceEventFromRow);
 }
 
-function listSources(ctx: ServiceCtx, sessionId: string, limit: number) {
+function listSources(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
        FROM sources
        WHERE session_id = ?
        ORDER BY created_at ASC, source_hash ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(sessionId, limit) as Row[];
+    .all(sessionId, limit, offset) as Row[];
   return rows.map((row) =>
     SourceViewSchema.parse({
       sourceId: row.source_id,
@@ -5466,16 +5669,16 @@ function listSources(ctx: ServiceCtx, sessionId: string, limit: number) {
   );
 }
 
-function listSpends(ctx: ServiceCtx, sessionId: string, limit: number) {
+function listSpends(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
        FROM spends
        WHERE session_id = ?
        ORDER BY created_at ASC, spend_id ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(sessionId, limit) as Row[];
+    .all(sessionId, limit, offset) as Row[];
   return rows.map((row) =>
     SpendViewSchema.parse({
       spendId: row.spend_id,
@@ -5496,16 +5699,16 @@ function listSpends(ctx: ServiceCtx, sessionId: string, limit: number) {
   );
 }
 
-function listArtifactPreflights(ctx: ServiceCtx, sessionId: string, limit: number) {
+function listArtifactPreflights(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
        FROM artifact_preflights
        WHERE session_id = ?
        ORDER BY created_at ASC, preflight_id ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(sessionId, limit) as Row[];
+    .all(sessionId, limit, offset) as Row[];
   return rows.map((row) =>
     ArtifactPreflightViewSchema.parse({
       preflightId: row.preflight_id,
@@ -5522,16 +5725,16 @@ function listArtifactPreflights(ctx: ServiceCtx, sessionId: string, limit: numbe
   );
 }
 
-function listQuotes(ctx: ServiceCtx, sessionId: string, limit: number) {
+function listQuotes(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
        FROM quotes
        WHERE session_id = ?
        ORDER BY created_at ASC, quote_id ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(sessionId, limit) as Row[];
+    .all(sessionId, limit, offset) as Row[];
   return rows.map((row) =>
     QuoteViewSchema.parse({
       quoteId: row.quote_id,
@@ -5552,16 +5755,16 @@ function listQuotes(ctx: ServiceCtx, sessionId: string, limit: number) {
   );
 }
 
-function listArtifactAccessTokens(ctx: ServiceCtx, sessionId: string, limit: number) {
+function listArtifactAccessTokens(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
        FROM artifact_access_tokens
        WHERE session_id = ?
        ORDER BY created_at ASC, token_id ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(sessionId, limit) as Row[];
+    .all(sessionId, limit, offset) as Row[];
   return rows.map((row) =>
     ArtifactAccessTokenViewSchema.parse({
       tokenId: row.token_id,
@@ -5583,7 +5786,23 @@ function listArtifactAccessTokens(ctx: ServiceCtx, sessionId: string, limit: num
   );
 }
 
-function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number) {
+function mcpAdapterCallFromRow(row: Row) {
+  return McpAdapterCallViewSchema.parse({
+    callId: row.call_id,
+    sessionId: row.session_id,
+    auditNonce: row.audit_nonce ?? `legacy:${row.call_id}`,
+    toolName: row.tool_name,
+    requestHash: row.request_hash,
+    responseHash: row.response_hash,
+    request: JSON.parse(String(row.request_json)),
+    response: JSON.parse(String(row.response_json)),
+    status: row.status,
+    createdAt: row.created_at,
+    proofAuthority: false,
+  });
+}
+
+function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
@@ -5596,51 +5815,37 @@ function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number) 
            ELSE 3
          END,
          call_id ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(sessionId, limit) as Row[];
-  return rows.map((row) =>
-    McpAdapterCallViewSchema.parse({
-      callId: row.call_id,
-      sessionId: row.session_id,
-      auditNonce: row.audit_nonce ?? `legacy:${row.call_id}`,
-      toolName: row.tool_name,
-      requestHash: row.request_hash,
-      responseHash: row.response_hash,
-      request: JSON.parse(String(row.request_json)),
-      response: JSON.parse(String(row.response_json)),
-      status: row.status,
-      createdAt: row.created_at,
-      proofAuthority: false,
-    }),
-  );
+    .all(sessionId, limit, offset) as Row[];
+  return rows.map(mcpAdapterCallFromRow);
 }
 
 function mcpCallByAuditNonce(ctx: ServiceCtx, auditNonce: string): ReturnType<typeof listMcpAdapterCalls>[number] | null {
   const row = ctx.db.sqlite
     .prepare(
-      `SELECT session_id
+      `SELECT *
        FROM mcp_adapter_calls
        WHERE audit_nonce = ?
        LIMIT 1`,
     )
     .get(auditNonce) as Row | undefined;
-  if (!row || typeof row.session_id !== "string") {
+  if (!row) {
     return null;
   }
-  return listMcpAdapterCalls(ctx, row.session_id, 200).find((call) => call.auditNonce === auditNonce) ?? null;
+  return mcpAdapterCallFromRow(row);
 }
 
-function listCawReceiptOperations(ctx: ServiceCtx, sessionId: string, limit: number) {
+function listCawReceiptOperations(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
        FROM caw_receipt_operations
        WHERE session_id = ?
        ORDER BY created_at ASC, operation_id ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(sessionId, limit) as Row[];
+    .all(sessionId, limit, offset) as Row[];
   return rows.map((row) =>
     CawReceiptOperationViewSchema.parse({
       operationId: row.operation_id,
@@ -5658,16 +5863,16 @@ function listCawReceiptOperations(ctx: ServiceCtx, sessionId: string, limit: num
   );
 }
 
-function listRawCawReceiptBundles(ctx: ServiceCtx, sessionId: string, limit: number) {
+function listRawCawReceiptBundles(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
        FROM caw_raw_receipt_bundles
        WHERE session_id = ?
        ORDER BY created_at ASC, bundle_id ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(sessionId, limit) as Row[];
+    .all(sessionId, limit, offset) as Row[];
   return rows.map((row) =>
     RawCawReceiptBundleViewSchema.parse({
       bundleId: row.bundle_id,
@@ -5683,16 +5888,16 @@ function listRawCawReceiptBundles(ctx: ServiceCtx, sessionId: string, limit: num
   );
 }
 
-function listCanonicalCawReceipts(ctx: ServiceCtx, sessionId: string, limit: number) {
+function listCanonicalCawReceipts(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
        FROM caw_canonical_receipts
        WHERE session_id = ?
        ORDER BY created_at ASC, raw_receipt_hash ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(sessionId, limit) as Row[];
+    .all(sessionId, limit, offset) as Row[];
   return rows.map((row) =>
     CanonicalCawReceiptViewSchema.parse({
       rawReceiptHash: row.raw_receipt_hash,
@@ -5719,16 +5924,16 @@ function listCanonicalCawReceipts(ctx: ServiceCtx, sessionId: string, limit: num
   );
 }
 
-function listLeaseRuns(ctx: ServiceCtx, sessionId: string, limit: number) {
+function listLeaseRuns(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
        FROM lease_runs
        WHERE session_id = ?
        ORDER BY created_at DESC, lease_run_id ASC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(sessionId, limit) as Row[];
+    .all(sessionId, limit, offset) as Row[];
   return rows.map((row) =>
     LeaseRunViewSchema.parse({
       leaseRunId: row.lease_run_id,
@@ -5753,42 +5958,19 @@ function listLeaseRuns(ctx: ServiceCtx, sessionId: string, limit: number) {
 }
 
 function verifyReplaySummaryCapIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
-  const errors: string[] = [];
-  const counts = replaySummaryCounts(ctx, sessionId);
-  for (const [label, count] of Object.entries(counts)) {
-    if (count > REPLAY_SUMMARY_LIMIT) {
-      errors.push(`${label} has ${count} rows, exceeding replay summary cap ${REPLAY_SUMMARY_LIMIT}; full proof requires paged/Merkle replay`);
-    }
-  }
-  return errors;
+  replayPageIndexFor(ctx, sessionId);
+  return [];
 }
 
 function assertReplaySummaryRoomForArtifactIssue(ctx: ServiceCtx, sessionId: string, requestId: string): void {
-  const counts = replaySummaryCounts(ctx, sessionId);
-  const eventCount = counts["replayBundle.events"] ?? 0;
-  const artifactAccessTokenCount = counts["replayBundle.artifactAccessTokens"] ?? 0;
-  if (eventCount >= REPLAY_SUMMARY_LIMIT || artifactAccessTokenCount >= REPLAY_SUMMARY_LIMIT) {
-    throw Object.assign(new Error("artifact access token would exceed replay summary cap"), {
-      apiError: proofBlockedError(requestId, "artifact access token would exceed replay summary cap", {
-        eventCount,
-        artifactAccessTokenCount,
-        replaySummaryLimit: REPLAY_SUMMARY_LIMIT,
-      }),
-    });
-  }
+  void ctx;
+  void sessionId;
+  void requestId;
 }
 
 function assertReplaySummaryWithinCap(ctx: ServiceCtx, sessionId: string, requestId: string): void {
-  const counts = replaySummaryCounts(ctx, sessionId);
-  const overflowing = Object.fromEntries(Object.entries(counts).filter(([, count]) => count > REPLAY_SUMMARY_LIMIT));
-  if (Object.keys(overflowing).length > 0) {
-    throw Object.assign(new Error("replay bundle exceeds replay summary cap"), {
-      apiError: proofBlockedError(requestId, "replay bundle exceeds replay summary cap; full proof requires paged/Merkle replay", {
-        replaySummaryLimit: REPLAY_SUMMARY_LIMIT,
-        counts: overflowing,
-      }),
-    });
-  }
+  replayPageIndexFor(ctx, sessionId);
+  void requestId;
 }
 
 function assertArtifactPayloadReplaySize(artifactPayloadJson: string, requestId: string): void {
@@ -6394,15 +6576,15 @@ function verifyReplayBundleBindings(
   if (typeof bundle.sessionId === "string" && bundle.sessionId !== sessionId) {
     errors.push("replayBundle.sessionId must match verifier sessionId");
   }
-	  const asOfCount =
-	    typeof bundle.asOfMcpAdapterCallCount === "number" && Number.isInteger(bundle.asOfMcpAdapterCallCount)
-	      ? Math.max(0, Math.min(bundle.asOfMcpAdapterCallCount, REPLAY_SUMMARY_LIMIT))
-	      : REPLAY_SUMMARY_LIMIT;
-	  const asOfEventSeq =
-	    typeof bundle.asOfEventSeq === "number" && Number.isInteger(bundle.asOfEventSeq)
-	      ? Math.max(0, Math.min(bundle.asOfEventSeq, REPLAY_SUMMARY_LIMIT))
-	      : REPLAY_SUMMARY_LIMIT;
-	  const expectedEvents = listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT).filter((event) => event.eventSeq <= asOfEventSeq);
+  const asOfCount =
+    typeof bundle.asOfMcpAdapterCallCount === "number" && Number.isInteger(bundle.asOfMcpAdapterCallCount)
+      ? Math.max(0, Math.min(bundle.asOfMcpAdapterCallCount, REPLAY_SUMMARY_LIMIT))
+      : REPLAY_SUMMARY_LIMIT;
+  const asOfEventSeq =
+    typeof bundle.asOfEventSeq === "number" && Number.isInteger(bundle.asOfEventSeq)
+      ? Math.max(0, Math.min(bundle.asOfEventSeq, REPLAY_SUMMARY_LIMIT))
+      : REPLAY_SUMMARY_LIMIT;
+  const expectedEvents = listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT).filter((event) => event.eventSeq <= asOfEventSeq);
   const expectedEventRoot = hashJson(expectedEvents.map((event) => event.eventHash));
   if (bundle.eventRoot !== expectedEventRoot) {
     errors.push("replayBundle.eventRoot does not match the server event snapshot");
@@ -6411,17 +6593,18 @@ function verifyReplayBundleBindings(
     errors.push("replayBundle.agentTranscriptHash does not match the server transcript snapshot");
   }
   compareReplaySnapshot(errors, "replayBundle.events", bundle.events, expectedEvents);
-	  compareReplaySnapshot(errors, "replayBundle.sources", bundle.sources, listSources(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
-	  compareReplaySnapshot(errors, "replayBundle.spends", bundle.spends, listSpends(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
-	  compareReplaySnapshot(errors, "replayBundle.artifactPreflights", bundle.artifactPreflights, listArtifactPreflights(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
-	  compareReplaySnapshot(errors, "replayBundle.quotes", bundle.quotes, listQuotes(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
-	  compareReplaySnapshot(errors, "replayBundle.artifactAccessTokens", bundle.artifactAccessTokens, listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
-	  compareReplaySnapshot(errors, "replayBundle.mcpAdapterCalls", bundle.mcpAdapterCalls, listMcpAdapterCalls(ctx, sessionId, asOfCount));
-	  compareReplaySnapshot(errors, "replayBundle.cawReceiptOperations", bundle.cawReceiptOperations, listCawReceiptOperations(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
-	  compareReplaySnapshot(errors, "replayBundle.rawCawReceiptBundles", bundle.rawCawReceiptBundles, listRawCawReceiptBundles(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
-	  compareReplaySnapshot(errors, "replayBundle.canonicalCawReceipts", bundle.canonicalCawReceipts, listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
-	  compareReplaySnapshot(errors, "replayBundle.leaseRuns", bundle.leaseRuns, listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+  compareReplaySnapshot(errors, "replayBundle.sources", bundle.sources, listSources(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+  compareReplaySnapshot(errors, "replayBundle.spends", bundle.spends, listSpends(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+  compareReplaySnapshot(errors, "replayBundle.artifactPreflights", bundle.artifactPreflights, listArtifactPreflights(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+  compareReplaySnapshot(errors, "replayBundle.quotes", bundle.quotes, listQuotes(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+  compareReplaySnapshot(errors, "replayBundle.artifactAccessTokens", bundle.artifactAccessTokens, listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+  compareReplaySnapshot(errors, "replayBundle.mcpAdapterCalls", bundle.mcpAdapterCalls, listMcpAdapterCalls(ctx, sessionId, asOfCount));
+  compareReplaySnapshot(errors, "replayBundle.cawReceiptOperations", bundle.cawReceiptOperations, listCawReceiptOperations(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+  compareReplaySnapshot(errors, "replayBundle.rawCawReceiptBundles", bundle.rawCawReceiptBundles, listRawCawReceiptBundles(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+  compareReplaySnapshot(errors, "replayBundle.canonicalCawReceipts", bundle.canonicalCawReceipts, listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+  compareReplaySnapshot(errors, "replayBundle.leaseRuns", bundle.leaseRuns, listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.judgeCheck", bundle.judgeCheck, readJudgeCheckData(sessionId, ctx));
+  compareReplaySnapshot(errors, "replayBundle.replayPageIndex", bundle.replayPageIndex, replayPageIndexFor(ctx, sessionId));
   return errors;
 }
 

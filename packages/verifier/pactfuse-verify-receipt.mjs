@@ -7,6 +7,10 @@ import { pathToFileURL } from "node:url";
 const BAD_EVIDENCE_VALUES = new Set(["pending", "fixture", "manual", "blocked"]);
 const INACTIVE_BRANCH_NULL_PATHS = new Set(["paymentProof.permit", "paymentProof.gatePaid"]);
 const HEX32_RE = /^0x[0-9a-fA-F]{64}$/;
+const ZERO_HASH = `0x${"0".repeat(64)}`;
+const REQUIRED_LEASE_TOOL_ARGUMENTS = ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"];
+const DANGEROUS_TOOL_NAME_PATTERN =
+  /(write|edit|delete|remove|shell|exec|terminal|command|commit|push|deploy|transfer|send|apply|patch|modify|create|move|copy|rename|upload|download|file|fs|process|subprocess)/;
 
 function usage() {
   console.error("Usage: node packages/verifier/pactfuse-verify-receipt.mjs [--schema-only] <receipt-pack.json>");
@@ -622,6 +626,21 @@ const JUDGE_ROW_EVENT_KINDS = {
   lease_execution: new Set(["lease.execution.succeeded", "lease.execution.blocked"]),
 };
 
+const REPLAY_PAGE_SIZE = 200;
+const REPLAY_COLLECTIONS = [
+  "artifactAccessTokens",
+  "artifactPreflights",
+  "canonicalCawReceipts",
+  "cawReceiptOperations",
+  "events",
+  "leaseRuns",
+  "mcpAdapterCalls",
+  "quotes",
+  "rawCawReceiptBundles",
+  "sources",
+  "spends",
+];
+
 function buildAgentTranscriptSnapshot(bundle, calls) {
   const callSummaries = calls.map((call) => ({
     callId: call.callId,
@@ -660,11 +679,37 @@ function buildAgentTranscriptSnapshot(bundle, calls) {
   };
 }
 
+function replayPageTotalRows(bundle, collectionName) {
+  const totalRows = bundle?.replayPageIndex?.collections?.[collectionName]?.totalRows;
+  return Number.isInteger(totalRows) ? totalRows : null;
+}
+
 function agentTranscriptBoundedToPinnedManifest(bundle, calls) {
   const successfulLeases = (Array.isArray(bundle.leaseRuns) ? bundle.leaseRuns : []).filter(
     (lease) => isObject(lease) && lease.status === "succeeded_live_mcp_transcript",
   );
   if (successfulLeases.length === 0) {
+    return false;
+  }
+  if (replayPageTotalRows(bundle, "leaseRuns") !== (Array.isArray(bundle.leaseRuns) ? bundle.leaseRuns.length : 0)) {
+    return false;
+  }
+  const expectedAuditNonces = new Set();
+  for (const lease of successfulLeases) {
+    if (typeof lease.leaseRunId !== "string") {
+      return false;
+    }
+    const prefix = lease.leaseRunId.slice(2, 22);
+    expectedAuditNonces.add(`lease_${prefix}_tools_list`);
+    expectedAuditNonces.add(`lease_${prefix}_tools_call`);
+  }
+  if (replayPageTotalRows(bundle, "mcpAdapterCalls") !== expectedAuditNonces.size) {
+    return false;
+  }
+  if (calls.length !== expectedAuditNonces.size) {
+    return false;
+  }
+  if (calls.some((call) => !isObject(call) || !expectedAuditNonces.has(call.auditNonce))) {
     return false;
   }
   const callsByAuditNonce = new Map(calls.filter(isObject).map((call) => [call.auditNonce, call]));
@@ -707,6 +752,12 @@ function verifyMcpAdapterCalls(bundle, calls, errors) {
   if (transcriptHash && lowerHex(bundle.agentTranscriptHash) !== transcriptHash) {
     errors.push("agentTranscriptHash must equal the hash of the replay MCP transcript snapshot");
   }
+  const successfulLeaseCount = (Array.isArray(bundle.leaseRuns) ? bundle.leaseRuns : []).filter(
+    (lease) => isObject(lease) && lease.status === "succeeded_live_mcp_transcript",
+  ).length;
+  if (successfulLeaseCount > 0 && transcript.boundedToPinnedManifest !== true) {
+    errors.push("agentTranscript with succeeded leases must contain only pinned manifest MCP transcript frames");
+  }
   return callsByAuditNonce;
 }
 
@@ -720,6 +771,68 @@ function requireLeaseHashField(lease, field, errors) {
 
 function jsonPath(root, path) {
   return path.reduce((value, key) => (value == null ? undefined : value[key]), root);
+}
+
+function validateLeaseToolDefinition(tool, label, errors = null) {
+  const fail = (message) => {
+    if (errors) {
+      errors.push(`${label} ${message}`);
+    }
+    return false;
+  };
+  if (!isObject(tool)) {
+    return fail("must be an object");
+  }
+  if (typeof tool.name !== "string" || !/^pactfuse_[a-z0-9_:-]{1,80}$/.test(tool.name)) {
+    return fail("name must be a controlled pactfuse_* capability");
+  }
+  if (DANGEROUS_TOOL_NAME_PATTERN.test(tool.name.toLowerCase())) {
+    return fail("name must not describe write, execution, transfer, or file capabilities");
+  }
+  const annotations = tool.annotations;
+  if (!isObject(annotations) || annotations.readOnlyHint !== true) {
+    return fail("must advertise annotations.readOnlyHint=true");
+  }
+  const schema = tool.inputSchema;
+  if (!isObject(schema)) {
+    return fail("must expose an inputSchema object");
+  }
+  if (schema.type !== "object") {
+    return fail("inputSchema.type must be object");
+  }
+  if (schema.additionalProperties !== false) {
+    return fail("inputSchema must set additionalProperties=false");
+  }
+  if (!isObject(schema.properties)) {
+    return fail("inputSchema must declare properties");
+  }
+  if (!Array.isArray(schema.required)) {
+    return fail("inputSchema must declare required fields");
+  }
+  const propertyNames = new Set(Object.keys(schema.properties));
+  const requiredNames = new Set(schema.required.filter((field) => typeof field === "string"));
+  const missing = REQUIRED_LEASE_TOOL_ARGUMENTS.filter((field) => !propertyNames.has(field) || !requiredNames.has(field));
+  if (missing.length > 0) {
+    return fail(`inputSchema is missing required PactFuse fields: ${missing.join(",")}`);
+  }
+  return true;
+}
+
+function sourceManifestHashesForSpend(sourceHashes, sourcesByHash, leaseRunId, errors) {
+  const manifestHashes = [];
+  for (const sourceHash of sourceHashes) {
+    const source = sourcesByHash.get(lowerHex(sourceHash));
+    if (!source) {
+      errors.push(`succeeded lease run ${leaseRunId} source ${sourceHash} is missing from replay sources`);
+      continue;
+    }
+    if (!isHex32(source.manifestHash)) {
+      errors.push(`succeeded lease run ${leaseRunId} source ${sourceHash} is missing manifestHash`);
+      continue;
+    }
+    manifestHashes.push(lowerHex(source.manifestHash));
+  }
+  return manifestHashes;
 }
 
 function pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall, errors = null) {
@@ -739,16 +852,21 @@ function pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall, err
   if (!Array.isArray(spend.sourceHashes) || spend.sourceHashes.length === 0) {
     return fail(`succeeded lease run ${lease.leaseRunId} spend is missing source hashes`);
   }
+  const sourceHashes = [];
+  for (const sourceHash of spend.sourceHashes) {
+    if (typeof sourceHash !== "string") {
+      return fail(`succeeded lease run ${lease.leaseRunId} spend contains a non-string source hash`);
+    }
+    sourceHashes.push(lowerHex(sourceHash));
+  }
+  sourceHashes.sort();
   const sourcesByHash = new Map(
     (Array.isArray(bundle.sources) ? bundle.sources : [])
       .filter((source) => isObject(source) && typeof source.sourceHash === "string")
       .map((source) => [lowerHex(source.sourceHash), source]),
   );
   const expectedTools = [];
-  for (const sourceHash of spend.sourceHashes) {
-    if (typeof sourceHash !== "string") {
-      return fail(`succeeded lease run ${lease.leaseRunId} spend contains a non-string source hash`);
-    }
+  for (const sourceHash of sourceHashes) {
     const source = sourcesByHash.get(lowerHex(sourceHash));
     if (!source) {
       return fail(`succeeded lease run ${lease.leaseRunId} source ${sourceHash} is missing from replay sources`);
@@ -767,6 +885,7 @@ function pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall, err
       if (!isObject(tool) || typeof tool.name !== "string") {
         return fail(`succeeded lease run ${lease.leaseRunId} source ${sourceHash} has invalid pinned MCP tool`);
       }
+      validateLeaseToolDefinition(tool, `succeeded lease run ${lease.leaseRunId} pinned MCP tool`, errors);
       expectedTools.push(tool);
     }
   }
@@ -777,6 +896,9 @@ function pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall, err
   if (!Array.isArray(actualTools) || actualTools.some((tool) => !isObject(tool))) {
     return fail(`succeeded lease run ${lease.leaseRunId} tools/list response is missing tool definitions`);
   }
+  for (const tool of actualTools) {
+    validateLeaseToolDefinition(tool, `succeeded lease run ${lease.leaseRunId} tools/list tool`, errors);
+  }
   const expectedToolsHash = safeHashJson(expectedTools, `lease run ${lease.leaseRunId} pinned MCP tools`, errors ?? []);
   const actualToolsHash = safeHashJson(actualTools, `lease run ${lease.leaseRunId} actual MCP tools`, errors ?? []);
   if (expectedToolsHash && actualToolsHash && expectedToolsHash !== actualToolsHash) {
@@ -786,7 +908,11 @@ function pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall, err
   if (requestedToolName !== expectedTools[0].name) {
     return fail(`succeeded lease run ${lease.leaseRunId} tools/call name does not match pinned source manifest`);
   }
-  return { ok: true, expectedToolsHash, actualToolsHash };
+  const manifestHashes = sourceManifestHashesForSpend(sourceHashes, sourcesByHash, lease.leaseRunId, errors ?? []);
+  if (manifestHashes.length !== sourceHashes.length) {
+    return { ok: false };
+  }
+  return { ok: true, expectedToolsHash, actualToolsHash, spend, sourceHashes, manifestHashes };
 }
 
 function verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors) {
@@ -802,9 +928,9 @@ function verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors) {
   const argumentsObject = jsonPath(toolCall, ["request", "params", "arguments"]);
   if (!isObject(argumentsObject)) {
     errors.push(`succeeded lease run ${lease.leaseRunId} tools/call request is missing arguments`);
-    return;
+    return { ok: false };
   }
-  pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall, errors);
+  const manifestBinding = pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall, errors);
   const expectedArguments = {
     sessionId: bundle.sessionId,
     leaseRunId: lease.leaseRunId,
@@ -819,6 +945,7 @@ function verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors) {
       errors.push(`succeeded lease run ${lease.leaseRunId} tools/call argument ${field} does not match lease run`);
     }
   }
+  return manifestBinding;
 }
 
 function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
@@ -854,7 +981,7 @@ function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
       errors.push(`succeeded lease run ${lease.leaseRunId} is missing bound MCP tools/list or tools/call transcript frames`);
       continue;
     }
-    verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors);
+    const manifestBinding = verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors);
     const expectedToolsListHash = safeHashJson(
       { requestHash: listCall.requestHash, responseHash: listCall.responseHash },
       `lease run ${lease.leaseRunId} tools/list hash body`,
@@ -891,6 +1018,23 @@ function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
     }
     if (expectedOutputHash && outputHash !== expectedOutputHash) {
       errors.push(`succeeded lease run ${lease.leaseRunId} outputHash does not match MCP tools/call response`);
+    }
+    let expectedManifestBindingHash = null;
+    if (manifestBinding?.ok) {
+      expectedManifestBindingHash = safeHashJson(
+        {
+          sessionId: bundle.sessionId,
+          leaseRunId: lease.leaseRunId,
+          spendId: lease.spendId,
+          sourceHashes: manifestBinding.sourceHashes,
+          manifestHashes: manifestBinding.manifestHashes,
+          pinnedManifestToolsHash: manifestBinding.expectedToolsHash,
+          toolsListHash: lease.toolsListHash,
+          toolsCallHash: lease.toolsCallHash,
+        },
+        `lease run ${lease.leaseRunId} manifest binding hash body`,
+        errors,
+      );
     }
     const token = artifactTokensById.get(lease.artifactTokenId);
     if (!token) {
@@ -940,6 +1084,20 @@ function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
       ]) {
         if (event.payload?.[field] !== lease[field]) {
           errors.push(`lease execution event ${event.eventId ?? "-"} payload.${field} does not match lease run`);
+        }
+      }
+      if (event.payload?.boundedToPinnedManifest !== true) {
+        errors.push(`lease execution event ${event.eventId ?? "-"} payload.boundedToPinnedManifest must be true`);
+      }
+      if (manifestBinding?.ok) {
+        if (event.payload?.pinnedManifestToolsHash !== manifestBinding.expectedToolsHash) {
+          errors.push(`lease execution event ${event.eventId ?? "-"} payload.pinnedManifestToolsHash does not match pinned manifest`);
+        }
+        if (JSON.stringify(event.payload?.pinnedManifestHashes) !== JSON.stringify(manifestBinding.manifestHashes)) {
+          errors.push(`lease execution event ${event.eventId ?? "-"} payload.pinnedManifestHashes does not match pinned manifest`);
+        }
+        if (expectedManifestBindingHash && event.payload?.manifestBindingHash !== expectedManifestBindingHash) {
+          errors.push(`lease execution event ${event.eventId ?? "-"} payload.manifestBindingHash does not recompute`);
         }
       }
     }
@@ -1160,6 +1318,115 @@ function verifyCawOperationBinding(canonical, operation, rawBundle, errors) {
   }
 }
 
+function verifyReplayPageIndex(bundle, errors, warnings) {
+  const index = bundle.replayPageIndex;
+  if (!isObject(index)) {
+    errors.push("replayPageIndex must be an object");
+    return;
+  }
+  if (index.pageSize !== REPLAY_PAGE_SIZE) {
+    errors.push(`replayPageIndex.pageSize must be ${REPLAY_PAGE_SIZE}`);
+  }
+  if (!isObject(index.collections)) {
+    errors.push("replayPageIndex.collections must be an object");
+    return;
+  }
+  const rootEntries = [];
+  for (const name of REPLAY_COLLECTIONS) {
+    const collection = index.collections[name];
+    if (!isObject(collection)) {
+      errors.push(`replayPageIndex.collections.${name} must be an object`);
+      continue;
+    }
+    const rows = Array.isArray(bundle[name]) ? bundle[name] : [];
+    if (!Array.isArray(collection.orderBy) || collection.orderBy.length === 0 || collection.orderBy.some((field) => typeof field !== "string")) {
+      errors.push(`replayPageIndex.collections.${name}.orderBy must be a non-empty string array`);
+    }
+    if (!Number.isInteger(collection.totalRows) || collection.totalRows < rows.length) {
+      errors.push(`replayPageIndex.collections.${name}.totalRows must cover the summary rows`);
+    }
+    if (!Array.isArray(collection.pageHashes) || collection.pageHashes.some((hash) => !isHex32(hash))) {
+      errors.push(`replayPageIndex.collections.${name}.pageHashes must be 32-byte hex hashes`);
+      continue;
+    }
+    const expectedPageCount = Math.ceil(Number(collection.totalRows ?? 0) / REPLAY_PAGE_SIZE);
+    if (collection.pageCount !== expectedPageCount || collection.pageHashes.length !== expectedPageCount) {
+      errors.push(`replayPageIndex.collections.${name}.pageCount must match totalRows/pageSize`);
+    }
+    const expectedFirstPageHash = replayPageHash(bundle.sessionId, name, 0, collection.orderBy, rows.slice(0, REPLAY_PAGE_SIZE));
+    if (collection.firstPageHash !== expectedFirstPageHash) {
+      errors.push(`replayPageIndex.collections.${name}.firstPageHash does not match summary rows`);
+    }
+    const expectedPageRoot = hashJson(collection.pageHashes);
+    if (collection.pageRoot !== expectedPageRoot) {
+      errors.push(`replayPageIndex.collections.${name}.pageRoot does not match pageHashes`);
+    }
+    if (collection.totalRows > rows.length) {
+      warnings.push(`replayPageIndex.collections.${name} is paged beyond the summary rows; server-side replay binding must compare full pages`);
+    }
+    rootEntries.push({ name, pageRoot: collection.pageRoot });
+  }
+  if (index.pageRoot !== hashJson(rootEntries)) {
+    errors.push("replayPageIndex.pageRoot does not match collection page roots");
+  }
+}
+
+function replayPageHash(sessionId, collection, pageIndex, orderBy, rows) {
+  return hashJson({ sessionId, collection, pageIndex, pageSize: REPLAY_PAGE_SIZE, orderBy, rows });
+}
+
+function verifyReplayEvents(bundle, events, errors) {
+  let previousEventSeq = 0;
+  let previousProofEventHash = ZERO_HASH;
+  for (const event of events) {
+    if (!isObject(event)) {
+      errors.push("events entries must be objects");
+      continue;
+    }
+    for (const field of ["eventId", "sessionId", "eventSeq", "eventHash", "authority", "kind", "payloadHash", "payload"]) {
+      requirePath(event, [field], errors);
+    }
+    if (event.sessionId !== bundle.sessionId) {
+      errors.push(`event ${event.eventId ?? "-"} sessionId is not bound to replay bundle session`);
+    }
+    if (!Number.isInteger(event.eventSeq) || event.eventSeq <= previousEventSeq) {
+      errors.push(`event ${event.eventId ?? "-"} eventSeq must be strictly increasing`);
+    }
+    previousEventSeq = Number.isInteger(event.eventSeq) ? event.eventSeq : previousEventSeq;
+    const expectedPayloadHash = safeHashJson(event.payload, `event ${event.eventId ?? "-"} payload`, errors);
+    if (expectedPayloadHash && lowerHex(event.payloadHash) !== expectedPayloadHash) {
+      errors.push(`event ${event.eventId ?? "-"} payloadHash does not match payload`);
+    }
+    const expectedPrevProofEventHash = event.authority === "proof" ? previousProofEventHash : null;
+    if ((event.prevProofEventHash ?? null) !== expectedPrevProofEventHash) {
+      errors.push(`event ${event.eventId ?? "-"} prevProofEventHash does not match proof authority chain`);
+    }
+    const expectedEventHash = expectedPayloadHash
+      ? safeHashJson(
+          {
+            sessionId: event.sessionId,
+            eventSeq: event.eventSeq,
+            authority: event.authority,
+            kind: event.kind,
+            payloadHash: event.payloadHash,
+            prevProofEventHash: event.prevProofEventHash ?? null,
+          },
+          `event ${event.eventId ?? "-"} hash body`,
+          errors,
+        )
+      : null;
+    if (expectedEventHash && lowerHex(event.eventHash) !== expectedEventHash) {
+      errors.push(`event ${event.eventId ?? "-"} eventHash does not recompute`);
+    }
+    if (expectedEventHash && lowerHex(event.eventId) !== expectedEventHash) {
+      errors.push(`event ${event.eventId ?? "-"} eventId must equal eventHash`);
+    }
+    if (event.authority === "proof" && isHex32(event.eventHash)) {
+      previousProofEventHash = lowerHex(event.eventHash);
+    }
+  }
+}
+
 function verifyReplayBundleEvidence(bundle, options = {}) {
   const errors = [];
   const warnings = [];
@@ -1168,6 +1435,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     "sessionId",
     "summaryMode",
     "asOfEventSeq",
+    "asOfMcpAdapterCallCount",
     "eventRoot",
     "agentTranscriptHash",
     "events",
@@ -1182,6 +1450,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     "canonicalCawReceipts",
     "leaseRuns",
     "judgeCheck",
+    "replayPageIndex",
   ]) {
     requirePath(bundle, [field], errors);
   }
@@ -1203,10 +1472,12 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   if (bundle.winnerClaimAllowed !== false) {
     errors.push("replay bundle winnerClaimAllowed must be false unless the final verifier is complete");
   }
+  verifyReplayPageIndex(bundle, errors, warnings);
   let eventsById = new Map();
   if (!Array.isArray(bundle.events)) {
     errors.push("events must be an array");
   } else {
+    verifyReplayEvents(bundle, bundle.events, errors);
     const eventRoot = safeHashJson(
       bundle.events.map((event) => (isObject(event) ? event.eventHash : undefined)),
       "eventRoot",
@@ -1282,14 +1553,14 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
         artifactCid: lowerHex(quote.artifactCid),
         priceDisclosureHash: quote.priceDisclosureHash,
         sourceStateSnapshotHash: quote.sourceStateSnapshotHash,
-	        quoteSignedAfterPreflight: true,
-	        modes: {
-	          CLAIM_MODE: "simulated",
-	          PAYMENT_MODE: "mocked",
-	          TOKEN_MODE: "local-mocked",
-	          IDENTITY_MODE: "pending",
-	          WINNER_CLAIM_ALLOWED: false,
-	        },
+        quoteSignedAfterPreflight: true,
+        modes: {
+          CLAIM_MODE: "simulated",
+          PAYMENT_MODE: "mocked",
+          TOKEN_MODE: "local-mocked",
+          IDENTITY_MODE: "pending",
+          WINNER_CLAIM_ALLOWED: false,
+        },
       },
       `quote ${quote.quoteId ?? "-"} quoteHash body`,
       errors,
