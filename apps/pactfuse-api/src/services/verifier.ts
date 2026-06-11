@@ -6,6 +6,7 @@ export function createVerifierAdapter(): EvidenceVerifier {
       const verifierUrl = new URL("../../../../packages/verifier/pactfuse-verify-receipt.mjs", import.meta.url).href;
       const mod = (await import(verifierUrl)) as {
         verifyEvidence?: (receipt: unknown, options?: Record<string, unknown>) => Record<string, unknown>;
+        createServerRuntimeVerifierOptions?: (options?: Record<string, unknown>) => Record<string, unknown>;
       };
       if (!mod.verifyEvidence) {
         return {
@@ -18,7 +19,8 @@ export function createVerifierAdapter(): EvidenceVerifier {
           errors: ["verifier module did not export verifyEvidence"],
         };
       }
-      return mod.verifyEvidence(receipt, options);
+      const effectiveOptions = mod.createServerRuntimeVerifierOptions ? mod.createServerRuntimeVerifierOptions(options) : options;
+      return mod.verifyEvidence(receipt, effectiveOptions);
     },
   };
 }

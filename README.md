@@ -208,6 +208,7 @@ Important `/api/v1` routes:
 | `POST /api/v1/mcp/audit` | Record audited MCP adapter calls |
 | `GET /api/v1/evidence/judge-check` | Read the six-row Judge Check |
 | `GET /api/v1/evidence/claim-readiness` | Derive current and target claim modes from evidence gates |
+| `GET /api/v1/evidence/public-claim` | Fail-closed public-claim authorization gate |
 | `GET /api/v1/evidence/replay-bundle` | Read `PACTFUSE_EVIDENCE_V1` summary plus embedded replay page proofs |
 | `GET /api/v1/evidence/replay-page` | Read paged replay collections |
 | `GET /api/v1/evidence/agent-transcript` | Read MCP transcript summary |
@@ -233,6 +234,7 @@ Expected behavior:
 - `--schema-only` accepts the pending structure.
 - full verifier mode rejects it because the example is pending, not final proof.
 - `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` remain `false` until every final replay gate passes.
+- `GET /api/v1/evidence/public-claim` returns `proof_pending` until claim readiness, verifier output, replay hash, and every live evidence gate are simultaneously green.
 
 The replay verifier checks:
 
@@ -244,6 +246,7 @@ The replay verifier checks:
 - MCP request/response hashes
 - exact pinned-manifest lease transcript boundaries
 - final replay blockers for live proof providers, CAW identity, wrong-target deny, live quote status, token settlement, Judge Check, and lease execution
+- public-claim authorization remains closed unless the backend can emit `authorized_public_claim`
 - paged replay roots plus embedded page bodies for large evidence collections
 - Judge Check row references
 

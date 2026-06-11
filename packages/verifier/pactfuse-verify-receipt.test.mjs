@@ -79,7 +79,7 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.proofChipAllowed).toBe(false);
     expect(result.finalVerifierComplete).toBe(false);
     expect(result.proofCompletenessErrors).toContain("final verifier requires live chain proof provider");
-    expect(result.proofCompletenessErrors).toContain("final verifier requires caw.identity.probed with mode=real, pass=true, walletAddress, proofAuthority=true, and winnerClaimAllowed=true");
+    expect(result.proofCompletenessErrors).toContain("final verifier requires caw.identity.probed with mode=real, pass=true, walletAddress, proofAuthority=true, and winnerClaimAllowed=false");
     expect(result.proofCompletenessErrors).toContain("final verifier refuses mocked_after_preflight_not_chain_settleable quotes");
     expect(result.schemaErrors).toEqual([]);
   });
@@ -99,7 +99,11 @@ describe("pactfuse receipt verifier contract", () => {
 
   it("rejects caller-supplied live provider flags without server runtime authority", () => {
     const bundle = replayBundle();
-    const result = verifyEvidence(bundle, { cliMode: "proof-chip", proofProviders: liveProofProvidersForTest() });
+    const result = verifyEvidence(bundle, {
+      cliMode: "proof-chip",
+      proofProviders: liveProofProvidersForTest(),
+      proofProviderAuthority: "server-runtime",
+    });
 
     expect(result.schemaOk).toBe(true);
     expect(result.proofChipAllowed).toBe(false);
@@ -2002,7 +2006,7 @@ function appendCawIdentityProbeForTest(bundle, walletAddress = bundle.spends[0].
       requestHash: hex32("identity-request"),
       responseHash: hex32("identity-response"),
       proofAuthority: true,
-      winnerClaimAllowed: true,
+      winnerClaimAllowed: false,
     },
     createdAt: "2026-06-11T00:00:03.500Z",
   });

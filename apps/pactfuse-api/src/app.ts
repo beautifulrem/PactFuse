@@ -14,6 +14,7 @@ import type { Context } from "hono";
 import type { ServiceCtx, ServiceResult } from "./types.js";
 import {
   assembleReplayBundle,
+  authorizePublicClaim,
   buildCawOperation,
   challengeSource,
   createSession,
@@ -87,6 +88,7 @@ const ROUTES = [
   { method: "GET", path: "/api/v1/evidence/{sessionId}/verify", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/judge-check", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/claim-readiness", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/public-claim", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/replay-bundle", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/replay-page", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/indexer-status", okStatus: 200 },
@@ -246,6 +248,16 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "finalVerifierComplete",
     "gates.status",
     "blockers",
+  ],
+  "/api/v1/evidence/public-claim": [
+    "claimStatus",
+    "claimMode",
+    "paymentMode",
+    "tokenMode",
+    "identityMode",
+    "replayBundleHash",
+    "publicClaimHash",
+    "winnerClaimAllowed",
   ],
   "/api/v1/evidence/replay-bundle": [
     "winnerClaimAllowed",
@@ -470,6 +482,11 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.get("/api/v1/evidence/claim-readiness", async (c) => {
     const sessionId = requiredQuery(c, "sessionId");
     return send(c, await readClaimReadiness(sessionId, ctx));
+  });
+
+  app.get("/api/v1/evidence/public-claim", async (c) => {
+    const sessionId = requiredQuery(c, "sessionId");
+    return send(c, await authorizePublicClaim(sessionId, ctx));
   });
 
   app.get("/api/v1/evidence/replay-bundle", async (c) => {
@@ -906,7 +923,7 @@ function buildOpenApi(): Record<string, unknown> {
             identityMode: { enum: ["p0-floor-one-wallet", "p0-win-separate-identities"] },
             pass: { type: "boolean" },
             proofAuthority: { type: "boolean" },
-            winnerClaimAllowed: { type: "boolean" },
+            winnerClaimAllowed: { const: false },
           },
         }),
         CawLiveContractCallInput: sessionEnvelopeSchema("#/components/schemas/CawLiveContractCallPayload"),
@@ -1227,6 +1244,37 @@ function buildOpenApi(): Record<string, unknown> {
             requiredExternalInputs: { type: "array", items: { type: "string" } },
             replayBundleHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
             verifierRun: { $ref: "#/components/schemas/FailClosedProofState" },
+          },
+        }),
+        PublicClaimResponse: serviceResponseSchema({
+          type: "object",
+          required: [
+            "sessionId",
+            "claimStatus",
+            "claimMode",
+            "paymentMode",
+            "tokenMode",
+            "identityMode",
+            "replayBundleHash",
+            "verifierRun",
+            "proofChipAllowed",
+            "finalVerifierComplete",
+            "winnerClaimAllowed",
+            "publicClaimHash",
+          ],
+          properties: {
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            claimStatus: { const: "authorized_public_claim" },
+            claimMode: { const: "caw-target-real" },
+            paymentMode: { const: "gate-paid-artifact-real" },
+            tokenMode: { enum: ["mock-test-token", "official-testnet-usdc"] },
+            identityMode: { enum: ["p0-floor-one-wallet", "p0-win-separate-identities"] },
+            replayBundleHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            verifierRun: { $ref: "#/components/schemas/FailClosedProofState" },
+            proofChipAllowed: { const: true },
+            finalVerifierComplete: { const: true },
+            winnerClaimAllowed: { const: true },
+            publicClaimHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
           },
         }),
         JudgeCheckData: {
@@ -2416,6 +2464,8 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/JudgeCheckResponse" };
     case "/api/v1/evidence/claim-readiness":
       return { $ref: "#/components/schemas/ClaimReadinessResponse" };
+    case "/api/v1/evidence/public-claim":
+      return { $ref: "#/components/schemas/PublicClaimResponse" };
     case "/api/v1/caw/receipts/ingest":
       return { $ref: "#/components/schemas/CawReceiptIngestResponse" };
     case "/api/v1/caw/live/identity/probe":

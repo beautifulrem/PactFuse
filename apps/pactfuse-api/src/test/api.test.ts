@@ -428,6 +428,39 @@ describe("pactfuse-api P0", () => {
     );
   });
 
+  it("keeps public claim authorization closed until readiness and verifier gates all pass", async () => {
+    const { app } = makeApp(":memory:", {
+      verifier: {
+        verify: async () => ({
+          schemaOk: true,
+          proofChipAllowed: true,
+          winnerClaimAllowed: true,
+          requestedWinnerClaimAllowed: true,
+          finalVerifierComplete: true,
+          warnings: [],
+          errors: [],
+        }),
+      },
+    });
+    const sessionId = await createSession(app, "sess-public-claim-blocked");
+
+    const claim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`);
+    const claimJson = await claim.json();
+
+    expect(claim.status).toBe(423);
+    expect(claimJson.error.code).toBe("proof_pending");
+    expect(claimJson.error.message).toContain("public claim remains blocked");
+    expect(claimJson.error.details.blockers).toContain("targetClaimMode is not caw-target-real");
+    expect(claimJson.error.details.blockers).toContain("claim readiness winnerClaimAllowed is false");
+    expect(claimJson.error.details.requiredExternalInputs).toEqual(
+      expect.arrayContaining([
+        "PACTFUSE_CAW_EXPORT_URL or equivalent raw CAW receipt export source",
+        "PACTFUSE_CAW_LIVE_API_URL, PACTFUSE_CAW_LIVE_API_KEY, and a CAW wallet id",
+        "PACTFUSE_CHAIN_RPC_URL and PACTFUSE_CHAIN_ID for a live public testnet RPC",
+      ]),
+    );
+  });
+
   it("fails verifier closed when a required indexer cursor is missing", async () => {
     const { app } = makeApp(":memory:", {
       cawLive: createFakeCawLiveClient(),
@@ -693,6 +726,9 @@ describe("pactfuse-api P0", () => {
     });
     const readiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
     const readinessJson = await readiness.json();
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const identityEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "caw.identity.probed");
 
     expect(probe.status).toBe(202);
     expect(probe.json.data).toEqual(
@@ -702,7 +738,7 @@ describe("pactfuse-api P0", () => {
         identityMode: "p0-floor-one-wallet",
         pass: true,
         proofAuthority: true,
-        winnerClaimAllowed: true,
+        winnerClaimAllowed: false,
       }),
     );
     expect(readiness.status).toBe(200);
@@ -711,6 +747,7 @@ describe("pactfuse-api P0", () => {
       expect.objectContaining({ status: "pass", evidenceEventId: probe.json.evidenceEventId }),
     );
     expect(readinessJson.data.winnerClaimAllowed).toBe(false);
+    expect(identityEvent.payload).toEqual(expect.objectContaining({ proofAuthority: true, winnerClaimAllowed: false }));
   });
 
   it("returns bad_request for missing evidence query parameters", async () => {
@@ -743,6 +780,19 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/evidence/claim-readiness"].get["x-pactfuse-proof-fields"]).toContain("targetClaimMode");
     expect(json.paths["/api/v1/evidence/claim-readiness"].get.responses["200"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/ClaimReadinessResponse",
+    );
+    expect(json.paths["/api/v1/evidence/public-claim"].get["x-pactfuse-proof-fields"]).toEqual([
+      "claimStatus",
+      "claimMode",
+      "paymentMode",
+      "tokenMode",
+      "identityMode",
+      "replayBundleHash",
+      "publicClaimHash",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/evidence/public-claim"].get.responses["200"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/PublicClaimResponse",
     );
     expect(json.paths["/api/v1/caw/live/identity/probe"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/CawLiveIdentityProbeInput",
@@ -1332,6 +1382,10 @@ describe("pactfuse-api P0", () => {
     ]);
     expect(json.components.schemas.FailClosedProofState.properties.claimMode.enum).toContain("simulated");
     expect(json.components.schemas.FailClosedProofState.properties.paymentMode.enum).toContain("mocked");
+    expect(json.components.schemas.PublicClaimResponse.oneOf[0].properties.data.properties.claimStatus.const).toBe(
+      "authorized_public_claim",
+    );
+    expect(json.components.schemas.PublicClaimResponse.oneOf[0].properties.data.properties.winnerClaimAllowed.const).toBe(true);
     expect(serialized).not.toContain('"verified"');
   });
 
@@ -6807,6 +6861,74 @@ describe("pactfuse-api P0", () => {
     expect(approve.json.error.message).toContain("policy authority binding");
   });
 
+  it("blocks CAW contract calls when no single Pact policy rule allows the chain target selector tuple", async () => {
+    const { app } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient({
+        policy: {
+          rules: [
+            {
+              chain_ids: ["84532"],
+              target_addresses: [TEST_PAYMENT_TOKEN_ADDRESS],
+              selectors: [ERC20_APPROVE_SELECTOR],
+            },
+            {
+              chain_ids: ["1"],
+              target_addresses: [INDEXER_ADDRESS],
+              selectors: [PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR],
+            },
+          ],
+          request_limit: "2",
+          expiry: "2026-06-12T00:00:00.000Z",
+        },
+      }),
+    });
+    const sessionId = await createSession(app, "sess-caw-live-policy-tuple");
+    const spendId = await registerSpend(app, sessionId);
+    await post(app, "/api/v1/caw/live/pacts/submit", {
+      sessionId,
+      idempotencyKey: "tuple-policy-pact-submit",
+      payload: { walletId: "wallet-live-1", intent: "tuple policy", spec: { policies: [] } },
+    });
+    const sync = await post(app, "/api/v1/caw/live/pacts/sync", {
+      sessionId,
+      idempotencyKey: "tuple-policy-pact-sync",
+      payload: { pactId: "pact-live-1" },
+    });
+    const activate = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "tuple-policy-activate",
+        payload: {
+          spendId,
+          operationKind: "activate_tool",
+          pactId: "pact-live-1",
+          walletId: "wallet-live-1",
+          chainId: "84532",
+          contractAddress: INDEXER_ADDRESS,
+          procurementGateAddress: INDEXER_ADDRESS,
+          calldata: cawActivateToolCalldataForTest(spendId),
+          requestId: "tuple-policy-activate",
+        },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(sync.status).toBe(202);
+    expect(sync.json.data.policyRules).toHaveLength(2);
+    expect(activate.status).toBe(422);
+    expect(activate.json.error.message).toContain("chain/target/selector tuple");
+    expect(
+      replayJson.data.events.some(
+        (event: { kind: string; payload: { requestId?: string } }) =>
+          event.kind === "caw.live.contract_call.submitted" && event.payload.requestId === "tuple-policy-activate",
+      ),
+    ).toBe(false);
+  });
+
   it("blocks CAW contract calls after Pact policy request limit is exhausted", async () => {
     const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient({ policyRequestLimit: "1" }) });
     const sessionId = await createSession(app, "sess-caw-live-policy-limit");
@@ -7977,6 +8099,7 @@ function createFakeCawLiveClient(
     includePolicyBinding: boolean;
     auditPolicyDigest: `0x${string}`;
     policyRequestLimit: string;
+    policy: Record<string, unknown>;
   }> = {},
 ): CawLiveClient {
   const contractCalls: Array<{ input: Parameters<CawLiveClient["contractCall"]>[0]; txHash: `0x${string}` }> = [];
@@ -8011,7 +8134,7 @@ function createFakeCawLiveClient(
       const policyFields = includePolicyBinding
         ? {
             policy_digest: pactPolicyDigest,
-            policy: {
+            policy: options.policy ?? {
               chain_ids: ["84532"],
               target_addresses: [TEST_PAYMENT_TOKEN_ADDRESS, INDEXER_ADDRESS],
               selectors: [ERC20_APPROVE_SELECTOR, PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR],

@@ -16,6 +16,7 @@ const MOCK_QUOTE_STATUS = "mocked_after_preflight_not_chain_settleable";
 const CHAIN_SETTLEABLE_QUOTE_STATUS = "chain_settleable_after_preflight";
 const BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
 const REQUIRED_LEASE_TOOL_ARGUMENTS = ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"];
+const SERVER_RUNTIME_PROOF_PROVIDER_TOKENS = new WeakSet();
 const DANGEROUS_TOOL_NAME_PATTERN =
   /(write|edit|delete|remove|shell|exec|terminal|command|commit|push|deploy|transfer|send|apply|patch|modify|create|move|copy|rename|upload|download|file|fs|process|subprocess)/;
 
@@ -2491,7 +2492,21 @@ function replayProviderReady(options, name) {
 }
 
 function replayProviderAuthorityLocked(options) {
-  return options.proofProviderAuthority === "server-runtime";
+  return (
+    options.proofProviderAuthority === "server-runtime" &&
+    isObject(options.proofProviderAuthorityToken) &&
+    SERVER_RUNTIME_PROOF_PROVIDER_TOKENS.has(options.proofProviderAuthorityToken)
+  );
+}
+
+export function createServerRuntimeVerifierOptions(options = {}) {
+  const proofProviderAuthorityToken = {};
+  SERVER_RUNTIME_PROOF_PROVIDER_TOKENS.add(proofProviderAuthorityToken);
+  return {
+    ...options,
+    proofProviderAuthority: "server-runtime",
+    proofProviderAuthorityToken,
+  };
 }
 
 function latestReplayEvent(eventsById, kind, predicate = () => true) {
@@ -2617,14 +2632,14 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
       payload.mode === "real" &&
       payload.pass === true &&
       payload.proofAuthority === true &&
-      payload.winnerClaimAllowed === true &&
+      payload.winnerClaimAllowed === false &&
       typeof payload.walletId === "string" &&
       typeof payload.walletAddress === "string"
     );
   });
   if (!cawIdentityProbe) {
     blockers.push(
-      "final verifier requires caw.identity.probed with mode=real, pass=true, walletAddress, proofAuthority=true, and winnerClaimAllowed=true",
+      "final verifier requires caw.identity.probed with mode=real, pass=true, walletAddress, proofAuthority=true, and winnerClaimAllowed=false",
     );
   }
 

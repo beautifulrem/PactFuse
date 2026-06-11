@@ -758,7 +758,7 @@ export const ReplayBundleViewSchema = z
     summaryMode: z.literal(true),
     asOfEventSeq: z.number().int().min(0).max(200),
     asOfMcpAdapterCallCount: z.number().int().min(0).max(200),
-    winnerClaimAllowed: z.literal(false),
+    winnerClaimAllowed: z.boolean(),
     eventRoot: Hex32Schema,
     agentTranscriptHash: Hex32Schema,
     fullReplayRoot: Hex32Schema,
@@ -887,6 +887,23 @@ export const ClaimReadinessViewSchema = z
   })
   .strict();
 
+export const PublicClaimViewSchema = z
+  .object({
+    sessionId: Hex32Schema,
+    claimStatus: z.literal("authorized_public_claim"),
+    claimMode: z.literal("caw-target-real"),
+    paymentMode: z.literal("gate-paid-artifact-real"),
+    tokenMode: z.enum(["mock-test-token", "official-testnet-usdc"]),
+    identityMode: z.enum(["p0-floor-one-wallet", "p0-win-separate-identities"]),
+    replayBundleHash: Hex32Schema,
+    verifierRun: VerifierRunViewSchema,
+    proofChipAllowed: z.literal(true),
+    finalVerifierComplete: z.literal(true),
+    winnerClaimAllowed: z.literal(true),
+    publicClaimHash: Hex32Schema,
+  })
+  .strict();
+
 export const ServiceOkSchema = <T extends z.ZodTypeAny>(data: T) =>
   z
     .object({
@@ -943,6 +960,7 @@ export type SessionView = z.infer<typeof SessionViewSchema>;
 export type JudgeCheckView = z.infer<typeof JudgeCheckViewSchema>;
 export type VerifierRunView = z.infer<typeof VerifierRunViewSchema>;
 export type ClaimReadinessView = z.infer<typeof ClaimReadinessViewSchema>;
+export type PublicClaimView = z.infer<typeof PublicClaimViewSchema>;
 export type ReplayBundleView = z.infer<typeof ReplayBundleViewSchema>;
 export type QuoteStatus = z.infer<typeof QuoteStatusSchema>;
 export type ChainIndexerBackfillInput = z.infer<typeof ChainIndexerBackfillInputSchema>;
