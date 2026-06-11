@@ -29,7 +29,8 @@ This section is for the final/current public claim, not the hour-4 `TARGET_*` ca
 
 Allowed only when all are true:
 
-- `docs/evidence/caw-identity-probe.json` has `mode: real`, `pass: true`, and `winnerClaimAllowed: true`, and the probed `walletAddress` matches the settled C spend `payer` and `agentWallet`
+- `docs/evidence/caw-identity-probe.json` has `mode: real`, `pass: true`, and `proofAuthority: true`, while its evidence row still has `winnerClaimAllowed: false`; only the final `public.claim.authorized` event may set `winnerClaimAllowed: true`
+- the probed `walletAddress` matches the settled C spend `payer` and `agentWallet`
 - CAW policy receipt plus matching tx/audit evidence proves chain, target, selector, expiry, tx-count/request-count limits, and usage
 - CAW receipt ingest proves every CAW operation came from raw API/export JSON, not hand-entered fields
 - wrong-target bypass has a real CAW deny request id or audit receipt
@@ -87,3 +88,4 @@ W1 default order: attempt `p0-win-separate-identities` (separate CAW wallets/ide
 - Missing replay bundle: `WINNER_CLAIM_ALLOWED: false`
 - Failed C settlement: no payment-path winner claim
 - Real C settlement but missing artifact delivery: `artifact-hash-proof` only
+- Any intermediate proof event with `winnerClaimAllowed: true`: invalid public-claim evidence; downgrade until only `public.claim.authorized` carries the final claim flag

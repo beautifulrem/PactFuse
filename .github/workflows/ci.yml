@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+    inputs:
+      live_smoke:
+        description: Run live public-claim smoke gate against a configured environment
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Set up Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check live-smoke syntax
+        run: node --check scripts/live-smoke.mjs
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test
+
+      - name: Test contracts
+        run: pnpm test:contracts
+
+  live-smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.live_smoke }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run live public-claim smoke gate
+        run: node scripts/live-smoke.mjs
+        env:
+          PACTFUSE_API_BASE_URL: ${{ secrets.PACTFUSE_API_BASE_URL }}
+          PACTFUSE_OPERATOR_TOKEN: ${{ secrets.PACTFUSE_OPERATOR_TOKEN }}
+          PACTFUSE_LIVE_SMOKE_SESSION_ID: ${{ secrets.PACTFUSE_LIVE_SMOKE_SESSION_ID }}
+          PACTFUSE_LIVE_SMOKE_REQUIRE_PUBLIC_CLAIM: "true"

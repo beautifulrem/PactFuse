@@ -1,0 +1,48 @@
+# PactFuse production live proof environment
+#
+# Copy these names into your secret manager or local untracked env file.
+# Do not commit real values.
+
+# API target for pnpm live-smoke
+PACTFUSE_API_BASE_URL=https://pactfuse-api.example.com
+PACTFUSE_LIVE_SMOKE_SESSION_ID=0x0000000000000000000000000000000000000000000000000000000000000000
+PACTFUSE_LIVE_SMOKE_REQUIRE_PUBLIC_CLAIM=true
+PACTFUSE_LIVE_SMOKE_REQUIRED_PROVIDERS=chain,caw_live,caw,mcp_lease
+
+# Operator and role tokens
+PACTFUSE_OPERATOR_TOKEN=replace-with-operator-token
+PACTFUSE_CHALLENGE_SUBMITTER_TOKEN=replace-with-challenge-submitter-token
+PACTFUSE_ARTIFACT_SIGNER_TOKEN=replace-with-artifact-signer-token
+PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=false
+
+# Evidence ingest secrets
+PACTFUSE_MCP_AUDIT_TOKEN=replace-with-mcp-audit-hmac-secret
+PACTFUSE_GATE_INGEST_TOKEN=replace-with-gate-ingest-hmac-secret
+PACTFUSE_CAW_INGEST_TOKEN=replace-with-caw-ingest-bearer-token
+
+# Chain and indexer
+PACTFUSE_CHAIN_RPC_URL=https://base-sepolia-rpc.example.com
+PACTFUSE_CHAIN_ID=84532
+PACTFUSE_INDEXER_ENABLED=true
+PACTFUSE_INDEXER_ADDRESS=0x0000000000000000000000000000000000000000
+PACTFUSE_INDEXER_CURSOR_ID=gate:indexer
+PACTFUSE_INDEXER_FINALITY_DEPTH=2
+PACTFUSE_INDEXER_START_BLOCK=0
+PACTFUSE_INDEXER_TOPICS=
+
+# Cobo Agentic Wallet / CAW live API
+AGENT_WALLET_API_URL=https://api.cobo.example.com
+AGENT_WALLET_API_KEY=replace-with-cobo-agentic-wallet-api-key
+AGENT_WALLET_WALLET_ID=replace-with-wallet-id
+PACTFUSE_CAW_LIVE_TIMEOUT_MS=10000
+
+# CAW receipt export source
+PACTFUSE_CAW_EXPORT_URL=https://caw-export.example.com/receipts
+PACTFUSE_CAW_API_KEY=replace-with-caw-export-api-key
+PACTFUSE_CAW_WALLET_ID=replace-with-wallet-id
+PACTFUSE_CAW_EXPORT_LIMIT=50
+
+# MCP lease executor
+PACTFUSE_LEASE_MCP_URL=https://mcp-lease.example.com/jsonrpc
+PACTFUSE_LEASE_MCP_TOOL_NAME=pactfuse_code_scan
+PACTFUSE_LEASE_MCP_TIMEOUT_MS=10000

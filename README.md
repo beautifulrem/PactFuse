@@ -282,6 +282,26 @@ The replay verifier checks:
 | `PACTFUSE_LEASE_MCP_URL` | MCP JSON-RPC endpoint for clean lease execution |
 | `PACTFUSE_LEASE_MCP_TOOL_NAME` | Required lease tool name, defaults to `pactfuse_code_scan` |
 
+### Live Release Gate
+
+The production claim path has a separate smoke gate. It does not create evidence and it does not accept fixture data; it only validates an already-built live session:
+
+```sh
+PACTFUSE_API_BASE_URL=http://127.0.0.1:8787 \
+PACTFUSE_OPERATOR_TOKEN=... \
+PACTFUSE_LIVE_SMOKE_SESSION_ID=0x... \
+pnpm live-smoke
+```
+
+Required result:
+
+- authenticated `/readyz` runs deep proof-provider checks
+- chain, CAW live, CAW receipt export, and MCP lease providers are ready
+- `/api/v1/evidence/live-preflight` returns `readyForPublicClaim=true` with no blockers
+- `/api/v1/evidence/public-claim` returns `authorized_public_claim`, `finalVerifierComplete=true`, and `winnerClaimAllowed=true`
+
+Use [docs/evidence/production-live-env.example](docs/evidence/production-live-env.example) as the non-secret manifest for the real Cobo/RPC/MCP environment.
+
 ## Smart Contracts
 
 Contracts live in [contracts/src](contracts/src):
@@ -321,14 +341,17 @@ pnpm --filter @pactfuse/pactfuse-mcp test
 pnpm test:contracts
 ```
 
+CI runs the same build, API/verifier/MCP tests, contract tests, and `node --check scripts/live-smoke.mjs`. The live public-claim smoke gate is manual-only through GitHub Actions `workflow_dispatch` and requires `PACTFUSE_API_BASE_URL`, `PACTFUSE_OPERATOR_TOKEN`, and `PACTFUSE_LIVE_SMOKE_SESSION_ID` secrets.
+
 Before publishing a branch or demo:
 
 1. Keep `winnerClaimAllowed=false` unless the claim-mode gates pass.
 2. Run `pnpm turbo run build --force`.
 3. Run `pnpm turbo run test --force`.
 4. Run `pnpm test:contracts`.
-5. Confirm fixture, pending, manual, and blocked rows do not appear as public proof.
-6. Confirm secrets are not committed.
+5. For live demos, run `pnpm live-smoke` against the real evidence session.
+6. Confirm fixture, pending, manual, and blocked rows do not appear as public proof.
+7. Confirm secrets are not committed.
 
 ## Documentation
 

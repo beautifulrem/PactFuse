@@ -12,6 +12,7 @@
     "test": "turbo run test",
     "build:contracts": "forge build",
     "test:contracts": "forge test",
+    "live-smoke": "node scripts/live-smoke.mjs",
     "dev:api": "pnpm --filter @pactfuse/api dev",
     "start:api": "pnpm --filter @pactfuse/api start"
   },

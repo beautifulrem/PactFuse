@@ -729,7 +729,7 @@ describe("pactfuse-api P0", () => {
     expect(repeatedClaim.status).toBe(200);
     expect(repeatedClaimJson.data.publicClaimHash).toBe(claimJson.data.publicClaimHash);
     expect(claimEvents).toHaveLength(1);
-    expect(claimEvents[0]).toEqual(expect.objectContaining({ authority: "advisory", kind: "public.claim.authorized" }));
+    expect(claimEvents[0]).toEqual(expect.objectContaining({ authority: "proof", kind: "public.claim.authorized" }));
     expect(claimEventPayload).toEqual(
       expect.objectContaining({
         publicClaimHash: claimJson.data.publicClaimHash,

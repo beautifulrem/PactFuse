@@ -4650,7 +4650,7 @@ function appendPublicClaimAuthorizedEvent(ctx: ServiceCtx, sessionId: string, cl
   const asOfEventSeq = Number(session.latest_event_seq);
   return appendEvidenceEvent(ctx, {
     sessionId,
-    authority: "advisory",
+    authority: "proof",
     kind: "public.claim.authorized",
     payload: jsonRecord({
       claim,
