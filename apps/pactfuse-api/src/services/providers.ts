@@ -4,6 +4,9 @@ import { createPublicClient, http } from "viem";
 import type {
   CawReceiptSource,
   ChainClient,
+  McpLeaseClient,
+  McpLeaseExecutionInput,
+  McpLeaseExecutionResult,
   PactTemplateBinding,
   PactTemplateRegistry,
   ProofProviderStatus,
@@ -14,6 +17,7 @@ const DEFAULT_TEMPLATES: Array<{ mode: PactTemplateBinding["mode"]; path: string
   { mode: "gate-paid-artifact-real", path: "../../../../pact-template/gate-paid-artifact-real.json" },
   { mode: "permit-payment-real", path: "../../../../pact-template/permit-payment-real.appendix.json" },
 ];
+const MAX_MCP_RESPONSE_BYTES = 512 * 1024;
 
 export function createUnconfiguredChainClient(): ChainClient {
   return {
@@ -191,6 +195,81 @@ export function createHttpsCawReceiptSource(input: {
   };
 }
 
+export function createUnconfiguredMcpLeaseClient(): McpLeaseClient {
+  return {
+    async status() {
+      return unconfiguredStatus("mcp_lease", "lease MCP endpoint is not configured");
+    },
+    async executeCleanLease() {
+      throw new Error("lease MCP endpoint is unconfigured; cannot execute tools/list or tools/call");
+    },
+  };
+}
+
+export function createHttpJsonRpcMcpLeaseClient(input: {
+  endpointUrl: string;
+  toolName?: string;
+  timeoutMs?: number;
+}): McpLeaseClient {
+  const toolName = input.toolName ?? "pactfuse_code_scan";
+  const timeoutMs = input.timeoutMs ?? 10_000;
+  return {
+    async status() {
+      try {
+        new URL(input.endpointUrl);
+        return {
+          name: "mcp_lease",
+          mode: "live",
+          ready: true,
+          reason: "lease MCP JSON-RPC endpoint is configured",
+          endpoint: input.endpointUrl,
+        };
+      } catch (error) {
+        return {
+          name: "mcp_lease",
+          mode: "live",
+          ready: false,
+          reason: error instanceof Error ? error.message : "lease MCP endpoint URL is invalid",
+          endpoint: input.endpointUrl,
+        };
+      }
+    },
+    async executeCleanLease(leaseInput) {
+      const toolsListRequest = jsonRpcRequest("tools/list", {});
+      const toolsListResponse = await postJsonRpc(input.endpointUrl, toolsListRequest, timeoutMs);
+      assertToolListed(toolsListResponse, toolName);
+      const toolsCallRequest = jsonRpcRequest("tools/call", {
+        name: toolName,
+        arguments: {
+          sessionId: leaseInput.sessionId,
+          leaseRunId: leaseInput.leaseRunId,
+          spendId: leaseInput.spendId,
+          payer: leaseInput.payer,
+          artifactHash: leaseInput.artifactHash,
+          targetRepo: leaseInput.targetRepo,
+          targetCommit: leaseInput.targetCommit,
+        },
+      });
+      const toolsCallResponse = await postJsonRpc(input.endpointUrl, toolsCallRequest, timeoutMs);
+      assertJsonRpcSuccess(toolsCallResponse, "tools/call");
+      return {
+        toolName,
+        toolsList: {
+          method: "tools/list",
+          request: toolsListRequest,
+          response: toolsListResponse,
+        },
+        toolsCall: {
+          method: "tools/call",
+          request: toolsCallRequest,
+          response: toolsCallResponse,
+        },
+        output: toolsCallResponse,
+      } satisfies McpLeaseExecutionResult;
+    },
+  };
+}
+
 export function createLocalTemplateRegistry(): PactTemplateRegistry {
   const bindings = DEFAULT_TEMPLATES.map((template) => {
     const url = new URL(template.path, import.meta.url);
@@ -202,6 +281,82 @@ export function createLocalTemplateRegistry(): PactTemplateRegistry {
     };
   });
   return createStaticTemplateRegistry(bindings);
+}
+
+function jsonRpcRequest(method: "tools/list" | "tools/call", params: Record<string, unknown>): Record<string, unknown> {
+  return {
+    jsonrpc: "2.0",
+    id: `${method}:${Date.now()}:${Math.random().toString(16).slice(2)}`,
+    method,
+    params,
+  };
+}
+
+async function postJsonRpc(endpointUrl: string, request: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(endpointUrl, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > MAX_MCP_RESPONSE_BYTES) {
+      throw new Error("lease MCP endpoint response exceeded 512 KiB");
+    }
+    let parsed: unknown = {};
+    if (text.length > 0) {
+      try {
+        parsed = JSON.parse(text) as unknown;
+      } catch {
+        throw new Error("lease MCP endpoint returned non-JSON response");
+      }
+    }
+    if (!response.ok) {
+      throw new Error(`lease MCP endpoint returned HTTP ${response.status}`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("lease MCP endpoint must return a JSON-RPC object");
+    }
+    return parsed as Record<string, unknown>;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function assertJsonRpcSuccess(response: Record<string, unknown>, method: string): void {
+  if (response.jsonrpc !== "2.0") {
+    throw new Error(`${method} response is missing jsonrpc=2.0`);
+  }
+  if ("error" in response) {
+    throw new Error(`${method} returned JSON-RPC error`);
+  }
+  if (!("result" in response)) {
+    throw new Error(`${method} response is missing result`);
+  }
+}
+
+function assertToolListed(response: Record<string, unknown>, toolName: string): void {
+  assertJsonRpcSuccess(response, "tools/list");
+  const result = response.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new Error("tools/list result must be an object");
+  }
+  const tools = (result as Record<string, unknown>).tools;
+  if (!Array.isArray(tools)) {
+    throw new Error("tools/list result must include a tools array");
+  }
+  const names = tools
+    .map((tool) => (tool && typeof tool === "object" && !Array.isArray(tool) ? (tool as Record<string, unknown>).name : null))
+    .filter((name): name is string => typeof name === "string");
+  if (!names.includes(toolName)) {
+    throw new Error(`tools/list did not expose required tool ${toolName}`);
+  }
 }
 
 export function createStaticTemplateRegistry(bindings: PactTemplateBinding[]): PactTemplateRegistry {

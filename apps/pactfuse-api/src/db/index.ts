@@ -193,10 +193,19 @@ CREATE TABLE IF NOT EXISTS lease_runs (
   lease_run_id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
   spend_id TEXT NOT NULL,
+  payer TEXT,
+  artifact_hash TEXT,
   target_repo TEXT NOT NULL,
   target_commit TEXT NOT NULL,
   status TEXT NOT NULL,
   transcript_hash TEXT,
+  tools_list_hash TEXT,
+  tools_call_hash TEXT,
+  output_hash TEXT,
+  lease_run_hash TEXT,
+  settlement_event_id TEXT,
+  artifact_token_id TEXT,
+  completed_at TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -332,6 +341,15 @@ CREATE TABLE IF NOT EXISTS judge_check_rows (
   ensureColumn(sqlite, "quotes", "source_state_snapshot_hash", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
   ensureColumn(sqlite, "artifact_access_tokens", "issued_by_verifier_run_id", "TEXT");
   ensureColumn(sqlite, "artifact_access_tokens", "settlement_event_id", "TEXT");
+  ensureColumn(sqlite, "lease_runs", "payer", "TEXT");
+  ensureColumn(sqlite, "lease_runs", "artifact_hash", "TEXT");
+  ensureColumn(sqlite, "lease_runs", "tools_list_hash", "TEXT");
+  ensureColumn(sqlite, "lease_runs", "tools_call_hash", "TEXT");
+  ensureColumn(sqlite, "lease_runs", "output_hash", "TEXT");
+  ensureColumn(sqlite, "lease_runs", "lease_run_hash", "TEXT");
+  ensureColumn(sqlite, "lease_runs", "settlement_event_id", "TEXT");
+  ensureColumn(sqlite, "lease_runs", "artifact_token_id", "TEXT");
+  ensureColumn(sqlite, "lease_runs", "completed_at", "TEXT");
   sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS mcp_adapter_calls_audit_nonce_idx ON mcp_adapter_calls(audit_nonce) WHERE audit_nonce IS NOT NULL");
   sqlite.exec(
     "CREATE UNIQUE INDEX IF NOT EXISTS artifact_access_tokens_active_tuple_idx ON artifact_access_tokens(session_id, spend_id, payer, artifact_hash) WHERE status = 'active'",

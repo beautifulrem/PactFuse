@@ -1,4 +1,4 @@
-import { integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const sessions = sqliteTable("sessions", {
   sessionId: text("session_id").primaryKey(),
@@ -25,6 +25,91 @@ export const apiRequests = sqliteTable(
     scopeKey: uniqueIndex("api_requests_scope_key").on(table.actionScope, table.idempotencyKey),
   }),
 );
+
+export const jobs = sqliteTable(
+  "jobs",
+  {
+    jobId: text("job_id").primaryKey(),
+    sessionId: text("session_id"),
+    kind: text("kind").notNull(),
+    status: text("status").notNull(),
+    dedupeKey: text("dedupe_key").notNull(),
+    attempts: integer("attempts").notNull().default(0),
+    nextAttemptAt: text("next_attempt_at"),
+    lockedAt: text("locked_at"),
+    payloadJson: text("payload_json").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => ({
+    kindDedupe: uniqueIndex("jobs_kind_dedupe").on(table.kind, table.dedupeKey),
+  }),
+);
+
+export const sources = sqliteTable(
+  "sources",
+  {
+    sourceId: text("source_id").notNull(),
+    sessionId: text("session_id").notNull(),
+    sourceHash: text("source_hash").notNull(),
+    manifestUrl: text("manifest_url").notNull(),
+    manifestHash: text("manifest_hash").notNull(),
+    issuer: text("issuer"),
+    signature: text("signature"),
+    capabilityVectorJson: text("capability_vector_json").notNull(),
+    proofStatus: text("proof_status").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.sessionId, table.sourceHash] }),
+  }),
+);
+
+export const sourceChallenges = sqliteTable("source_challenges", {
+  challengeId: text("challenge_id").primaryKey(),
+  sessionId: text("session_id").notNull(),
+  sourceHash: text("source_hash").notNull(),
+  reasonHash: text("reason_hash").notNull(),
+  evidenceRef: text("evidence_ref"),
+  status: text("status").notNull(),
+  createdAt: text("created_at").notNull(),
+});
+
+export const spends = sqliteTable(
+  "spends",
+  {
+    spendId: text("spend_id").notNull(),
+    sessionId: text("session_id").notNull(),
+    pactId: text("pact_id").notNull(),
+    toolId: text("tool_id").notNull(),
+    payer: text("payer").notNull(),
+    agentWallet: text("agent_wallet").notNull(),
+    sourceHashesJson: text("source_hashes_json").notNull(),
+    sourceSetHash: text("source_set_hash").notNull(),
+    sessionCommitment: text("session_commitment").notNull(),
+    spendPreimageJson: text("spend_preimage_json").notNull(),
+    maxPriceAtomic: text("max_price_atomic").notNull(),
+    nonce: text("nonce").notNull(),
+    status: text("status").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.sessionId, table.spendId] }),
+  }),
+);
+
+export const cawReceiptOperations = sqliteTable("caw_receipt_operations", {
+  operationId: text("operation_id").primaryKey(),
+  sessionId: text("session_id").notNull(),
+  spendId: text("spend_id"),
+  operationKind: text("operation_kind").notNull(),
+  target: text("target"),
+  selector: text("selector"),
+  valueAtomic: text("value_atomic").notNull(),
+  requestJson: text("request_json").notNull(),
+  receiptBundleHash: text("receipt_bundle_hash"),
+  status: text("status").notNull(),
+  createdAt: text("created_at").notNull(),
+});
 
 export const evidenceEvents = sqliteTable(
   "evidence_events",
@@ -133,6 +218,40 @@ export const gateChainEvents = sqliteTable(
   }),
 );
 
+export const artifactPreflights = sqliteTable("artifact_preflights", {
+  preflightId: text("preflight_id").primaryKey(),
+  sessionId: text("session_id").notNull(),
+  spendId: text("spend_id").notNull(),
+  artifactHashPreview: text("artifact_hash_preview").notNull(),
+  endpointUrl: text("endpoint_url").notNull(),
+  priceDisclosureHash: text("price_disclosure_hash").notNull(),
+  sourceStateSnapshotHash: text("source_state_snapshot_hash").notNull(),
+  status: text("status").notNull(),
+  createdAt: text("created_at").notNull(),
+});
+
+export const quotes = sqliteTable(
+  "quotes",
+  {
+    quoteId: text("quote_id").primaryKey(),
+    sessionId: text("session_id").notNull(),
+    spendId: text("spend_id").notNull(),
+    preflightId: text("preflight_id").notNull(),
+    artifactCommitment: text("artifact_commitment").notNull(),
+    priceDisclosureHash: text("price_disclosure_hash").notNull(),
+    sourceStateSnapshotHash: text("source_state_snapshot_hash").notNull(),
+    priceAtomic: text("price_atomic").notNull(),
+    quoteNonce: text("quote_nonce").notNull(),
+    validUntilBlock: text("valid_until_block").notNull(),
+    quoteHash: text("quote_hash").notNull(),
+    status: text("status").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => ({
+    sessionQuoteNonce: uniqueIndex("quotes_session_quote_nonce").on(table.sessionId, table.quoteNonce),
+  }),
+);
+
 export const artifactAccessTokens = sqliteTable("artifact_access_tokens", {
   tokenId: text("token_id").primaryKey(),
   sessionId: text("session_id").notNull(),
@@ -143,6 +262,26 @@ export const artifactAccessTokens = sqliteTable("artifact_access_tokens", {
   status: text("status").notNull(),
   issuedByVerifierRunId: text("issued_by_verifier_run_id"),
   settlementEventId: text("settlement_event_id"),
+  createdAt: text("created_at").notNull(),
+});
+
+export const leaseRuns = sqliteTable("lease_runs", {
+  leaseRunId: text("lease_run_id").primaryKey(),
+  sessionId: text("session_id").notNull(),
+  spendId: text("spend_id").notNull(),
+  payer: text("payer"),
+  artifactHash: text("artifact_hash"),
+  targetRepo: text("target_repo").notNull(),
+  targetCommit: text("target_commit").notNull(),
+  status: text("status").notNull(),
+  transcriptHash: text("transcript_hash"),
+  toolsListHash: text("tools_list_hash"),
+  toolsCallHash: text("tools_call_hash"),
+  outputHash: text("output_hash"),
+  leaseRunHash: text("lease_run_hash"),
+  settlementEventId: text("settlement_event_id"),
+  artifactTokenId: text("artifact_token_id"),
+  completedAt: text("completed_at"),
   createdAt: text("created_at").notNull(),
 });
 
@@ -183,6 +322,25 @@ export const chainIndexedLogs = sqliteTable(
   }),
 );
 
+export const mcpAdapterCalls = sqliteTable(
+  "mcp_adapter_calls",
+  {
+    callId: text("call_id").primaryKey(),
+    sessionId: text("session_id"),
+    auditNonce: text("audit_nonce"),
+    toolName: text("tool_name").notNull(),
+    requestHash: text("request_hash").notNull(),
+    responseHash: text("response_hash").notNull(),
+    requestJson: text("request_json").notNull().default("{}"),
+    responseJson: text("response_json").notNull().default("{}"),
+    status: text("status").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => ({
+    auditNonce: uniqueIndex("mcp_adapter_calls_audit_nonce").on(table.auditNonce),
+  }),
+);
+
 export const operatorKeys = sqliteTable("operator_keys", {
   keyId: text("key_id").primaryKey(),
   role: text("role").notNull(),
@@ -194,3 +352,33 @@ export const operatorKeys = sqliteTable("operator_keys", {
   createdAt: text("created_at").notNull(),
   lastUsedAt: text("last_used_at"),
 });
+
+export const verifierRuns = sqliteTable("verifier_runs", {
+  verifierRunId: text("verifier_run_id").primaryKey(),
+  sessionId: text("session_id").notNull(),
+  inputHash: text("input_hash").notNull(),
+  resultJson: text("result_json").notNull(),
+  schemaOk: integer("schema_ok").notNull(),
+  proofChipAllowed: integer("proof_chip_allowed").notNull(),
+  winnerClaimAllowed: integer("winner_claim_allowed").notNull(),
+  finalVerifierComplete: integer("final_verifier_complete").notNull(),
+  createdAt: text("created_at").notNull(),
+});
+
+export const judgeCheckRows = sqliteTable(
+  "judge_check_rows",
+  {
+    sessionId: text("session_id").notNull(),
+    rowId: text("row_id").notNull(),
+    label: text("label").notNull(),
+    status: text("status").notNull(),
+    authority: text("authority").notNull(),
+    reason: text("reason").notNull(),
+    evidenceEventId: text("evidence_event_id"),
+    evidenceUrl: text("evidence_url"),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.sessionId, table.rowId] }),
+  }),
+);

@@ -82,7 +82,7 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/quotes": ["preflightId", "quoteSignedAfterPreflight", "priceDisclosureHash", "winnerClaimAllowed"],
   "/api/v1/artifacts/access-token": ["tokenId", "tokenHash", "verifierRunId", "settlementEventId", "bearerBound", "winnerClaimAllowed"],
   "/api/v1/artifacts/refund": ["spendId", "quoteId", "status", "winnerClaimAllowed"],
-  "/api/v1/lease/execute": ["leaseRunId", "bearerBound", "artifactHash", "winnerClaimAllowed"],
+  "/api/v1/lease/execute": ["leaseRunId", "bearerBound", "artifactHash", "transcriptHash", "leaseRunHash", "winnerClaimAllowed"],
   "/api/v1/mcp/audit": ["proofAuthority", "winnerClaimAllowed", "requestHash", "responseHash"],
   "/api/v1/evidence/verify": ["schemaOk", "proofChipAllowed", "winnerClaimAllowed", "finalVerifierComplete"],
   "/api/v1/evidence/judge-check": ["winnerClaimAllowed", "rows.status", "rows.authority"],
@@ -93,9 +93,11 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "cawReceiptOperations",
     "rawCawReceiptBundles",
     "canonicalCawReceipts",
+    "leaseRuns",
     "judgeCheck",
   ],
   "/api/v1/evidence/indexer-status": ["provider.ready", "cursors.status", "cursors.lagBlocks", "winnerClaimAllowed"],
+  "/api/v1/evidence/runner-heartbeat": ["status", "latestLeaseRunId", "transcriptHash", "leaseRunHash", "winnerClaimAllowed"],
   "/api/v1/evidence/agent-transcript": ["transcriptHash", "toolsCallHash", "boundedToPinnedManifest", "winnerClaimAllowed"],
 };
 
@@ -156,6 +158,10 @@ export function createApp(ctx: ServiceCtx): Hono {
       mcpAudit: {
         mode: "hmac-shared-secret",
         configured: Boolean(ctx.mcpAuditSecret),
+      },
+      gateIngest: {
+        mode: "hmac-shared-secret",
+        configured: Boolean(ctx.gateIngestSecret),
       },
       winnerClaimAllowed: false,
     });
@@ -379,7 +385,7 @@ function authorizeMcpAudit(c: Context, ctx: ServiceCtx, payload: unknown): unkno
 
 function authorizeGateEventIngest(c: Context, ctx: ServiceCtx, payload: unknown): void {
   const requestId = newRequestId("gate_event_auth");
-  const secret = ctx.mcpAuditSecret;
+  const secret = ctx.gateIngestSecret;
   const signature = c.req.header("x-pactfuse-gate-signature") ?? "";
   if (!secret) {
     throw Object.assign(new Error("Gate event ingest token is not configured"), {
@@ -530,6 +536,117 @@ function buildOpenApi(): Record<string, unknown> {
             payload: { type: "object", additionalProperties: true },
           },
         },
+        SourceRegisterInput: sessionEnvelopeSchema("#/components/schemas/SourceRegisterPayload"),
+        SourceRegisterPayload: {
+          type: "object",
+          required: ["sourceId", "sourceHash", "manifestUrl", "manifestHash"],
+          additionalProperties: false,
+          properties: {
+            sourceId: { type: "string", minLength: 1, maxLength: 120 },
+            sourceHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            manifestUrl: { type: "string", minLength: 1, maxLength: 500 },
+            manifestHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            issuer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+            signature: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+            capabilityVector: { type: "object", additionalProperties: true, default: {} },
+          },
+        },
+        SourceChallengeInput: sessionEnvelopeSchema("#/components/schemas/SourceChallengePayload"),
+        SourceChallengePayload: {
+          type: "object",
+          required: ["sourceHash", "reasonHash"],
+          additionalProperties: false,
+          properties: {
+            sourceHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            reasonHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            evidenceRef: { type: "string", minLength: 1, maxLength: 500 },
+          },
+        },
+        SpendRegisterBatchInput: sessionEnvelopeSchema("#/components/schemas/SpendRegisterPayload"),
+        SpendRegisterPayload: {
+          type: "object",
+          required: ["spends"],
+          additionalProperties: false,
+          properties: {
+            spends: {
+              type: "array",
+              minItems: 1,
+              maxItems: 32,
+              items: {
+                type: "object",
+                required: ["spendId", "pactId", "toolId", "payer", "agentWallet", "sourceHashes", "maxPriceAtomic", "nonce"],
+                additionalProperties: false,
+                properties: {
+                  spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  pactId: { type: "string", minLength: 1, maxLength: 120 },
+                  toolId: { type: "string", minLength: 1, maxLength: 120 },
+                  payer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+                  agentWallet: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+                  sourceHashes: {
+                    type: "array",
+                    minItems: 1,
+                    maxItems: 16,
+                    items: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  },
+                  maxPriceAtomic: { type: "string", pattern: "^(0|[1-9][0-9]*)$" },
+                  nonce: { type: "string", minLength: 1, maxLength: 128 },
+                },
+              },
+            },
+          },
+        },
+        CawOperationBuildInput: sessionEnvelopeSchema("#/components/schemas/CawOperationBuildPayload"),
+        CawOperationBuildPayload: {
+          type: "object",
+          required: ["spendId", "operationKind"],
+          additionalProperties: false,
+          properties: {
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            operationKind: { enum: ["deny_probe", "approve", "activate_tool"] },
+            target: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+            selector: { type: "string", pattern: "^0x[0-9a-fA-F]{8}$" },
+            valueAtomic: { type: "string", pattern: "^(0|[1-9][0-9]*)$", default: "0" },
+          },
+        },
+        CawReceiptIngestInput: sessionEnvelopeSchema("#/components/schemas/CawReceiptIngestPayload"),
+        CawReceiptIngestPayload: {
+          type: "object",
+          required: ["sourceLabel"],
+          additionalProperties: false,
+          properties: {
+            sourceLabel: { type: "string", minLength: 1, maxLength: 120 },
+            operationId: { type: "string", minLength: 1, maxLength: 160 },
+            receipts: { type: "array", maxItems: 64, items: { type: "object", additionalProperties: true }, default: [] },
+            manual: { type: "boolean", default: false },
+          },
+        },
+        ArtifactPreflightInput: sessionEnvelopeSchema("#/components/schemas/ArtifactPreflightPayload"),
+        ArtifactPreflightPayload: {
+          type: "object",
+          required: ["spendId", "artifactHashPreview", "endpointUrl", "priceDisclosureHash", "sourceStateSnapshotHash"],
+          additionalProperties: false,
+          properties: {
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            artifactHashPreview: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            endpointUrl: { type: "string", minLength: 1, maxLength: 500 },
+            priceDisclosureHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            sourceStateSnapshotHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+          },
+        },
+        QuoteInput: sessionEnvelopeSchema("#/components/schemas/QuotePayload"),
+        QuotePayload: {
+          type: "object",
+          required: ["spendId", "preflightId", "artifactCommitment", "priceAtomic", "quoteNonce", "validUntilBlock"],
+          additionalProperties: false,
+          properties: {
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            preflightId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            artifactCommitment: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            priceAtomic: { type: "string", pattern: "^(0|[1-9][0-9]*)$" },
+            quoteNonce: { type: "string", minLength: 1, maxLength: 128 },
+            validUntilBlock: { type: "string", pattern: "^[0-9]+$" },
+          },
+        },
         LeaseExecuteInput: {
           type: "object",
           required: ["sessionId", "idempotencyKey", "payload"],
@@ -604,6 +721,16 @@ function buildOpenApi(): Record<string, unknown> {
               maxItems: 4,
               items: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]+$" }, { type: "null" }] },
             },
+          },
+        },
+        VerifyEvidenceInput: sessionEnvelopeSchema("#/components/schemas/VerifyEvidencePayload"),
+        VerifyEvidencePayload: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            receipt: { type: "object", additionalProperties: true },
+            replayBundle: { type: "object", additionalProperties: true },
+            schemaOnly: { type: "boolean", default: false },
           },
         },
         ChainIndexerCursor: {
@@ -913,14 +1040,54 @@ function buildOpenApi(): Record<string, unknown> {
         }),
         LeaseExecuteResponse: serviceResponseSchema({
           type: "object",
-          required: ["leaseRunId", "payer", "artifactHash", "bearerBound", "status", "winnerClaimAllowed"],
+          required: [
+            "leaseRunId",
+            "payer",
+            "artifactHash",
+            "bearerBound",
+            "transcriptHash",
+            "toolsListHash",
+            "toolsCallHash",
+            "outputHash",
+            "leaseRunHash",
+            "settlementEventId",
+            "status",
+            "winnerClaimAllowed",
+          ],
           properties: {
             leaseRunId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             payer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
             artifactHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             bearerBound: { const: true },
-            status: { enum: ["blocked_missing_runner_execution"] },
+            transcriptHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            toolsListHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            toolsCallHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            outputHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            leaseRunHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            settlementEventId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            status: { enum: ["blocked_missing_runner_execution", "blocked_mcp_execution_failed", "succeeded_live_mcp_transcript"] },
             winnerClaimAllowed: { const: false },
+          },
+        }),
+        RunnerHeartbeatResponse: serviceResponseSchema({
+          type: "object",
+          required: [
+            "sessionId",
+            "status",
+            "latestLeaseRunId",
+            "transcriptHash",
+            "leaseRunHash",
+            "winnerClaimAllowed",
+            "updatedAt",
+          ],
+          properties: {
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            status: { enum: ["pending", "blocked", "idle", "lease_executed"] },
+            latestLeaseRunId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            transcriptHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            leaseRunHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            winnerClaimAllowed: { const: false },
+            updatedAt: { type: "string", format: "date-time" },
           },
         }),
         McpAuditResponse: serviceResponseSchema({
@@ -950,6 +1117,7 @@ function buildOpenApi(): Record<string, unknown> {
             "cawReceiptOperations",
             "rawCawReceiptBundles",
             "canonicalCawReceipts",
+            "leaseRuns",
             "judgeCheck",
           ],
           properties: {
@@ -1133,6 +1301,50 @@ function buildOpenApi(): Record<string, unknown> {
                 },
               },
             },
+            leaseRuns: {
+              type: "array",
+              items: {
+                type: "object",
+                required: [
+                  "leaseRunId",
+                  "sessionId",
+                  "spendId",
+                  "payer",
+                  "artifactHash",
+                  "targetRepo",
+                  "targetCommit",
+                  "status",
+                  "transcriptHash",
+                  "toolsListHash",
+                  "toolsCallHash",
+                  "outputHash",
+                  "leaseRunHash",
+                  "settlementEventId",
+                  "artifactTokenId",
+                  "createdAt",
+                  "completedAt",
+                ],
+                properties: {
+                  leaseRunId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  payer: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]+$" }, { type: "null" }] },
+                  artifactHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  targetRepo: { type: "string" },
+                  targetCommit: { type: "string" },
+                  status: { enum: ["blocked_missing_runner_execution", "blocked_mcp_execution_failed", "succeeded_live_mcp_transcript"] },
+                  transcriptHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  toolsListHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  toolsCallHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  outputHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  leaseRunHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  settlementEventId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  artifactTokenId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  createdAt: { type: "string", format: "date-time" },
+                  completedAt: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
+                },
+              },
+            },
             judgeCheck: { $ref: "#/components/schemas/JudgeCheckData" },
           },
         }),
@@ -1201,6 +1413,27 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   if (path === "/api/v1/sessions") {
     return jsonRequestBody({ $ref: "#/components/schemas/CreateSessionInput" });
   }
+  if (path === "/api/v1/sources/register") {
+    return jsonRequestBody({ $ref: "#/components/schemas/SourceRegisterInput" });
+  }
+  if (path === "/api/v1/sources/challenge") {
+    return jsonRequestBody({ $ref: "#/components/schemas/SourceChallengeInput" });
+  }
+  if (path === "/api/v1/spends/register-batch") {
+    return jsonRequestBody({ $ref: "#/components/schemas/SpendRegisterBatchInput" });
+  }
+  if (path === "/api/v1/caw/operations/build") {
+    return jsonRequestBody({ $ref: "#/components/schemas/CawOperationBuildInput" });
+  }
+  if (path === "/api/v1/caw/receipts/ingest") {
+    return jsonRequestBody({ $ref: "#/components/schemas/CawReceiptIngestInput" });
+  }
+  if (path === "/api/v1/artifacts/preflight") {
+    return jsonRequestBody({ $ref: "#/components/schemas/ArtifactPreflightInput" });
+  }
+  if (path === "/api/v1/quotes") {
+    return jsonRequestBody({ $ref: "#/components/schemas/QuoteInput" });
+  }
   if (path === "/api/v1/lease/execute") {
     return jsonRequestBody({ $ref: "#/components/schemas/LeaseExecuteInput" });
   }
@@ -1215,6 +1448,9 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   }
   if (path === "/api/v1/artifacts/access-token") {
     return jsonRequestBody({ $ref: "#/components/schemas/ArtifactAccessIssueInput" });
+  }
+  if (path === "/api/v1/evidence/verify") {
+    return jsonRequestBody({ $ref: "#/components/schemas/VerifyEvidenceInput" });
   }
   if (path.startsWith("/api/v1/") && !path.includes("{")) {
     return jsonRequestBody({ $ref: "#/components/schemas/SessionScopedEnvelope" });
@@ -1342,6 +1578,19 @@ function jsonRequestBody(schema: Record<string, unknown>): Record<string, unknow
   };
 }
 
+function sessionEnvelopeSchema(payloadRef: string): Record<string, unknown> {
+  return {
+    type: "object",
+    required: ["sessionId", "idempotencyKey", "payload"],
+    additionalProperties: false,
+    properties: {
+      sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+      idempotencyKey: { type: "string", minLength: 4, maxLength: 160, pattern: "^[a-z][a-z0-9:_-]+$" },
+      payload: { $ref: payloadRef },
+    },
+  };
+}
+
 function responseSchemaFor(path: string): Record<string, unknown> {
   switch (path) {
     case "/api/v1/evidence/verify":
@@ -1371,6 +1620,8 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/ReplayBundleResponse" };
     case "/api/v1/evidence/indexer-status":
       return { $ref: "#/components/schemas/ChainIndexerStatusResponse" };
+    case "/api/v1/evidence/runner-heartbeat":
+      return { $ref: "#/components/schemas/RunnerHeartbeatResponse" };
     case "/api/v1/evidence/agent-transcript":
       return { $ref: "#/components/schemas/AgentTranscriptResponse" };
     default:

@@ -329,6 +329,7 @@ export const EvidenceEventKindSchema = z.enum([
   "gate.spend_settled",
   "reorg.invalidated",
   "lease.execution.blocked",
+  "lease.execution.succeeded",
   "verifier.fail_closed",
   "judge_check.pending",
   "runner.heartbeat",
@@ -467,6 +468,28 @@ export const CanonicalCawReceiptViewSchema = z
   })
   .strict();
 
+export const LeaseRunViewSchema = z
+  .object({
+    leaseRunId: Hex32Schema,
+    sessionId: Hex32Schema,
+    spendId: Hex32Schema,
+    payer: HexSchema.nullable(),
+    artifactHash: Hex32Schema.nullable(),
+    targetRepo: z.string().min(1).max(500),
+    targetCommit: z.string().min(6).max(128),
+    status: z.enum(["blocked_missing_runner_execution", "blocked_mcp_execution_failed", "succeeded_live_mcp_transcript"]),
+    transcriptHash: Hex32Schema.nullable(),
+    toolsListHash: Hex32Schema.nullable(),
+    toolsCallHash: Hex32Schema.nullable(),
+    outputHash: Hex32Schema.nullable(),
+    leaseRunHash: Hex32Schema.nullable(),
+    settlementEventId: Hex32Schema.nullable(),
+    artifactTokenId: Hex32Schema.nullable(),
+    createdAt: IsoDateStringSchema,
+    completedAt: IsoDateStringSchema.nullable(),
+  })
+  .strict();
+
 export const ReplayBundleViewSchema = z
   .object({
     bundleType: z.literal("PACTFUSE_EVIDENCE_V1"),
@@ -482,6 +505,7 @@ export const ReplayBundleViewSchema = z
     cawReceiptOperations: z.array(CawReceiptOperationViewSchema).max(200),
     rawCawReceiptBundles: z.array(RawCawReceiptBundleViewSchema).max(200),
     canonicalCawReceipts: z.array(CanonicalCawReceiptViewSchema).max(200),
+    leaseRuns: z.array(LeaseRunViewSchema).max(200),
     judgeCheck: JudgeCheckViewSchema,
   })
   .strict();
@@ -489,7 +513,10 @@ export const ReplayBundleViewSchema = z
 export const RunnerHeartbeatViewSchema = z
   .object({
     sessionId: Hex32Schema,
-    status: z.enum(["pending", "blocked", "idle"]),
+    status: z.enum(["pending", "blocked", "idle", "lease_executed"]),
+    latestLeaseRunId: Hex32Schema.nullable(),
+    transcriptHash: Hex32Schema.nullable(),
+    leaseRunHash: Hex32Schema.nullable(),
     winnerClaimAllowed: z.literal(false),
     updatedAt: IsoDateStringSchema,
   })

@@ -30,7 +30,7 @@ export type EvidenceVerifier = {
 };
 
 export type ProofProviderStatus = {
-  name: "chain" | "caw";
+  name: "chain" | "caw" | "mcp_lease";
   mode: "unconfigured" | "fixture" | "live";
   ready: boolean;
   reason: string;
@@ -56,6 +56,34 @@ export type ChainClient = {
 export type CawReceiptSource = {
   status: () => Promise<ProofProviderStatus>;
   fetchReceiptBundle: (input: Record<string, unknown>) => Promise<Record<string, unknown>>;
+};
+
+export type McpLeaseExecutionInput = {
+  sessionId: string;
+  leaseRunId: string;
+  spendId: string;
+  payer: string;
+  artifactHash: string;
+  targetRepo: string;
+  targetCommit: string;
+};
+
+export type McpJsonRpcFrame = {
+  method: "tools/list" | "tools/call";
+  request: Record<string, unknown>;
+  response: Record<string, unknown>;
+};
+
+export type McpLeaseExecutionResult = {
+  toolName: string;
+  toolsList: McpJsonRpcFrame;
+  toolsCall: McpJsonRpcFrame;
+  output: Record<string, unknown>;
+};
+
+export type McpLeaseClient = {
+  status: () => Promise<ProofProviderStatus>;
+  executeCleanLease: (input: McpLeaseExecutionInput) => Promise<McpLeaseExecutionResult>;
 };
 
 export type PactTemplateBinding = {
@@ -84,8 +112,10 @@ export type ServiceCtx = {
   verifier: EvidenceVerifier;
   chain: ChainClient;
   caw: CawReceiptSource;
+  mcpLease: McpLeaseClient;
   templates: PactTemplateRegistry;
   mcpAuditSecret: string | null;
+  gateIngestSecret: string | null;
   cawIngestToken: string | null;
   apiSecurity: ApiSecurityConfig;
   requiredIndexerCursors: RequiredIndexerCursor[];

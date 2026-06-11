@@ -15,25 +15,30 @@ import {
   createStaticTemplateRegistry,
   createUnconfiguredCawReceiptSource,
   createUnconfiguredChainClient,
+  createUnconfiguredMcpLeaseClient,
 } from "../services/providers.js";
 import { appendEvidenceEvent, recordMcpAdapterCall } from "../services/service.js";
 import { createVerifierAdapter } from "../services/verifier.js";
-import type { ApiSecurityConfig, CawReceiptSource, ChainClient, ServiceCtx } from "../types.js";
+import type { ApiSecurityConfig, CawReceiptSource, ChainClient, McpLeaseClient, ServiceCtx } from "../types.js";
 
 const MCP_AUDIT_TOKEN = "test-mcp-audit-token";
+const GATE_INGEST_TOKEN = "test-gate-ingest-token";
 
 function makeApp(
   dbPath = ":memory:",
   options: {
     caw?: CawReceiptSource;
     chain?: ChainClient;
+    mcpLease?: McpLeaseClient;
     mcpAuditSecret?: string | null;
+    gateIngestSecret?: string | null;
     cawIngestToken?: string | null;
     apiSecurity?: Partial<ApiSecurityConfig>;
     requiredIndexerCursors?: ServiceCtx["requiredIndexerCursors"];
   } = {},
 ) {
   const mcpAuditSecret = options.mcpAuditSecret === undefined ? MCP_AUDIT_TOKEN : options.mcpAuditSecret;
+  const gateIngestSecret = options.gateIngestSecret === undefined ? GATE_INGEST_TOKEN : options.gateIngestSecret;
   const apiSecurity: ApiSecurityConfig = {
     operatorToken: null,
     challengeSubmitterToken: null,
@@ -49,6 +54,7 @@ function makeApp(
     verifier: createVerifierAdapter(),
     chain: options.chain ?? createUnconfiguredChainClient(),
     caw: options.caw ?? createUnconfiguredCawReceiptSource(),
+    mcpLease: options.mcpLease ?? createUnconfiguredMcpLeaseClient(),
     templates: createStaticTemplateRegistry([
       {
         mode: "gate-paid-artifact-real",
@@ -62,6 +68,7 @@ function makeApp(
       },
     ]),
     mcpAuditSecret,
+    gateIngestSecret,
     cawIngestToken: options.cawIngestToken ?? null,
     requiredIndexerCursors: options.requiredIndexerCursors ?? [],
     apiSecurity,
@@ -361,6 +368,8 @@ describe("pactfuse-api P0", () => {
     expect(serialized).not.toContain("mcpAuditSecret");
     expect(serialized).not.toContain("mcpAuditTokenHash");
     expect(serialized).not.toContain(MCP_AUDIT_TOKEN);
+    expect(serialized).not.toContain("gateIngestSecret");
+    expect(serialized).not.toContain(GATE_INGEST_TOKEN);
   });
 
   it("surfaces disabled MCP audit readiness and rejects audit writes when the secret is missing", async () => {
@@ -382,6 +391,28 @@ describe("pactfuse-api P0", () => {
     expect(readyJson.mcpAudit).toEqual({ mode: "hmac-shared-secret", configured: false });
     expect(audit.status).toBe(403);
     expect(audit.json.error.code).toBe("forbidden");
+  });
+
+  it("keeps gate ingest and MCP audit HMAC secrets separated", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const sessionId = await createSession(app, "sess-gate-secret-split");
+    const spendId = await registerSpend(app, sessionId);
+    const body = gateEventEnvelope(sessionId, spendId, "gate-secret-split");
+    logs.push(indexerLog("gate-secret-split", 100, body.payload));
+
+    const wrongSecret = await post(app, "/api/v1/gate/events/ingest", body, {
+      "x-pactfuse-gate-signature": signAuditPayload(MCP_AUDIT_TOKEN, body),
+    });
+    const rightSecret = await postSignedGateEvent(app, body);
+    const ready = await app.request("/readyz");
+    const readyJson = await ready.json();
+
+    expect(wrongSecret.status).toBe(403);
+    expect(wrongSecret.json.error.code).toBe("forbidden");
+    expect(rightSecret.status).toBe(202);
+    expect(readyJson.gateIngest).toEqual({ mode: "hmac-shared-secret", configured: true });
+    expect(ctx.mcpAuditSecret).not.toBe(ctx.gateIngestSecret);
   });
 
   it("returns six pending Judge Check rows", async () => {
@@ -421,6 +452,14 @@ describe("pactfuse-api P0", () => {
       "winnerClaimAllowed",
       "finalVerifierComplete",
     ]);
+    expect(json.paths["/api/v1/evidence/verify"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/VerifyEvidenceInput",
+    );
+    expect(json.components.schemas.VerifyEvidenceInput.properties.payload.$ref).toBe(
+      "#/components/schemas/VerifyEvidencePayload",
+    );
+    expect(json.components.schemas.VerifyEvidencePayload.additionalProperties).toBe(false);
+    expect(json.components.schemas.VerifyEvidencePayload.properties.schemaOnly.default).toBe(false);
     expect(json.paths["/api/v1/sessions"].post.parameters).toEqual([
       expect.objectContaining({
         name: "authorization",
@@ -436,6 +475,21 @@ describe("pactfuse-api P0", () => {
         description: expect.stringContaining("PACTFUSE_CHALLENGE_SUBMITTER_TOKEN"),
       }),
     ]);
+    expect(json.paths["/api/v1/sources/register"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/SourceRegisterInput",
+    );
+    expect(json.paths["/api/v1/sources/challenge"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/SourceChallengeInput",
+    );
+    expect(json.paths["/api/v1/spends/register-batch"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/SpendRegisterBatchInput",
+    );
+    expect(json.paths["/api/v1/caw/operations/build"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/CawOperationBuildInput",
+    );
+    expect(json.paths["/api/v1/caw/receipts/ingest"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/CawReceiptIngestInput",
+    );
     expect(json.paths["/api/v1/quotes"].post.parameters).toEqual([
       expect.objectContaining({
         name: "authorization",
@@ -530,12 +584,16 @@ describe("pactfuse-api P0", () => {
       "priceDisclosureHash",
       "winnerClaimAllowed",
     ]);
+    expect(json.paths["/api/v1/artifacts/preflight"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ArtifactPreflightInput",
+    );
     expect(json.paths["/api/v1/quotes"].post["x-pactfuse-proof-fields"]).toEqual([
       "preflightId",
       "quoteSignedAfterPreflight",
       "priceDisclosureHash",
       "winnerClaimAllowed",
     ]);
+    expect(json.paths["/api/v1/quotes"].post.requestBody.content["application/json"].schema.$ref).toBe("#/components/schemas/QuoteInput");
     expect(json.paths["/api/v1/artifacts/access-token"].post["x-pactfuse-proof-fields"]).toEqual([
       "tokenId",
       "tokenHash",
@@ -590,6 +648,8 @@ describe("pactfuse-api P0", () => {
       "leaseRunId",
       "bearerBound",
       "artifactHash",
+      "transcriptHash",
+      "leaseRunHash",
       "winnerClaimAllowed",
     ]);
     expect(json.paths["/api/v1/lease/execute"].post.parameters).toEqual([
@@ -686,11 +746,16 @@ describe("pactfuse-api P0", () => {
       "cawReceiptOperations",
       "rawCawReceiptBundles",
       "canonicalCawReceipts",
+      "leaseRuns",
       "judgeCheck",
     ]);
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("mcpAdapterCalls");
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("rawCawReceiptBundles");
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("canonicalCawReceipts");
+    expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("leaseRuns");
+    expect(json.paths["/api/v1/evidence/runner-heartbeat"].get.responses["200"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/RunnerHeartbeatResponse",
+    );
     expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.rawCawReceiptBundles.items.required).toEqual([
       "bundleId",
       "sessionId",
@@ -1811,10 +1876,10 @@ describe("pactfuse-api P0", () => {
     expect(pendingJson.error.code).toBe("proof_pending");
     expect(invalidPayer.status).toBe(400);
     expect(invalidJson.error.code).toBe("bad_request");
-    expect(missingBearer.status).toBe(423);
-    expect(missingBearerJson.error.code).toBe("proof_pending");
-    expect(wrongBearer.status).toBe(423);
-    expect(wrongBearerJson.error.code).toBe("proof_pending");
+    expect(missingBearer.status).toBe(401);
+    expect(missingBearerJson.error.code).toBe("unauthorized");
+    expect(wrongBearer.status).toBe(403);
+    expect(wrongBearerJson.error.code).toBe("forbidden");
     expect(allowed.status).toBe(200);
     expect(allowedJson.data).toEqual(
       expect.objectContaining({
@@ -1861,8 +1926,8 @@ describe("pactfuse-api P0", () => {
     const verify = await app.request(`/api/v1/evidence/${sessionId}/verify`);
     const verifyJson = await verify.json();
 
-    expect(read.status).toBe(423);
-    expect(readJson.error.code).toBe("proof_pending");
+    expect(read.status).toBe(403);
+    expect(readJson.error.code).toBe("forbidden");
     expect(verify.status).toBe(200);
     expect(verifyJson.data.schemaOk).toBe(false);
     expect(verifyJson.data.errors.some((error: string) => error.includes("missing issued_by_verifier_run_id"))).toBe(true);
@@ -3341,10 +3406,10 @@ describe("pactfuse-api P0", () => {
     const replayJson = await replay.json();
     const leaseEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "lease.execution.blocked");
 
-    expect(missingToken.status).toBe(423);
-    expect(missingToken.json.error.code).toBe("proof_pending");
-    expect(wrongToken.status).toBe(423);
-    expect(wrongToken.json.error.code).toBe("proof_pending");
+    expect(missingToken.status).toBe(401);
+    expect(missingToken.json.error.code).toBe("unauthorized");
+    expect(wrongToken.status).toBe(403);
+    expect(wrongToken.json.error.code).toBe("forbidden");
     expect(payerMismatch.status).toBe(422);
     expect(payerMismatch.json.error.code).toBe("proof_blocked");
     expect(lease.status).toBe(202);
@@ -3365,6 +3430,139 @@ describe("pactfuse-api P0", () => {
         winnerClaimAllowed: false,
       }),
     );
+  });
+
+  it("executes a clean lease through MCP JSON-RPC and binds the transcript into replay evidence", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+      mcpLease: createFakeMcpLeaseClient(),
+    });
+    const sessionId = await createSession(app, "sess-lease-transcript-success");
+    const spendId = await registerSpend(app, sessionId);
+    const payer = "0x1234";
+    const artifactHash = hex32("lease-artifact-transcript");
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-transcript-settlement");
+    const issued = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-transcript-lease-token",
+      payload: {
+        spendId,
+        payer,
+        artifactHash,
+      },
+    });
+    const bearerToken = issued.json.data.accessToken as string;
+
+    const lease = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId,
+        idempotencyKey: "lease-transcript-success",
+        payload: {
+          spendId,
+          payer,
+          artifactHash,
+          targetRepo: "https://github.com/example/independent-target",
+          targetCommit: "abcdef123456",
+        },
+      },
+      { authorization: `Bearer ${bearerToken}` },
+    );
+    const transcript = await app.request(`/api/v1/evidence/agent-transcript?sessionId=${sessionId}`);
+    const transcriptJson = await transcript.json();
+    const heartbeat = await app.request(`/api/v1/evidence/runner-heartbeat?sessionId=${sessionId}`);
+    const heartbeatJson = await heartbeat.json();
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const judge = await app.request(`/api/v1/evidence/judge-check?sessionId=${sessionId}`);
+    const judgeJson = await judge.json();
+    const verifyReplay = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-lease-transcript-replay",
+      payload: { replayBundle: replayJson.data },
+    });
+    const verifyTamperedLease = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-lease-transcript-tampered",
+      payload: {
+        replayBundle: {
+          ...replayJson.data,
+          leaseRuns: [],
+        },
+      },
+    });
+    const leaseEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "lease.execution.succeeded");
+    const heartbeatEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "runner.heartbeat");
+
+    expect(issued.status).toBe(202);
+    expect(lease.status).toBe(202);
+    expect(lease.json.data).toEqual(
+      expect.objectContaining({
+        leaseRunId: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        payer,
+        artifactHash,
+        bearerBound: true,
+        transcriptHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        toolsListHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        toolsCallHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        outputHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        leaseRunHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        settlementEventId: issued.json.data.settlementEventId,
+        status: "succeeded_live_mcp_transcript",
+        winnerClaimAllowed: false,
+      }),
+    );
+    expect(transcriptJson.data.status).toBe("summarized");
+    expect(transcriptJson.data.callCount).toBe(2);
+    expect(transcriptJson.data.calls.map((call: { toolName: string }) => call.toolName)).toEqual(["tools/list", "tools/call"]);
+    expect(heartbeatJson.data).toEqual(
+      expect.objectContaining({
+        status: "lease_executed",
+        latestLeaseRunId: lease.json.data.leaseRunId,
+        transcriptHash: lease.json.data.transcriptHash,
+        leaseRunHash: lease.json.data.leaseRunHash,
+        winnerClaimAllowed: false,
+      }),
+    );
+    expect(replayJson.data.mcpAdapterCalls).toHaveLength(2);
+    expect(replayJson.data.leaseRuns).toEqual([
+      expect.objectContaining({
+        leaseRunId: lease.json.data.leaseRunId,
+        status: "succeeded_live_mcp_transcript",
+        transcriptHash: lease.json.data.transcriptHash,
+        leaseRunHash: lease.json.data.leaseRunHash,
+      }),
+    ]);
+    expect(leaseEvent.payload).toEqual(
+      expect.objectContaining({
+        leaseRunId: lease.json.data.leaseRunId,
+        transcriptHash: lease.json.data.transcriptHash,
+        leaseRunHash: lease.json.data.leaseRunHash,
+        status: "succeeded_live_mcp_transcript",
+        winnerClaimAllowed: false,
+      }),
+    );
+    expect(heartbeatEvent.payload).toEqual(
+      expect.objectContaining({
+        step: "lease_executed",
+        leaseRunId: lease.json.data.leaseRunId,
+        leaseRunHash: lease.json.data.leaseRunHash,
+      }),
+    );
+    expect(judgeJson.data.rows.find((row: { rowId: string }) => row.rowId === "lease_execution")).toEqual(
+      expect.objectContaining({
+        status: "pass",
+        authority: "delivery",
+        evidenceEventId: lease.json.evidenceEventId,
+      }),
+    );
+    expect(verifyReplay.status).toBe(200);
+    expect(verifyReplay.json.data.schemaOk).toBe(true);
+    expect(verifyTamperedLease.status).toBe(200);
+    expect(verifyTamperedLease.json.data.schemaOk).toBe(false);
+    expect(verifyTamperedLease.json.data.errors).toContain("replayBundle.leaseRuns does not match the server snapshot");
   });
 
   it("surfaces fail-closed proof providers and binds Pact template hashes", async () => {
@@ -3397,6 +3595,7 @@ describe("pactfuse-api P0", () => {
     expect(readyJson.proofProviders).toEqual([
       expect.objectContaining({ name: "chain", mode: "unconfigured", ready: false }),
       expect.objectContaining({ name: "caw", mode: "unconfigured", ready: false }),
+      expect.objectContaining({ name: "mcp_lease", mode: "unconfigured", ready: false }),
     ]);
     expect(session.json.data.pactTemplates).toEqual([
       expect.objectContaining({ mode: "gate-paid-artifact-real", templateHash: hex32("gate-paid-template") }),
@@ -3406,7 +3605,8 @@ describe("pactfuse-api P0", () => {
     expect(operation.json.data.pactTemplateHash).toBe(hex32("gate-paid-template"));
     expect(verify.json.data.warnings).toContain("chain proof provider is unconfigured: chain RPC endpoint is not configured");
     expect(verify.json.data.warnings).toContain("caw proof provider is unconfigured: CAW receipt source is not configured");
-    expect(verify.json.data.raw.proofProviders).toHaveLength(2);
+    expect(verify.json.data.warnings).toContain("mcp_lease proof provider is unconfigured: lease MCP endpoint is not configured");
+    expect(verify.json.data.raw.proofProviders).toHaveLength(3);
   });
 
   it("passes pinned Pact template hashes into the verifier", async () => {
@@ -3692,7 +3892,7 @@ function gateEventEnvelope(
 
 async function postSignedGateEvent(app: ReturnType<typeof createApp>, body: Record<string, unknown>) {
   return post(app, "/api/v1/gate/events/ingest", body, {
-    "x-pactfuse-gate-signature": signAuditPayload(MCP_AUDIT_TOKEN, body),
+    "x-pactfuse-gate-signature": signAuditPayload(GATE_INGEST_TOKEN, body),
   });
 }
 
@@ -3869,6 +4069,79 @@ function hashForTestJson(value: unknown): `0x${string}` {
 
 function keccakJsonForTest(value: unknown): `0x${string}` {
   return keccak256(toBytes(canonicalizeJson(value)));
+}
+
+function createFakeMcpLeaseClient(toolName = "pactfuse_code_scan"): McpLeaseClient {
+  return {
+    async status() {
+      return {
+        name: "mcp_lease",
+        mode: "fixture",
+        ready: true,
+        reason: "fake MCP lease client",
+      };
+    },
+    async executeCleanLease(input) {
+      const listRequest = {
+        jsonrpc: "2.0",
+        id: "lease-tools-list",
+        method: "tools/list",
+        params: {},
+      };
+      const listResponse = {
+        jsonrpc: "2.0",
+        id: "lease-tools-list",
+        result: {
+          tools: [
+            {
+              name: toolName,
+              description: "Deterministic code scan",
+            },
+          ],
+        },
+      };
+      const callRequest = {
+        jsonrpc: "2.0",
+        id: "lease-tools-call",
+        method: "tools/call",
+        params: {
+          name: toolName,
+          arguments: {
+            sessionId: input.sessionId,
+            leaseRunId: input.leaseRunId,
+            spendId: input.spendId,
+            payer: input.payer,
+            artifactHash: input.artifactHash,
+            targetRepo: input.targetRepo,
+            targetCommit: input.targetCommit,
+          },
+        },
+      };
+      const callResponse = {
+        jsonrpc: "2.0",
+        id: "lease-tools-call",
+        result: {
+          content: [
+            {
+              type: "text",
+              text: `scan:${input.targetRepo}@${input.targetCommit}`,
+            },
+          ],
+          structuredContent: {
+            targetRepo: input.targetRepo,
+            targetCommit: input.targetCommit,
+            findingCount: 0,
+          },
+        },
+      };
+      return {
+        toolName,
+        toolsList: { method: "tools/list", request: listRequest, response: listResponse },
+        toolsCall: { method: "tools/call", request: callRequest, response: callResponse },
+        output: callResponse,
+      };
+    },
+  };
 }
 
 function signAuditPayload(secret: string, payload: unknown): `0x${string}` {

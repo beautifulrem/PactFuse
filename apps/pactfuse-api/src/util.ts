@@ -105,6 +105,16 @@ export function forbiddenError(requestId: string, message: string): ApiError {
   };
 }
 
+export function unauthorizedError(requestId: string, message: string): ApiError {
+  return {
+    code: "unauthorized",
+    message,
+    requestId,
+    retryable: false,
+    downgrade: "failed",
+  };
+}
+
 export function rateLimitedError(requestId: string): ApiError {
   return {
     code: "rate_limited",

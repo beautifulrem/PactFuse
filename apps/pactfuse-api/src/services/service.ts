@@ -19,6 +19,7 @@ import {
   IsoDateStringSchema,
   JudgeCheckViewSchema,
   LeaseExecutePayloadSchema,
+  LeaseRunViewSchema,
   LOCKED_RUNTIME_MODES,
   McpAdapterAuditPayloadSchema,
   McpAdapterCallViewSchema,
@@ -44,11 +45,12 @@ import {
   type ChainIndexerBackfillInput,
   type VerifierRunView,
 } from "@pactfuse/evidence-schema";
-import type { ProofProviderStatus, ServiceCtx, ServiceResult } from "../types.js";
+import type { McpLeaseExecutionResult, ProofProviderStatus, ServiceCtx, ServiceResult } from "../types.js";
 import {
   ZERO_HASH,
   badRequestError,
   conflictError,
+  forbiddenError,
   hashJson,
   keccakJson,
   newRequestId,
@@ -59,6 +61,7 @@ import {
   proofPendingError,
   sha256Hex,
   toApiError,
+  unauthorizedError,
 } from "../util.js";
 
 type Row = Record<string, unknown>;
@@ -1318,8 +1321,9 @@ export async function executeLease(
       assertSession(ctx, envelope.sessionId, requestId);
       const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
       const payer = requireSpendPayer(spend, payload.payer, requestId);
-      requireFinalizedSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
-      requireActiveArtifactAccess(
+      const settlement = requireFinalizedSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
+      assertNoArtifactRefundPending(ctx, envelope.sessionId, payload.spendId, requestId);
+      const activeToken = requireActiveArtifactAccess(
         ctx,
         {
           sessionId: envelope.sessionId,
@@ -1330,19 +1334,113 @@ export async function executeLease(
         },
         requestId,
       );
-      const createdAt = ctx.clock.now().toISOString();
       const leaseRunId = hashJson({ sessionId: envelope.sessionId, payload, requestId });
+      let leaseExecution: McpLeaseExecutionResult;
+      try {
+        leaseExecution = await ctx.mcpLease.executeCleanLease({
+          sessionId: envelope.sessionId,
+          leaseRunId,
+          spendId: payload.spendId,
+          payer,
+          artifactHash: payload.artifactHash,
+          targetRepo: payload.targetRepo,
+          targetCommit: payload.targetCommit,
+        });
+      } catch (error) {
+        return recordBlockedLeaseExecution(ctx, {
+          requestId,
+          sessionId: envelope.sessionId,
+          spendId: payload.spendId,
+          payer,
+          artifactHash: payload.artifactHash,
+          targetRepo: payload.targetRepo,
+          targetCommit: payload.targetCommit,
+          leaseRunId,
+          settlementEventId: settlement.finalizedEventId,
+          artifactTokenId: String(activeToken.token_id),
+          status: error instanceof Error && !error.message.includes("unconfigured") ? "blocked_mcp_execution_failed" : "blocked_missing_runner_execution",
+          reason: error instanceof Error ? error.message : "lease MCP execution failed",
+        });
+      }
+
+      const listCall = recordMcpAdapterCall(
+        {
+          sessionId: envelope.sessionId,
+          auditNonce: `lease_${leaseRunId.slice(2, 22)}_tools_list`,
+          toolName: "tools/list",
+          request: jsonRecord(leaseExecution.toolsList.request),
+          response: jsonRecord(leaseExecution.toolsList.response),
+          status: "succeeded",
+        },
+        ctx,
+      );
+      const toolCall = recordMcpAdapterCall(
+        {
+          sessionId: envelope.sessionId,
+          auditNonce: `lease_${leaseRunId.slice(2, 22)}_tools_call`,
+          toolName: "tools/call",
+          request: jsonRecord(leaseExecution.toolsCall.request),
+          response: jsonRecord(leaseExecution.toolsCall.response),
+          status: "succeeded",
+        },
+        ctx,
+      );
+      const transcriptHash = hashJson({
+        format: "mcp-json-rpc",
+        sessionId: envelope.sessionId,
+        leaseRunId,
+        frameCallIds: [listCall.callId, toolCall.callId],
+        frames: [
+          { method: "tools/list", requestHash: listCall.requestHash, responseHash: listCall.responseHash },
+          { method: "tools/call", requestHash: toolCall.requestHash, responseHash: toolCall.responseHash },
+        ],
+      });
+      const toolsListHash = hashJson({ requestHash: listCall.requestHash, responseHash: listCall.responseHash });
+      const toolsCallHash = hashJson({ requestHash: toolCall.requestHash, responseHash: toolCall.responseHash });
+      const outputHash = hashJson(leaseExecution.output);
+      const leaseRunHash = hashJson({
+        sessionId: envelope.sessionId,
+        leaseRunId,
+        spendId: payload.spendId,
+        payer,
+        artifactHash: payload.artifactHash,
+        targetRepo: payload.targetRepo,
+        targetCommit: payload.targetCommit,
+        settlementEventId: settlement.finalizedEventId,
+        artifactTokenId: String(activeToken.token_id),
+        transcriptHash,
+        outputHash,
+      });
+      const now = ctx.clock.now().toISOString();
       ctx.db.sqlite
         .prepare(
           `INSERT INTO lease_runs
-            (lease_run_id, session_id, spend_id, target_repo, target_commit, status, transcript_hash, created_at)
-           VALUES (?, ?, ?, ?, ?, 'blocked_missing_runner_execution', NULL, ?)`,
+            (lease_run_id, session_id, spend_id, payer, artifact_hash, target_repo, target_commit, status, transcript_hash,
+             tools_list_hash, tools_call_hash, output_hash, lease_run_hash, settlement_event_id, artifact_token_id, completed_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'succeeded_live_mcp_transcript', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(leaseRunId, envelope.sessionId, payload.spendId, payload.targetRepo, payload.targetCommit, createdAt);
+        .run(
+          leaseRunId,
+          envelope.sessionId,
+          payload.spendId,
+          payer,
+          payload.artifactHash,
+          payload.targetRepo,
+          payload.targetCommit,
+          transcriptHash,
+          toolsListHash,
+          toolsCallHash,
+          outputHash,
+          leaseRunHash,
+          settlement.finalizedEventId,
+          String(activeToken.token_id),
+          now,
+          now,
+        );
       const event = appendEvidenceEvent(ctx, {
         sessionId: envelope.sessionId,
-        authority: "operator",
-        kind: "lease.execution.blocked",
+        authority: "delivery",
+        kind: "lease.execution.succeeded",
         payload: {
           leaseRunId,
           spendId: payload.spendId,
@@ -1350,10 +1448,39 @@ export async function executeLease(
           artifactHash: payload.artifactHash,
           targetRepo: payload.targetRepo,
           targetCommit: payload.targetCommit,
+          settlementEventId: settlement.finalizedEventId,
+          artifactTokenId: String(activeToken.token_id),
+          transcriptHash,
+          toolsListHash,
+          toolsCallHash,
+          outputHash,
+          leaseRunHash,
+          mcpToolName: leaseExecution.toolName,
           bearerBound: true,
-          status: "blocked_missing_runner_execution",
+          status: "succeeded_live_mcp_transcript",
+          proofAuthority: false,
           winnerClaimAllowed: false,
         },
+      });
+      appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "delivery",
+        kind: "runner.heartbeat",
+        payload: {
+          step: "lease_executed",
+          leaseRunId,
+          transcriptHash,
+          leaseRunHash,
+          evidenceEventId: event.eventId,
+          winnerClaimAllowed: false,
+        },
+      });
+      updateJudgeCheckRow(ctx, envelope.sessionId, {
+        rowId: "lease_execution",
+        status: "pass",
+        authority: "delivery",
+        reason: "MCP tools/list and tools/call transcript recorded for bearer-bound clean lease",
+        evidenceEventId: event.eventId,
       });
       return {
         ok: true,
@@ -1364,12 +1491,103 @@ export async function executeLease(
           payer,
           artifactHash: payload.artifactHash,
           bearerBound: true,
-          status: "blocked_missing_runner_execution",
+          transcriptHash,
+          toolsListHash,
+          toolsCallHash,
+          outputHash,
+          leaseRunHash,
+          settlementEventId: settlement.finalizedEventId,
+          status: "succeeded_live_mcp_transcript",
           winnerClaimAllowed: false,
         },
       };
     },
   );
+}
+
+function recordBlockedLeaseExecution(
+  ctx: ServiceCtx,
+  input: {
+    requestId: string;
+    sessionId: string;
+    spendId: string;
+    payer: string;
+    artifactHash: string;
+    targetRepo: string;
+    targetCommit: string;
+    leaseRunId: string;
+    settlementEventId: string;
+    artifactTokenId: string;
+    status: "blocked_missing_runner_execution" | "blocked_mcp_execution_failed";
+    reason: string;
+  },
+): ServiceResult<unknown> {
+  const createdAt = ctx.clock.now().toISOString();
+  ctx.db.sqlite
+    .prepare(
+      `INSERT INTO lease_runs
+        (lease_run_id, session_id, spend_id, payer, artifact_hash, target_repo, target_commit, status, transcript_hash,
+         tools_list_hash, tools_call_hash, output_hash, lease_run_hash, settlement_event_id, artifact_token_id, completed_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL, ?)`,
+    )
+    .run(
+      input.leaseRunId,
+      input.sessionId,
+      input.spendId,
+      input.payer,
+      input.artifactHash,
+      input.targetRepo,
+      input.targetCommit,
+      input.status,
+      input.settlementEventId,
+      input.artifactTokenId,
+      createdAt,
+    );
+  const event = appendEvidenceEvent(ctx, {
+    sessionId: input.sessionId,
+    authority: "operator",
+    kind: "lease.execution.blocked",
+    payload: {
+      leaseRunId: input.leaseRunId,
+      spendId: input.spendId,
+      payer: input.payer,
+      artifactHash: input.artifactHash,
+      targetRepo: input.targetRepo,
+      targetCommit: input.targetCommit,
+      settlementEventId: input.settlementEventId,
+      artifactTokenId: input.artifactTokenId,
+      bearerBound: true,
+      status: input.status,
+      reason: input.reason,
+      winnerClaimAllowed: false,
+    },
+  });
+  updateJudgeCheckRow(ctx, input.sessionId, {
+    rowId: "lease_execution",
+    status: "blocked",
+    authority: "operator",
+    reason: input.reason,
+    evidenceEventId: event.eventId,
+  });
+  return {
+    ok: true,
+    requestId: input.requestId,
+    evidenceEventId: event.eventId,
+    data: {
+      leaseRunId: input.leaseRunId,
+      payer: input.payer,
+      artifactHash: input.artifactHash,
+      bearerBound: true,
+      transcriptHash: null,
+      toolsListHash: null,
+      toolsCallHash: null,
+      outputHash: null,
+      leaseRunHash: null,
+      settlementEventId: input.settlementEventId,
+      status: input.status,
+      winnerClaimAllowed: false,
+    },
+  };
 }
 
 export async function verifyEvidenceForSession(
@@ -1455,6 +1673,7 @@ async function buildVerifierRunView(
     ...verifyMcpAdapterCallIntegrity(ctx, sessionId),
     ...verifyGateFinalityIntegrity(ctx, sessionId),
     ...verifyArtifactAccessTokenIntegrity(ctx, sessionId),
+    ...verifyLeaseRunIntegrity(ctx, sessionId),
     ...(await verifyIndexerCursorIntegrity(ctx, proofProviders)),
     ...verifyReplayBundleBindings(ctx, sessionId, payload),
   ];
@@ -1483,8 +1702,8 @@ async function buildVerifierRunView(
 }
 
 export async function readProofProviderStatus(ctx: ServiceCtx): Promise<ProofProviderStatus[]> {
-  const [chain, caw] = await Promise.all([ctx.chain.status(), ctx.caw.status()]);
-  return [chain, caw];
+  const [chain, caw, mcpLease] = await Promise.all([ctx.chain.status(), ctx.caw.status(), ctx.mcpLease.status()]);
+  return [chain, caw, mcpLease];
 }
 
 export async function readJudgeCheck(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<JudgeCheckView>> {
@@ -1521,6 +1740,7 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBun
   const cawReceiptOperations = listCawReceiptOperations(ctx, sessionId, 200);
   const rawCawReceiptBundles = listRawCawReceiptBundles(ctx, sessionId, 200);
   const canonicalCawReceipts = listCanonicalCawReceipts(ctx, sessionId, 200);
+  const leaseRuns = listLeaseRuns(ctx, sessionId, 200);
   const agentTranscript = buildAgentTranscriptData(sessionId, ctx, mcpAdapterCalls.length);
   return ReplayBundleViewSchema.parse({
     bundleType: "PACTFUSE_EVIDENCE_V1",
@@ -1536,6 +1756,7 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBun
     cawReceiptOperations,
     rawCawReceiptBundles,
     canonicalCawReceipts,
+    leaseRuns,
     judgeCheck: readJudgeCheckData(sessionId, ctx),
   });
 }
@@ -1544,14 +1765,25 @@ export async function readRunnerHeartbeat(sessionId: string, ctx: ServiceCtx): P
   const requestId = newRequestId("runner_heartbeat");
   const parsedSessionId = parseStrict(Hex32Schema, sessionId);
   assertSession(ctx, parsedSessionId, requestId);
+  const latestLease = listLeaseRuns(ctx, parsedSessionId, 1)[0] ?? null;
+  const status = latestLease
+    ? latestLease.status === "succeeded_live_mcp_transcript"
+      ? "lease_executed"
+      : latestLease.status.startsWith("blocked_")
+        ? "blocked"
+        : "pending"
+    : "pending";
   return {
     ok: true,
     requestId,
     data: RunnerHeartbeatViewSchema.parse({
       sessionId: parsedSessionId,
-      status: "pending",
+      status,
+      latestLeaseRunId: latestLease?.leaseRunId ?? null,
+      transcriptHash: latestLease?.transcriptHash ?? null,
+      leaseRunHash: latestLease?.leaseRunHash ?? null,
       winnerClaimAllowed: false,
-      updatedAt: nowIso(),
+      updatedAt: latestLease?.completedAt ?? latestLease?.createdAt ?? nowIso(),
     }),
   };
 }
@@ -1865,6 +2097,7 @@ export function appendEvidenceEvent(
       | "gate.spend_settled"
       | "reorg.invalidated"
       | "lease.execution.blocked"
+      | "lease.execution.succeeded"
       | "verifier.fail_closed"
       | "judge_check.pending"
       | "runner.heartbeat"
@@ -3874,7 +4107,7 @@ function requireActiveArtifactAccess(
   }
   if (!input.bearerToken) {
     throw Object.assign(new Error("artifact bearer token is required"), {
-      apiError: proofPendingError(requestId, "artifact bearer token is required but no proof-valid token is active"),
+      apiError: unauthorizedError(requestId, "artifact bearer token is required"),
     });
   }
   const tokenHash = sha256Hex(input.bearerToken);
@@ -3887,7 +4120,7 @@ function requireActiveArtifactAccess(
   );
   if (!active) {
     throw Object.assign(new Error("artifact bearer token is not active for tuple"), {
-      apiError: proofPendingError(requestId, "artifact bearer token is not backed by a proof-valid active access row"),
+      apiError: forbiddenError(requestId, "artifact bearer token is not active for this access tuple"),
     });
   }
   const activeVerifierRunId = String(active.issued_by_verifier_run_id);
@@ -4029,9 +4262,9 @@ function updateJudgeCheckRow(
   ctx: ServiceCtx,
   sessionId: string,
   input: {
-    rowId: "source_challenge" | "ab_trip" | "c_settlement" | "artifact_access";
+    rowId: "source_challenge" | "ab_trip" | "c_settlement" | "artifact_access" | "lease_execution";
     status: "pass" | "pending" | "blocked";
-    authority: "proof" | "delivery" | "advisory";
+    authority: "proof" | "delivery" | "operator" | "advisory";
     reason: string;
     evidenceEventId: string;
   },
@@ -4081,7 +4314,13 @@ function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number) 
       `SELECT *
        FROM mcp_adapter_calls
        WHERE session_id = ?
-       ORDER BY created_at ASC, call_id ASC
+       ORDER BY created_at ASC,
+         CASE tool_name
+           WHEN 'tools/list' THEN 1
+           WHEN 'tools/call' THEN 2
+           ELSE 3
+         END,
+         call_id ASC
        LIMIT ?`,
     )
     .all(sessionId, limit) as Row[];
@@ -4100,6 +4339,21 @@ function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number) 
       proofAuthority: false,
     }),
   );
+}
+
+function mcpCallByAuditNonce(ctx: ServiceCtx, auditNonce: string): ReturnType<typeof listMcpAdapterCalls>[number] | null {
+  const row = ctx.db.sqlite
+    .prepare(
+      `SELECT session_id
+       FROM mcp_adapter_calls
+       WHERE audit_nonce = ?
+       LIMIT 1`,
+    )
+    .get(auditNonce) as Row | undefined;
+  if (!row || typeof row.session_id !== "string") {
+    return null;
+  }
+  return listMcpAdapterCalls(ctx, row.session_id, 200).find((call) => call.auditNonce === auditNonce) ?? null;
 }
 
 function listCawReceiptOperations(ctx: ServiceCtx, sessionId: string, limit: number) {
@@ -4186,6 +4440,39 @@ function listCanonicalCawReceipts(ctx: ServiceCtx, sessionId: string, limit: num
       expiry: row.expiry,
       fetchedAt: row.fetched_at,
       createdAt: row.created_at,
+    }),
+  );
+}
+
+function listLeaseRuns(ctx: ServiceCtx, sessionId: string, limit: number) {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM lease_runs
+       WHERE session_id = ?
+       ORDER BY created_at DESC, lease_run_id ASC
+       LIMIT ?`,
+    )
+    .all(sessionId, limit) as Row[];
+  return rows.map((row) =>
+    LeaseRunViewSchema.parse({
+      leaseRunId: row.lease_run_id,
+      sessionId: row.session_id,
+      spendId: row.spend_id,
+      payer: row.payer ?? null,
+      artifactHash: row.artifact_hash ?? null,
+      targetRepo: row.target_repo,
+      targetCommit: row.target_commit,
+      status: row.status,
+      transcriptHash: row.transcript_hash ?? null,
+      toolsListHash: row.tools_list_hash ?? null,
+      toolsCallHash: row.tools_call_hash ?? null,
+      outputHash: row.output_hash ?? null,
+      leaseRunHash: row.lease_run_hash ?? null,
+      settlementEventId: row.settlement_event_id ?? null,
+      artifactTokenId: row.artifact_token_id ?? null,
+      createdAt: row.created_at,
+      completedAt: row.completed_at ?? null,
     }),
   );
 }
@@ -4443,6 +4730,124 @@ function verifyArtifactAccessTokenIntegrity(ctx: ServiceCtx, sessionId: string):
   return errors;
 }
 
+function verifyLeaseRunIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  const errors: string[] = [];
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT lease_run_id, spend_id, payer, artifact_hash, target_repo, target_commit, status, transcript_hash,
+              tools_list_hash, tools_call_hash, output_hash, lease_run_hash, settlement_event_id, artifact_token_id
+       FROM lease_runs
+       WHERE session_id = ?
+       ORDER BY created_at ASC`,
+    )
+    .all(sessionId) as Row[];
+  const events = listEvents(ctx, sessionId, 0, 200);
+  for (const row of rows) {
+    const leaseRunId = String(row.lease_run_id);
+    if (row.status !== "succeeded_live_mcp_transcript") {
+      const blockedEvent = events.find(
+        (event) => event.kind === "lease.execution.blocked" && event.payload.leaseRunId === leaseRunId,
+      );
+      if (!blockedEvent) {
+        errors.push(`blocked lease run ${leaseRunId} has no lease.execution.blocked evidence event`);
+      }
+      continue;
+    }
+    const required = [
+      "payer",
+      "artifact_hash",
+      "transcript_hash",
+      "tools_list_hash",
+      "tools_call_hash",
+      "output_hash",
+      "lease_run_hash",
+      "settlement_event_id",
+      "artifact_token_id",
+    ] as const;
+    for (const field of required) {
+      if (typeof row[field] !== "string") {
+        errors.push(`succeeded lease run ${leaseRunId} is missing ${field}`);
+      }
+    }
+    if (required.some((field) => typeof row[field] !== "string")) {
+      continue;
+    }
+    const listCall = mcpCallByAuditNonce(ctx, `lease_${leaseRunId.slice(2, 22)}_tools_list`);
+    const toolCall = mcpCallByAuditNonce(ctx, `lease_${leaseRunId.slice(2, 22)}_tools_call`);
+    if (!listCall || !toolCall) {
+      errors.push(`succeeded lease run ${leaseRunId} is missing MCP transcript frames`);
+      continue;
+    }
+    const expectedToolsListHash = hashJson({ requestHash: listCall.requestHash, responseHash: listCall.responseHash });
+    const expectedToolsCallHash = hashJson({ requestHash: toolCall.requestHash, responseHash: toolCall.responseHash });
+    const expectedOutputHash = hashJson(toolCall.response);
+    const expectedTranscriptHash = hashJson({
+      format: "mcp-json-rpc",
+      sessionId,
+      leaseRunId,
+      frameCallIds: [listCall.callId, toolCall.callId],
+      frames: [
+        { method: "tools/list", requestHash: listCall.requestHash, responseHash: listCall.responseHash },
+        { method: "tools/call", requestHash: toolCall.requestHash, responseHash: toolCall.responseHash },
+      ],
+    });
+    const expectedLeaseRunHash = hashJson({
+      sessionId,
+      leaseRunId,
+      spendId: row.spend_id,
+      payer: row.payer,
+      artifactHash: row.artifact_hash,
+      targetRepo: row.target_repo,
+      targetCommit: row.target_commit,
+      settlementEventId: row.settlement_event_id,
+      artifactTokenId: row.artifact_token_id,
+      transcriptHash: expectedTranscriptHash,
+      outputHash: expectedOutputHash,
+    });
+    const checks = [
+      ["tools_list_hash", expectedToolsListHash],
+      ["tools_call_hash", expectedToolsCallHash],
+      ["output_hash", expectedOutputHash],
+      ["transcript_hash", expectedTranscriptHash],
+      ["lease_run_hash", expectedLeaseRunHash],
+    ] as const;
+    for (const [field, expected] of checks) {
+      if (row[field] !== expected) {
+        errors.push(`succeeded lease run ${leaseRunId} ${field} does not match recomputed transcript data`);
+      }
+    }
+    const event = events.find((candidate) => candidate.kind === "lease.execution.succeeded" && candidate.payload.leaseRunId === leaseRunId);
+    if (!event) {
+      errors.push(`succeeded lease run ${leaseRunId} has no lease.execution.succeeded evidence event`);
+      continue;
+    }
+    const eventFields = [
+      ["spendId", row.spend_id],
+      ["payer", row.payer],
+      ["artifactHash", row.artifact_hash],
+      ["targetRepo", row.target_repo],
+      ["targetCommit", row.target_commit],
+      ["settlementEventId", row.settlement_event_id],
+      ["artifactTokenId", row.artifact_token_id],
+      ["transcriptHash", row.transcript_hash],
+      ["toolsListHash", row.tools_list_hash],
+      ["toolsCallHash", row.tools_call_hash],
+      ["outputHash", row.output_hash],
+      ["leaseRunHash", row.lease_run_hash],
+      ["status", "succeeded_live_mcp_transcript"],
+    ] as const;
+    for (const [field, expected] of eventFields) {
+      if (event.payload[field] !== expected) {
+        errors.push(`lease execution event ${event.eventId} payload.${field} does not match lease run row`);
+      }
+    }
+    if (event.authority !== "delivery" || event.payload.proofAuthority !== false || event.payload.winnerClaimAllowed !== false) {
+      errors.push(`lease execution event ${event.eventId} does not carry delivery-only fail-closed payload`);
+    }
+  }
+  return errors;
+}
+
 async function verifyIndexerCursorIntegrity(ctx: ServiceCtx, proofProviders: ProofProviderStatus[]): Promise<string[]> {
   const rows = ctx.db.sqlite
     .prepare(
@@ -4529,6 +4934,7 @@ function verifyReplayBundleBindings(
   compareReplaySnapshot(errors, "replayBundle.cawReceiptOperations", bundle.cawReceiptOperations, listCawReceiptOperations(ctx, sessionId, 200));
   compareReplaySnapshot(errors, "replayBundle.rawCawReceiptBundles", bundle.rawCawReceiptBundles, listRawCawReceiptBundles(ctx, sessionId, 200));
   compareReplaySnapshot(errors, "replayBundle.canonicalCawReceipts", bundle.canonicalCawReceipts, listCanonicalCawReceipts(ctx, sessionId, 200));
+  compareReplaySnapshot(errors, "replayBundle.leaseRuns", bundle.leaseRuns, listLeaseRuns(ctx, sessionId, 200));
   compareReplaySnapshot(errors, "replayBundle.judgeCheck", bundle.judgeCheck, readJudgeCheckData(sessionId, ctx));
   return errors;
 }

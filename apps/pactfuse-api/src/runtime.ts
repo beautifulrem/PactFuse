@@ -2,9 +2,11 @@ import pino from "pino";
 import { openPactFuseDb } from "./db/index.js";
 import {
   createLocalTemplateRegistry,
+  createHttpJsonRpcMcpLeaseClient,
   createHttpsCawReceiptSource,
   createUnconfiguredCawReceiptSource,
   createUnconfiguredChainClient,
+  createUnconfiguredMcpLeaseClient,
   createViemChainClient,
 } from "./services/providers.js";
 import { createVerifierAdapter } from "./services/verifier.js";
@@ -30,6 +32,17 @@ function createRuntimeCawSource() {
     input.limit = Number(process.env.PACTFUSE_CAW_EXPORT_LIMIT);
   }
   return createHttpsCawReceiptSource(input);
+}
+
+function createRuntimeMcpLeaseClient() {
+  if (!process.env.PACTFUSE_LEASE_MCP_URL) {
+    return createUnconfiguredMcpLeaseClient();
+  }
+  return createHttpJsonRpcMcpLeaseClient({
+    endpointUrl: process.env.PACTFUSE_LEASE_MCP_URL,
+    toolName: process.env.PACTFUSE_LEASE_MCP_TOOL_NAME ?? "pactfuse_code_scan",
+    timeoutMs: numberEnv("PACTFUSE_LEASE_MCP_TIMEOUT_MS", 10_000),
+  });
 }
 
 function numberEnv(name: string, fallback: number): number {
@@ -126,8 +139,10 @@ export function createServiceCtx(options: {
         })
       : createUnconfiguredChainClient(),
     caw: createRuntimeCawSource(),
+    mcpLease: createRuntimeMcpLeaseClient(),
     templates: createLocalTemplateRegistry(),
     mcpAuditSecret: process.env.PACTFUSE_MCP_AUDIT_TOKEN ?? null,
+    gateIngestSecret: process.env.PACTFUSE_GATE_INGEST_TOKEN ?? null,
     cawIngestToken: process.env.PACTFUSE_CAW_INGEST_TOKEN ?? null,
     requiredIndexerCursors: options.requiredIndexerCursors ?? runtimeIndexerOptions?.cursors ?? [],
     apiSecurity: {
