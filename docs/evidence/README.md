@@ -6,6 +6,7 @@ This folder separates current checked-in status from future winner-claim evidenc
 
 - `caw-identity-probe.json`: pending same-wallet CAW probe; not real evidence yet.
 - `mock-token.json`: pending public testnet mock ERC20 deployment evidence; not real evidence yet.
+- `deployment-registry.example.json`: non-authoritative example of the live deployment registry shape; real deployments must be supplied through `PACTFUSE_DEPLOYMENT_REGISTRY_PATH` or `PACTFUSE_DEPLOYMENT_REGISTRY_JSON`.
 - `caw-policy-receipt.example.json`: template for normalized CAW receipt capture.
 - `receipt-pack.pending.example.json`: schema-only example only; not real evidence yet.
 - Artifact preflight / Judge Check / claim readiness / runner heartbeat / CAW receipt ingest / Agent Transcript / replay bundle records are API-backed. Replay bundles include indexed page roots and embedded page proofs, but checked-in public evidence remains pending until live Cobo identity, deployed token, and external-chain receipts are captured.
@@ -41,6 +42,7 @@ WINNER_CLAIM_ALLOWED: false
 - `../../packages/verifier/pactfuse-verify-receipt.mjs`: importable `verifyEvidence()` plus CLI for receipt-pack mode branches, pending markers, A/B/C proof cardinality, replay-page hashes, CAW allowlist shape, and final replay claim blockers; default mode is a proof-chip gate, `--schema-only` is structural preflight, and the verifier reports `schemaOk`, `proofChipAllowed`, `finalVerifierComplete`, `winnerClaimAllowed`, and `proofCompletenessErrors`.
 - `/api/v1/evidence/claim-readiness`: operator-only derivation of current and target public modes from live evidence gates; it is a readiness report, not a manual mode override.
 - `/api/v1/evidence/public-claim`: the operator-only fail-closed public-claim gate; it returns `authorized_public_claim` only when readiness, replay hash, and final verifier authority all pass together.
+- Mock-token public claims require a live deployment registry entry binding the payment token address to chain id, deployment transaction, explorer URL, decimals, and code hash.
 - Receipt-pack hashes must bind CAW policy receipts, CAW operations, payment proof, source proof, chain events, artifact hash, and block window into one `PACTFUSE_EVIDENCE_V1` transcript.
 - W2 receipt-pack hashes also bind `priceDisclosure`, `deliveryPreflight`, optional `leaseRunHash`, and Judge Check rows through app-level evidence records before any paid-content-unlock or "used what it bought" claim.
 - W3 winner rows additionally require raw CAW receipt ingest, MCP Agent Transcript, independent target repo proof, and a `PACTFUSE_EVIDENCE_V1` replay bundle under one `sessionId`.

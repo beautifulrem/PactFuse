@@ -31,6 +31,35 @@ export const TokenModeSchema = z.enum(["local-mocked", "mock-test-token", "offic
 export const IdentityModeSchema = z.enum(["pending", "p0-floor-one-wallet", "p0-win-separate-identities"]);
 export const QuoteStatusSchema = z.enum(["mocked_after_preflight_not_chain_settleable", "chain_settleable_after_preflight"]);
 
+export const DeploymentRegistryEntrySchema = z
+  .object({
+    contractName: z.enum(["SourceStateRegistry", "ProcurementGate", "PaidArtifactMarket", "PaymentToken"]),
+    chainId: z.string().min(1).max(80),
+    address: AddressSchema,
+    deploymentTxHash: Hex32Schema,
+    explorerUrl: z.string().min(1).max(1000),
+    codeHash: Hex32Schema,
+    tokenMode: TokenModeSchema.optional(),
+    symbol: z.string().min(1).max(40).optional(),
+    decimals: z.number().int().min(0).max(255).optional(),
+  })
+  .strict();
+
+export const DeploymentRegistrySchema = z
+  .object({
+    mode: z.enum(["pending", "live"]),
+    chainId: z.string().min(1).max(80),
+    officialUsdcProbe: z
+      .object({
+        status: z.enum(["not_attempted", "failed", "passed"]),
+        reason: z.string().min(1).max(500),
+      })
+      .strict()
+      .optional(),
+    entries: z.array(DeploymentRegistryEntrySchema).max(64).default([]),
+  })
+  .strict();
+
 export const RuntimeModesSchema = z
   .object({
     CLAIM_MODE: ClaimModeSchema,
@@ -1040,6 +1069,8 @@ export type JudgeCheckView = z.infer<typeof JudgeCheckViewSchema>;
 export type VerifierRunView = z.infer<typeof VerifierRunViewSchema>;
 export type ClaimReadinessView = z.infer<typeof ClaimReadinessViewSchema>;
 export type PublicClaimView = z.infer<typeof PublicClaimViewSchema>;
+export type DeploymentRegistry = z.infer<typeof DeploymentRegistrySchema>;
+export type DeploymentRegistryEntry = z.infer<typeof DeploymentRegistryEntrySchema>;
 export type LiveProofPreflightView = z.infer<typeof LiveProofPreflightViewSchema>;
 export type ReplayBundleView = z.infer<typeof ReplayBundleViewSchema>;
 export type QuoteStatus = z.infer<typeof QuoteStatusSchema>;

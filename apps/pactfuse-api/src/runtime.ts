@@ -1,4 +1,6 @@
+import { readFileSync } from "node:fs";
 import pino from "pino";
+import { DeploymentRegistrySchema, type DeploymentRegistry } from "@pactfuse/evidence-schema";
 import { openPactFuseDb } from "./db/index.js";
 import {
   createCoboAgenticWalletClient,
@@ -63,6 +65,16 @@ function createRuntimeCawLiveClient() {
     clientInput.walletId = walletId;
   }
   return createCoboAgenticWalletClient(clientInput);
+}
+
+function createRuntimeDeploymentRegistry(): DeploymentRegistry | undefined {
+  const rawJson = process.env.PACTFUSE_DEPLOYMENT_REGISTRY_JSON;
+  const registryPath = process.env.PACTFUSE_DEPLOYMENT_REGISTRY_PATH;
+  if (!rawJson && !registryPath) {
+    return undefined;
+  }
+  const raw = rawJson ?? readFileSync(String(registryPath), "utf8");
+  return DeploymentRegistrySchema.parse(JSON.parse(raw));
 }
 
 function numberEnv(name: string, fallback: number): number {
@@ -165,6 +177,7 @@ export function createServiceCtx(options: {
     mcpAuditSecret: process.env.PACTFUSE_MCP_AUDIT_TOKEN ?? null,
     gateIngestSecret: process.env.PACTFUSE_GATE_INGEST_TOKEN ?? null,
     cawIngestToken: process.env.PACTFUSE_CAW_INGEST_TOKEN ?? null,
+    deploymentRegistry: createRuntimeDeploymentRegistry(),
     requiredIndexerCursors: options.requiredIndexerCursors ?? runtimeIndexerOptions?.cursors ?? [],
     apiSecurity: {
       operatorToken: process.env.PACTFUSE_OPERATOR_TOKEN ?? null,

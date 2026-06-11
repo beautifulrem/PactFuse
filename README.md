@@ -273,6 +273,8 @@ The replay verifier checks:
 | --- | --- |
 | `PACTFUSE_CHAIN_RPC_URL` | Enables viem-backed chain reads |
 | `PACTFUSE_CHAIN_ID` | Chain id for indexer and provider checks |
+| `PACTFUSE_DEPLOYMENT_REGISTRY_PATH` | JSON registry for live contract/payment-token deployment evidence |
+| `PACTFUSE_DEPLOYMENT_REGISTRY_JSON` | Inline deployment registry JSON alternative |
 | `PACTFUSE_INDEXER_ENABLED` | Enables the chain indexer worker |
 | `PACTFUSE_INDEXER_ADDRESS` | Optional indexed contract address |
 | `PACTFUSE_INDEXER_TOPICS` | Optional comma-separated topic filter |
@@ -299,6 +301,8 @@ Required result:
 - chain, CAW live, CAW receipt export, and MCP lease providers are ready
 - `/api/v1/evidence/live-preflight` returns `readyForPublicClaim=true` with no blockers
 - `/api/v1/evidence/public-claim` returns `authorized_public_claim`, `finalVerifierComplete=true`, and `winnerClaimAllowed=true`
+
+For `mock-test-token`, claim readiness also requires a live deployment registry entry for the payment token address, deployment transaction, explorer URL, decimals, and bytecode hash. Official Base Sepolia USDC is accepted only on chain id `84532`.
 
 Use [docs/evidence/production-live-env.example](docs/evidence/production-live-env.example) as the non-secret manifest for the real Cobo/RPC/MCP environment.
 

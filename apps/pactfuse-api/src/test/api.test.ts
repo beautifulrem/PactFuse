@@ -70,6 +70,7 @@ function makeApp(
     mcpAuditSecret?: string | null;
     gateIngestSecret?: string | null;
     cawIngestToken?: string | null;
+    deploymentRegistry?: ServiceCtx["deploymentRegistry"];
     apiSecurity?: Partial<ApiSecurityConfig>;
     requiredIndexerCursors?: ServiceCtx["requiredIndexerCursors"];
     verifier?: ServiceCtx["verifier"];
@@ -110,6 +111,7 @@ function makeApp(
     mcpAuditSecret,
     gateIngestSecret,
     cawIngestToken: options.cawIngestToken === undefined ? CAW_INGEST_TOKEN : options.cawIngestToken,
+    deploymentRegistry: options.deploymentRegistry,
     requiredIndexerCursors: options.requiredIndexerCursors ?? [],
     apiSecurity,
     clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
@@ -550,6 +552,7 @@ describe("pactfuse-api P0", () => {
       cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 130, logs, tokenBalances }),
       mcpLease: createFakeMcpLeaseClient("pactfuse_code_scan", "live"),
+      deploymentRegistry: testDeploymentRegistry(),
     });
     const sessionId = await createSession(app, "sess-public-claim-authorized");
     const spendId = await registerSpendWithKeyForTest(app, sessionId, "public-claim-c");
@@ -712,6 +715,12 @@ describe("pactfuse-api P0", () => {
     expect(readinessJson.data.verifierRun.proofLevel).toBe("final_replay_claim");
     expect(readinessJson.data.verifierRun.finalVerifierComplete).toBe(true);
     expect(readinessJson.data.verifierRun.winnerClaimAllowed).toBe(true);
+    expect(readinessJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry")).toEqual(
+      expect.objectContaining({
+        status: "pass",
+        reason: expect.stringContaining("mock token deployment registry binds"),
+      }),
+    );
     expect(claim.status).toBe(200);
     expect(claimJson.data).toEqual(
       expect.objectContaining({
@@ -990,6 +999,9 @@ describe("pactfuse-api P0", () => {
     expect(json.data.requiredExternalInputs).toContain("chain-settleable artifact quote issued after preflight");
     expect(json.data.requiredExternalInputs).toContain("PACTFUSE_LEASE_MCP_URL for a live MCP lease runner");
     expect(json.data.requiredExternalInputs).toContain("raw CAW API/export receipts canonicalized for deny_probe, approve, and activate_tool");
+    expect(json.data.requiredExternalInputs).toContain(
+      "live deployment registry for the payment token address, deployment tx, explorer URL, decimals, and code hash",
+    );
     expect(json.data.requiredExternalInputs).toContain("full chain/signature/hash verifier that can set finalVerifierComplete=true");
     expect(json.data.verifierRun.winnerClaimAllowed).toBe(false);
     expect(json.data.replayBundleHash).toMatch(/^0x[0-9a-f]{64}$/);
@@ -8082,6 +8094,30 @@ const TEST_PACT_ID = hex32("pact-c");
 const TEST_TOOL_ID = hex32("code-scan");
 const TEST_ARTIFACT_PAYLOAD = Object.freeze({ artifactType: "source-bound-code-scan-mcp-lease", seed: "artifact", content: "scan:artifact" });
 const TEST_ARTIFACT_HASH = hashForTestJson(TEST_ARTIFACT_PAYLOAD);
+
+function testDeploymentRegistry(): NonNullable<ServiceCtx["deploymentRegistry"]> {
+  return {
+    mode: "live",
+    chainId: "84532",
+    officialUsdcProbe: {
+      status: "failed",
+      reason: "test fixture uses a public mock token path",
+    },
+    entries: [
+      {
+        contractName: "PaymentToken",
+        chainId: "84532",
+        address: TEST_PAYMENT_TOKEN_ADDRESS,
+        deploymentTxHash: hex32("test-payment-token-deploy"),
+        explorerUrl: "https://sepolia.basescan.org/tx/0x0000000000000000000000000000000000000000000000000000000000000000",
+        codeHash: hex32("test-payment-token-code"),
+        tokenMode: "mock-test-token",
+        symbol: "MOCK",
+        decimals: 18,
+      },
+    ],
+  };
+}
 
 function cawApproveCalldataForTest(spender: string, amountAtomic: string): `0x${string}` {
   return encodeFunctionData({

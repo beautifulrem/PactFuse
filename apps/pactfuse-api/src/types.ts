@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { ApiError } from "@pactfuse/evidence-schema";
+import type { ApiError, DeploymentRegistry } from "@pactfuse/evidence-schema";
 import type * as schema from "./db/schema.js";
 
 export type Logger = {
@@ -198,6 +198,7 @@ export type ServiceCtx = {
   mcpAuditSecret: string | null;
   gateIngestSecret: string | null;
   cawIngestToken: string | null;
+  deploymentRegistry: DeploymentRegistry | undefined;
   apiSecurity: ApiSecurityConfig;
   requiredIndexerCursors: RequiredIndexerCursor[];
   clock: Clock;

@@ -4401,6 +4401,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
   const cawAllowance = latestKind("caw.allowance.verified");
   const cawActivation = latestKind("caw.activation.verified");
   const tokenDelta = latest((event) => event.kind === "token.balance_delta.verified" && isLiveChainProofPayload(eventPayload(event)));
+  const tokenDeployment = tokenDeploymentRegistryGate(ctx, tokenDelta);
   const liveArtifactQuote = hasLiveArtifactQuote(replayBundle);
   const gates = [
     providerGate(proofProviders, "chain", ["paymentMode", "tokenMode", "winnerClaimAllowed"]),
@@ -4475,6 +4476,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
       "ERC20 Transfer and block-level balance delta are bound to the finalized settlement",
       "missing token.balance_delta.verified proof event",
     ),
+    tokenDeployment,
     judgeGate(rowsById, "artifact_access", ["winnerClaimAllowed"]),
     judgeGate(rowsById, "lease_execution", ["winnerClaimAllowed"]),
     verifierGate("replay_verifier", "Replay bundle verifier", Boolean(view.schemaOk), ["winnerClaimAllowed"], view.schemaOk ? "replay bundle and event log checks pass" : "replay bundle or event log verification failed"),
@@ -5013,6 +5015,56 @@ function tokenModeForPaymentToken(paymentToken: string): "official-testnet-usdc"
   return normalized ? "mock-test-token" : null;
 }
 
+function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent | null): ClaimReadinessGate {
+  const blocks: ClaimGateBlock[] = ["tokenMode", "winnerClaimAllowed"];
+  if (!tokenDelta) {
+    return {
+      gateId: "token_deployment_registry",
+      label: "Token deployment registry",
+      status: "pending",
+      blocks,
+      reason: "token deployment registry waits for token balance delta evidence",
+      evidenceEventId: null,
+    };
+  }
+  const payload = eventPayload(tokenDelta);
+  const chainId = String(payload.chainId ?? "");
+  const paymentToken = String(payload.paymentToken ?? "").toLowerCase();
+  const tokenMode = tokenModeForPaymentToken(paymentToken);
+  if (tokenMode === "official-testnet-usdc") {
+    const pass = chainId === "84532";
+    return {
+      gateId: "token_deployment_registry",
+      label: "Token deployment registry",
+      status: pass ? "pass" : "blocked",
+      blocks,
+      reason: pass
+        ? "payment token is the official Base Sepolia USDC address"
+        : "official USDC token mode requires Base Sepolia chainId 84532",
+      evidenceEventId: tokenDelta.eventId,
+    };
+  }
+  const registry = ctx.deploymentRegistry;
+  const entry = registry?.entries.find(
+    (candidate) =>
+      candidate.contractName === "PaymentToken" &&
+      candidate.chainId === chainId &&
+      candidate.address.toLowerCase() === paymentToken &&
+      candidate.tokenMode === "mock-test-token",
+  );
+  const pass = registry?.mode === "live" && Boolean(entry);
+  return {
+    gateId: "token_deployment_registry",
+    label: "Token deployment registry",
+    status: pass ? "pass" : "pending",
+    blocks,
+    reason: pass
+      ? `mock token deployment registry binds ${entry?.symbol ?? "PaymentToken"} on chain ${chainId}`
+      : "missing live deployment registry entry for the mock payment token",
+    evidenceEventId: pass ? tokenDelta.eventId : null,
+  };
+}
+
 function identityTargetMode(event: EvidenceEvent): "p0-win-separate-identities" | "p0-floor-one-wallet" {
   const value = String(eventPayload(event).identityMode ?? eventPayload(event).tier ?? "");
   return value === "p0-win-separate-identities" ? "p0-win-separate-identities" : "p0-floor-one-wallet";
@@ -5082,6 +5134,9 @@ function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: C
     }
     if (gate.gateId === "token_balance_delta") {
       inputs.add("public ERC20 token tx/log/balance evidence for the finalized settlement");
+    }
+    if (gate.gateId === "token_deployment_registry") {
+      inputs.add("live deployment registry for the payment token address, deployment tx, explorer URL, decimals, and code hash");
     }
     if (gate.gateId === "artifact_quote_live") {
       inputs.add("chain-settleable artifact quote issued after preflight");

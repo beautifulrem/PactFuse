@@ -23,6 +23,8 @@ PACTFUSE_CAW_INGEST_TOKEN=replace-with-caw-ingest-bearer-token
 # Chain and indexer
 PACTFUSE_CHAIN_RPC_URL=https://base-sepolia-rpc.example.com
 PACTFUSE_CHAIN_ID=84532
+PACTFUSE_DEPLOYMENT_REGISTRY_PATH=deployments/base-sepolia.json
+# Alternative: PACTFUSE_DEPLOYMENT_REGISTRY_JSON={"mode":"live","chainId":"84532","entries":[]}
 PACTFUSE_INDEXER_ENABLED=true
 PACTFUSE_INDEXER_ADDRESS=0x0000000000000000000000000000000000000000
 PACTFUSE_INDEXER_CURSOR_ID=gate:indexer

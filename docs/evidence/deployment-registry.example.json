@@ -1,0 +1,21 @@
+{
+  "mode": "pending",
+  "chainId": "84532",
+  "officialUsdcProbe": {
+    "status": "not_attempted",
+    "reason": "replace with passed official USDC evidence or the recorded reason for falling back to a public mock token"
+  },
+  "entries": [
+    {
+      "contractName": "PaymentToken",
+      "chainId": "84532",
+      "address": "0x0000000000000000000000000000000000000000",
+      "deploymentTxHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "explorerUrl": "https://sepolia.basescan.org/tx/0x0000000000000000000000000000000000000000000000000000000000000000",
+      "codeHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "tokenMode": "mock-test-token",
+      "symbol": "MOCK",
+      "decimals": 18
+    }
+  ]
+}
