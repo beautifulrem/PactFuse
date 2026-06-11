@@ -81,6 +81,17 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.schemaErrors).toEqual([]);
   });
 
+  it("accepts structurally bound signed source identity rows", () => {
+    const bundle = replayBundle();
+    appendSignedSourceForTest(bundle);
+    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.schemaErrors).toEqual([]);
+  });
+
 	  it.each([
 	    [
 	      "raw bundle hash",
@@ -189,6 +200,22 @@ describe("pactfuse receipt verifier contract", () => {
         delete sourceEvent.payload.sourceRegistryAddress;
       },
       "requires sourceRegistryAddress",
+    ],
+    [
+      "source identity hash",
+      (bundle) => {
+        const source = appendSignedSourceForTest(bundle);
+        source.sourceHash = hex32("bad-source-identity-hash");
+      },
+      "sourceHash does not match signed source identity preimage",
+    ],
+    [
+      "source identity partial signature",
+      (bundle) => {
+        const source = appendSignedSourceForTest(bundle);
+        source.signature = null;
+      },
+      "issuer and signature must be provided together",
     ],
 	  ])("rejects replay bundles with tampered %s", (_label, mutate, expected) => {
     const bundle = replayBundle();
@@ -705,6 +732,33 @@ function appendContractProofEventsForTest(bundle) {
   bundle.asOfEventSeq = bundle.events.length;
   bundle.eventRoot = hashJson(bundle.events.map((event) => event.eventHash));
   return { gateEvent, sourceEvent };
+}
+
+function appendSignedSourceForTest(bundle) {
+  const sourceBase = {
+    sourceId: "signed-source",
+    manifestUrl: "https://example.com/signed-source.json",
+    manifestHash: hex32("signed-source-manifest"),
+    capabilityVector: { has_write_file: false },
+  };
+  const sourceHash = hashJson({
+    version: "pactfuse-source-identity-v1",
+    sourceId: sourceBase.sourceId,
+    manifestUrl: sourceBase.manifestUrl,
+    manifestHash: sourceBase.manifestHash.toLowerCase(),
+    capabilityVector: sourceBase.capabilityVector,
+  });
+  const source = {
+    ...sourceBase,
+    sessionId: bundle.sessionId,
+    sourceHash,
+    issuer: "0x1111111111111111111111111111111111111111",
+    signature: hex32("signed-source-signature"),
+    proofStatus: "pending",
+    createdAt: "2026-06-11T00:00:03.000Z",
+  };
+  bundle.sources = [...bundle.sources, source];
+  return source;
 }
 
 function mcpCallForTest({ callId, sessionId, auditNonce, toolName, request, response, createdAt }) {

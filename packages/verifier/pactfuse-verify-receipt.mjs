@@ -927,6 +927,34 @@ function verifyContractStateProofEvents(bundle, events, errors) {
   }
 }
 
+function verifySourceIdentityBindings(bundle, errors) {
+  for (const source of Array.isArray(bundle.sources) ? bundle.sources : []) {
+    if (!isObject(source)) {
+      errors.push("sources entries must be objects");
+      continue;
+    }
+    const hasIssuer = typeof source.issuer === "string" && source.issuer.length > 0;
+    const hasSignature = typeof source.signature === "string" && source.signature.length > 0;
+    if (hasIssuer !== hasSignature) {
+      errors.push(`source ${source.sourceHash ?? "-"} issuer and signature must be provided together`);
+      continue;
+    }
+    if (!hasIssuer || !hasSignature) {
+      continue;
+    }
+    const expectedSourceHash = hashJson({
+      version: "pactfuse-source-identity-v1",
+      sourceId: source.sourceId,
+      manifestUrl: source.manifestUrl,
+      manifestHash: lowerHex(source.manifestHash),
+      capabilityVector: source.capabilityVector,
+    });
+    if (lowerHex(source.sourceHash) !== expectedSourceHash) {
+      errors.push(`source ${source.sourceHash ?? "-"} sourceHash does not match signed source identity preimage`);
+    }
+  }
+}
+
 function verifyGateContractStateProofEvent(bundle, event, errors) {
   const payload = isObject(event.payload) ? event.payload : null;
   const label = `gate proof event ${event.eventId ?? "-"}`;
@@ -1124,6 +1152,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors);
   verifyJudgeCheck(bundle, eventsById, errors);
   verifyContractStateProofEvents(bundle, Array.isArray(bundle.events) ? bundle.events : [], errors);
+  verifySourceIdentityBindings(bundle, errors);
   const preflightsById = new Map(preflights.filter(isObject).map((preflight) => [preflight.preflightId, preflight]));
   const quotesById = new Map(quotes.filter(isObject).map((quote) => [quote.quoteId, quote]));
   for (const preflight of preflights) {

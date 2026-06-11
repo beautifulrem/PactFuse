@@ -50,6 +50,7 @@ import {
   type ChainIndexerBackfillInput,
   type VerifierRunView,
 } from "@pactfuse/evidence-schema";
+import { recoverMessageAddress } from "viem";
 import type { McpLeaseExecutionResult, ProofProviderStatus, ServiceCtx, ServiceResult } from "../types.js";
 import {
   ZERO_HASH,
@@ -270,6 +271,7 @@ export async function registerSignedSource(
   return withIdempotency(ctx, scoped("sources:register", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
     const sourceHash = payload.sourceHash.toLowerCase();
+    const sourceIdentity = await verifyOptionalSourceIdentity(payload, sourceHash, requestId);
     const createdAt = ctx.clock.now().toISOString();
     const capabilityVectorJson = canonicalizeJson(payload.capabilityVector);
     const existing = ctx.db.sqlite
@@ -315,6 +317,8 @@ export async function registerSignedSource(
         sourceId: payload.sourceId,
         sourceHash,
         manifestHash: payload.manifestHash,
+        sourceIdentityHash: sourceIdentity.sourceIdentityHash,
+        identityVerified: sourceIdentity.identityVerified,
         proofStatus: "pending",
       },
     });
@@ -325,6 +329,80 @@ export async function registerSignedSource(
       data: { sourceHash, status: "pending", winnerClaimAllowed: false },
     };
   });
+}
+
+async function verifyOptionalSourceIdentity(
+  payload: {
+    sourceId: string;
+    manifestUrl: string;
+    manifestHash: string;
+    issuer?: string | undefined;
+    signature?: string | undefined;
+    capabilityVector: unknown;
+  },
+  sourceHash: string,
+  requestId: string,
+): Promise<{ sourceIdentityHash: `0x${string}`; identityVerified: boolean }> {
+  const sourceIdentityHash = sourceIdentityHashFor(payload);
+  const hasIssuer = typeof payload.issuer === "string" && payload.issuer.length > 0;
+  const hasSignature = typeof payload.signature === "string" && payload.signature.length > 0;
+  if (hasIssuer !== hasSignature) {
+    throw Object.assign(new Error("source issuer and signature must be provided together"), {
+      apiError: proofBlockedError(requestId, "source issuer and signature must be provided together"),
+    });
+  }
+  if (!hasIssuer || !hasSignature) {
+    return { sourceIdentityHash, identityVerified: false };
+  }
+  const issuer = payload.issuer as string;
+  const signature = payload.signature as `0x${string}`;
+  if (sourceHash.toLowerCase() !== sourceIdentityHash.toLowerCase()) {
+    throw Object.assign(new Error("sourceHash does not match signed source identity"), {
+      apiError: proofBlockedError(requestId, "sourceHash does not match signed source identity", {
+        expected: sourceIdentityHash,
+        actual: sourceHash,
+      }),
+    });
+  }
+  let recovered: string;
+  try {
+    recovered = await recoverMessageAddress({
+      message: sourceIdentityMessage(sourceIdentityHash),
+      signature,
+    });
+  } catch (error) {
+    throw Object.assign(new Error("source signature cannot be recovered"), {
+      apiError: proofBlockedError(requestId, chainFailureMessage("source signature cannot be recovered", error)),
+    });
+  }
+  if (recovered.toLowerCase() !== issuer.toLowerCase()) {
+    throw Object.assign(new Error("source signature does not recover issuer"), {
+      apiError: proofBlockedError(requestId, "source signature does not recover issuer", {
+        expected: issuer,
+        actual: recovered,
+      }),
+    });
+  }
+  return { sourceIdentityHash, identityVerified: true };
+}
+
+function sourceIdentityHashFor(payload: {
+  sourceId: string;
+  manifestUrl: string;
+  manifestHash: string;
+  capabilityVector: unknown;
+}): `0x${string}` {
+  return hashJson({
+    version: "pactfuse-source-identity-v1",
+    sourceId: payload.sourceId,
+    manifestUrl: payload.manifestUrl,
+    manifestHash: payload.manifestHash.toLowerCase(),
+    capabilityVector: payload.capabilityVector,
+  });
+}
+
+function sourceIdentityMessage(sourceIdentityHash: `0x${string}`): string {
+  return `PactFuse source identity v1:${sourceIdentityHash}`;
 }
 
 export async function challengeSource(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {

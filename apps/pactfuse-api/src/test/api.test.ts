@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { encodeEventTopics, keccak256, toBytes } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import { canonicalizeJson } from "@pactfuse/evidence-schema";
 import { createApp } from "../app.js";
 import { openPactFuseDb } from "../db/index.js";
@@ -999,6 +1000,74 @@ describe("pactfuse-api P0", () => {
     expect(json.data.agentTranscriptHash).toMatch(/^0x[0-9a-f]{64}$/);
     expect(json.data.asOfEventSeq).toBe(3);
     expect(json.data.asOfMcpAdapterCallCount).toBe(0);
+  });
+
+  it("verifies signed source identity when issuer and signature are provided", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-source-identity");
+    const signed = await signedSourcePayloadForTest("signed-source");
+
+    const res = await post(app, "/api/v1/sources/register", {
+      sessionId,
+      idempotencyKey: "signed-source-register",
+      payload: signed.payload,
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const event = replayJson.data.events.find((candidate: { kind: string }) => candidate.kind === "source.registered");
+
+    expect(res.status).toBe(201);
+    expect(res.json.data.status).toBe("pending");
+    expect(event.payload).toEqual(
+      expect.objectContaining({
+        sourceHash: signed.payload.sourceHash,
+        sourceIdentityHash: signed.payload.sourceHash,
+        identityVerified: true,
+      }),
+    );
+    expect(replayJson.data.sources[0]).toEqual(
+      expect.objectContaining({
+        sourceHash: signed.payload.sourceHash,
+        issuer: signed.payload.issuer,
+        signature: signed.payload.signature,
+      }),
+    );
+  });
+
+  it("blocks source identity registrations with partial or invalid signatures", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-source-identity-blocked");
+    const signed = await signedSourcePayloadForTest("blocked-source");
+    const wrongIssuer = privateKeyToAccount(hex32("wrong-source-issuer")).address;
+    const cases = [
+      {
+        key: "missing-signature",
+        payload: { ...signed.payload, signature: undefined },
+        expected: "source issuer and signature must be provided together",
+      },
+      {
+        key: "bad-source-hash",
+        payload: { ...signed.payload, sourceHash: hex32("bad-source-hash") },
+        expected: "sourceHash does not match signed source identity",
+      },
+      {
+        key: "wrong-issuer",
+        payload: { ...signed.payload, issuer: wrongIssuer },
+        expected: "source signature does not recover issuer",
+      },
+    ];
+
+    for (const entry of cases) {
+      const res = await post(app, "/api/v1/sources/register", {
+        sessionId,
+        idempotencyKey: `source-${entry.key}`,
+        payload: entry.payload,
+      });
+
+      expect(res.status).toBe(422);
+      expect(res.json.error.code).toBe("proof_blocked");
+      expect(res.json.error.message).toContain(entry.expected);
+    }
   });
 
   it("rejects source-bound spends whose spendId is not the W8.1 preimage hash", async () => {
@@ -5168,6 +5237,36 @@ async function registerSource(app: ReturnType<typeof createApp>, sessionId: stri
     },
   });
   expect(res.status).toBe(201);
+}
+
+async function signedSourcePayloadForTest(seed: string) {
+  const account = privateKeyToAccount(hex32(`source-issuer:${seed}`));
+  const unsigned = {
+    sourceId: seed,
+    manifestUrl: `https://example.com/${seed}.json`,
+    manifestHash: hex32(`manifest:${seed}`),
+    capabilityVector: { has_write_file: false, seed },
+  };
+  const sourceHash = hashForTestJson({
+    version: "pactfuse-source-identity-v1",
+    sourceId: unsigned.sourceId,
+    manifestUrl: unsigned.manifestUrl,
+    manifestHash: unsigned.manifestHash.toLowerCase(),
+    capabilityVector: unsigned.capabilityVector,
+  });
+  const signature = await account.signMessage({ message: sourceIdentityMessageForTest(sourceHash) });
+  return {
+    payload: {
+      ...unsigned,
+      sourceHash,
+      issuer: account.address,
+      signature,
+    },
+  };
+}
+
+function sourceIdentityMessageForTest(sourceIdentityHash: `0x${string}`): string {
+  return `PactFuse source identity v1:${sourceIdentityHash}`;
 }
 
 async function registerSpend(app: ReturnType<typeof createApp>, sessionId: string): Promise<string> {
