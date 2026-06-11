@@ -2270,6 +2270,10 @@ function verifyReplayPageIndex(bundle, errors, warnings) {
     errors.push("replayPageIndex.collections must be an object");
     return;
   }
+  const replayPages = bundle.replayPages;
+  if (!isObject(replayPages)) {
+    errors.push("replayPages must be an object with every indexed replay page");
+  }
   const rootEntries = [];
   for (const name of REPLAY_COLLECTIONS) {
     const collection = index.collections[name];
@@ -2278,8 +2282,14 @@ function verifyReplayPageIndex(bundle, errors, warnings) {
       continue;
     }
     const rows = Array.isArray(bundle[name]) ? bundle[name] : [];
-    if (!Array.isArray(collection.orderBy) || collection.orderBy.length === 0 || collection.orderBy.some((field) => typeof field !== "string")) {
-      errors.push(`replayPageIndex.collections.${name}.orderBy must be a non-empty string array`);
+    const canonicalOrderBy = replayCollectionOrderBy(name);
+    const collectionOrderByOk =
+      Array.isArray(collection.orderBy) &&
+      collection.orderBy.length === canonicalOrderBy.length &&
+      collection.orderBy.every((field) => typeof field === "string") &&
+      hashJson(collection.orderBy) === hashJson(canonicalOrderBy);
+    if (!collectionOrderByOk) {
+      errors.push(`replayPageIndex.collections.${name}.orderBy must match the canonical replay order`);
     }
     if (!Number.isInteger(collection.totalRows) || collection.totalRows < rows.length) {
       errors.push(`replayPageIndex.collections.${name}.totalRows must cover the summary rows`);
@@ -2292,7 +2302,7 @@ function verifyReplayPageIndex(bundle, errors, warnings) {
     if (collection.pageCount !== expectedPageCount || collection.pageHashes.length !== expectedPageCount) {
       errors.push(`replayPageIndex.collections.${name}.pageCount must match totalRows/pageSize`);
     }
-    const expectedFirstPageHash = replayPageHash(bundle.sessionId, name, 0, collection.orderBy, rows.slice(0, REPLAY_PAGE_SIZE));
+    const expectedFirstPageHash = replayPageHash(bundle.sessionId, name, 0, canonicalOrderBy, rows.slice(0, REPLAY_PAGE_SIZE));
     if (collection.firstPageHash !== expectedFirstPageHash) {
       errors.push(`replayPageIndex.collections.${name}.firstPageHash does not match summary rows`);
     }
@@ -2300,18 +2310,115 @@ function verifyReplayPageIndex(bundle, errors, warnings) {
     if (collection.pageRoot !== expectedPageRoot) {
       errors.push(`replayPageIndex.collections.${name}.pageRoot does not match pageHashes`);
     }
-    if (collection.totalRows > rows.length) {
-      warnings.push(`replayPageIndex.collections.${name} is paged beyond the summary rows; server-side replay binding must compare full pages`);
+    if (isObject(replayPages)) {
+      verifyReplayPagesForCollection(bundle, name, collection, canonicalOrderBy, rows, errors);
     }
     rootEntries.push({ name, pageRoot: collection.pageRoot });
   }
   if (index.pageRoot !== hashJson(rootEntries)) {
     errors.push("replayPageIndex.pageRoot does not match collection page roots");
   }
+  if (bundle.fullReplayRoot !== index.pageRoot) {
+    errors.push("fullReplayRoot must match replayPageIndex.pageRoot");
+  }
+}
+
+function verifyReplayPagesForCollection(bundle, name, collection, canonicalOrderBy, summaryRows, errors) {
+  const pages = bundle.replayPages[name];
+  const expectedPageCount = Math.ceil(Number(collection.totalRows ?? 0) / REPLAY_PAGE_SIZE);
+  if (!Array.isArray(pages)) {
+    errors.push(`replayPages.${name} must be an array`);
+    return;
+  }
+  if (pages.length !== expectedPageCount) {
+    errors.push(`replayPages.${name} must contain exactly ${expectedPageCount} page(s)`);
+  }
+  const flattenedRows = [];
+  const recomputedPageHashes = [];
+  const seenPageIndexes = new Set();
+  for (let index = 0; index < pages.length; index += 1) {
+    const page = pages[index];
+    if (!isObject(page)) {
+      errors.push(`replayPages.${name}.${index} must be an object`);
+      continue;
+    }
+    if (seenPageIndexes.has(page.pageIndex)) {
+      errors.push(`replayPages.${name} contains duplicate pageIndex ${page.pageIndex}`);
+    }
+    seenPageIndexes.add(page.pageIndex);
+    if (page.bundleType !== "PACTFUSE_REPLAY_PAGE_V1") {
+      errors.push(`replayPages.${name}.${index}.bundleType must be PACTFUSE_REPLAY_PAGE_V1`);
+    }
+    if (page.sessionId !== bundle.sessionId) {
+      errors.push(`replayPages.${name}.${index}.sessionId must match the replay bundle sessionId`);
+    }
+    if (page.collection !== name) {
+      errors.push(`replayPages.${name}.${index}.collection must match its replayPages key`);
+    }
+    if (page.pageIndex !== index) {
+      errors.push(`replayPages.${name}.${index}.pageIndex must match its position`);
+    }
+    if (page.pageSize !== REPLAY_PAGE_SIZE) {
+      errors.push(`replayPages.${name}.${index}.pageSize must be ${REPLAY_PAGE_SIZE}`);
+    }
+    if (
+      !Array.isArray(page.orderBy) ||
+      page.orderBy.some((field) => typeof field !== "string") ||
+      hashJson(page.orderBy) !== hashJson(canonicalOrderBy)
+    ) {
+      errors.push(`replayPages.${name}.${index}.orderBy must match the canonical replay order`);
+    }
+    const pageRows = Array.isArray(page.rows) ? page.rows : null;
+    if (!pageRows) {
+      errors.push(`replayPages.${name}.${index}.rows must be an array`);
+      continue;
+    }
+    if (pageRows.length > REPLAY_PAGE_SIZE) {
+      errors.push(`replayPages.${name}.${index}.rows exceeds page size`);
+    }
+    if (index < expectedPageCount - 1 && pageRows.length !== REPLAY_PAGE_SIZE) {
+      errors.push(`replayPages.${name}.${index}.rows must be full before the final page`);
+    }
+    const expectedPageHash = replayPageHash(bundle.sessionId, name, index, canonicalOrderBy, pageRows);
+    if (page.pageHash !== expectedPageHash) {
+      errors.push(`replayPages.${name}.${index}.pageHash does not match page rows`);
+    }
+    if (collection.pageHashes[index] !== page.pageHash) {
+      errors.push(`replayPageIndex.collections.${name}.pageHashes.${index} does not match replayPages.${name}.${index}.pageHash`);
+    }
+    recomputedPageHashes.push(expectedPageHash);
+    flattenedRows.push(...pageRows);
+  }
+  if (flattenedRows.length !== collection.totalRows) {
+    errors.push(`replayPages.${name} row count must match replayPageIndex.collections.${name}.totalRows`);
+  }
+  if (hashJson(recomputedPageHashes) !== collection.pageRoot) {
+    errors.push(`replayPageIndex.collections.${name}.pageRoot does not match replayPages.${name}`);
+  }
+  if (hashJson(flattenedRows.slice(0, summaryRows.length)) !== hashJson(summaryRows)) {
+    errors.push(`replayPages.${name} must have the summary rows as its prefix`);
+  }
 }
 
 function replayPageHash(sessionId, collection, pageIndex, orderBy, rows) {
   return hashJson({ sessionId, collection, pageIndex, pageSize: REPLAY_PAGE_SIZE, orderBy, rows });
+}
+
+function replayCollectionOrderBy(collection) {
+  return {
+    artifactAccessTokens: ["createdAt ASC", "tokenId ASC"],
+    artifactPreflights: ["createdAt ASC", "preflightId ASC"],
+    canonicalCawReceipts: ["createdAt ASC", "rawReceiptHash ASC"],
+    cawLiveInteractions: ["createdAt ASC", "interactionId ASC"],
+    cawReceiptOperations: ["createdAt ASC", "operationId ASC"],
+    events: ["eventSeq ASC"],
+    leaseRuns: ["createdAt DESC", "leaseRunId ASC"],
+    mcpAdapterCalls: ["createdAt ASC", "toolName tools/list before tools/call", "callId ASC"],
+    quotes: ["createdAt ASC", "quoteId ASC"],
+    rawCawReceiptBundles: ["createdAt ASC", "bundleId ASC"],
+    sources: ["createdAt ASC", "sourceHash ASC"],
+    spends: ["createdAt ASC", "spendId ASC"],
+  }[collection];
 }
 
 function verifyReplayEvents(bundle, events, errors) {
@@ -2377,6 +2484,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     "asOfMcpAdapterCallCount",
     "eventRoot",
     "agentTranscriptHash",
+    "fullReplayRoot",
     "events",
     "sources",
     "spends",
@@ -2391,6 +2499,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     "leaseRuns",
     "judgeCheck",
     "replayPageIndex",
+    "replayPages",
   ]) {
     requirePath(bundle, [field], errors);
   }

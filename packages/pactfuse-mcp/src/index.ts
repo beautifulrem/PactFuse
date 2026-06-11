@@ -70,7 +70,7 @@ export function createPactFuseTools(client: PactFuseMcpClient): PactFuseTool[] {
     },
     {
       name: "pactfuse_get_replay_bundle",
-      description: "Read the summary PACTFUSE_EVIDENCE_V1 replay bundle.",
+      description: "Read the PACTFUSE_EVIDENCE_V1 replay bundle with summary rows and embedded replay page proofs.",
       inputSchema: SessionOnlySchema,
       invoke: async (input) => {
         const parsed = SessionOnlySchema.parse(input);

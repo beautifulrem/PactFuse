@@ -241,7 +241,7 @@ The replay verifier checks:
 - bearer-bound artifact access proofs
 - MCP request/response hashes
 - exact pinned-manifest lease transcript boundaries
-- paged replay roots for large evidence collections
+- paged replay roots plus embedded page bodies for large evidence collections
 - Judge Check row references
 
 ## Configuration

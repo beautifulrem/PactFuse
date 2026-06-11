@@ -75,6 +75,17 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.schemaErrors).toEqual([]);
   });
 
+  it("rejects replay bundles missing a page beyond the summary rows", () => {
+    const bundle = replayBundle();
+    addSecondReplayEventPageForTest(bundle);
+    bundle.replayPages.events.pop();
+    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(false);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.errors).toContain("replayPages.events must contain exactly 2 page(s)");
+  });
+
   it("accepts replay contract state proof markers while keeping final authority closed", () => {
     const bundle = replayBundle();
     appendContractProofEventsForTest(bundle);
@@ -237,7 +248,7 @@ describe("pactfuse receipt verifier contract", () => {
       "missing registered spend",
       (bundle) => {
         bundle.spends = [];
-        bundle.replayPageIndex = replayPageIndexForTest(bundle);
+        refreshReplayPagingForTest(bundle);
       },
       "references missing registered spend",
     ],
@@ -367,7 +378,7 @@ describe("pactfuse receipt verifier contract", () => {
         row.status = "pass";
         row.authority = "proof";
         row.evidenceEventId = gateEvent.eventId;
-        bundle.replayPageIndex = replayPageIndexForTest(bundle);
+        refreshReplayPagingForTest(bundle);
       },
       "judgeCheck pass row c_settlement must reference token.balance_delta.verified",
     ],
@@ -453,7 +464,7 @@ describe("pactfuse receipt verifier contract", () => {
 	    bundle.artifactAccessTokens[0].artifactHash = uppercaseHexBody(bundle.artifactAccessTokens[0].artifactHash);
 	    bundle.artifactAccessTokens[0].artifactCid = `sha256:${uppercaseHexBody(bundle.artifactAccessTokens[0].artifactHash)}`;
 	    bundle.artifactAccessTokens[0].artifactPayloadHash = uppercaseHexBody(bundle.artifactAccessTokens[0].artifactPayloadHash);
-    bundle.replayPageIndex = replayPageIndexForTest(bundle);
+    refreshReplayPagingForTest(bundle);
 
 	    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
 
@@ -529,7 +540,7 @@ describe("pactfuse receipt verifier contract", () => {
       "lease registered spend artifact",
       (bundle) => {
         bundle.spends[0].artifactHash = hex32("lease-spend-artifact-drift");
-        bundle.replayPageIndex = replayPageIndexForTest(bundle);
+        refreshReplayPagingForTest(bundle);
       },
       "artifactHash does not match registered spend artifactHash",
     ],
@@ -561,6 +572,45 @@ describe("pactfuse receipt verifier contract", () => {
         rehashLeaseTranscriptForTest(bundle, false);
       },
       "agentTranscript with succeeded leases must contain only pinned manifest MCP transcript frames",
+    ],
+    [
+      "missing replay page collection",
+      (bundle) => {
+        delete bundle.replayPages.events;
+      },
+      "replayPages.events must be an array",
+    ],
+    [
+      "replay page row tamper",
+      (bundle) => {
+        bundle.replayPages.events[0].rows[0].kind = "tampered.event";
+      },
+      "replayPages.events.0.pageHash does not match page rows",
+    ],
+    [
+      "self-consistent fake replay page root",
+      (bundle) => {
+        bundle.replayPages.events[0].rows[0].kind = "tampered.event";
+        const orderBy = replayCollectionOrderByForTest("events");
+        const pageHash = replayPageHashForTest(bundle.sessionId, "events", 0, orderBy, bundle.replayPages.events[0].rows);
+        bundle.replayPages.events[0].pageHash = pageHash;
+        bundle.replayPageIndex.collections.events.pageHashes[0] = pageHash;
+        bundle.replayPageIndex.collections.events.firstPageHash = pageHash;
+        bundle.replayPageIndex.collections.events.pageRoot = hashJson(bundle.replayPageIndex.collections.events.pageHashes);
+        bundle.replayPageIndex.pageRoot = hashJson(
+          Object.entries(bundle.replayPageIndex.collections).map(([name, collection]) => ({ name, pageRoot: collection.pageRoot })),
+        );
+        bundle.fullReplayRoot = bundle.replayPageIndex.pageRoot;
+      },
+      "replayPages.events must have the summary rows as its prefix",
+    ],
+    [
+      "non-canonical replay order",
+      (bundle) => {
+        bundle.replayPageIndex.collections.events.orderBy = ["createdAt ASC"];
+        bundle.replayPages.events[0].orderBy = ["createdAt ASC"];
+      },
+      "orderBy must match the canonical replay order",
     ],
     [
       "post-summary MCP frame hidden behind replay page index",
@@ -703,6 +753,7 @@ function replayBundle() {
     winnerClaimAllowed: false,
     eventRoot: ZERO_HASH,
     agentTranscriptHash: hashJson(agentTranscriptForTest(sessionId, [])),
+    fullReplayRoot: ZERO_HASH,
     events,
     sources: [],
     spends: [
@@ -916,7 +967,7 @@ function replayBundle() {
   sealReplayBundleForTest(bundle);
   const tokenBalanceEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
   bundle.artifactAccessTokens[0].settlementEventId = tokenBalanceEvent.eventId;
-  bundle.replayPageIndex = replayPageIndexForTest(bundle);
+  refreshReplayPagingForTest(bundle);
   return bundle;
 		}
 
@@ -936,7 +987,7 @@ function rehashFirstQuoteForTest(bundle) {
     quoteSignedAfterPreflight: true,
     modes: lockedRuntimeModes(),
   });
-  bundle.replayPageIndex = replayPageIndexForTest(bundle);
+  refreshReplayPagingForTest(bundle);
 }
 
 function rehashFirstCawReceiptForTest(bundle) {
@@ -1369,7 +1420,7 @@ function appendCawAllowanceEventForTest(bundle, approve, auditUsage) {
   row.authority = "proof";
   row.reason = "CAW approve tx, ERC20 Approval log, and allowance state verified";
   row.evidenceEventId = allowanceEvent.eventId;
-  bundle.replayPageIndex = replayPageIndexForTest(bundle);
+  refreshReplayPagingForTest(bundle);
   return allowanceEvent;
 }
 
@@ -1490,7 +1541,7 @@ function resealTokenBalanceEventForTest(bundle) {
   if (bundle.artifactAccessTokens[0] && tokenEvent) {
     bundle.artifactAccessTokens[0].settlementEventId = tokenEvent.eventId;
   }
-  bundle.replayPageIndex = replayPageIndexForTest(bundle);
+  refreshReplayPagingForTest(bundle);
 }
 
 function expectedApproveCalldata(spender, amount) {
@@ -1825,7 +1876,7 @@ function appendSignedSourceForTest(bundle) {
     createdAt: "2026-06-11T00:00:03.000Z",
   };
   bundle.sources = [...bundle.sources, source];
-  bundle.replayPageIndex = replayPageIndexForTest(bundle);
+  refreshReplayPagingForTest(bundle);
   return source;
 }
 
@@ -1893,7 +1944,72 @@ function sealReplayBundleForTest(bundle) {
   });
   bundle.asOfEventSeq = bundle.events.length;
   bundle.eventRoot = hashJson(bundle.events.map((event) => event.eventHash));
+  refreshReplayPagingForTest(bundle);
+}
+
+function refreshReplayPagingForTest(bundle) {
   bundle.replayPageIndex = replayPageIndexForTest(bundle);
+  bundle.replayPages = replayPagesForTest(bundle);
+  bundle.fullReplayRoot = bundle.replayPageIndex.pageRoot;
+}
+
+function addSecondReplayEventPageForTest(bundle) {
+  while (bundle.events.length < 200) {
+    bundle.events.push({
+      authority: "operator",
+      kind: "overflow.summary.event",
+      payload: { i: bundle.events.length + 1, winnerClaimAllowed: false },
+      createdAt: "2026-06-11T00:05:00.000Z",
+    });
+  }
+  sealReplayBundleForTest(bundle);
+  const orderBy = replayCollectionOrderByForTest("events");
+  const extraEvent = replayEventForSeqTest(bundle.sessionId, 201, "overflow.page.event", { i: 201, winnerClaimAllowed: false });
+  const extraPage = {
+    bundleType: "PACTFUSE_REPLAY_PAGE_V1",
+    sessionId: bundle.sessionId,
+    collection: "events",
+    pageIndex: 1,
+    pageSize: 200,
+    orderBy,
+    rows: [extraEvent],
+    pageHash: replayPageHashForTest(bundle.sessionId, "events", 1, orderBy, [extraEvent]),
+  };
+  const collection = bundle.replayPageIndex.collections.events;
+  collection.totalRows = 201;
+  collection.pageCount = 2;
+  collection.pageHashes = [bundle.replayPages.events[0].pageHash, extraPage.pageHash];
+  collection.firstPageHash = bundle.replayPages.events[0].pageHash;
+  collection.pageRoot = hashJson(collection.pageHashes);
+  bundle.replayPages.events.push(extraPage);
+  bundle.replayPageIndex.pageRoot = hashJson(
+    Object.entries(bundle.replayPageIndex.collections).map(([name, item]) => ({ name, pageRoot: item.pageRoot })),
+  );
+  bundle.fullReplayRoot = bundle.replayPageIndex.pageRoot;
+}
+
+function replayEventForSeqTest(sessionId, eventSeq, kind, payload) {
+  const payloadHash = hashJson(payload);
+  const eventHash = hashJson({
+    sessionId,
+    eventSeq,
+    authority: "operator",
+    kind,
+    payloadHash,
+    prevProofEventHash: null,
+  });
+  return {
+    eventId: eventHash,
+    sessionId,
+    eventSeq,
+    eventHash,
+    prevProofEventHash: null,
+    authority: "operator",
+    kind,
+    payloadHash,
+    payload,
+    createdAt: "2026-06-11T00:05:00.000Z",
+  };
 }
 
 function leaseManifestBindingForTest(bundle, leaseRun, toolsListHash, toolsCallHash) {
@@ -1944,6 +2060,35 @@ function replayPageIndexForTest(bundle) {
     pageRoot: hashJson(Object.entries(collections).map(([name, collection]) => ({ name, pageRoot: collection.pageRoot }))),
     collections,
   };
+}
+
+function replayPagesForTest(bundle) {
+  return Object.fromEntries(
+    Object.keys(bundle.replayPageIndex.collections).map((name) => {
+      const collection = bundle.replayPageIndex.collections[name];
+      const orderBy = replayCollectionOrderByForTest(name);
+      const rows = bundle[name] ?? [];
+      const pages = [];
+      for (let pageIndex = 0; pageIndex < collection.pageCount; pageIndex += 1) {
+        const pageRows = cloneJsonForTest(rows.slice(pageIndex * 200, pageIndex * 200 + 200));
+        pages.push({
+          bundleType: "PACTFUSE_REPLAY_PAGE_V1",
+          sessionId: bundle.sessionId,
+          collection: name,
+          pageIndex,
+          pageSize: 200,
+          orderBy,
+          rows: pageRows,
+          pageHash: replayPageHashForTest(bundle.sessionId, name, pageIndex, orderBy, pageRows),
+        });
+      }
+      return [name, pages];
+    }),
+  );
+}
+
+function cloneJsonForTest(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
 function replayPageCollectionForTest(sessionId, collection, rows) {

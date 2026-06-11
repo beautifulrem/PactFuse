@@ -229,6 +229,7 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/evidence/replay-bundle": [
     "winnerClaimAllowed",
     "eventRoot",
+    "fullReplayRoot",
     "mcpAdapterCalls",
     "cawReceiptOperations",
     "cawLiveInteractions",
@@ -236,6 +237,7 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "canonicalCawReceipts",
     "leaseRuns",
     "judgeCheck",
+    "replayPages",
   ],
   "/api/v1/evidence/indexer-status": ["provider.ready", "cursors.status", "cursors.lagBlocks", "winnerClaimAllowed"],
   "/api/v1/evidence/runner-heartbeat": ["status", "latestLeaseRunId", "transcriptHash", "leaseRunHash", "winnerClaimAllowed"],
@@ -1451,6 +1453,7 @@ function buildOpenApi(): Record<string, unknown> {
             "winnerClaimAllowed",
             "eventRoot",
             "agentTranscriptHash",
+            "fullReplayRoot",
             "events",
             "sources",
             "spends",
@@ -1465,6 +1468,7 @@ function buildOpenApi(): Record<string, unknown> {
             "leaseRuns",
             "judgeCheck",
             "replayPageIndex",
+            "replayPages",
           ],
           properties: {
             bundleType: { const: "PACTFUSE_EVIDENCE_V1" },
@@ -1475,6 +1479,7 @@ function buildOpenApi(): Record<string, unknown> {
             winnerClaimAllowed: { const: false },
             eventRoot: { type: "string" },
             agentTranscriptHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            fullReplayRoot: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             events: {
               type: "array",
               items: {
@@ -1937,6 +1942,42 @@ function buildOpenApi(): Record<string, unknown> {
                         maxItems: 5000,
                       },
                     },
+                  },
+                },
+              },
+            },
+            replayPages: {
+              type: "object",
+              additionalProperties: {
+                type: "array",
+                maxItems: 5000,
+                items: {
+                  type: "object",
+                  required: ["bundleType", "sessionId", "collection", "pageIndex", "pageSize", "orderBy", "rows", "pageHash"],
+                  properties: {
+                    bundleType: { const: "PACTFUSE_REPLAY_PAGE_V1" },
+                    sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                    collection: {
+                      enum: [
+                        "events",
+                        "sources",
+                        "spends",
+                        "artifactPreflights",
+                        "quotes",
+                        "artifactAccessTokens",
+                        "mcpAdapterCalls",
+                        "cawReceiptOperations",
+                        "cawLiveInteractions",
+                        "rawCawReceiptBundles",
+                        "canonicalCawReceipts",
+                        "leaseRuns",
+                      ],
+                    },
+                    pageIndex: { type: "integer", minimum: 0 },
+                    pageSize: { const: 200 },
+                    orderBy: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 4 },
+                    rows: { type: "array", maxItems: 200, items: { type: "object", additionalProperties: true } },
+                    pageHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
                   },
                 },
               },

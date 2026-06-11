@@ -1054,6 +1054,7 @@ describe("pactfuse-api P0", () => {
       "winnerClaimAllowed",
       "eventRoot",
       "agentTranscriptHash",
+      "fullReplayRoot",
       "events",
       "sources",
       "spends",
@@ -1068,6 +1069,7 @@ describe("pactfuse-api P0", () => {
       "leaseRuns",
       "judgeCheck",
       "replayPageIndex",
+      "replayPages",
     ]);
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("mcpAdapterCalls");
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("rawCawReceiptBundles");
@@ -4174,6 +4176,8 @@ describe("pactfuse-api P0", () => {
     const eventPage0Json = await eventPage0.json();
     const eventPage1 = await app.request(`/api/v1/evidence/replay-page?sessionId=${sessionId}&collection=events&page=1`);
     const eventPage1Json = await eventPage1.json();
+    const emptyPage = await app.request(`/api/v1/evidence/replay-page?sessionId=${sessionId}&collection=rawCawReceiptBundles&page=0`);
+    const emptyPageJson = await emptyPage.json();
     const outOfRange = await app.request(`/api/v1/evidence/replay-page?sessionId=${sessionId}&collection=events&page=99`);
     const outOfRangeJson = await outOfRange.json();
 		    const verify = await post(app, "/api/v1/evidence/verify", {
@@ -4184,17 +4188,25 @@ describe("pactfuse-api P0", () => {
 
 		    expect(replay.status).toBe(200);
 		    expect(replayJson.data.events).toHaveLength(200);
+		    expect(replayJson.data.fullReplayRoot).toBe(replayJson.data.replayPageIndex.pageRoot);
 		    expect(replayJson.data.replayPageIndex.collections.events.totalRows).toBeGreaterThan(200);
 		    expect(replayJson.data.replayPageIndex.collections.events.pageHashes.length).toBeGreaterThan(1);
+    expect(replayJson.data.replayPages.events).toHaveLength(replayJson.data.replayPageIndex.collections.events.pageCount);
     expect(eventPage0.status).toBe(200);
     expect(eventPage0Json.data.bundleType).toBe("PACTFUSE_REPLAY_PAGE_V1");
     expect(eventPage0Json.data.collection).toBe("events");
     expect(eventPage0Json.data.rows).toHaveLength(200);
     expect(eventPage0Json.data.pageHash).toBe(replayJson.data.replayPageIndex.collections.events.pageHashes[0]);
+    expect(replayJson.data.replayPages.events[0]).toEqual(eventPage0Json.data);
     expect(eventPage1.status).toBe(200);
     expect(eventPage1Json.data.pageIndex).toBe(1);
     expect(eventPage1Json.data.rows.length).toBeGreaterThan(0);
     expect(eventPage1Json.data.pageHash).toBe(replayJson.data.replayPageIndex.collections.events.pageHashes[1]);
+    expect(replayJson.data.replayPages.events[1]).toEqual(eventPage1Json.data);
+    expect(replayJson.data.replayPageIndex.collections.rawCawReceiptBundles.pageCount).toBe(0);
+    expect(replayJson.data.replayPages.rawCawReceiptBundles).toEqual([]);
+    expect(emptyPage.status).toBe(400);
+    expect(emptyPageJson.error.code).toBe("bad_request");
     expect(outOfRange.status).toBe(400);
     expect(outOfRangeJson.error.code).toBe("bad_request");
 		    expect(verify.status).toBe(200);
@@ -4327,6 +4339,18 @@ describe("pactfuse-api P0", () => {
         },
       },
     });
+    const tamperedReplayPages = JSON.parse(JSON.stringify(replayJson.data.replayPages));
+    tamperedReplayPages.events[0].rows[0].kind = "tampered.event";
+    const verifyTamperedReplayPages = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-replay-pages-tampered",
+      payload: {
+        replayBundle: {
+          ...replayJson.data,
+          replayPages: tamperedReplayPages,
+        },
+      },
+    });
     const verifyTamperedJudgeCheck = await post(app, "/api/v1/evidence/verify", {
       sessionId,
       idempotencyKey: "verify-replay-judge-tampered",
@@ -4358,6 +4382,8 @@ describe("pactfuse-api P0", () => {
     expect(verifyTamperedEventRoot.json.data.errors).toContain("replayBundle.eventRoot does not match the server event snapshot");
     expect(verifyTamperedMcpCalls.json.data.schemaOk).toBe(false);
     expect(verifyTamperedMcpCalls.json.data.errors).toContain("replayBundle.mcpAdapterCalls does not match the server snapshot");
+    expect(verifyTamperedReplayPages.json.data.schemaOk).toBe(false);
+    expect(verifyTamperedReplayPages.json.data.errors).toContain("replayBundle.replayPages does not match the server snapshot");
     expect(verifyTamperedJudgeCheck.json.data.schemaOk).toBe(false);
     expect(verifyTamperedJudgeCheck.json.data.errors).toContain("replayBundle.judgeCheck does not match the server snapshot");
     expect(verifyMissingSources.json.data.schemaOk).toBe(false);

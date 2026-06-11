@@ -3958,6 +3958,7 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBun
   const canonicalCawReceipts = listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const leaseRuns = listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const agentTranscript = buildAgentTranscriptData(sessionId, ctx, mcpAdapterCalls.length);
+  const replayPageIndex = replayPageIndexFor(ctx, sessionId);
   return ReplayBundleViewSchema.parse({
     bundleType: "PACTFUSE_EVIDENCE_V1",
     sessionId,
@@ -3967,6 +3968,7 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBun
     winnerClaimAllowed: false,
     eventRoot: hashJson(events.map((event) => event.eventHash)),
     agentTranscriptHash: hashJson(agentTranscript),
+    fullReplayRoot: replayPageIndex.pageRoot,
     events,
     sources,
     spends,
@@ -3980,7 +3982,8 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBun
     canonicalCawReceipts,
     leaseRuns,
     judgeCheck: readJudgeCheckData(sessionId, ctx),
-    replayPageIndex: replayPageIndexFor(ctx, sessionId),
+    replayPageIndex,
+    replayPages: replayPagesFor(ctx, sessionId, replayPageIndex),
   });
 }
 
@@ -4137,6 +4140,16 @@ function replayPageIndexFor(ctx: ServiceCtx, sessionId: string) {
   };
 }
 
+function replayPagesFor(ctx: ServiceCtx, sessionId: string, index = replayPageIndexFor(ctx, sessionId)) {
+  return Object.fromEntries(
+    REPLAY_COLLECTION_NAMES.map((collection) => {
+      const pageCount = index.collections[collection]?.pageCount ?? 0;
+      const pages = Array.from({ length: pageCount }, (_, pageIndex) => replayPageData(ctx, sessionId, collection, pageIndex));
+      return [collection, pages];
+    }),
+  );
+}
+
 function replayPageCollection(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName) {
   const totalRows = replayCollectionRowCount(ctx, sessionId, collection);
   const pageCount = Math.ceil(totalRows / REPLAY_SUMMARY_LIMIT);
@@ -4172,22 +4185,26 @@ export async function readReplayPage(
   }
   const totalRows = replayCollectionRowCount(ctx, sessionId, input.collection);
   const pageCount = Math.ceil(totalRows / REPLAY_SUMMARY_LIMIT);
-  if (pageIndex >= Math.max(pageCount, 1)) {
+  if (pageIndex >= pageCount) {
     return { ok: false, requestId, error: badRequestError(requestId, "replay page is out of range") };
   }
-  const orderBy = replayCollectionOrderBy(input.collection);
-  const rows = replayCollectionRows(ctx, sessionId, input.collection, pageIndex);
-  const data = ReplayPageViewSchema.parse({
+  const data = replayPageData(ctx, sessionId, input.collection, pageIndex);
+  return { ok: true, requestId, data };
+}
+
+function replayPageData(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName, pageIndex: number) {
+  const orderBy = replayCollectionOrderBy(collection);
+  const rows = replayCollectionRows(ctx, sessionId, collection, pageIndex);
+  return ReplayPageViewSchema.parse({
     bundleType: "PACTFUSE_REPLAY_PAGE_V1",
     sessionId,
-    collection: input.collection,
+    collection,
     pageIndex,
     pageSize: REPLAY_SUMMARY_LIMIT,
     orderBy,
     rows,
-    pageHash: replayPageHash(sessionId, input.collection, pageIndex, orderBy, rows),
+    pageHash: replayPageHash(sessionId, collection, pageIndex, orderBy, rows),
   });
-  return { ok: true, requestId, data };
 }
 
 function replayPageHash(sessionId: string, collection: ReplayCollectionName, pageIndex: number, orderBy: string[], rows: unknown[]): string {
@@ -10506,7 +10523,10 @@ function verifyReplayBundleBindings(
   compareReplaySnapshot(errors, "replayBundle.canonicalCawReceipts", bundle.canonicalCawReceipts, listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.leaseRuns", bundle.leaseRuns, listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.judgeCheck", bundle.judgeCheck, readJudgeCheckData(sessionId, ctx));
-  compareReplaySnapshot(errors, "replayBundle.replayPageIndex", bundle.replayPageIndex, replayPageIndexFor(ctx, sessionId));
+  const replayPageIndex = replayPageIndexFor(ctx, sessionId);
+  compareReplaySnapshot(errors, "replayBundle.replayPageIndex", bundle.replayPageIndex, replayPageIndex);
+  compareReplaySnapshot(errors, "replayBundle.replayPages", bundle.replayPages, replayPagesFor(ctx, sessionId, replayPageIndex));
+  compareReplaySnapshot(errors, "replayBundle.fullReplayRoot", bundle.fullReplayRoot, replayPageIndex.pageRoot);
   return errors;
 }
 

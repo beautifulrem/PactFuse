@@ -706,6 +706,32 @@ export const LeaseRunViewSchema = z
   })
   .strict();
 
+export const ReplayPageViewSchema = z
+  .object({
+    bundleType: z.literal("PACTFUSE_REPLAY_PAGE_V1"),
+    sessionId: Hex32Schema,
+    collection: z.enum([
+      "events",
+      "sources",
+      "spends",
+      "artifactPreflights",
+      "quotes",
+      "artifactAccessTokens",
+      "mcpAdapterCalls",
+      "cawReceiptOperations",
+      "cawLiveInteractions",
+      "rawCawReceiptBundles",
+      "canonicalCawReceipts",
+      "leaseRuns",
+    ]),
+    pageIndex: z.number().int().min(0),
+    pageSize: z.literal(200),
+    orderBy: z.array(z.string().min(1)).min(1).max(4),
+    rows: z.array(JsonValueSchema).max(200),
+    pageHash: Hex32Schema,
+  })
+  .strict();
+
 export const ReplayBundleViewSchema = z
   .object({
     bundleType: z.literal("PACTFUSE_EVIDENCE_V1"),
@@ -716,6 +742,7 @@ export const ReplayBundleViewSchema = z
     winnerClaimAllowed: z.literal(false),
     eventRoot: Hex32Schema,
     agentTranscriptHash: Hex32Schema,
+    fullReplayRoot: Hex32Schema,
     events: z.array(EvidenceEventSchema).max(200),
     sources: z.array(SourceViewSchema).max(200),
     spends: z.array(SpendViewSchema).max(200),
@@ -746,32 +773,7 @@ export const ReplayBundleViewSchema = z
         ),
       })
       .strict(),
-  })
-  .strict();
-
-export const ReplayPageViewSchema = z
-  .object({
-    bundleType: z.literal("PACTFUSE_REPLAY_PAGE_V1"),
-    sessionId: Hex32Schema,
-    collection: z.enum([
-      "events",
-      "sources",
-      "spends",
-      "artifactPreflights",
-      "quotes",
-      "artifactAccessTokens",
-      "mcpAdapterCalls",
-      "cawReceiptOperations",
-      "cawLiveInteractions",
-      "rawCawReceiptBundles",
-      "canonicalCawReceipts",
-      "leaseRuns",
-    ]),
-    pageIndex: z.number().int().min(0),
-    pageSize: z.literal(200),
-    orderBy: z.array(z.string().min(1)).min(1).max(4),
-    rows: z.array(JsonValueSchema).max(200),
-    pageHash: Hex32Schema,
+    replayPages: z.record(z.string(), z.array(ReplayPageViewSchema).max(5000)),
   })
   .strict();
 

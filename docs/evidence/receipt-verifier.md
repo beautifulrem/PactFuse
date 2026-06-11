@@ -31,7 +31,7 @@ Final winner-grade verifier checks:
 - verify CAW policy receipts for request id, target, selector, policy digest, expiry, tx/request count limits, and usage
 - verify `cawReceiptIngest.manualEntry === false`, source is API/export in winner mode, and every CAW operation references a raw ingested receipt hash
 - canonicalize only `canonicalReceipt` inside CAW policy receipt files; wrapper/status fields are never part of the hash preimage
-- canonicalize each `cawOperation` and the mode-specific `paymentProof`, then bind those hashes with chain events, artifact payload hash, Agent Transcript hash, Judge Check hash, and receipt-pack hash into one `PACTFUSE_EVIDENCE_V1` replay bundle
+- canonicalize each `cawOperation` and the mode-specific `paymentProof`, then bind those hashes with chain events, artifact payload hash, Agent Transcript hash, Judge Check hash, full replay page roots, embedded replay page bodies, and receipt-pack hash into one `PACTFUSE_EVIDENCE_V1` replay bundle
 - require gate-paid payment proof to include `approveTxHash`, `allowanceBefore`, `allowanceAfter`, `approvedAmount`, `quotePrice`, `policyTxCount`, and `approveBeforeActivate: true`
 - order A/B `SpendTripped` tx hashes by `(blockNumber, transactionIndex, logIndex, txHash)` before transcript hashing
 - fail proof-chip eligibility if any included proof chip is `pending`, `fixture`, `manual`, `blocked`, placeholder, or unexpected null evidence
