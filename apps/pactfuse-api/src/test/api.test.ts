@@ -582,6 +582,77 @@ describe("pactfuse-api P0", () => {
     expect(json.data.winnerClaimAllowed).toBe(false);
   });
 
+  it("reports evidence-derived claim readiness gates without unlocking public modes by default", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-claim-readiness");
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json.data).toEqual(
+      expect.objectContaining({
+        sessionId,
+        claimMode: "simulated",
+        paymentMode: "mocked",
+        tokenMode: "local-mocked",
+        identityMode: "pending",
+        targetClaimMode: null,
+        targetPaymentMode: null,
+        targetTokenMode: null,
+        targetIdentityMode: null,
+        proofChipAllowed: false,
+        finalVerifierComplete: false,
+        winnerClaimAllowed: false,
+      }),
+    );
+    expect(json.data.gates.find((gate: { gateId: string }) => gate.gateId === "final_verifier_complete")).toEqual(
+      expect.objectContaining({
+        status: "blocked",
+        reason: "current verifier still reports finalVerifierComplete=false",
+      }),
+    );
+    expect(json.data.blockers).toContain("final_verifier_complete: current verifier still reports finalVerifierComplete=false");
+    expect(json.data.requiredExternalInputs).toContain("full chain/signature/hash verifier that can set finalVerifierComplete=true");
+    expect(json.data.verifierRun.winnerClaimAllowed).toBe(false);
+    expect(json.data.replayBundleHash).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  it("records a live CAW identity probe that can satisfy the readiness identity gate", async () => {
+    const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
+    const sessionId = await createSession(app, "sess-caw-identity-probe");
+
+    const probe = await post(app, "/api/v1/caw/live/identity/probe", {
+      sessionId,
+      idempotencyKey: "caw-identity-probe",
+      payload: {
+        walletId: "wallet-live-1",
+        expectedWalletAddress: TEST_PAYER_ADDRESS,
+        identityMode: "p0-floor-one-wallet",
+      },
+    });
+    const readiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const readinessJson = await readiness.json();
+
+    expect(probe.status).toBe(202);
+    expect(probe.json.data).toEqual(
+      expect.objectContaining({
+        walletId: "wallet-live-1",
+        walletAddress: TEST_PAYER_ADDRESS.toLowerCase(),
+        identityMode: "p0-floor-one-wallet",
+        pass: true,
+        proofAuthority: true,
+        winnerClaimAllowed: true,
+      }),
+    );
+    expect(readiness.status).toBe(200);
+    expect(readinessJson.data.targetIdentityMode).toBe("p0-floor-one-wallet");
+    expect(readinessJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "caw_identity_probe")).toEqual(
+      expect.objectContaining({ status: "pass", evidenceEventId: probe.json.evidenceEventId }),
+    );
+    expect(readinessJson.data.winnerClaimAllowed).toBe(false);
+  });
+
   it("returns bad_request for missing evidence query parameters", async () => {
     const { app } = makeApp();
 
@@ -609,6 +680,21 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/evidence/verify"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/VerifyEvidenceInput",
     );
+    expect(json.paths["/api/v1/evidence/claim-readiness"].get["x-pactfuse-proof-fields"]).toContain("targetClaimMode");
+    expect(json.paths["/api/v1/evidence/claim-readiness"].get.responses["200"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ClaimReadinessResponse",
+    );
+    expect(json.paths["/api/v1/caw/live/identity/probe"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/CawLiveIdentityProbeInput",
+    );
+    expect(json.paths["/api/v1/caw/live/identity/probe"].post.responses["202"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/CawLiveIdentityProbeResponse",
+    );
+    expect(json.components.schemas.ClaimReadinessResponse.oneOf[0].properties.data.properties.claimMode.enum).toEqual([
+      "simulated",
+      "caw-target-real",
+      "caw-stable-params-real",
+    ]);
     expect(json.components.schemas.VerifyEvidenceInput.properties.payload.$ref).toBe(
       "#/components/schemas/VerifyEvidencePayload",
     );
@@ -7615,7 +7701,7 @@ function createFakeCawLiveClient(
       };
     },
     async getWallet(walletId) {
-      return { success: true, result: { id: walletId, status: "active" } };
+      return { success: true, result: { id: walletId, status: "active", wallet_address: TEST_PAYER_ADDRESS } };
     },
     async submitPact(input) {
       return {

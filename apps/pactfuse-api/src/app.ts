@@ -27,12 +27,14 @@ import {
   readAgentTranscript,
   readArtifactAccess,
   readChainIndexerStatus,
+  readClaimReadiness,
   readJudgeCheck,
   readProofProviderStatus,
   readReplayPage,
   readRunnerHeartbeat,
   recordMcpAdapterAudit,
   previewVerifyEvidenceForSession,
+  probeCawLiveIdentity,
   refundUndeliveredArtifact,
   registerSignedSource,
   registerSourceBoundSpends,
@@ -63,6 +65,7 @@ const ROUTES = [
   { method: "POST", path: "/api/v1/spends/register-batch", okStatus: 201 },
   { method: "POST", path: "/api/v1/caw/operations/build", okStatus: 201 },
   { method: "GET", path: "/api/v1/caw/live/status", okStatus: 200 },
+  { method: "POST", path: "/api/v1/caw/live/identity/probe", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/live/pacts/submit", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/live/pacts/sync", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/live/transfers/submit", okStatus: 202 },
@@ -83,6 +86,7 @@ const ROUTES = [
   { method: "POST", path: "/api/v1/evidence/verify", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/{sessionId}/verify", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/judge-check", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/claim-readiness", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/replay-bundle", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/replay-page", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/indexer-status", okStatus: 200 },
@@ -94,6 +98,7 @@ const ROUTES = [
 const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/caw/receipts/ingest": ["proofAuthority", "winnerClaimAllowed"],
   "/api/v1/caw/live/pacts/submit": ["interactionId", "pactId", "requestHash", "responseHash", "proofAuthority", "winnerClaimAllowed"],
+  "/api/v1/caw/live/identity/probe": ["walletId", "walletAddress", "identityMode", "pass", "proofAuthority", "winnerClaimAllowed"],
   "/api/v1/caw/live/pacts/sync": [
     "interactionId",
     "pactId",
@@ -226,6 +231,20 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/mcp/audit": ["proofAuthority", "winnerClaimAllowed", "requestHash", "responseHash"],
   "/api/v1/evidence/verify": ["schemaOk", "proofChipAllowed", "winnerClaimAllowed", "finalVerifierComplete"],
   "/api/v1/evidence/judge-check": ["winnerClaimAllowed", "rows.status", "rows.authority"],
+  "/api/v1/evidence/claim-readiness": [
+    "claimMode",
+    "paymentMode",
+    "tokenMode",
+    "identityMode",
+    "targetClaimMode",
+    "targetPaymentMode",
+    "targetTokenMode",
+    "targetIdentityMode",
+    "winnerClaimAllowed",
+    "finalVerifierComplete",
+    "gates.status",
+    "blockers",
+  ],
   "/api/v1/evidence/replay-bundle": [
     "winnerClaimAllowed",
     "eventRoot",
@@ -342,6 +361,11 @@ export function createApp(ctx: ServiceCtx): Hono {
 
   app.get("/api/v1/caw/live/status", async (c) => send(c, { ok: true, requestId: newRequestId("caw_live_status"), data: await ctx.cawLive.status() }));
 
+  app.post("/api/v1/caw/live/identity/probe", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await probeCawLiveIdentity(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
+  });
+
   app.post("/api/v1/caw/live/pacts/submit", async (c) => {
     authorizeApiRole(c, ctx, "operator");
     return send(c, await submitCawLivePact(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
@@ -439,6 +463,11 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.get("/api/v1/evidence/judge-check", async (c) => {
     const sessionId = requiredQuery(c, "sessionId");
     return send(c, await readJudgeCheck(sessionId, ctx));
+  });
+
+  app.get("/api/v1/evidence/claim-readiness", async (c) => {
+    const sessionId = requiredQuery(c, "sessionId");
+    return send(c, await readClaimReadiness(sessionId, ctx));
   });
 
   app.get("/api/v1/evidence/replay-bundle", async (c) => {
@@ -855,6 +884,29 @@ function buildOpenApi(): Record<string, unknown> {
             manual: { type: "boolean", default: false },
           },
         },
+        CawLiveIdentityProbeInput: sessionEnvelopeSchema("#/components/schemas/CawLiveIdentityProbePayload"),
+        CawLiveIdentityProbePayload: {
+          type: "object",
+          required: ["walletId"],
+          additionalProperties: false,
+          properties: {
+            walletId: { type: "string", minLength: 1, maxLength: 160 },
+            expectedWalletAddress: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
+            identityMode: { enum: ["p0-floor-one-wallet", "p0-win-separate-identities"], default: "p0-floor-one-wallet" },
+          },
+        },
+        CawLiveIdentityProbeResponse: serviceResponseSchema({
+          type: "object",
+          required: ["walletId", "walletAddress", "identityMode", "pass", "proofAuthority", "winnerClaimAllowed"],
+          properties: {
+            walletId: { type: "string" },
+            walletAddress: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{40}$" }, { type: "null" }] },
+            identityMode: { enum: ["p0-floor-one-wallet", "p0-win-separate-identities"] },
+            pass: { type: "boolean" },
+            proofAuthority: { type: "boolean" },
+            winnerClaimAllowed: { type: "boolean" },
+          },
+        }),
         CawLiveContractCallInput: sessionEnvelopeSchema("#/components/schemas/CawLiveContractCallPayload"),
         CawLiveContractCallPayload: {
           type: "object",
@@ -1111,6 +1163,65 @@ function buildOpenApi(): Record<string, unknown> {
         },
         VerifierRunResponse: serviceResponseSchema({
           allOf: [{ $ref: "#/components/schemas/FailClosedProofState" }],
+        }),
+        ClaimReadinessResponse: serviceResponseSchema({
+          type: "object",
+          required: [
+            "sessionId",
+            "claimMode",
+            "paymentMode",
+            "tokenMode",
+            "identityMode",
+            "targetClaimMode",
+            "targetPaymentMode",
+            "targetTokenMode",
+            "targetIdentityMode",
+            "proofChipAllowed",
+            "finalVerifierComplete",
+            "winnerClaimAllowed",
+            "gates",
+            "blockers",
+            "requiredExternalInputs",
+            "replayBundleHash",
+            "verifierRun",
+          ],
+          properties: {
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            claimMode: { enum: ["simulated", "caw-target-real", "caw-stable-params-real"] },
+            paymentMode: { enum: ["mocked", "gate-paid-artifact-real", "permit-payment-real"] },
+            tokenMode: { enum: ["local-mocked", "mock-test-token", "official-testnet-usdc"] },
+            identityMode: { enum: ["pending", "p0-floor-one-wallet", "p0-win-separate-identities"] },
+            targetClaimMode: { anyOf: [{ enum: ["simulated", "caw-target-real", "caw-stable-params-real"] }, { type: "null" }] },
+            targetPaymentMode: { anyOf: [{ enum: ["mocked", "gate-paid-artifact-real", "permit-payment-real"] }, { type: "null" }] },
+            targetTokenMode: { anyOf: [{ enum: ["local-mocked", "mock-test-token", "official-testnet-usdc"] }, { type: "null" }] },
+            targetIdentityMode: { anyOf: [{ enum: ["pending", "p0-floor-one-wallet", "p0-win-separate-identities"] }, { type: "null" }] },
+            proofChipAllowed: { type: "boolean" },
+            finalVerifierComplete: { type: "boolean" },
+            winnerClaimAllowed: { type: "boolean" },
+            gates: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["gateId", "label", "status", "blocks", "reason", "evidenceEventId"],
+                properties: {
+                  gateId: { type: "string" },
+                  label: { type: "string" },
+                  status: { enum: ["pass", "pending", "blocked"] },
+                  blocks: {
+                    type: "array",
+                    items: { enum: ["claimMode", "paymentMode", "tokenMode", "identityMode", "winnerClaimAllowed"] },
+                    minItems: 1,
+                  },
+                  reason: { type: "string" },
+                  evidenceEventId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                },
+              },
+            },
+            blockers: { type: "array", items: { type: "string" } },
+            requiredExternalInputs: { type: "array", items: { type: "string" } },
+            replayBundleHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            verifierRun: { $ref: "#/components/schemas/FailClosedProofState" },
+          },
         }),
         JudgeCheckData: {
           type: "object",
@@ -2090,6 +2201,9 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   if (path === "/api/v1/caw/operations/build") {
     return jsonRequestBody({ $ref: "#/components/schemas/CawOperationBuildInput" });
   }
+  if (path === "/api/v1/caw/live/identity/probe") {
+    return jsonRequestBody({ $ref: "#/components/schemas/CawLiveIdentityProbeInput" });
+  }
   if (path === "/api/v1/caw/live/contracts/call") {
     return jsonRequestBody({ $ref: "#/components/schemas/CawLiveContractCallInput" });
   }
@@ -2291,8 +2405,12 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/VerifierRunResponse" };
     case "/api/v1/evidence/judge-check":
       return { $ref: "#/components/schemas/JudgeCheckResponse" };
+    case "/api/v1/evidence/claim-readiness":
+      return { $ref: "#/components/schemas/ClaimReadinessResponse" };
     case "/api/v1/caw/receipts/ingest":
       return { $ref: "#/components/schemas/CawReceiptIngestResponse" };
+    case "/api/v1/caw/live/identity/probe":
+      return { $ref: "#/components/schemas/CawLiveIdentityProbeResponse" };
     case "/api/v1/gate/events/ingest":
       return { $ref: "#/components/schemas/GateEventIngestResponse" };
     case "/api/v1/indexer/backfill":

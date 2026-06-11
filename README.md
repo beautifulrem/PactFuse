@@ -195,6 +195,7 @@ Important `/api/v1` routes:
 | `POST /api/v1/sources/challenge` | Record source challenge evidence |
 | `POST /api/v1/spends/register-batch` | Register source-bound spends |
 | `POST /api/v1/caw/operations/build` | Build CAW operation envelopes |
+| `POST /api/v1/caw/live/identity/probe` | Probe live CAW wallet identity evidence |
 | `POST /api/v1/caw/live/contracts/call` | Record CAW live approve or `activate_tool` contract-call evidence |
 | `POST /api/v1/caw/live/allowances/verify` | Verify CAW approve tx, ERC20 `Approval` log, and on-chain allowance state |
 | `POST /api/v1/caw/receipts/ingest` | Ingest raw CAW receipt exports |
@@ -206,7 +207,8 @@ Important `/api/v1` routes:
 | `POST /api/v1/lease/execute` | Execute clean leases through audited MCP JSON-RPC |
 | `POST /api/v1/mcp/audit` | Record audited MCP adapter calls |
 | `GET /api/v1/evidence/judge-check` | Read the six-row Judge Check |
-| `GET /api/v1/evidence/replay-bundle` | Read summary `PACTFUSE_EVIDENCE_V1` |
+| `GET /api/v1/evidence/claim-readiness` | Derive current and target claim modes from evidence gates |
+| `GET /api/v1/evidence/replay-bundle` | Read `PACTFUSE_EVIDENCE_V1` summary plus embedded replay page proofs |
 | `GET /api/v1/evidence/replay-page` | Read paged replay collections |
 | `GET /api/v1/evidence/agent-transcript` | Read MCP transcript summary |
 | `GET /api/v1/evidence/stream` | SSE evidence stream |

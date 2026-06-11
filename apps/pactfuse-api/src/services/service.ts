@@ -5,6 +5,7 @@ import {
   ArtifactAccessIssuePayloadSchema,
   ArtifactPreflightPayloadSchema,
   ArtifactRefundPayloadSchema,
+  ClaimReadinessViewSchema,
   CawOperationBuildPayloadSchema,
   ChainIndexedLogViewSchema,
   ChainIndexerBackfillInputSchema,
@@ -14,6 +15,7 @@ import {
   CawLiveAuditSyncPayloadSchema,
   CawAllowanceVerifyPayloadSchema,
   CawLiveContractCallSubmitPayloadSchema,
+  CawLiveIdentityProbePayloadSchema,
   CawLiveInteractionViewSchema,
   CawLivePactSubmitPayloadSchema,
   CawLivePactSyncPayloadSchema,
@@ -51,6 +53,7 @@ import {
   canonicalizeJson,
   type CreateSessionInput,
   type CawOperationBuildPayload,
+  type ClaimReadinessView,
   type EvidenceEvent,
   type JsonValue,
   type JudgeCheckView,
@@ -61,6 +64,7 @@ import {
   type CawLiveAuditSyncPayload,
   type CawAllowanceVerifyPayload,
   type CawLiveContractCallSubmitPayload,
+  type CawLiveIdentityProbePayload,
   type CawLivePactSubmitPayload,
   type CawLiveTransferSubmitPayload,
   type TokenBalanceDeltaVerifyPayload,
@@ -1045,6 +1049,63 @@ export async function ingestCawReceiptBundle(
         status: CAW_STRUCTURAL_AUTHORITY_STATUS,
         proofAuthority: true,
         winnerClaimAllowed: false,
+      },
+    };
+  });
+}
+
+export async function probeCawLiveIdentity(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(CawLiveIdentityProbePayloadSchema, envelope.payload);
+  return withIdempotency(ctx, scoped("caw:live:identity:probe", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
+    assertSession(ctx, envelope.sessionId, requestId);
+    await requireCawLiveReady(ctx, requestId);
+    const request = { wallet_id: payload.walletId, include_spend_summary: false };
+    const response = await ctx.cawLive.getWallet(payload.walletId);
+    const wallet = cawWalletRecord(response);
+    const walletAddress = cawWalletAddress(wallet);
+    const status = String(wallet.status ?? wallet.state ?? "").toLowerCase();
+    const active = ["active", "enabled", "ready", "available"].includes(status) || wallet.active === true;
+    const expectedWalletAddress = payload.expectedWalletAddress?.toLowerCase() ?? null;
+    const addressMatches =
+      !expectedWalletAddress || (typeof walletAddress === "string" && walletAddress.toLowerCase() === expectedWalletAddress);
+    const pass = active && addressMatches && Boolean(wallet.id ?? wallet.wallet_id ?? payload.walletId);
+    const event = appendEvidenceEvent(ctx, {
+      sessionId: envelope.sessionId,
+      authority: "proof",
+      kind: "caw.identity.probed",
+      payload: {
+        mode: pass ? "real" : "blocked",
+        pass,
+        walletId: payload.walletId,
+        walletAddress: walletAddress ?? null,
+        expectedWalletAddress,
+        walletStatus: status || null,
+        identityMode: payload.identityMode,
+        requestHash: hashJson(request),
+        responseHash: hashJson(redactCawLiveSecrets(response)),
+        proofAuthority: pass,
+        winnerClaimAllowed: pass,
+      },
+    });
+    updateJudgeCheckRow(ctx, envelope.sessionId, {
+      rowId: "caw_boundary",
+      status: pass ? "pass" : "blocked",
+      authority: "proof",
+      reason: pass ? "live CAW wallet identity probe passed" : "live CAW wallet identity probe failed",
+      evidenceEventId: event.eventId,
+    });
+    return {
+      ok: true,
+      requestId,
+      evidenceEventId: event.eventId,
+      data: {
+        walletId: payload.walletId,
+        walletAddress: walletAddress ?? null,
+        identityMode: payload.identityMode,
+        pass,
+        proofAuthority: pass,
+        winnerClaimAllowed: pass,
       },
     };
   });
@@ -2475,6 +2536,44 @@ function assertCawPactRequestCapacity(
       }),
     });
   }
+}
+
+function cawWalletRecord(response: Record<string, unknown>): Record<string, unknown> {
+  const result = response.result;
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    return result as Record<string, unknown>;
+  }
+  return response;
+}
+
+function cawWalletAddress(wallet: Record<string, unknown>): string | null {
+  const direct = optionalStringFromCaw(wallet, [
+    "wallet_address",
+    "walletAddress",
+    "address",
+    "evm_address",
+    "evmAddress",
+    "account_address",
+    "accountAddress",
+  ]);
+  if (direct && /^0x[0-9a-fA-F]{40}$/.test(direct)) {
+    return direct.toLowerCase();
+  }
+  const addresses = wallet.addresses;
+  if (Array.isArray(addresses)) {
+    for (const item of addresses) {
+      if (typeof item === "string" && /^0x[0-9a-fA-F]{40}$/.test(item)) {
+        return item.toLowerCase();
+      }
+      if (item && typeof item === "object" && !Array.isArray(item)) {
+        const nested = optionalStringFromCaw(item as Record<string, unknown>, ["address", "wallet_address", "walletAddress"]);
+        if (nested && /^0x[0-9a-fA-F]{40}$/.test(nested)) {
+          return nested.toLowerCase();
+        }
+      }
+    }
+  }
+  return null;
 }
 
 function optionalStringFromCaw(response: Record<string, unknown>, keys: string[]): string | null {
@@ -3910,6 +4009,262 @@ async function buildVerifierRunView(
   return { view, verifierInput };
 }
 
+export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<ClaimReadinessView>> {
+  const requestId = newRequestId("claim_readiness");
+  const parsedSessionId = parseStrict(Hex32Schema, sessionId);
+  assertSession(ctx, parsedSessionId, requestId);
+  const proofProviders = await readProofProviderStatus(ctx);
+  const replayBundle = assembleReplayBundleData(parsedSessionId, ctx);
+  const { view } = await buildVerifierRunView(ctx, parsedSessionId, {
+    replayBundle: replayBundle as unknown as Record<string, JsonValue>,
+    schemaOnly: false,
+  });
+  const judgeCheck = readJudgeCheckData(parsedSessionId, ctx);
+  const events = listEvents(ctx, parsedSessionId, 0, REPLAY_SUMMARY_LIMIT);
+  const rowsById = new Map(judgeCheck.rows.map((row) => [String(row.rowId), row]));
+  const latest = (predicate: (event: EvidenceEvent) => boolean) => [...events].reverse().find(predicate) ?? null;
+  const latestKind = (kind: string) => latest((event) => event.kind === kind);
+  const cawIdentityProbe = latest((event) => {
+    const payload = eventPayload(event);
+    return event.kind === "caw.identity.probed" && payload.mode === "real" && payload.pass === true && payload.winnerClaimAllowed === true;
+  });
+  const cawDeny = latest((event) => {
+    const payload = eventPayload(event);
+    return (
+      event.kind === "caw.live.audit.usage.verified" &&
+      event.authority === "proof" &&
+      payload.result === "denied" &&
+      payload.proofAuthority === true
+    );
+  });
+  const cawAllowance = latestKind("caw.allowance.verified");
+  const cawActivation = latestKind("caw.activation.verified");
+  const tokenDelta = latestKind("token.balance_delta.verified");
+  const gates = [
+    providerGate(proofProviders, "chain", ["paymentMode", "tokenMode", "winnerClaimAllowed"]),
+    providerGate(proofProviders, "caw_live", ["claimMode", "paymentMode", "identityMode", "winnerClaimAllowed"]),
+    providerGate(proofProviders, "caw", ["claimMode", "winnerClaimAllowed"]),
+    eventGate(
+      "caw_identity_probe",
+      "CAW identity probe",
+      Boolean(cawIdentityProbe),
+      ["identityMode", "winnerClaimAllowed"],
+      cawIdentityProbe,
+      "live CAW wallet identity probe proves real same-wallet semantics",
+      "missing live CAW identity probe with mode=real, pass=true, winnerClaimAllowed=true",
+    ),
+    judgeGate(rowsById, "caw_boundary", ["claimMode", "paymentMode", "winnerClaimAllowed"]),
+    eventGate(
+      "caw_wrong_target_deny",
+      "CAW wrong-target deny",
+      Boolean(cawDeny),
+      ["claimMode", "winnerClaimAllowed"],
+      cawDeny,
+      "live CAW audit contains a denied bypass attempt",
+      "missing real CAW deny receipt for the wrong-target bypass attempt",
+    ),
+    eventGate(
+      "caw_allowance_proof",
+      "CAW approve allowance proof",
+      Boolean(cawAllowance),
+      ["paymentMode", "winnerClaimAllowed"],
+      cawAllowance,
+      "approve tx, ERC20 Approval log, allowance state, and active Pact policy are bound",
+      "missing caw.allowance.verified proof event",
+    ),
+    eventGate(
+      "caw_activation_proof",
+      "CAW activation proof",
+      Boolean(cawActivation),
+      ["paymentMode", "winnerClaimAllowed"],
+      cawActivation,
+      "activateTool call is bound to CAW audit usage and the finalized Gate settlement",
+      "missing caw.activation.verified proof event",
+    ),
+    judgeGate(rowsById, "source_challenge", ["claimMode", "winnerClaimAllowed"]),
+    judgeGate(rowsById, "ab_trip", ["claimMode", "winnerClaimAllowed"]),
+    judgeGate(rowsById, "c_settlement", ["paymentMode", "tokenMode", "winnerClaimAllowed"]),
+    eventGate(
+      "token_balance_delta",
+      "Token balance delta",
+      Boolean(tokenDelta),
+      ["paymentMode", "tokenMode", "winnerClaimAllowed"],
+      tokenDelta,
+      "ERC20 Transfer and block-level balance delta are bound to the finalized settlement",
+      "missing token.balance_delta.verified proof event",
+    ),
+    judgeGate(rowsById, "artifact_access", ["winnerClaimAllowed"]),
+    judgeGate(rowsById, "lease_execution", ["winnerClaimAllowed"]),
+    verifierGate("replay_verifier", "Replay bundle verifier", Boolean(view.schemaOk), ["winnerClaimAllowed"], view.schemaOk ? "replay bundle and event log checks pass" : "replay bundle or event log verification failed"),
+    verifierGate(
+      "final_verifier_complete",
+      "Final verifier complete",
+      Boolean(view.finalVerifierComplete),
+      ["winnerClaimAllowed"],
+      view.finalVerifierComplete
+        ? "full chain/signature/hash verifier is complete"
+        : "current verifier still reports finalVerifierComplete=false",
+    ),
+    verifierGate(
+      "proof_chip_allowed",
+      "Proof chip allowed",
+      Boolean(view.proofChipAllowed),
+      ["winnerClaimAllowed"],
+      view.proofChipAllowed ? "proof-chip verifier accepts the evidence pack" : "proof-chip verifier still refuses the evidence pack",
+    ),
+  ];
+  const gatePassed = (id: string) => gates.find((gate) => gate.gateId === id)?.status === "pass";
+  const cawTargetReady =
+    gatePassed("caw_identity_probe") &&
+    gatePassed("caw_wrong_target_deny") &&
+    gatePassed("caw_allowance_proof") &&
+    gatePassed("caw_activation_proof") &&
+    ["caw_boundary", "source_challenge", "ab_trip"].every((id) => rowsById.get(id)?.status === "pass");
+  const gatePaidReady = cawTargetReady && gatePassed("token_balance_delta") && rowsById.get("c_settlement")?.status === "pass";
+  const tokenMode = tokenTargetMode(tokenDelta);
+  const targetIdentityMode = cawIdentityProbe ? identityTargetMode(cawIdentityProbe) : null;
+  const winnerClaimAllowed = gates.every((gate) => gate.status === "pass");
+  const blockers = gates.filter((gate) => gate.status !== "pass").map((gate) => `${gate.gateId}: ${gate.reason}`);
+  const data = ClaimReadinessViewSchema.parse({
+    sessionId: parsedSessionId,
+    claimMode: winnerClaimAllowed ? "caw-target-real" : ctx.config.claimMode,
+    paymentMode: winnerClaimAllowed ? "gate-paid-artifact-real" : ctx.config.paymentMode,
+    tokenMode: winnerClaimAllowed && tokenMode ? tokenMode : ctx.config.tokenMode,
+    identityMode: winnerClaimAllowed && targetIdentityMode ? targetIdentityMode : ctx.config.identityMode,
+    targetClaimMode: cawTargetReady ? "caw-target-real" : null,
+    targetPaymentMode: gatePaidReady ? "gate-paid-artifact-real" : null,
+    targetTokenMode: tokenMode,
+    targetIdentityMode,
+    proofChipAllowed: Boolean(view.proofChipAllowed),
+    finalVerifierComplete: Boolean(view.finalVerifierComplete),
+    winnerClaimAllowed,
+    gates,
+    blockers,
+    requiredExternalInputs: claimReadinessExternalInputs(proofProviders, gates),
+    replayBundleHash: hashJson(replayBundle),
+    verifierRun: view,
+  });
+  return { ok: true, requestId, data };
+}
+
+type ClaimGateBlock = "claimMode" | "paymentMode" | "tokenMode" | "identityMode" | "winnerClaimAllowed";
+type ClaimReadinessGate = {
+  gateId: string;
+  label: string;
+  status: "pass" | "pending" | "blocked";
+  blocks: ClaimGateBlock[];
+  reason: string;
+  evidenceEventId: string | null;
+};
+
+function providerGate(providers: ProofProviderStatus[], name: ProofProviderStatus["name"], blocks: ClaimGateBlock[]): ClaimReadinessGate {
+  const provider = providers.find((candidate) => candidate.name === name);
+  const pass = provider?.ready === true && provider.mode === "live";
+  return {
+    gateId: `provider_${name}`,
+    label: `${name} provider`,
+    status: pass ? "pass" : "pending",
+    blocks,
+    reason: pass ? `${name} provider is live` : provider?.reason ?? `${name} provider is not configured`,
+    evidenceEventId: null,
+  };
+}
+
+function judgeGate(rowsById: Map<string, JudgeCheckView["rows"][number]>, rowId: string, blocks: ClaimGateBlock[]): ClaimReadinessGate {
+  const row = rowsById.get(rowId);
+  const pass = row?.status === "pass" && (row.authority === "proof" || row.authority === "delivery");
+  return {
+    gateId: `judge_${rowId}`,
+    label: row?.label ?? rowId,
+    status: pass ? "pass" : row?.status === "blocked" ? "blocked" : "pending",
+    blocks,
+    reason: pass ? `${rowId} Judge Check row passes with ${row.authority} authority` : row?.reason ?? `${rowId} Judge Check row is missing`,
+    evidenceEventId: row?.evidenceEventId ?? null,
+  };
+}
+
+function eventGate(
+  gateId: string,
+  label: string,
+  pass: boolean,
+  blocks: ClaimGateBlock[],
+  event: EvidenceEvent | null,
+  passReason: string,
+  pendingReason: string,
+): ClaimReadinessGate {
+  return {
+    gateId,
+    label,
+    status: pass ? "pass" : "pending",
+    blocks,
+    reason: pass ? passReason : pendingReason,
+    evidenceEventId: event?.eventId ?? null,
+  };
+}
+
+function verifierGate(gateId: string, label: string, pass: boolean, blocks: ClaimGateBlock[], reason: string): ClaimReadinessGate {
+  return {
+    gateId,
+    label,
+    status: pass ? "pass" : "blocked",
+    blocks,
+    reason,
+    evidenceEventId: null,
+  };
+}
+
+function tokenTargetMode(event: EvidenceEvent | null): "official-testnet-usdc" | "mock-test-token" | null {
+  if (!event) {
+    return null;
+  }
+  const paymentToken = String(eventPayload(event).paymentToken ?? "").toLowerCase();
+  if (paymentToken === "0x036cbd53842c5426634e7929541ec2318f3dcf7e") {
+    return "official-testnet-usdc";
+  }
+  return paymentToken ? "mock-test-token" : null;
+}
+
+function identityTargetMode(event: EvidenceEvent): "p0-win-separate-identities" | "p0-floor-one-wallet" {
+  const value = String(eventPayload(event).identityMode ?? eventPayload(event).tier ?? "");
+  return value === "p0-win-separate-identities" ? "p0-win-separate-identities" : "p0-floor-one-wallet";
+}
+
+function eventPayload(event: EvidenceEvent): Record<string, unknown> {
+  return event.payload && typeof event.payload === "object" && !Array.isArray(event.payload) ? (event.payload as Record<string, unknown>) : {};
+}
+
+function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: ClaimReadinessGate[]): string[] {
+  const inputs = new Set<string>();
+  const provider = (name: ProofProviderStatus["name"]) => providers.find((candidate) => candidate.name === name);
+  if (provider("chain")?.ready !== true) {
+    inputs.add("PACTFUSE_CHAIN_RPC_URL and PACTFUSE_CHAIN_ID for a live public testnet RPC");
+  }
+  if (provider("caw_live")?.ready !== true) {
+    inputs.add("PACTFUSE_CAW_LIVE_API_URL, PACTFUSE_CAW_LIVE_API_KEY, and a CAW wallet id");
+  }
+  if (provider("caw")?.ready !== true) {
+    inputs.add("PACTFUSE_CAW_EXPORT_URL or equivalent raw CAW receipt export source");
+  }
+  for (const gate of gates) {
+    if (gate.status === "pass") {
+      continue;
+    }
+    if (gate.gateId === "caw_identity_probe") {
+      inputs.add("live CAW identity probe evidence with mode=real and same-wallet semantics");
+    }
+    if (gate.gateId === "caw_wrong_target_deny") {
+      inputs.add("real CAW wrong-target deny request id or audit receipt");
+    }
+    if (gate.gateId === "token_balance_delta") {
+      inputs.add("public ERC20 token tx/log/balance evidence for the finalized settlement");
+    }
+    if (gate.gateId === "final_verifier_complete" || gate.gateId === "proof_chip_allowed") {
+      inputs.add("full chain/signature/hash verifier that can set finalVerifierComplete=true");
+    }
+  }
+  return [...inputs].sort();
+}
+
 export async function readProofProviderStatus(ctx: ServiceCtx): Promise<ProofProviderStatus[]> {
   const [chain, caw, cawLive, mcpLease] = await Promise.all([ctx.chain.status(), ctx.caw.status(), ctx.cawLive.status(), ctx.mcpLease.status()]);
   return [chain, caw, cawLive, mcpLease];
@@ -4560,6 +4915,7 @@ export function appendEvidenceEvent(
       | "source.challenge.confirmed"
       | "spend.registered"
       | "caw.operation.built"
+      | "caw.identity.probed"
       | "caw.live.pact.submitted"
       | "caw.live.pact.synced"
       | "caw.live.transfer.submitted"

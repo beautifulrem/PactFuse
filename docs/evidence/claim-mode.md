@@ -19,6 +19,8 @@ Hour 4 may lock target values such as `TARGET_CLAIM_MODE: caw-target-real` and `
 
 This is not a winner claim. `WINNER_CLAIM_ALLOWED` remains `false` until the full upgrade rules below pass.
 
+The backend exposes `/api/v1/evidence/claim-readiness?sessionId=<id>` as the machine-readable gate for these modes. It derives target modes from provider status, CAW events, token settlement evidence, Judge Check rows, replay bundle verification, and the final verifier flags. It may report target modes as viable, but current public modes stay locked until every gate passes.
+
 ## Upgrade Current Claim To `caw-target-real`
 
 This section is for the final/current public claim, not the hour-4 `TARGET_*` candidate block.

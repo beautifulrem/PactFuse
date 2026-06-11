@@ -25,13 +25,18 @@ export const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
 );
 export const JsonObjectSchema = z.record(z.string(), JsonValueSchema);
 
+export const ClaimModeSchema = z.enum(["simulated", "caw-target-real", "caw-stable-params-real"]);
+export const PaymentModeSchema = z.enum(["mocked", "gate-paid-artifact-real", "permit-payment-real"]);
+export const TokenModeSchema = z.enum(["local-mocked", "mock-test-token", "official-testnet-usdc"]);
+export const IdentityModeSchema = z.enum(["pending", "p0-floor-one-wallet", "p0-win-separate-identities"]);
+
 export const RuntimeModesSchema = z
   .object({
-    CLAIM_MODE: z.literal("simulated"),
-    PAYMENT_MODE: z.literal("mocked"),
-    TOKEN_MODE: z.literal("local-mocked"),
-    IDENTITY_MODE: z.literal("pending"),
-    WINNER_CLAIM_ALLOWED: z.literal(false),
+    CLAIM_MODE: ClaimModeSchema,
+    PAYMENT_MODE: PaymentModeSchema,
+    TOKEN_MODE: TokenModeSchema,
+    IDENTITY_MODE: IdentityModeSchema,
+    WINNER_CLAIM_ALLOWED: z.boolean(),
   })
   .strict();
 
@@ -171,6 +176,14 @@ export const CawLivePactSubmitPayloadSchema = z
 export const CawLivePactSyncPayloadSchema = z
   .object({
     pactId: z.string().min(1).max(160),
+  })
+  .strict();
+
+export const CawLiveIdentityProbePayloadSchema = z
+  .object({
+    walletId: z.string().min(1).max(160),
+    expectedWalletAddress: AddressSchema.optional(),
+    identityMode: IdentityModeSchema.default("p0-floor-one-wallet"),
   })
   .strict();
 
@@ -412,6 +425,7 @@ export const EvidenceEventKindSchema = z.enum([
   "source.challenge.confirmed",
   "spend.registered",
   "caw.operation.built",
+  "caw.identity.probed",
   "caw.live.pact.submitted",
   "caw.live.pact.synced",
   "caw.live.transfer.submitted",
@@ -835,6 +849,39 @@ export const VerifierRunViewSchema = z
   })
   .strict();
 
+export const ClaimReadinessGateSchema = z
+  .object({
+    gateId: z.string().min(1).max(80),
+    label: z.string().min(1).max(160),
+    status: z.enum(["pass", "pending", "blocked"]),
+    blocks: z.array(z.enum(["claimMode", "paymentMode", "tokenMode", "identityMode", "winnerClaimAllowed"])).min(1),
+    reason: z.string().min(1).max(400),
+    evidenceEventId: Hex32Schema.nullable(),
+  })
+  .strict();
+
+export const ClaimReadinessViewSchema = z
+  .object({
+    sessionId: Hex32Schema,
+    claimMode: ClaimModeSchema,
+    paymentMode: PaymentModeSchema,
+    tokenMode: TokenModeSchema,
+    identityMode: IdentityModeSchema,
+    targetClaimMode: ClaimModeSchema.nullable(),
+    targetPaymentMode: PaymentModeSchema.nullable(),
+    targetTokenMode: TokenModeSchema.nullable(),
+    targetIdentityMode: IdentityModeSchema.nullable(),
+    proofChipAllowed: z.boolean(),
+    finalVerifierComplete: z.boolean(),
+    winnerClaimAllowed: z.boolean(),
+    gates: z.array(ClaimReadinessGateSchema),
+    blockers: z.array(z.string()),
+    requiredExternalInputs: z.array(z.string()),
+    replayBundleHash: Hex32Schema.nullable(),
+    verifierRun: VerifierRunViewSchema,
+  })
+  .strict();
+
 export const ServiceOkSchema = <T extends z.ZodTypeAny>(data: T) =>
   z
     .object({
@@ -890,11 +937,13 @@ export type SessionCreated = z.infer<typeof SessionCreatedSchema>;
 export type SessionView = z.infer<typeof SessionViewSchema>;
 export type JudgeCheckView = z.infer<typeof JudgeCheckViewSchema>;
 export type VerifierRunView = z.infer<typeof VerifierRunViewSchema>;
+export type ClaimReadinessView = z.infer<typeof ClaimReadinessViewSchema>;
 export type ReplayBundleView = z.infer<typeof ReplayBundleViewSchema>;
 export type ChainIndexerBackfillInput = z.infer<typeof ChainIndexerBackfillInputSchema>;
 export type CawOperationBuildPayload = z.infer<typeof CawOperationBuildPayloadSchema>;
 export type CawLivePactSubmitPayload = z.infer<typeof CawLivePactSubmitPayloadSchema>;
 export type CawLivePactSyncPayload = z.infer<typeof CawLivePactSyncPayloadSchema>;
+export type CawLiveIdentityProbePayload = z.infer<typeof CawLiveIdentityProbePayloadSchema>;
 export type CawLiveTransferSubmitPayload = z.infer<typeof CawLiveTransferSubmitPayloadSchema>;
 export type CawLiveContractCallSubmitPayload = z.infer<typeof CawLiveContractCallSubmitPayloadSchema>;
 export type CawAllowanceVerifyPayload = z.infer<typeof CawAllowanceVerifyPayloadSchema>;

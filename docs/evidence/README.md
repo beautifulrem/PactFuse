@@ -8,7 +8,7 @@ This folder separates current checked-in status from future winner-claim evidenc
 - `mock-token.json`: pending public testnet mock ERC20 deployment evidence; not real evidence yet.
 - `caw-policy-receipt.example.json`: template for normalized CAW receipt capture.
 - `receipt-pack.pending.example.json`: schema-only example only; not real evidence yet.
-- Artifact preflight / Judge Check / runner heartbeat / CAW receipt ingest / Agent Transcript / replay bundle records are API-backed. Replay bundles include indexed page roots and embedded page proofs, but checked-in public evidence remains pending until live Cobo identity, deployed token, and external-chain receipts are captured.
+- Artifact preflight / Judge Check / claim readiness / runner heartbeat / CAW receipt ingest / Agent Transcript / replay bundle records are API-backed. Replay bundles include indexed page roots and embedded page proofs, but checked-in public evidence remains pending until live Cobo identity, deployed token, and external-chain receipts are captured.
 - The backend now requires an active CAW Pact policy authority binding before proof-bearing contract calls: policy digest, policy snapshot hash, chain allowlist, target allowlist, selector allowlist, request limit, and expiry must be present and consistent.
 - The backend requires `caw.allowance.verified` before `token.balance_delta.verified`: CAW live approve call evidence, matching Pact policy digest, CAW audit allow usage, approve tx receipt, ERC20 `Approval(owner=agentWallet, spender=ProcurementGate)`, and block-level `allowance` state must all match the registered spend.
 - Token settlement proof also requires `caw.activation.verified`: the CAW `activate_tool` contract call must have the same Pact policy digest, audit allow usage, and a tx hash matching the finalized `SpendSettled` event before ERC20 `Transfer` and `balanceOf` deltas can pass.
@@ -39,6 +39,7 @@ WINNER_CLAIM_ALLOWED: false
 
 - `receipt-verifier.md`: minimal P0 `pactfuse verify receipt.json` verifier spec and implementation boundary.
 - `../../packages/verifier/pactfuse-verify-receipt.mjs`: importable `verifyEvidence()` plus CLI for receipt-pack mode branches, pending markers, A/B/C proof cardinality, and gate-paid CAW allowlist shape; default mode is a proof-chip gate, `--schema-only` is structural preflight, and the scaffold reports `schemaOk`, `proofChipAllowed`, `finalVerifierComplete`, and refuses `winnerClaimAllowed: true`.
+- `/api/v1/evidence/claim-readiness`: derives current and target public modes from live evidence gates; it is a readiness report, not a manual mode override.
 - Receipt-pack hashes must bind CAW policy receipts, CAW operations, payment proof, source proof, chain events, artifact hash, and block window into one `PACTFUSE_EVIDENCE_V1` transcript.
 - W2 receipt-pack hashes also bind `priceDisclosure`, `deliveryPreflight`, optional `leaseRunHash`, and Judge Check rows through app-level evidence records before any paid-content-unlock or "used what it bought" claim.
 - W3 winner rows additionally require raw CAW receipt ingest, MCP Agent Transcript, independent target repo proof, and a `PACTFUSE_EVIDENCE_V1` replay bundle under one `sessionId`.

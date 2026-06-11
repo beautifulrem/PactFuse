@@ -17,7 +17,15 @@ export type PactFuseDb = {
   drizzleSchema: typeof schema;
 };
 
-export type LockedRuntimeConfig = {
+export type RuntimeConfig = {
+  claimMode: "simulated" | "caw-target-real" | "caw-stable-params-real";
+  paymentMode: "mocked" | "gate-paid-artifact-real" | "permit-payment-real";
+  tokenMode: "local-mocked" | "mock-test-token" | "official-testnet-usdc";
+  identityMode: "pending" | "p0-floor-one-wallet" | "p0-win-separate-identities";
+  winnerClaimAllowed: boolean;
+};
+
+export type LockedRuntimeConfig = RuntimeConfig & {
   claimMode: "simulated";
   paymentMode: "mocked";
   tokenMode: "local-mocked";
@@ -191,7 +199,7 @@ export type ServiceCtx = {
   requiredIndexerCursors: RequiredIndexerCursor[];
   clock: Clock;
   logger: Logger;
-  config: LockedRuntimeConfig;
+  config: RuntimeConfig;
 };
 
 export type ServiceResult<T> =
