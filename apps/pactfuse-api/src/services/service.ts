@@ -4,6 +4,7 @@ import {
   ArtifactRefundPayloadSchema,
   CawOperationBuildPayloadSchema,
   CawReceiptIngestPayloadSchema,
+  CawReceiptOperationViewSchema,
   CreateSessionInputSchema,
   EvidenceEventSchema,
   GateEventIngestPayloadSchema,
@@ -14,6 +15,7 @@ import {
   McpAdapterAuditPayloadSchema,
   McpAdapterCallViewSchema,
   QuotePayloadSchema,
+  RawCawReceiptBundleViewSchema,
   ReplayBundleViewSchema,
   RunnerHeartbeatViewSchema,
   SessionScopedEnvelopeSchema,
@@ -51,6 +53,15 @@ import {
 } from "../util.js";
 
 type Row = Record<string, unknown>;
+type CawReceiptIngestData = {
+  receiptBundleHash: `0x${string}`;
+  rawReceiptBundleHash?: `0x${string}`;
+  operationId: string | null;
+  receiptCount: number;
+  status: "fixture_manual_receipt" | "raw_ingested_pending_proof";
+  proofAuthority: false;
+  winnerClaimAllowed: false;
+};
 
 const JUDGE_ROWS = [
   ["caw_boundary", "CAW boundary", "pending CAW deny/allow receipts are not live"],
@@ -382,51 +393,145 @@ export async function buildCawOperation(input: SessionScopedEnvelope, ctx: Servi
 export async function ingestCawReceiptBundle(
   input: SessionScopedEnvelope,
   ctx: ServiceCtx,
-): Promise<ServiceResult<unknown>> {
+): Promise<ServiceResult<CawReceiptIngestData>> {
   const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
   const payload = parseStrict(CawReceiptIngestPayloadSchema, envelope.payload);
-  return withIdempotency(ctx, scoped("caw:receipts:ingest", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
+  return withIdempotency<CawReceiptIngestData>(ctx, scoped("caw:receipts:ingest", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
     if (!payload.manual && !payload.operationId) {
       throw Object.assign(new Error("CAW receipt ingest requires operationId"), {
         apiError: badRequestError(requestId, "non-manual CAW receipt ingest requires operationId"),
       });
     }
-    const receiptBundleHash = hashJson(payload.receipts);
-    const createdAt = ctx.clock.now().toISOString();
+    const operation = payload.operationId
+      ? (ctx.db.sqlite
+          .prepare(
+            `SELECT operation_id, session_id, operation_kind, target, selector, request_json, receipt_bundle_hash, status
+             FROM caw_receipt_operations
+             WHERE operation_id = ? AND session_id = ?`,
+          )
+          .get(payload.operationId, envelope.sessionId) as Row | undefined)
+      : undefined;
+    if (payload.operationId && !operation) {
+      throw Object.assign(new Error("CAW operation not found for receipt ingest"), {
+        apiError: notFoundError(requestId, "caw operation"),
+      });
+    }
     if (payload.operationId) {
+      assertCawOperationCanAcceptReceipt(operation, requestId);
+    }
+
+    if (payload.manual) {
+      const receiptBundleHash = hashJson(payload.receipts);
+      const event = withImmediateTransaction(ctx, () => {
+        if (payload.operationId) {
+          const result = ctx.db.sqlite
+            .prepare("UPDATE caw_receipt_operations SET receipt_bundle_hash = ?, status = ? WHERE operation_id = ? AND session_id = ?")
+            .run(receiptBundleHash, "fixture_manual_receipt", payload.operationId, envelope.sessionId);
+          if (result.changes === 0) {
+            throw Object.assign(new Error("CAW operation not found for receipt ingest"), {
+              apiError: notFoundError(requestId, "caw operation"),
+            });
+          }
+        }
+        return appendEvidenceEvent(ctx, {
+          sessionId: envelope.sessionId,
+          authority: "advisory",
+          kind: "caw.receipt.ingested.fixture",
+          payload: {
+            receiptBundleHash,
+            operationId: payload.operationId ?? null,
+            sourceLabel: payload.sourceLabel,
+            receiptCount: payload.receipts.length,
+            manual: true,
+            proofAuthority: false,
+            status: "fixture_manual_receipt",
+          },
+        });
+      });
+      return {
+        ok: true,
+        requestId,
+        evidenceEventId: event.eventId,
+        data: {
+          receiptBundleHash,
+          operationId: payload.operationId ?? null,
+          receiptCount: payload.receipts.length,
+          status: "fixture_manual_receipt",
+          proofAuthority: false,
+          winnerClaimAllowed: false,
+        },
+      };
+    }
+
+    const operationId = String(payload.operationId);
+    const rawBundle = await fetchAndValidateCawRawBundle(ctx, {
+      requestId,
+      sessionId: envelope.sessionId,
+      sourceLabel: payload.sourceLabel,
+      operationId,
+      expectedReceipts: payload.receipts,
+      operation,
+    });
+    const createdAt = ctx.clock.now().toISOString();
+    const rawReceiptBundleHash = hashJson(rawBundle.bundle);
+    const rawBundleId = hashJson({ sessionId: envelope.sessionId, operationId, rawReceiptBundleHash });
+    const event = withImmediateTransaction(ctx, () => {
       const result = ctx.db.sqlite
         .prepare("UPDATE caw_receipt_operations SET receipt_bundle_hash = ?, status = ? WHERE operation_id = ? AND session_id = ?")
-        .run(receiptBundleHash, payload.manual ? "fixture_manual_receipt" : "ingested_pending_proof", payload.operationId, envelope.sessionId);
+        .run(rawReceiptBundleHash, "raw_ingested_pending_proof", operationId, envelope.sessionId);
       if (result.changes === 0) {
         throw Object.assign(new Error("CAW operation not found for receipt ingest"), {
           apiError: notFoundError(requestId, "caw operation"),
         });
       }
-    }
-    const event = appendEvidenceEvent(ctx, {
-      sessionId: envelope.sessionId,
-      authority: "advisory",
-      kind: "caw.receipt.ingested.fixture",
-      payload: {
-        receiptBundleHash,
-        operationId: payload.operationId ?? null,
-        sourceLabel: payload.sourceLabel,
-        receiptCount: payload.receipts.length,
-        manual: payload.manual,
-        proofAuthority: false,
-        status: payload.manual ? "fixture_manual_receipt" : "ingested_pending_proof",
-      },
+      ctx.db.sqlite
+        .prepare(
+          `INSERT OR IGNORE INTO caw_raw_receipt_bundles
+            (bundle_id, session_id, operation_id, source_label, fetched_at, raw_bundle_hash, raw_bundle_json, receipt_count, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          rawBundleId,
+          envelope.sessionId,
+          operationId,
+          payload.sourceLabel,
+          rawBundle.fetchedAt,
+          rawReceiptBundleHash,
+          canonicalizeJson(rawBundle.bundle),
+          rawBundle.receipts.length,
+          createdAt,
+        );
+      return appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "advisory",
+        kind: "caw.receipt.ingested.raw",
+        payload: {
+          rawBundleId,
+          rawReceiptBundleHash,
+          receiptBundleHash: rawReceiptBundleHash,
+          operationId,
+          sourceLabel: payload.sourceLabel,
+          rawSource: rawBundle.source,
+          fetchedAt: rawBundle.fetchedAt,
+          receiptCount: rawBundle.receipts.length,
+          expectedReceiptCount: payload.receipts.length,
+          manual: false,
+          proofAuthority: false,
+          status: "raw_ingested_pending_proof",
+        },
+      });
     });
     return {
       ok: true,
       requestId,
       evidenceEventId: event.eventId,
       data: {
-        receiptBundleHash,
-        operationId: payload.operationId ?? null,
-        receiptCount: payload.receipts.length,
-        status: payload.manual ? "fixture_manual_receipt" : "ingested_pending_proof",
+        receiptBundleHash: rawReceiptBundleHash,
+        rawReceiptBundleHash,
+        operationId,
+        receiptCount: rawBundle.receipts.length,
+        status: "raw_ingested_pending_proof",
         proofAuthority: false,
         winnerClaimAllowed: false,
       },
@@ -945,6 +1050,8 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
   assertSession(ctx, parsedSessionId, requestId);
   const events = listEvents(ctx, parsedSessionId, 0, 200);
   const mcpAdapterCalls = listMcpAdapterCalls(ctx, parsedSessionId, 200);
+  const cawReceiptOperations = listCawReceiptOperations(ctx, parsedSessionId, 200);
+  const rawCawReceiptBundles = listRawCawReceiptBundles(ctx, parsedSessionId, 200);
   const agentTranscript = buildAgentTranscriptData(parsedSessionId, ctx, mcpAdapterCalls.length);
   const data = ReplayBundleViewSchema.parse({
     bundleType: "PACTFUSE_EVIDENCE_V1",
@@ -957,6 +1064,8 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
     agentTranscriptHash: hashJson(agentTranscript),
     events,
     mcpAdapterCalls,
+    cawReceiptOperations,
+    rawCawReceiptBundles,
     judgeCheck: readJudgeCheckData(parsedSessionId, ctx),
   });
   const bundleBytes = Buffer.byteLength(canonicalizeJson(data), "utf8");
@@ -1250,15 +1359,25 @@ function mcpSessionCandidate(value: Record<string, JsonValue>, path: string, req
 
 export function listEventsAfterEventId(ctx: ServiceCtx, sessionId: string, afterEventId: string | null): EvidenceEvent[] {
   const parsedSessionId = parseStrict(Hex32Schema, sessionId);
-  assertSession(ctx, parsedSessionId, newRequestId("stream"));
+  const requestId = newRequestId("stream");
+  assertSession(ctx, parsedSessionId, requestId);
   let afterSeq = 0;
   if (afterEventId) {
     const row = ctx.db.sqlite
       .prepare("SELECT event_seq FROM evidence_events WHERE session_id = ? AND event_id = ?")
       .get(parsedSessionId, afterEventId) as Row | undefined;
-    afterSeq = row ? Number(row.event_seq) : Number(afterEventId);
-    if (!Number.isFinite(afterSeq)) {
-      afterSeq = 0;
+    if (row) {
+      afterSeq = Number(row.event_seq);
+    } else if (Hex32Schema.safeParse(afterEventId).success) {
+      throw Object.assign(new Error("stream cursor event does not belong to this session"), {
+        apiError: badRequestError(requestId, "afterEventId does not belong to this session"),
+      });
+    } else if (/^(0|[1-9][0-9]*)$/.test(afterEventId)) {
+      afterSeq = Number(afterEventId);
+    } else {
+      throw Object.assign(new Error("invalid stream cursor"), {
+        apiError: badRequestError(requestId, "afterEventId must be an event id for this session or an event sequence number"),
+      });
     }
   }
   return listEvents(ctx, parsedSessionId, afterSeq, 200);
@@ -1276,6 +1395,7 @@ export function appendEvidenceEvent(
       | "spend.registered"
       | "caw.operation.built"
       | "caw.receipt.ingested.fixture"
+      | "caw.receipt.ingested.raw"
       | "artifact.preflight.pending"
       | "quote.signed.mocked"
       | "artifact.refund.pending"
@@ -1579,6 +1699,205 @@ function requireSpendPayer(spend: Row, payer: string, requestId: string): string
     });
   }
   return registeredPayer;
+}
+
+function assertCawOperationCanAcceptReceipt(operation: Row | undefined, requestId: string): void {
+  if (!operation) {
+    return;
+  }
+  if (operation.receipt_bundle_hash || operation.status !== "built_mocked") {
+    throw Object.assign(new Error("CAW operation already has an attached receipt bundle"), {
+      apiError: conflictError(requestId, "CAW operation already has an attached receipt bundle"),
+    });
+  }
+}
+
+async function fetchAndValidateCawRawBundle(
+  ctx: ServiceCtx,
+  input: {
+    requestId: string;
+    sessionId: string;
+    sourceLabel: string;
+    operationId: string;
+    expectedReceipts: Array<Record<string, JsonValue>>;
+    operation: Row | undefined;
+  },
+): Promise<{ bundle: Record<string, JsonValue>; receipts: Array<Record<string, JsonValue>>; source: string; fetchedAt: string }> {
+  if (!input.operation) {
+    throw Object.assign(new Error("CAW operation not found for raw receipt ingest"), {
+      apiError: notFoundError(input.requestId, "caw operation"),
+    });
+  }
+  let status;
+  try {
+    status = await ctx.caw.status();
+  } catch (error) {
+    throw Object.assign(new Error("CAW receipt source readiness check failed"), {
+      apiError: proofPendingError(input.requestId, cawFailureMessage("CAW receipt source readiness check failed", error)),
+    });
+  }
+  if (!status.ready) {
+    throw Object.assign(new Error("CAW receipt source is not ready"), {
+      apiError: proofPendingError(input.requestId, `CAW receipt source is not ready: ${status.reason}`),
+    });
+  }
+
+  let raw;
+  try {
+    raw = await ctx.caw.fetchReceiptBundle({
+      sessionId: input.sessionId,
+      sourceLabel: input.sourceLabel,
+      operationId: input.operationId,
+      operationKind: input.operation.operation_kind,
+      target: input.operation.target,
+      selector: input.operation.selector,
+      request: JSON.parse(String(input.operation.request_json)),
+    });
+  } catch (error) {
+    throw Object.assign(new Error("failed to fetch raw CAW receipt bundle"), {
+      apiError: proofPendingError(input.requestId, cawFailureMessage("failed to fetch raw CAW receipt bundle", error)),
+    });
+  }
+  const bundle = normalizeCawRawBundle(raw, input.requestId);
+  const receipts = cawBundleReceipts(bundle);
+  if (receipts.length === 0) {
+    throw Object.assign(new Error("raw CAW receipt bundle is empty"), {
+      apiError: proofBlockedError(input.requestId, "raw CAW receipt bundle is empty"),
+    });
+  }
+  assertCawBundleMetadata(bundle, input);
+  assertCawOperationMembership(receipts, input);
+  assertExpectedCawReceipts(receipts, input.expectedReceipts, input.requestId);
+  return {
+    bundle,
+    receipts,
+    source: cawBundleSource(bundle, input.sourceLabel),
+    fetchedAt: cawBundleFetchedAt(bundle, ctx.clock.now().toISOString()),
+  };
+}
+
+function normalizeCawRawBundle(value: unknown, requestId: string): Record<string, JsonValue> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw Object.assign(new Error("raw CAW receipt bundle must be a JSON object"), {
+      apiError: proofBlockedError(requestId, "raw CAW receipt bundle must be a JSON object"),
+    });
+  }
+  return normalizeChainJson(value) as Record<string, JsonValue>;
+}
+
+function cawBundleReceipts(bundle: Record<string, JsonValue>): Array<Record<string, JsonValue>> {
+  const candidates = [
+    bundle.receipts,
+    bundle.rawReceipts,
+    bundle.operations,
+    bundle.records,
+  ];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate.filter((item): item is Record<string, JsonValue> => Boolean(item && typeof item === "object" && !Array.isArray(item)));
+    }
+  }
+  return [];
+}
+
+function assertCawBundleMetadata(
+  bundle: Record<string, JsonValue>,
+  input: { requestId: string; sessionId: string; sourceLabel: string },
+): void {
+  const sessionId = asOptionalString(bundle.sessionId);
+  if (sessionId && sessionId !== input.sessionId) {
+    throw Object.assign(new Error("raw CAW receipt bundle sessionId mismatch"), {
+      apiError: proofBlockedError(input.requestId, "raw CAW receipt bundle sessionId mismatch", {
+        expected: input.sessionId,
+        actual: sessionId,
+      }),
+    });
+  }
+  const source = asOptionalString(bundle.source ?? bundle.sourceLabel);
+  if (source && source !== input.sourceLabel) {
+    throw Object.assign(new Error("raw CAW receipt bundle source mismatch"), {
+      apiError: proofBlockedError(input.requestId, "raw CAW receipt bundle source mismatch", {
+        expected: input.sourceLabel,
+        actual: source,
+      }),
+    });
+  }
+}
+
+function assertCawOperationMembership(
+  receipts: Array<Record<string, JsonValue>>,
+  input: {
+    requestId: string;
+    sessionId: string;
+    operationId: string;
+    operation: Row | undefined;
+  },
+): void {
+  const matching = receipts.find((receipt) => {
+    const operationId = asOptionalString(receipt.operationId ?? receipt.cawOperationId ?? receipt.requestId);
+    if (!operationId || operationId !== input.operationId) {
+      return false;
+    }
+    const sessionId = asOptionalString(receipt.sessionId);
+    if (!sessionId || sessionId !== input.sessionId) {
+      return false;
+    }
+    const operationKind = asOptionalString(receipt.operationKind ?? receipt.kind);
+    if (!operationKind || operationKind !== String(input.operation?.operation_kind)) {
+      return false;
+    }
+    const target = asOptionalString(receipt.target);
+    if (input.operation?.target && (!target || target.toLowerCase() !== String(input.operation.target).toLowerCase())) {
+      return false;
+    }
+    const selector = asOptionalString(receipt.selector);
+    if (input.operation?.selector && (!selector || selector.toLowerCase() !== String(input.operation.selector).toLowerCase())) {
+      return false;
+    }
+    return true;
+  });
+  if (!matching) {
+    throw Object.assign(new Error("raw CAW receipt bundle does not contain the requested operation"), {
+      apiError: proofBlockedError(input.requestId, "raw CAW receipt bundle does not contain the requested operation", {
+        operationId: input.operationId,
+      }),
+    });
+  }
+}
+
+function assertExpectedCawReceipts(
+  rawReceipts: Array<Record<string, JsonValue>>,
+  expectedReceipts: Array<Record<string, JsonValue>>,
+  requestId: string,
+): void {
+  if (expectedReceipts.length === 0) {
+    return;
+  }
+  const rawHashes = new Set(rawReceipts.map((receipt) => hashJson(receipt)));
+  const missing = expectedReceipts.map((receipt) => hashJson(receipt)).filter((receiptHash) => !rawHashes.has(receiptHash));
+  if (missing.length > 0) {
+    throw Object.assign(new Error("expected CAW receipt rows are not members of the raw bundle"), {
+      apiError: proofBlockedError(requestId, "expected CAW receipt rows are not members of the raw bundle", {
+        missingReceiptHashes: missing,
+      }),
+    });
+  }
+}
+
+function cawBundleSource(bundle: Record<string, JsonValue>, fallback: string): string {
+  return asOptionalString(bundle.source ?? bundle.sourceLabel) ?? fallback;
+}
+
+function cawBundleFetchedAt(bundle: Record<string, JsonValue>, fallback: string): string {
+  return asOptionalString(bundle.fetchedAt ?? bundle.exportedAt ?? bundle.createdAt) ?? fallback;
+}
+
+function asOptionalString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function cawFailureMessage(prefix: string, error: unknown): string {
+  return error instanceof Error ? `${prefix}: ${error.message}` : prefix;
 }
 
 function recordOperatorKeyUse(
@@ -2375,6 +2694,58 @@ function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number) 
   );
 }
 
+function listCawReceiptOperations(ctx: ServiceCtx, sessionId: string, limit: number) {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM caw_receipt_operations
+       WHERE session_id = ?
+       ORDER BY created_at ASC, operation_id ASC
+       LIMIT ?`,
+    )
+    .all(sessionId, limit) as Row[];
+  return rows.map((row) =>
+    CawReceiptOperationViewSchema.parse({
+      operationId: row.operation_id,
+      sessionId: row.session_id,
+      spendId: row.spend_id ?? null,
+      operationKind: row.operation_kind,
+      target: row.target ?? null,
+      selector: row.selector ?? null,
+      valueAtomic: row.value_atomic,
+      request: JSON.parse(String(row.request_json)),
+      receiptBundleHash: row.receipt_bundle_hash ?? null,
+      status: row.status,
+      createdAt: row.created_at,
+    }),
+  );
+}
+
+function listRawCawReceiptBundles(ctx: ServiceCtx, sessionId: string, limit: number) {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM caw_raw_receipt_bundles
+       WHERE session_id = ?
+       ORDER BY created_at ASC, bundle_id ASC
+       LIMIT ?`,
+    )
+    .all(sessionId, limit) as Row[];
+  return rows.map((row) =>
+    RawCawReceiptBundleViewSchema.parse({
+      bundleId: row.bundle_id,
+      sessionId: row.session_id,
+      operationId: row.operation_id,
+      sourceLabel: row.source_label,
+      fetchedAt: row.fetched_at,
+      rawBundleHash: row.raw_bundle_hash,
+      rawBundle: JSON.parse(String(row.raw_bundle_json)),
+      receiptCount: row.receipt_count,
+      createdAt: row.created_at,
+    }),
+  );
+}
+
 function verifyEventLogIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   const events = listEvents(ctx, sessionId, 0, 200);
   const errors: string[] = [];
@@ -2536,18 +2907,38 @@ function verifyReplayBundleBindings(
   if (typeof bundle.sessionId === "string" && bundle.sessionId !== sessionId) {
     errors.push("replayBundle.sessionId must match verifier sessionId");
   }
-  if (typeof bundle.agentTranscriptHash !== "string") {
-    return errors;
-  }
   const asOfCount =
     typeof bundle.asOfMcpAdapterCallCount === "number" && Number.isInteger(bundle.asOfMcpAdapterCallCount)
       ? Math.max(0, Math.min(bundle.asOfMcpAdapterCallCount, 200))
       : 200;
-  const expectedAgentTranscriptHash = hashJson(buildAgentTranscriptData(sessionId, ctx, asOfCount));
-  if (bundle.agentTranscriptHash !== expectedAgentTranscriptHash) {
+  const asOfEventSeq =
+    typeof bundle.asOfEventSeq === "number" && Number.isInteger(bundle.asOfEventSeq)
+      ? Math.max(0, Math.min(bundle.asOfEventSeq, 200))
+      : 200;
+  const expectedEvents = listEvents(ctx, sessionId, 0, 200).filter((event) => event.eventSeq <= asOfEventSeq);
+  const expectedEventRoot = hashJson(expectedEvents.map((event) => event.eventHash));
+  if (bundle.eventRoot !== expectedEventRoot) {
+    errors.push("replayBundle.eventRoot does not match the server event snapshot");
+  }
+  if (bundle.agentTranscriptHash !== hashJson(buildAgentTranscriptData(sessionId, ctx, asOfCount))) {
     errors.push("replayBundle.agentTranscriptHash does not match the server transcript snapshot");
   }
+  compareReplaySnapshot(errors, "replayBundle.events", bundle.events, expectedEvents);
+  compareReplaySnapshot(errors, "replayBundle.mcpAdapterCalls", bundle.mcpAdapterCalls, listMcpAdapterCalls(ctx, sessionId, asOfCount));
+  compareReplaySnapshot(errors, "replayBundle.cawReceiptOperations", bundle.cawReceiptOperations, listCawReceiptOperations(ctx, sessionId, 200));
+  compareReplaySnapshot(errors, "replayBundle.rawCawReceiptBundles", bundle.rawCawReceiptBundles, listRawCawReceiptBundles(ctx, sessionId, 200));
+  compareReplaySnapshot(errors, "replayBundle.judgeCheck", bundle.judgeCheck, readJudgeCheckData(sessionId, ctx));
   return errors;
+}
+
+function compareReplaySnapshot(errors: string[], label: string, actual: unknown, expected: unknown): void {
+  if (actual === undefined) {
+    errors.push(`${label} is missing from the verifier replay bundle`);
+    return;
+  }
+  if (hashJson(actual) !== hashJson(expected)) {
+    errors.push(`${label} does not match the server snapshot`);
+  }
 }
 
 function replayBundleFromVerifierPayload(payload: {

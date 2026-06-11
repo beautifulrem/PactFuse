@@ -110,6 +110,19 @@ CREATE TABLE IF NOT EXISTS caw_receipt_operations (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS caw_raw_receipt_bundles (
+  bundle_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  source_label TEXT NOT NULL,
+  fetched_at TEXT NOT NULL,
+  raw_bundle_hash TEXT NOT NULL,
+  raw_bundle_json TEXT NOT NULL,
+  receipt_count INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(session_id, operation_id, raw_bundle_hash)
+);
+
 CREATE TABLE IF NOT EXISTS artifact_preflights (
   preflight_id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,

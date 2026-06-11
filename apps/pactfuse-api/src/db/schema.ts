@@ -46,6 +46,28 @@ export const evidenceEvents = sqliteTable(
   }),
 );
 
+export const cawRawReceiptBundles = sqliteTable(
+  "caw_raw_receipt_bundles",
+  {
+    bundleId: text("bundle_id").primaryKey(),
+    sessionId: text("session_id").notNull(),
+    operationId: text("operation_id").notNull(),
+    sourceLabel: text("source_label").notNull(),
+    fetchedAt: text("fetched_at").notNull(),
+    rawBundleHash: text("raw_bundle_hash").notNull(),
+    rawBundleJson: text("raw_bundle_json").notNull(),
+    receiptCount: integer("receipt_count").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => ({
+    sessionOperationBundle: uniqueIndex("caw_raw_receipt_bundles_session_operation_bundle").on(
+      table.sessionId,
+      table.operationId,
+      table.rawBundleHash,
+    ),
+  }),
+);
+
 export const gateChainEvents = sqliteTable(
   "gate_chain_events",
   {

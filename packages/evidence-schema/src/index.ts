@@ -142,10 +142,14 @@ export const CawReceiptIngestPayloadSchema = z
   .object({
     sourceLabel: z.string().min(1).max(120),
     operationId: z.string().min(1).max(160).optional(),
-    receipts: z.array(JsonObjectSchema).min(1).max(64),
+    receipts: z.array(JsonObjectSchema).max(64).default([]),
     manual: z.boolean().default(false),
   })
-  .strict();
+  .strict()
+  .refine((payload) => !payload.manual || payload.receipts.length > 0, {
+    message: "manual CAW receipt ingest requires at least one receipt row",
+    path: ["receipts"],
+  });
 
 export const ArtifactPreflightPayloadSchema = z
   .object({
@@ -235,6 +239,7 @@ export const EvidenceEventKindSchema = z.enum([
   "spend.registered",
   "caw.operation.built",
   "caw.receipt.ingested.fixture",
+  "caw.receipt.ingested.raw",
   "artifact.preflight.pending",
   "quote.signed.mocked",
   "artifact.refund.pending",
@@ -328,6 +333,36 @@ export const McpAdapterCallViewSchema = z
   })
   .strict();
 
+export const CawReceiptOperationViewSchema = z
+  .object({
+    operationId: Hex32Schema,
+    sessionId: Hex32Schema,
+    spendId: Hex32Schema.nullable(),
+    operationKind: z.enum(["deny_probe", "approve", "activate_tool"]),
+    target: HexSchema.nullable(),
+    selector: z.string().regex(/^0x[0-9a-fA-F]{8}$/).nullable(),
+    valueAtomic: DecimalStringSchema,
+    request: JsonObjectSchema,
+    receiptBundleHash: Hex32Schema.nullable(),
+    status: z.enum(["built_mocked", "fixture_manual_receipt", "raw_ingested_pending_proof"]),
+    createdAt: IsoDateStringSchema,
+  })
+  .strict();
+
+export const RawCawReceiptBundleViewSchema = z
+  .object({
+    bundleId: Hex32Schema,
+    sessionId: Hex32Schema,
+    operationId: Hex32Schema,
+    sourceLabel: z.string().min(1).max(120),
+    fetchedAt: IsoDateStringSchema,
+    rawBundleHash: Hex32Schema,
+    rawBundle: JsonObjectSchema,
+    receiptCount: z.number().int().min(1).max(64),
+    createdAt: IsoDateStringSchema,
+  })
+  .strict();
+
 export const ReplayBundleViewSchema = z
   .object({
     bundleType: z.literal("PACTFUSE_EVIDENCE_V1"),
@@ -340,6 +375,8 @@ export const ReplayBundleViewSchema = z
     agentTranscriptHash: Hex32Schema,
     events: z.array(EvidenceEventSchema).max(200),
     mcpAdapterCalls: z.array(McpAdapterCallViewSchema).max(200),
+    cawReceiptOperations: z.array(CawReceiptOperationViewSchema).max(200),
+    rawCawReceiptBundles: z.array(RawCawReceiptBundleViewSchema).max(200),
     judgeCheck: JudgeCheckViewSchema,
   })
   .strict();

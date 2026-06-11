@@ -15,17 +15,17 @@ import {
 } from "../services/providers.js";
 import { appendEvidenceEvent, recordMcpAdapterCall } from "../services/service.js";
 import { createVerifierAdapter } from "../services/verifier.js";
-import type { ChainClient, ServiceCtx } from "../types.js";
+import type { CawReceiptSource, ChainClient, ServiceCtx } from "../types.js";
 
 const MCP_AUDIT_TOKEN = "test-mcp-audit-token";
 
-function makeApp(dbPath = ":memory:", options: { chain?: ChainClient; mcpAuditSecret?: string | null } = {}) {
+function makeApp(dbPath = ":memory:", options: { caw?: CawReceiptSource; chain?: ChainClient; mcpAuditSecret?: string | null } = {}) {
   const mcpAuditSecret = options.mcpAuditSecret === undefined ? MCP_AUDIT_TOKEN : options.mcpAuditSecret;
   const ctx: ServiceCtx = {
     db: openPactFuseDb(dbPath),
     verifier: createVerifierAdapter(),
     chain: options.chain ?? createUnconfiguredChainClient(),
-    caw: createUnconfiguredCawReceiptSource(),
+    caw: options.caw ?? createUnconfiguredCawReceiptSource(),
     templates: createStaticTemplateRegistry([
       {
         mode: "gate-paid-artifact-real",
@@ -252,6 +252,20 @@ describe("pactfuse-api P0", () => {
       "proofAuthority",
       "winnerClaimAllowed",
     ]);
+    const cawIngestDataSchema = json.components.schemas.CawReceiptIngestResponse.oneOf[0].properties.data;
+    expect(cawIngestDataSchema.required).toEqual([
+      "receiptBundleHash",
+      "operationId",
+      "receiptCount",
+      "status",
+      "proofAuthority",
+      "winnerClaimAllowed",
+    ]);
+    expect(cawIngestDataSchema.properties.status.enum).toEqual([
+      "fixture_manual_receipt",
+      "raw_ingested_pending_proof",
+    ]);
+    expect(cawIngestDataSchema.properties.rawReceiptBundleHash.type).toBe("string");
     expect(json.paths["/api/v1/gate/events/ingest"].post["x-pactfuse-proof-fields"]).toEqual([
       "finalityStatus",
       "confirmations",
@@ -404,9 +418,23 @@ describe("pactfuse-api P0", () => {
       "agentTranscriptHash",
       "events",
       "mcpAdapterCalls",
+      "cawReceiptOperations",
+      "rawCawReceiptBundles",
       "judgeCheck",
     ]);
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("mcpAdapterCalls");
+    expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("rawCawReceiptBundles");
+    expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.rawCawReceiptBundles.items.required).toEqual([
+      "bundleId",
+      "sessionId",
+      "operationId",
+      "sourceLabel",
+      "fetchedAt",
+      "rawBundleHash",
+      "rawBundle",
+      "receiptCount",
+      "createdAt",
+    ]);
     expect(json.paths["/api/v1/evidence/agent-transcript"].get["x-pactfuse-proof-fields"]).toEqual([
       "transcriptHash",
       "toolsCallHash",
@@ -572,6 +600,21 @@ describe("pactfuse-api P0", () => {
     expect(text).not.toContain("event: session.created");
   });
 
+  it("rejects SSE resume cursors from another session", async () => {
+    const { app } = makeApp();
+    const sessionA = await createSession(app, "sess-sse-a");
+    const sessionB = await createSession(app, "sess-sse-b");
+    const replayA = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionA}`);
+    const replayAJson = await replayA.json();
+
+    const stream = await app.request(`/api/v1/evidence/stream?sessionId=${sessionB}&afterEventId=${replayAJson.data.events[0].eventId}`);
+    const json = await stream.json();
+
+    expect(stream.status).toBe(400);
+    expect(json.error.code).toBe("bad_request");
+    expect(json.error.message).toContain("afterEventId does not belong to this session");
+  });
+
   it("does not let manual CAW receipt rows pass proof state", async () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-caw");
@@ -625,8 +668,48 @@ describe("pactfuse-api P0", () => {
     expect(unknownOperation.json.error.code).toBe("not_found");
   });
 
-  it("links non-manual CAW receipt ingest to a built operation", async () => {
+  it("keeps non-manual CAW receipt ingest pending when the raw provider is unavailable", async () => {
     const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-caw-raw-unconfigured");
+    const spendId = await registerSpend(app, sessionId);
+    const operation = await post(app, "/api/v1/caw/operations/build", {
+      sessionId,
+      idempotencyKey: "build-unconfigured-caw-op",
+      payload: {
+        spendId,
+        operationKind: "approve",
+        target: "0x1234",
+        selector: "0x095ea7b3",
+      },
+    });
+
+    const ingest = await post(app, "/api/v1/caw/receipts/ingest", {
+      sessionId,
+      idempotencyKey: "ingest-unconfigured-caw-receipt",
+      payload: {
+        sourceLabel: "caw-api",
+        operationId: operation.json.data.operationId,
+        manual: false,
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(operation.status).toBe(201);
+    expect(ingest.status).toBe(423);
+    expect(ingest.json.error.code).toBe("proof_pending");
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("caw.receipt.ingested.raw");
+  });
+
+  it("links non-manual CAW receipt ingest to a built operation", async () => {
+    const rawReceipt = {
+      operationKind: "activate_tool",
+      target: "0x1234",
+      selector: "0xabcdef12",
+      requestId: "req-linked",
+      status: "succeeded",
+    };
+    const { app, ctx } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: [rawReceipt] }) });
     const sessionId = await createSession(app, "sess-caw-receipt-linked");
     const spendId = await registerSpend(app, sessionId);
 
@@ -646,23 +729,195 @@ describe("pactfuse-api P0", () => {
       payload: {
         sourceLabel: "caw-api",
         operationId: operation.json.data.operationId,
-        receipts: [{ requestId: "req-linked", spendId }],
+        receipts: [{ ...rawReceipt, operationId: operation.json.data.operationId, sessionId }],
         manual: false,
       },
     });
     const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
     const replayJson = await replay.json();
-    const event = replayJson.data.events.find((candidate: { kind: string }) => candidate.kind === "caw.receipt.ingested.fixture");
+    const event = replayJson.data.events.find((candidate: { kind: string }) => candidate.kind === "caw.receipt.ingested.raw");
+    const bundleRow = ctx.db.sqlite
+      .prepare("SELECT operation_id, source_label, receipt_count, raw_bundle_hash, raw_bundle_json FROM caw_raw_receipt_bundles")
+      .get() as Record<string, unknown>;
 
     expect(operation.status).toBe(201);
     expect(ingest.status).toBe(202);
     expect(ingest.json.data.operationId).toBe(operation.json.data.operationId);
     expect(ingest.json.data.receiptCount).toBe(1);
-    expect(ingest.json.data.status).toBe("ingested_pending_proof");
+    expect(ingest.json.data.status).toBe("raw_ingested_pending_proof");
     expect(ingest.json.data.proofAuthority).toBe(false);
     expect(event.payload.operationId).toBe(operation.json.data.operationId);
     expect(event.payload.receiptCount).toBe(1);
+    expect(event.payload.manual).toBe(false);
+    expect(event.payload.rawReceiptBundleHash).toBe(ingest.json.data.rawReceiptBundleHash);
+    expect(replayJson.data.cawReceiptOperations).toEqual([
+      expect.objectContaining({
+        operationId: operation.json.data.operationId,
+        receiptBundleHash: ingest.json.data.rawReceiptBundleHash,
+        status: "raw_ingested_pending_proof",
+      }),
+    ]);
+    expect(replayJson.data.rawCawReceiptBundles).toEqual([
+      expect.objectContaining({
+        operationId: operation.json.data.operationId,
+        sourceLabel: "caw-api",
+        rawBundleHash: ingest.json.data.rawReceiptBundleHash,
+        receiptCount: 1,
+      }),
+    ]);
+    expect(replayJson.data.rawCawReceiptBundles[0].rawBundle.receipts[0].operationId).toBe(operation.json.data.operationId);
+    const verifyTamperedRawCaw = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-raw-caw-bundle-tampered",
+      payload: {
+        replayBundle: {
+          ...replayJson.data,
+          rawCawReceiptBundles: [],
+        },
+      },
+    });
+    expect(verifyTamperedRawCaw.json.data.schemaOk).toBe(false);
+    expect(verifyTamperedRawCaw.json.data.errors).toContain("replayBundle.rawCawReceiptBundles does not match the server snapshot");
+    expect(bundleRow).toEqual(
+      expect.objectContaining({
+        operation_id: operation.json.data.operationId,
+        source_label: "caw-api",
+        receipt_count: 1,
+        raw_bundle_hash: ingest.json.data.rawReceiptBundleHash,
+      }),
+    );
+    expect(JSON.stringify(JSON.parse(String(bundleRow.raw_bundle_json)))).toContain(operation.json.data.operationId);
   });
+
+  it("does not let later CAW receipt ingests overwrite an operation bundle", async () => {
+    const rawReceipt = {
+      operationKind: "activate_tool",
+      target: "0x1234",
+      selector: "0xabcdef12",
+      status: "succeeded",
+    };
+    const { app } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: [rawReceipt] }) });
+    const sessionId = await createSession(app, "sess-caw-no-overwrite");
+    const spendId = await registerSpend(app, sessionId);
+    const operation = await post(app, "/api/v1/caw/operations/build", {
+      sessionId,
+      idempotencyKey: "build-no-overwrite-caw-op",
+      payload: {
+        spendId,
+        operationKind: "activate_tool",
+        target: "0x1234",
+        selector: "0xabcdef12",
+      },
+    });
+    const rawIngest = await post(app, "/api/v1/caw/receipts/ingest", {
+      sessionId,
+      idempotencyKey: "ingest-no-overwrite-raw",
+      payload: {
+        sourceLabel: "caw-api",
+        operationId: operation.json.data.operationId,
+        manual: false,
+      },
+    });
+    const manualOverwrite = await post(app, "/api/v1/caw/receipts/ingest", {
+      sessionId,
+      idempotencyKey: "ingest-no-overwrite-manual",
+      payload: {
+        sourceLabel: "operator-entry",
+        operationId: operation.json.data.operationId,
+        receipts: [{ operationId: operation.json.data.operationId, sessionId, note: "manual overwrite attempt" }],
+        manual: true,
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(rawIngest.status).toBe(202);
+    expect(manualOverwrite.status).toBe(409);
+    expect(manualOverwrite.json.error.code).toBe("idempotency_conflict");
+    expect(replayJson.data.cawReceiptOperations[0]).toEqual(
+      expect.objectContaining({
+        operationId: operation.json.data.operationId,
+        receiptBundleHash: rawIngest.json.data.rawReceiptBundleHash,
+        status: "raw_ingested_pending_proof",
+      }),
+    );
+  });
+
+  it("blocks raw CAW receipt bundles that do not contain the requested operation", async () => {
+    const { app } = makeApp(":memory:", {
+      caw: createFakeCawReceiptSource({
+        receipts: [{ operationId: "other-operation", operationKind: "activate_tool", target: "0x1234", selector: "0xabcdef12" }],
+      }),
+    });
+    const sessionId = await createSession(app, "sess-caw-raw-operation-missing");
+    const spendId = await registerSpend(app, sessionId);
+    const operation = await post(app, "/api/v1/caw/operations/build", {
+      sessionId,
+      idempotencyKey: "build-missing-raw-op",
+      payload: {
+        spendId,
+        operationKind: "activate_tool",
+        target: "0x1234",
+        selector: "0xabcdef12",
+      },
+    });
+
+    const ingest = await post(app, "/api/v1/caw/receipts/ingest", {
+      sessionId,
+      idempotencyKey: "ingest-missing-raw-op",
+      payload: {
+        sourceLabel: "caw-api",
+        operationId: operation.json.data.operationId,
+        manual: false,
+      },
+    });
+
+    expect(operation.status).toBe(201);
+    expect(ingest.status).toBe(422);
+    expect(ingest.json.error.code).toBe("proof_blocked");
+    expect(ingest.json.error.message).toContain("does not contain the requested operation");
+  });
+
+  it.each(["sessionId", "operationKind", "target", "selector"])(
+    "blocks raw CAW receipt bundles that omit %s from the operation link",
+    async (missingField) => {
+      const rawReceipt: Record<string, unknown> = {
+        operationKind: "activate_tool",
+        target: "0x1234",
+        selector: "0xabcdef12",
+        status: "succeeded",
+        [missingField]: undefined,
+      };
+      const { app } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: [rawReceipt] }) });
+      const sessionId = await createSession(app, `sess-caw-raw-missing-${missingField.toLowerCase()}`);
+      const spendId = await registerSpend(app, sessionId);
+      const operation = await post(app, "/api/v1/caw/operations/build", {
+        sessionId,
+        idempotencyKey: `build-missing-${missingField.toLowerCase()}-raw-op`,
+        payload: {
+          spendId,
+          operationKind: "activate_tool",
+          target: "0x1234",
+          selector: "0xabcdef12",
+        },
+      });
+
+      const ingest = await post(app, "/api/v1/caw/receipts/ingest", {
+        sessionId,
+        idempotencyKey: `ingest-missing-${missingField.toLowerCase()}-raw-op`,
+        payload: {
+          sourceLabel: "caw-api",
+          operationId: operation.json.data.operationId,
+          manual: false,
+        },
+      });
+
+      expect(operation.status).toBe(201);
+      expect(ingest.status).toBe(422);
+      expect(ingest.json.error.code).toBe("proof_blocked");
+      expect(ingest.json.error.message).toContain("does not contain the requested operation");
+    },
+  );
 
   it("requires signed gate event ingest before accepting observed logs", async () => {
     const { app } = makeApp();
@@ -1414,6 +1669,39 @@ describe("pactfuse-api P0", () => {
         },
       },
     });
+    const verifyTamperedEventRoot = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-replay-event-root-tampered",
+      payload: {
+        replayBundle: {
+          ...replayJson.data,
+          eventRoot: hex32("tampered-event-root"),
+        },
+      },
+    });
+    const verifyTamperedMcpCalls = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-replay-mcp-tampered",
+      payload: {
+        replayBundle: {
+          ...replayJson.data,
+          mcpAdapterCalls: [],
+        },
+      },
+    });
+    const verifyTamperedJudgeCheck = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-replay-judge-tampered",
+      payload: {
+        replayBundle: {
+          ...replayJson.data,
+          judgeCheck: {
+            ...replayJson.data.judgeCheck,
+            sessionId: hex32("tampered-judge-check"),
+          },
+        },
+      },
+    });
 
     expect(verifySnapshot.json.data.errors).not.toContain(
       "replayBundle.agentTranscriptHash does not match the server transcript snapshot",
@@ -1421,6 +1709,12 @@ describe("pactfuse-api P0", () => {
     expect(verifyTampered.json.data.errors).toContain(
       "replayBundle.agentTranscriptHash does not match the server transcript snapshot",
     );
+    expect(verifyTamperedEventRoot.json.data.schemaOk).toBe(false);
+    expect(verifyTamperedEventRoot.json.data.errors).toContain("replayBundle.eventRoot does not match the server event snapshot");
+    expect(verifyTamperedMcpCalls.json.data.schemaOk).toBe(false);
+    expect(verifyTamperedMcpCalls.json.data.errors).toContain("replayBundle.mcpAdapterCalls does not match the server snapshot");
+    expect(verifyTamperedJudgeCheck.json.data.schemaOk).toBe(false);
+    expect(verifyTamperedJudgeCheck.json.data.errors).toContain("replayBundle.judgeCheck does not match the server snapshot");
   });
 
   it("reports verifier errors when MCP adapter row hashes diverge from evidence events", async () => {
@@ -2051,6 +2345,33 @@ function createFakeGateChainClient(currentBlockNumber = 101): ChainClient {
           rawLogHash: input.rawLogHash,
         },
       ];
+    },
+  };
+}
+
+function createFakeCawReceiptSource(input: { receipts: Array<Record<string, unknown>>; source?: string }): CawReceiptSource {
+  return {
+    async status() {
+      return {
+        name: "caw",
+        mode: "fixture",
+        ready: true,
+        reason: "test CAW receipt source",
+      };
+    },
+    async fetchReceiptBundle(request: Record<string, unknown>) {
+      return {
+        source: input.source ?? "caw-api",
+        sourceLabel: request.sourceLabel,
+        sessionId: request.sessionId,
+        operationId: request.operationId,
+        fetchedAt: "2026-06-11T00:00:00.000Z",
+        receipts: input.receipts.map((receipt) => ({
+          sessionId: request.sessionId,
+          operationId: request.operationId,
+          ...receipt,
+        })),
+      };
     },
   };
 }
