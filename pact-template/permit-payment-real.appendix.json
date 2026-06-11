@@ -1,6 +1,6 @@
 {
   "intent": "Appendix fallback: Agent may buy one source-bound code-scan MCP lease through PactFuse using CAW-signed GatePaymentAuthorization and EIP-2612 Permit",
-  "execution_plan": "Sign GatePaymentAuthorization, sign EIP-2612 Permit, then call ProcurementGate.activateTool. Do not call PaidArtifactMarket directly.",
+  "execution_plan": "Sign GatePaymentAuthorization, sign EIP-2612 Permit, then call ProcurementGate.activateTool(bytes32,bytes). Do not call PaidArtifactMarket directly.",
   "evidence_requirements": [
     "This appendix JSON alone is not enough for permit-payment-real.",
     "CAW message_sign receipts must include exact typed-data hashes for GatePaymentAuthorization and EIP-2612 Permit.",
@@ -90,10 +90,8 @@
             }
           ],
           "params_match": [
-            { "param_name": "pactId", "op": "eq", "value": "<pactId>" },
-            { "param_name": "toolId", "op": "eq", "value": "<toolId>" },
-            { "param_name": "paymentToken", "op": "eq", "value": "<PUBLIC_TESTNET_MOCK_ERC20>" },
-            { "param_name": "maxPrice", "op": "lte", "value": "200000" }
+            { "param_name": "spendId", "op": "eq", "value": "<spendId>" },
+            { "param_name": "paymentAuth", "op": "eq", "value": "<paymentAuth>" }
           ]
         },
         "deny_if": {
@@ -106,12 +104,7 @@
           "selector": "<activateTool-selector>",
           "name": "activateTool",
           "inputs": [
-            { "name": "pactId", "type": "bytes32" },
             { "name": "spendId", "type": "bytes32" },
-            { "name": "toolId", "type": "bytes32" },
-            { "name": "paymentToken", "type": "address" },
-            { "name": "maxPrice", "type": "uint256" },
-            { "name": "signedQuote", "type": "bytes" },
             { "name": "paymentAuth", "type": "bytes" }
           ]
         }

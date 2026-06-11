@@ -119,7 +119,7 @@ export function renderPactSeries(config, baseTemplate) {
         spendId: pact.spendId,
         quoteNonce: String(pact.quoteNonce),
         sourceBinding: pact.sourceBinding,
-        gateBinding: "spendId is registered in Gate storage, not pinned in pre-approved CAW params_match",
+        gateBinding: "spendId is pinned in CAW params_match and re-verified against ProcurementGate registeredSpend storage",
         expectedReceiptSlots: {
           denyRequestId: null,
           approveTxHash: null,

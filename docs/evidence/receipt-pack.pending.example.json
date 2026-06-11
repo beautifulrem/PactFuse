@@ -140,10 +140,10 @@
         },
         {
           "target": "ProcurementGate",
-          "selector": "activateTool(bytes32,bytes32,bytes32,address,uint256,bytes,bytes)",
+          "selector": "activateTool(bytes32,bytes)",
           "constraints": {
-            "quotePrice": "Gate-enforced exact value",
-            "paymentAuth": "empty"
+            "spendId": "Gate-registered spend",
+            "paymentAuth": "0x"
           }
         }
       ],

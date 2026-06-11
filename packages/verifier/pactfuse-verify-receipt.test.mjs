@@ -10,6 +10,7 @@ const verifierPath = new URL("./pactfuse-verify-receipt.mjs", import.meta.url);
 const pendingReceiptFile = fileURLToPath(pendingReceiptPath);
 const verifierFile = fileURLToPath(verifierPath);
 const ZERO_HASH = `0x${"0".repeat(64)}`;
+const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 
 describe("pactfuse receipt verifier contract", () => {
   it("keeps schema-only separate from proof-chip authority", () => {
@@ -122,6 +123,22 @@ describe("pactfuse receipt verifier contract", () => {
 	      },
 	      "target is not bound to CAW operation target",
 	    ],
+    [
+      "CAW activate selector",
+      (bundle) => {
+        bundle.rawCawReceiptBundles[0].rawBundle.receipts[0].selector = "0xca255603";
+        rehashFirstCawReceiptForTest(bundle);
+      },
+      "selector must be ProcurementGate.activateTool(bytes32,bytes)",
+    ],
+    [
+      "CAW activate target split from finalized gate contract",
+      (bundle) => {
+        bundle.rawCawReceiptBundles[0].rawBundle.receipts[0].target = "0x9999999999999999999999999999999999999999";
+        rehashFirstCawReceiptForTest(bundle);
+      },
+      "target does not match finalized ProcurementGate contractAddress",
+    ],
 	    [
 	      "CAW operation receipt bundle",
 	      (bundle) => {
@@ -465,7 +482,7 @@ function replayBundle() {
     effect: "allow",
     status: "succeeded",
     target: "0x2222222222222222222222222222222222222222",
-    selector: "0x12345678",
+    selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
     txHash: hex32("tx"),
     txCount: "1",
     expiry: "2026-06-12T00:00:00.000Z",
@@ -712,7 +729,7 @@ function replayBundle() {
         finalizedHeadBlock: 102,
         latestHeadBlock: 102,
         contractStateVerified: true,
-        contractAddress: "0x1111111111111111111111111111111111111111",
+        contractAddress: rawReceipt.target,
         contractFunction: "registeredSpend",
         contractSessionId: sessionId,
         contractPactId: bundle.spends[0].pactId,
@@ -751,6 +768,31 @@ function rehashFirstQuoteForTest(bundle) {
     modes: lockedRuntimeModes(),
   });
   bundle.replayPageIndex = replayPageIndexForTest(bundle);
+}
+
+function rehashFirstCawReceiptForTest(bundle) {
+  const rawBundle = bundle.rawCawReceiptBundles[0];
+  const rawReceipt = rawBundle.rawBundle.receipts[0];
+  const mirroredRawReceipt = rawBundle.rawBundle.raw?.receipts?.[0];
+  if (mirroredRawReceipt && mirroredRawReceipt !== rawReceipt) {
+    Object.assign(mirroredRawReceipt, rawReceipt);
+  }
+  rawBundle.rawBundleHash = hashJson(rawBundle.rawBundle);
+
+  const canonical = bundle.canonicalCawReceipts[0];
+  canonical.target = rawReceipt.target;
+  canonical.selector = rawReceipt.selector;
+  canonical.rawReceiptHash = hashJson(rawReceipt);
+  const { rawReceiptHash: _rawReceiptHash, canonicalReceiptHash: _canonicalReceiptHash, ...canonicalBase } = canonical;
+  canonical.canonicalReceiptHash = hashJson(canonicalBase);
+
+  const operation = bundle.cawReceiptOperations[0];
+  operation.target = rawReceipt.target;
+  operation.selector = rawReceipt.selector;
+  operation.request.target = rawReceipt.target;
+  operation.request.selector = rawReceipt.selector;
+  operation.receiptBundleHash = rawBundle.rawBundleHash;
+  sealReplayBundleForTest(bundle);
 }
 
 function retargetArtifactForTest(bundle, artifactPayload) {

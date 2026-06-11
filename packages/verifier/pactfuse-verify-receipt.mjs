@@ -8,6 +8,7 @@ const BAD_EVIDENCE_VALUES = new Set(["pending", "fixture", "manual", "blocked"])
 const INACTIVE_BRANCH_NULL_PATHS = new Set(["paymentProof.permit", "paymentProof.gatePaid"]);
 const HEX32_RE = /^0x[0-9a-fA-F]{64}$/;
 const ZERO_HASH = `0x${"0".repeat(64)}`;
+const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 const REQUIRED_LEASE_TOOL_ARGUMENTS = ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"];
 const DANGEROUS_TOOL_NAME_PATTERN =
   /(write|edit|delete|remove|shell|exec|terminal|command|commit|push|deploy|transfer|send|apply|patch|modify|create|move|copy|rename|upload|download|file|fs|process|subprocess)/;
@@ -237,8 +238,8 @@ function checkGatePaid(root, errors) {
   if (amountMax !== null && approvedAmount !== null && approvedAmount > amountMax) {
     errors.push("gate-paid approvedAmount must be <= approve amountMax");
   }
-  if (activate && at(activate, ["constraints", "paymentAuth"]) !== "empty") {
-    errors.push("activateTool allowed call must require paymentAuth: empty for gate-paid path");
+  if (activate && at(activate, ["constraints", "paymentAuth"]) !== "0x") {
+    errors.push("activateTool allowed call must require paymentAuth: 0x for gate-paid path");
   }
 }
 
@@ -1487,6 +1488,12 @@ function verifyCawReceiptSettlementBinding(canonical, operation, bundle, errors)
     errors.push(`${label} activate_tool allow receipt requires txHash`);
     return;
   }
+  if (!isEvmAddress(canonical.target)) {
+    errors.push(`${label} activate_tool allow receipt requires ProcurementGate target address`);
+  }
+  if (lowerHex(canonical.selector) !== PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR) {
+    errors.push(`${label} activate_tool allow receipt selector must be ProcurementGate.activateTool(bytes32,bytes)`);
+  }
   const settled = (Array.isArray(bundle.events) ? bundle.events : []).find((event) => {
     const payload = isObject(event?.payload) ? event.payload : {};
     return (
@@ -1500,6 +1507,15 @@ function verifyCawReceiptSettlementBinding(canonical, operation, bundle, errors)
   });
   if (!settled) {
     errors.push(`${label} activate_tool allow receipt does not match a finalized SpendSettled proof event by spendId and txHash`);
+    return;
+  }
+  const settledPayload = isObject(settled.payload) ? settled.payload : {};
+  if (!isEvmAddress(settledPayload.contractAddress)) {
+    errors.push(`${label} matching SpendSettled proof event requires ProcurementGate contractAddress`);
+    return;
+  }
+  if (lowerHex(canonical.target) !== lowerHex(settledPayload.contractAddress)) {
+    errors.push(`${label} activate_tool allow receipt target does not match finalized ProcurementGate contractAddress`);
   }
 }
 

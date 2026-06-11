@@ -30,6 +30,8 @@ const MCP_AUDIT_TOKEN = "test-mcp-audit-token";
 const GATE_INGEST_TOKEN = "test-gate-ingest-token";
 const CAW_INGEST_TOKEN = "test-caw-ingest-token";
 const ZERO_HASH = `0x${"0".repeat(64)}`;
+const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
+const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 
 function makeApp(
   dbPath = ":memory:",
@@ -1396,6 +1398,60 @@ describe("pactfuse-api P0", () => {
     expect(unknownOperation.json.error.code).toBe("not_found");
   });
 
+  it("pins CAW operation builds to current ProcurementGate selectors and registered spend targets", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-caw-operation-pins");
+    const spendId = await registerSpend(app, sessionId);
+
+    const missingGateTarget = await post(app, "/api/v1/caw/operations/build", {
+      sessionId,
+      idempotencyKey: "caw-op-missing-gate-target",
+      payload: {
+        spendId,
+        operationKind: "activate_tool",
+      },
+    });
+    const legacySelector = await post(app, "/api/v1/caw/operations/build", {
+      sessionId,
+      idempotencyKey: "caw-op-legacy-selector",
+      payload: {
+        spendId,
+        operationKind: "activate_tool",
+        target: "0x2222222222222222222222222222222222222222",
+        selector: "0xca255603",
+      },
+    });
+    const directMarket = await post(app, "/api/v1/caw/operations/build", {
+      sessionId,
+      idempotencyKey: "caw-op-direct-market",
+      payload: {
+        spendId,
+        operationKind: "activate_tool",
+        target: TEST_MARKET_ADDRESS,
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+      },
+    });
+    const wrongApproveTarget = await post(app, "/api/v1/caw/operations/build", {
+      sessionId,
+      idempotencyKey: "caw-op-wrong-approve-target",
+      payload: {
+        spendId,
+        operationKind: "approve",
+        target: TEST_PAYER_ADDRESS,
+        selector: ERC20_APPROVE_SELECTOR,
+      },
+    });
+
+    expect(missingGateTarget.status).toBe(422);
+    expect(missingGateTarget.json.error.message).toContain("requires a ProcurementGate target address");
+    expect(legacySelector.status).toBe(422);
+    expect(legacySelector.json.error.message).toContain("activateTool(bytes32,bytes)");
+    expect(directMarket.status).toBe(422);
+    expect(directMarket.json.error.message).toContain("cannot be the PaidArtifactMarket");
+    expect(wrongApproveTarget.status).toBe(422);
+    expect(wrongApproveTarget.json.error.message).toContain("target must match registered ProcurementGate paymentToken");
+  });
+
   it("keeps non-manual CAW receipt ingest pending when the raw provider is unavailable", async () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-caw-raw-unconfigured");
@@ -1406,8 +1462,8 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         operationKind: "approve",
-        target: "0x1000000000000000000000000000000000000001",
-        selector: "0x095ea7b3",
+        target: TEST_PAYMENT_TOKEN_ADDRESS,
+        selector: ERC20_APPROVE_SELECTOR,
       },
     });
 
@@ -1492,7 +1548,7 @@ describe("pactfuse-api P0", () => {
                 operationId,
                 operationKind,
                 target: "0x1000000000000000000000000000000000000001",
-                selector: "0xabcdef12",
+                selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
               },
             ]
           : [];
@@ -1523,7 +1579,7 @@ describe("pactfuse-api P0", () => {
           spendId,
           operationKind: "activate_tool",
           target: "0x1000000000000000000000000000000000000001",
-          selector: "0xabcdef12",
+          selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
         },
       });
 
@@ -1554,7 +1610,7 @@ describe("pactfuse-api P0", () => {
       ...cawReceiptFields("linked"),
       operationKind: "activate_tool",
       target: "0x1000000000000000000000000000000000000001",
-      selector: "0xabcdef12",
+      selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
     };
     const { app, ctx } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: [rawReceipt] }) });
     const sessionId = await createSession(app, "sess-caw-receipt-linked");
@@ -1567,7 +1623,7 @@ describe("pactfuse-api P0", () => {
         spendId,
         operationKind: "activate_tool",
         target: "0x1000000000000000000000000000000000000001",
-        selector: "0xabcdef12",
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
       },
     });
     const ingest = await post(app, "/api/v1/caw/receipts/ingest", {
@@ -1675,7 +1731,7 @@ describe("pactfuse-api P0", () => {
       ...cawReceiptFields("no-overwrite"),
       operationKind: "activate_tool",
       target: "0x1000000000000000000000000000000000000001",
-      selector: "0xabcdef12",
+      selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
     };
     const { app } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: [rawReceipt] }) });
     const sessionId = await createSession(app, "sess-caw-no-overwrite");
@@ -1687,7 +1743,7 @@ describe("pactfuse-api P0", () => {
         spendId,
         operationKind: "activate_tool",
         target: "0x1000000000000000000000000000000000000001",
-        selector: "0xabcdef12",
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
       },
     });
     const rawIngest = await post(app, "/api/v1/caw/receipts/ingest", {
@@ -1729,7 +1785,7 @@ describe("pactfuse-api P0", () => {
       ...cawReceiptFields("duplicate-canonical"),
       operationKind: "activate_tool",
       target: "0x1000000000000000000000000000000000000001",
-      selector: "0xabcdef12",
+      selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
     };
     const { app } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: [rawReceipt, rawReceipt] }) });
     const sessionId = await createSession(app, "sess-caw-duplicate-canonical");
@@ -1741,7 +1797,7 @@ describe("pactfuse-api P0", () => {
         spendId,
         operationKind: "activate_tool",
         target: "0x1000000000000000000000000000000000000001",
-        selector: "0xabcdef12",
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
       },
     });
 
@@ -1770,7 +1826,7 @@ describe("pactfuse-api P0", () => {
             operationId: "other-operation",
             operationKind: "activate_tool",
             target: "0x1000000000000000000000000000000000000001",
-            selector: "0xabcdef12",
+            selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
           },
         ],
       }),
@@ -1784,7 +1840,7 @@ describe("pactfuse-api P0", () => {
         spendId,
         operationKind: "activate_tool",
         target: "0x1000000000000000000000000000000000000001",
-        selector: "0xabcdef12",
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
       },
     });
 
@@ -1811,7 +1867,7 @@ describe("pactfuse-api P0", () => {
         ...cawReceiptFields(`missing-${missingField.toLowerCase()}`),
         operationKind: "activate_tool",
         target: "0x1000000000000000000000000000000000000001",
-        selector: "0xabcdef12",
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
         [missingField]: undefined,
       };
       const { app } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: [rawReceipt] }) });
@@ -1824,7 +1880,7 @@ describe("pactfuse-api P0", () => {
           spendId,
           operationKind: "activate_tool",
           target: "0x1000000000000000000000000000000000000001",
-          selector: "0xabcdef12",
+          selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
         },
       });
 
@@ -1852,7 +1908,7 @@ describe("pactfuse-api P0", () => {
         ...cawReceiptFields(`missing-canonical-${missingField.toLowerCase()}`),
         operationKind: "activate_tool",
         target: "0x1000000000000000000000000000000000000001",
-        selector: "0xabcdef12",
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
         [missingField]: undefined,
       };
       const { app } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: [rawReceipt] }) });
@@ -1865,7 +1921,7 @@ describe("pactfuse-api P0", () => {
           spendId,
           operationKind: "activate_tool",
           target: "0x1000000000000000000000000000000000000001",
-          selector: "0xabcdef12",
+          selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
         },
       });
 
@@ -5527,7 +5583,7 @@ describe("pactfuse-api P0", () => {
         spendId,
         operationKind: "activate_tool",
         target: "0x1000000000000000000000000000000000000001",
-        selector: "0xabcdef12",
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
       },
     });
     const verify = await post(app, "/api/v1/evidence/verify", {
@@ -6467,7 +6523,7 @@ function schemaValidWinnerRequestedReceipt(): Record<string, unknown> {
             target: "ProcurementGate",
             selector: "activateTool",
             constraints: {
-              paymentAuth: "empty",
+              paymentAuth: "0x",
             },
           },
         ],

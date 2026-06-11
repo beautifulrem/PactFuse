@@ -47,6 +47,7 @@ import {
   VerifyEvidencePayloadSchema,
   canonicalizeJson,
   type CreateSessionInput,
+  type CawOperationBuildPayload,
   type EvidenceEvent,
   type JsonValue,
   type JudgeCheckView,
@@ -228,6 +229,8 @@ const GATE_SPEND_STATE = {
 } as const;
 const SOURCE_STATE_CHALLENGED = 2;
 const CAW_STRUCTURAL_AUTHORITY_STATUS = "verified_policy_authority_structural";
+const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
+const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 
 const JUDGE_ROWS = [
   ["caw_boundary", "CAW boundary", "pending CAW deny/allow receipts are not live"],
@@ -654,12 +657,11 @@ export async function buildCawOperation(input: SessionScopedEnvelope, ctx: Servi
   const payload = parseStrict(CawOperationBuildPayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("caw:operations:build", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
-    if (payload.spendId) {
-      assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
-    }
+    const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    const operationPayload = normalizeCawOperationBuildPayload(payload, spend, requestId);
     const createdAt = ctx.clock.now().toISOString();
     const pactTemplate = ctx.templates.require("gate-paid-artifact-real");
-    const operationId = hashJson({ sessionId: envelope.sessionId, payload, requestId });
+    const operationId = hashJson({ sessionId: envelope.sessionId, payload: operationPayload, requestId });
     ctx.db.sqlite
       .prepare(
         `INSERT INTO caw_receipt_operations
@@ -669,12 +671,12 @@ export async function buildCawOperation(input: SessionScopedEnvelope, ctx: Servi
       .run(
         operationId,
         envelope.sessionId,
-        payload.spendId,
-        payload.operationKind,
-        payload.target ?? null,
-        payload.selector ?? null,
-        payload.valueAtomic,
-        canonicalizeJson(payload),
+        operationPayload.spendId,
+        operationPayload.operationKind,
+        operationPayload.target ?? null,
+        operationPayload.selector ?? null,
+        operationPayload.valueAtomic,
+        canonicalizeJson(operationPayload),
         createdAt,
       );
     const event = appendEvidenceEvent(ctx, {
@@ -696,12 +698,77 @@ export async function buildCawOperation(input: SessionScopedEnvelope, ctx: Servi
       data: {
         operationId,
         status: "built_mocked",
+        target: operationPayload.target ?? null,
+        selector: operationPayload.selector ?? null,
         pactTemplateMode: pactTemplate.mode,
         pactTemplateHash: pactTemplate.templateHash,
         winnerClaimAllowed: false,
       },
     };
   });
+}
+
+function normalizeCawOperationBuildPayload(payload: CawOperationBuildPayload, spend: Row, requestId: string): CawOperationBuildPayload {
+  const normalized: CawOperationBuildPayload = {
+    ...payload,
+    target: payload.target?.toLowerCase() as CawOperationBuildPayload["target"],
+    selector: payload.selector?.toLowerCase(),
+  };
+  if (normalized.operationKind === "approve") {
+    if (!normalized.target) {
+      throw Object.assign(new Error("CAW approve operation requires the registered payment token target"), {
+        apiError: proofBlockedError(requestId, "CAW approve operation requires the registered payment token target", {
+          spendId: normalized.spendId,
+          expectedTarget: String(spend.payment_token).toLowerCase(),
+        }),
+      });
+    }
+    if (normalized.target !== String(spend.payment_token).toLowerCase()) {
+      throw Object.assign(new Error("CAW approve operation target must match registered ProcurementGate paymentToken"), {
+        apiError: proofBlockedError(requestId, "CAW approve operation target must match registered ProcurementGate paymentToken", {
+          spendId: normalized.spendId,
+          expectedTarget: String(spend.payment_token).toLowerCase(),
+          actualTarget: normalized.target,
+        }),
+      });
+    }
+    if (normalized.selector && normalized.selector !== ERC20_APPROVE_SELECTOR) {
+      throw Object.assign(new Error("CAW approve operation selector must be ERC20 approve(address,uint256)"), {
+        apiError: proofBlockedError(requestId, "CAW approve operation selector must be ERC20 approve(address,uint256)", {
+          expectedSelector: ERC20_APPROVE_SELECTOR,
+          actualSelector: normalized.selector,
+        }),
+      });
+    }
+    return { ...normalized, selector: ERC20_APPROVE_SELECTOR };
+  }
+  if (normalized.operationKind === "activate_tool") {
+    if (!normalized.target) {
+      throw Object.assign(new Error("CAW activate_tool operation requires a ProcurementGate target address"), {
+        apiError: proofBlockedError(requestId, "CAW activate_tool operation requires a ProcurementGate target address", {
+          spendId: normalized.spendId,
+        }),
+      });
+    }
+    if (normalized.target === String(spend.market).toLowerCase()) {
+      throw Object.assign(new Error("CAW activate_tool operation target cannot be the PaidArtifactMarket"), {
+        apiError: proofBlockedError(requestId, "CAW activate_tool operation target cannot be the PaidArtifactMarket", {
+          spendId: normalized.spendId,
+          market: String(spend.market).toLowerCase(),
+        }),
+      });
+    }
+    if (normalized.selector && normalized.selector !== PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR) {
+      throw Object.assign(new Error("CAW activate_tool operation selector must be ProcurementGate.activateTool(bytes32,bytes)"), {
+        apiError: proofBlockedError(requestId, "CAW activate_tool operation selector must be ProcurementGate.activateTool(bytes32,bytes)", {
+          expectedSelector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+          actualSelector: normalized.selector,
+        }),
+      });
+    }
+    return { ...normalized, selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR };
+  }
+  return normalized;
 }
 
 export async function ingestCawReceiptBundle(

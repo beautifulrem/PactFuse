@@ -138,7 +138,7 @@ export const CawOperationBuildPayloadSchema = z
   .object({
     spendId: Hex32Schema,
     operationKind: z.enum(["deny_probe", "approve", "activate_tool"]),
-    target: HexSchema.optional(),
+    target: AddressSchema.optional(),
     selector: z.string().regex(/^0x[0-9a-fA-F]{8}$/).optional(),
     valueAtomic: DecimalStringSchema.default("0"),
   })
@@ -852,6 +852,7 @@ export type JudgeCheckView = z.infer<typeof JudgeCheckViewSchema>;
 export type VerifierRunView = z.infer<typeof VerifierRunViewSchema>;
 export type ReplayBundleView = z.infer<typeof ReplayBundleViewSchema>;
 export type ChainIndexerBackfillInput = z.infer<typeof ChainIndexerBackfillInputSchema>;
+export type CawOperationBuildPayload = z.infer<typeof CawOperationBuildPayloadSchema>;
 export type CawLivePactSubmitPayload = z.infer<typeof CawLivePactSubmitPayloadSchema>;
 export type CawLivePactSyncPayload = z.infer<typeof CawLivePactSyncPayloadSchema>;
 export type CawLiveTransferSubmitPayload = z.infer<typeof CawLiveTransferSubmitPayloadSchema>;
