@@ -613,10 +613,16 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     "eventRoot",
     "agentTranscriptHash",
     "events",
+    "sources",
+    "spends",
+    "artifactPreflights",
+    "quotes",
+    "artifactAccessTokens",
     "mcpAdapterCalls",
     "cawReceiptOperations",
     "rawCawReceiptBundles",
     "canonicalCawReceipts",
+    "leaseRuns",
     "judgeCheck",
   ]) {
     requirePath(bundle, [field], errors);

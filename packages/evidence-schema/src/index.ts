@@ -429,6 +429,87 @@ export const CawReceiptOperationViewSchema = z
   })
   .strict();
 
+export const SourceViewSchema = z
+  .object({
+    sourceId: z.string().min(1).max(120),
+    sessionId: Hex32Schema,
+    sourceHash: Hex32Schema,
+    manifestUrl: z.string().min(1).max(500),
+    manifestHash: Hex32Schema,
+    issuer: HexSchema.nullable(),
+    signature: HexSchema.nullable(),
+    capabilityVector: JsonObjectSchema,
+    proofStatus: z.enum(["pending", "challenged", "active"]),
+    createdAt: IsoDateStringSchema,
+  })
+  .strict();
+
+export const SpendViewSchema = z
+  .object({
+    spendId: Hex32Schema,
+    sessionId: Hex32Schema,
+    pactId: z.string().min(1).max(120),
+    toolId: z.string().min(1).max(120),
+    payer: HexSchema,
+    agentWallet: HexSchema,
+    sourceHashes: z.array(Hex32Schema).min(1).max(16),
+    sourceSetHash: Hex32Schema,
+    sessionCommitment: Hex32Schema,
+    spendPreimage: JsonObjectSchema,
+    maxPriceAtomic: DecimalStringSchema,
+    nonce: z.string().min(1).max(128),
+    status: z.string().min(1).max(120),
+    createdAt: IsoDateStringSchema,
+  })
+  .strict();
+
+export const ArtifactPreflightViewSchema = z
+  .object({
+    preflightId: Hex32Schema,
+    sessionId: Hex32Schema,
+    spendId: Hex32Schema,
+    artifactHashPreview: Hex32Schema,
+    endpointUrl: z.string().min(1).max(500),
+    priceDisclosureHash: Hex32Schema,
+    sourceStateSnapshotHash: Hex32Schema,
+    status: z.enum(["pending_live_delivery"]),
+    createdAt: IsoDateStringSchema,
+  })
+  .strict();
+
+export const QuoteViewSchema = z
+  .object({
+    quoteId: Hex32Schema,
+    sessionId: Hex32Schema,
+    spendId: Hex32Schema,
+    preflightId: Hex32Schema,
+    artifactCommitment: Hex32Schema,
+    priceDisclosureHash: Hex32Schema,
+    sourceStateSnapshotHash: Hex32Schema,
+    priceAtomic: DecimalStringSchema,
+    quoteNonce: z.string().min(1).max(128),
+    validUntilBlock: z.string().regex(/^[0-9]+$/),
+    quoteHash: Hex32Schema,
+    status: z.enum(["mocked_after_preflight_not_chain_settleable"]),
+    createdAt: IsoDateStringSchema,
+  })
+  .strict();
+
+export const ArtifactAccessTokenViewSchema = z
+  .object({
+    tokenId: Hex32Schema,
+    sessionId: Hex32Schema,
+    spendId: Hex32Schema,
+    payer: HexSchema,
+    artifactHash: Hex32Schema,
+    tokenHash: Hex32Schema,
+    status: z.enum(["active"]),
+    issuedByVerifierRunId: Hex32Schema.nullable(),
+    settlementEventId: Hex32Schema.nullable(),
+    createdAt: IsoDateStringSchema,
+  })
+  .strict();
+
 export const RawCawReceiptBundleViewSchema = z
   .object({
     bundleId: Hex32Schema,
@@ -501,6 +582,11 @@ export const ReplayBundleViewSchema = z
     eventRoot: Hex32Schema,
     agentTranscriptHash: Hex32Schema,
     events: z.array(EvidenceEventSchema).max(200),
+    sources: z.array(SourceViewSchema).max(200),
+    spends: z.array(SpendViewSchema).max(200),
+    artifactPreflights: z.array(ArtifactPreflightViewSchema).max(200),
+    quotes: z.array(QuoteViewSchema).max(200),
+    artifactAccessTokens: z.array(ArtifactAccessTokenViewSchema).max(200),
     mcpAdapterCalls: z.array(McpAdapterCallViewSchema).max(200),
     cawReceiptOperations: z.array(CawReceiptOperationViewSchema).max(200),
     rawCawReceiptBundles: z.array(RawCawReceiptBundleViewSchema).max(200),

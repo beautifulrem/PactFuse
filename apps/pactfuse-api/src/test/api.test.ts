@@ -23,6 +23,7 @@ import type { ApiSecurityConfig, CawReceiptSource, ChainClient, McpLeaseClient, 
 
 const MCP_AUDIT_TOKEN = "test-mcp-audit-token";
 const GATE_INGEST_TOKEN = "test-gate-ingest-token";
+const CAW_INGEST_TOKEN = "test-caw-ingest-token";
 
 function makeApp(
   dbPath = ":memory:",
@@ -69,7 +70,7 @@ function makeApp(
     ]),
     mcpAuditSecret,
     gateIngestSecret,
-    cawIngestToken: options.cawIngestToken ?? null,
+    cawIngestToken: options.cawIngestToken === undefined ? CAW_INGEST_TOKEN : options.cawIngestToken,
     requiredIndexerCursors: options.requiredIndexerCursors ?? [],
     apiSecurity,
     clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
@@ -467,6 +468,10 @@ describe("pactfuse-api P0", () => {
         required: false,
       }),
     ]);
+    expect(json.components.schemas.CreateSessionInput.properties.payload.additionalProperties).toBe(false);
+    expect(json.components.schemas.CreateSessionInput.properties.payload.properties.modes.$ref).toBe(
+      "#/components/schemas/RuntimeModes",
+    );
     expect(json.paths["/api/v1/sources/challenge"].post.parameters).toEqual([
       expect.objectContaining({
         name: "authorization",
@@ -501,6 +506,13 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/caw/receipts/ingest"].post["x-pactfuse-proof-fields"]).toEqual([
       "proofAuthority",
       "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/caw/receipts/ingest"].post.parameters).toEqual([
+      expect.objectContaining({
+        name: "authorization",
+        in: "header",
+        required: true,
+      }),
     ]);
     const cawIngestDataSchema = json.components.schemas.CawReceiptIngestResponse.oneOf[0].properties.data;
     expect(cawIngestDataSchema.required).toEqual([
@@ -742,6 +754,11 @@ describe("pactfuse-api P0", () => {
       "eventRoot",
       "agentTranscriptHash",
       "events",
+      "sources",
+      "spends",
+      "artifactPreflights",
+      "quotes",
+      "artifactAccessTokens",
       "mcpAdapterCalls",
       "cawReceiptOperations",
       "rawCawReceiptBundles",
@@ -753,6 +770,30 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("rawCawReceiptBundles");
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("canonicalCawReceipts");
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("leaseRuns");
+    expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.sources.items.required).toEqual([
+      "sourceId",
+      "sessionId",
+      "sourceHash",
+      "manifestUrl",
+      "manifestHash",
+      "issuer",
+      "signature",
+      "capabilityVector",
+      "proofStatus",
+      "createdAt",
+    ]);
+    expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.spends.items.required).toContain(
+      "spendPreimage",
+    );
+    expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.artifactPreflights.items.required).toContain(
+      "sourceStateSnapshotHash",
+    );
+    expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.quotes.items.required).toContain(
+      "quoteHash",
+    );
+    expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.artifactAccessTokens.items.required).toContain(
+      "tokenHash",
+    );
     expect(json.paths["/api/v1/evidence/runner-heartbeat"].get.responses["200"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/RunnerHeartbeatResponse",
     );
@@ -894,6 +935,35 @@ describe("pactfuse-api P0", () => {
     expect(res.json.error.code).toBe("proof_pending");
   });
 
+  it("blocks rebinding an existing spend to a different payer or price", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-spend-rebind");
+    const spendId = await registerSpend(app, sessionId);
+
+    const rebind = await post(app, "/api/v1/spends/register-batch", {
+      sessionId,
+      idempotencyKey: "spend-register-rebind",
+      payload: {
+        spends: [
+          {
+            spendId,
+            pactId: "pact-c",
+            toolId: "code-scan",
+            payer: "0xbeef",
+            agentWallet: "0xabcd",
+            sourceHashes: [hex32("source")],
+            maxPriceAtomic: "2000",
+            nonce: "nonce-1",
+          },
+        ],
+      },
+    });
+
+    expect(rebind.status).toBe(422);
+    expect(rebind.json.error.code).toBe("proof_blocked");
+    expect(rebind.json.error.message).toContain("spendId does not match");
+  });
+
   it("records operator key usage when scheduling a source challenge", async () => {
     const { app, ctx } = makeApp();
     const sessionId = await createSession(app, "sess-challenge-key-used");
@@ -990,6 +1060,13 @@ describe("pactfuse-api P0", () => {
 
     expect(ingest.status).toBe(202);
     expect(ingest.json.data.proofAuthority).toBe(false);
+    expect(judgeJson.data.rows.find((row: { rowId: string }) => row.rowId === "caw_boundary")).toEqual(
+      expect.objectContaining({
+        status: "manual",
+        authority: "fixture",
+        evidenceEventId: ingest.json.evidenceEventId,
+      }),
+    );
     expect(judgeJson.data.rows.some((row: { status: string }) => row.status === "pass")).toBe(false);
     expect(judgeJson.data.winnerClaimAllowed).toBe(false);
   });
@@ -1071,13 +1148,37 @@ describe("pactfuse-api P0", () => {
       },
     };
 
-    const missing = await post(app, "/api/v1/caw/receipts/ingest", body);
+    const missing = await post(app, "/api/v1/caw/receipts/ingest", body, { "x-test-skip-caw-auth": "1" });
     const wrong = await post(app, "/api/v1/caw/receipts/ingest", body, { authorization: "Bearer wrong" });
     const allowed = await post(app, "/api/v1/caw/receipts/ingest", body, { authorization: "Bearer caw-ingest-secret" });
 
     expect(missing.status).toBe(403);
     expect(wrong.status).toBe(403);
     expect(allowed.status).toBe(202);
+  });
+
+  it("fails closed when CAW receipt ingest token is not configured", async () => {
+    const { app } = makeApp(":memory:", { cawIngestToken: null });
+    const sessionId = await createSession(app, "sess-caw-ingest-unconfigured");
+
+    const res = await post(
+      app,
+      "/api/v1/caw/receipts/ingest",
+      {
+        sessionId,
+        idempotencyKey: "ingest-unconfigured",
+        payload: {
+          sourceLabel: "manual-row",
+          receipts: [{ requestId: "manual" }],
+          manual: true,
+        },
+      },
+      { "x-test-skip-caw-auth": "1" },
+    );
+
+    expect(res.status).toBe(403);
+    expect(res.json.error.code).toBe("forbidden");
+    expect(res.json.error.message).toContain("not configured");
   });
 
   it("fetches raw CAW receipts from a configured export source", async () => {
@@ -1188,6 +1289,7 @@ describe("pactfuse-api P0", () => {
     const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
     const replayJson = await replay.json();
     const event = replayJson.data.events.find((candidate: { kind: string }) => candidate.kind === "caw.receipt.ingested.raw");
+    const cawJudgeRow = replayJson.data.judgeCheck.rows.find((row: { rowId: string }) => row.rowId === "caw_boundary");
     const bundleRow = ctx.db.sqlite
       .prepare("SELECT operation_id, source_label, receipt_count, raw_bundle_hash, raw_bundle_json FROM caw_raw_receipt_bundles")
       .get() as Record<string, unknown>;
@@ -1203,6 +1305,13 @@ describe("pactfuse-api P0", () => {
     expect(event.payload.receiptCount).toBe(1);
     expect(event.payload.manual).toBe(false);
     expect(event.payload.rawReceiptBundleHash).toBe(ingest.json.data.rawReceiptBundleHash);
+    expect(cawJudgeRow).toEqual(
+      expect.objectContaining({
+        status: "pass",
+        authority: "delivery",
+        evidenceEventId: ingest.json.evidenceEventId,
+      }),
+    );
     expect(replayJson.data.cawReceiptOperations).toEqual([
       expect.objectContaining({
         operationId: operation.json.data.operationId,
@@ -1560,6 +1669,38 @@ describe("pactfuse-api P0", () => {
     expect(finalized.json.error.message).toContain("chain proof provider is not ready");
     expect(kinds).toContain("gate.spend_settled.observed");
     expect(kinds).not.toContain("gate.spend_settled");
+  });
+
+  it("rejects finalized gate proofs when the re-fetched log lacks decoded event semantics", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const chain = createFakeIndexerChainClient({ currentBlockNumber: 101, logs });
+    const { app } = makeApp(":memory:", {
+      chain: {
+        ...chain,
+        getLogs: async () => logs,
+      },
+    });
+    const sessionId = await createSession(app, "sess-gate-finality-undecoded", { finalityDepth: 2 });
+    const spendId = await registerSpend(app, sessionId);
+    const body = gateEventEnvelope(sessionId, spendId, "gate-undecoded-log", {
+      blockNumber: 100,
+      currentBlockNumber: 101,
+      txHash: hex32("gate-undecoded-tx"),
+      rawLogHash: hex32("gate-undecoded-log"),
+    });
+    logs.push(
+      indexerLog("gate-undecoded", 100, {
+        transactionHash: hex32("gate-undecoded-tx"),
+        rawLogHash: hex32("gate-undecoded-log"),
+        logIndex: 0,
+      }),
+    );
+
+    const finalized = await postSignedGateEvent(app, body);
+
+    expect(finalized.status).toBe(423);
+    expect(finalized.json.error.code).toBe("proof_pending");
+    expect(finalized.json.error.message).toContain("claimed gate event log was not found on chain");
   });
 
   it("finalizes gate settlement only from indexed public-chain logs and records a matching proof row", async () => {
@@ -2874,6 +3015,9 @@ describe("pactfuse-api P0", () => {
     const replayJson = await replay.json();
     expect(replayJson.data.agentTranscriptHash).toBe(hashForTestJson(transcriptJson.data));
     expect(replayJson.data.asOfMcpAdapterCallCount).toBe(1);
+    for (const key of ["sources", "spends", "artifactPreflights", "quotes", "artifactAccessTokens"] as const) {
+      expect(replayJson.data[key]).toEqual([]);
+    }
 
     recordMcpAdapterCall(
       {
@@ -2934,6 +3078,13 @@ describe("pactfuse-api P0", () => {
         },
       },
     });
+    const replayMissingSources = { ...replayJson.data } as Record<string, unknown>;
+    delete replayMissingSources.sources;
+    const verifyMissingSources = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-replay-sources-missing",
+      payload: { replayBundle: replayMissingSources },
+    });
 
     expect(verifySnapshot.json.data.errors).not.toContain(
       "replayBundle.agentTranscriptHash does not match the server transcript snapshot",
@@ -2947,6 +3098,8 @@ describe("pactfuse-api P0", () => {
     expect(verifyTamperedMcpCalls.json.data.errors).toContain("replayBundle.mcpAdapterCalls does not match the server snapshot");
     expect(verifyTamperedJudgeCheck.json.data.schemaOk).toBe(false);
     expect(verifyTamperedJudgeCheck.json.data.errors).toContain("replayBundle.judgeCheck does not match the server snapshot");
+    expect(verifyMissingSources.json.data.schemaOk).toBe(false);
+    expect(verifyMissingSources.json.data.errors).toContain("replayBundle.sources is missing from the verifier replay bundle");
   });
 
   it("serves a read-only public verifier preview for a replay bundle", async () => {
@@ -3527,6 +3680,35 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(replayJson.data.mcpAdapterCalls).toHaveLength(2);
+    expect(replayJson.data.sources).toEqual([
+      expect.objectContaining({
+        sourceId: "clean-source",
+        sourceHash: hex32("source"),
+        manifestHash: hex32("manifest"),
+        capabilityVector: { has_write_file: false },
+        proofStatus: "pending",
+      }),
+    ]);
+    expect(replayJson.data.spends).toEqual([
+      expect.objectContaining({
+        spendId,
+        payer,
+        sourceHashes: [hex32("source")],
+        maxPriceAtomic: "1000",
+        status: "settled_finalized",
+      }),
+    ]);
+    expect(replayJson.data.artifactAccessTokens).toEqual([
+      expect.objectContaining({
+        tokenId: issued.json.data.tokenId,
+        spendId,
+        payer,
+        artifactHash,
+        tokenHash: issued.json.data.tokenHash,
+        issuedByVerifierRunId: issued.json.data.verifierRunId,
+        settlementEventId: issued.json.data.settlementEventId,
+      }),
+    ]);
     expect(replayJson.data.leaseRuns).toEqual([
       expect.objectContaining({
         leaseRunId: lease.json.data.leaseRunId,
@@ -3959,7 +4141,9 @@ async function computeSpendIdForTest(
     pactId: "pact-c",
     toolId: "code-scan",
     sourceSetHash,
+    payer: "0x1234",
     agentWallet: "0xabcd",
+    maxPriceAtomic: "1000",
     nonce: "nonce-1",
   });
 }
@@ -4022,9 +4206,15 @@ async function post(
   body: unknown,
   headers: Record<string, string> = {},
 ) {
+  const effectiveHeaders = { ...headers };
+  const skipCawAuth = effectiveHeaders["x-test-skip-caw-auth"];
+  delete effectiveHeaders["x-test-skip-caw-auth"];
+  if (path === "/api/v1/caw/receipts/ingest" && !skipCawAuth && !Object.keys(effectiveHeaders).some((key) => key.toLowerCase() === "authorization")) {
+    effectiveHeaders.authorization = `Bearer ${CAW_INGEST_TOKEN}`;
+  }
   const res = await app.request(path, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers },
+    headers: { "content-type": "application/json", ...effectiveHeaders },
     body: JSON.stringify(body),
   });
   return { status: res.status, headers: res.headers, json: await res.json() };

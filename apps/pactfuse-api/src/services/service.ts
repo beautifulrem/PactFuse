@@ -1,5 +1,7 @@
 import {
   AgentTranscriptViewSchema,
+  ArtifactAccessTokenViewSchema,
+  ArtifactPreflightViewSchema,
   ArtifactAccessIssuePayloadSchema,
   ArtifactPreflightPayloadSchema,
   ArtifactRefundPayloadSchema,
@@ -23,14 +25,17 @@ import {
   LOCKED_RUNTIME_MODES,
   McpAdapterAuditPayloadSchema,
   McpAdapterCallViewSchema,
+  QuoteViewSchema,
   QuotePayloadSchema,
   RawCawReceiptBundleViewSchema,
   ReplayBundleViewSchema,
   RunnerHeartbeatViewSchema,
   SessionScopedEnvelopeSchema,
   SessionViewSchema,
+  SourceViewSchema,
   SourceChallengePayloadSchema,
   SourceRegisterPayloadSchema,
+  SpendViewSchema,
   SpendRegisterPayloadSchema,
   VerifierRunViewSchema,
   VerifyEvidencePayloadSchema,
@@ -322,7 +327,9 @@ export async function registerSourceBoundSpends(
           pactId: spend.pactId,
           toolId: spend.toolId,
           sourceHashes,
+          payer: spend.payer,
           agentWallet: spend.agentWallet,
+          maxPriceAtomic: spend.maxPriceAtomic,
           nonce: spend.nonce,
         });
         if (spend.spendId.toLowerCase() !== binding.spendId) {
@@ -333,28 +340,52 @@ export async function registerSourceBoundSpends(
             }),
           });
         }
-        ctx.db.sqlite
-          .prepare(
-            `INSERT OR REPLACE INTO spends
-              (spend_id, session_id, pact_id, tool_id, payer, agent_wallet, source_hashes_json, source_set_hash, session_commitment,
-               spend_preimage_json, max_price_atomic, nonce, status, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered_pending_chain_log', ?)`,
-          )
-          .run(
-            binding.spendId,
-            envelope.sessionId,
-            spend.pactId,
-            spend.toolId,
-            spend.payer,
-            spend.agentWallet,
-            canonicalizeJson(sourceHashes),
-            binding.sourceSetHash,
-            binding.sessionCommitment,
-            canonicalizeJson(binding.spendPreimage),
-            spend.maxPriceAtomic,
-            spend.nonce,
-            createdAt,
+        const sourceHashesJson = canonicalizeJson(sourceHashes);
+        const spendPreimageJson = canonicalizeJson(binding.spendPreimage);
+        const existingSpend = ctx.db.sqlite
+          .prepare("SELECT * FROM spends WHERE session_id = ? AND spend_id = ?")
+          .get(envelope.sessionId, binding.spendId) as Row | undefined;
+        if (existingSpend) {
+          assertExistingSpendMatches(
+            existingSpend,
+            {
+              pactId: spend.pactId,
+              toolId: spend.toolId,
+              payer: spend.payer,
+              agentWallet: spend.agentWallet,
+              sourceHashesJson,
+              sourceSetHash: binding.sourceSetHash,
+              sessionCommitment: binding.sessionCommitment,
+              spendPreimageJson,
+              maxPriceAtomic: spend.maxPriceAtomic,
+              nonce: spend.nonce,
+            },
+            requestId,
           );
+        } else {
+          ctx.db.sqlite
+            .prepare(
+              `INSERT INTO spends
+                (spend_id, session_id, pact_id, tool_id, payer, agent_wallet, source_hashes_json, source_set_hash, session_commitment,
+                 spend_preimage_json, max_price_atomic, nonce, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered_pending_chain_log', ?)`,
+            )
+            .run(
+              binding.spendId,
+              envelope.sessionId,
+              spend.pactId,
+              spend.toolId,
+              spend.payer,
+              spend.agentWallet,
+              sourceHashesJson,
+              binding.sourceSetHash,
+              binding.sessionCommitment,
+              spendPreimageJson,
+              spend.maxPriceAtomic,
+              spend.nonce,
+              createdAt,
+            );
+        }
         registeredSpends.push({
           spendId: binding.spendId,
           sourceSetHash: binding.sourceSetHash,
@@ -491,7 +522,7 @@ export async function ingestCawReceiptBundle(
             });
           }
         }
-        return appendEvidenceEvent(ctx, {
+        const event = appendEvidenceEvent(ctx, {
           sessionId: envelope.sessionId,
           authority: "advisory",
           kind: "caw.receipt.ingested.fixture",
@@ -506,6 +537,14 @@ export async function ingestCawReceiptBundle(
             status: "fixture_manual_receipt",
           },
         });
+        updateJudgeCheckRow(ctx, envelope.sessionId, {
+          rowId: "caw_boundary",
+          status: "manual",
+          authority: "fixture",
+          reason: "manual CAW receipt rows are recorded but cannot prove the CAW boundary",
+          evidenceEventId: event.eventId,
+        });
+        return event;
       });
       return {
         ok: true,
@@ -604,7 +643,7 @@ export async function ingestCawReceiptBundle(
             receipt.createdAt,
           );
       }
-      return appendEvidenceEvent(ctx, {
+      const event = appendEvidenceEvent(ctx, {
         sessionId: envelope.sessionId,
         authority: "advisory",
         kind: "caw.receipt.ingested.raw",
@@ -625,6 +664,14 @@ export async function ingestCawReceiptBundle(
           status: "raw_ingested_pending_proof",
         },
       });
+      updateJudgeCheckRow(ctx, envelope.sessionId, {
+        rowId: "caw_boundary",
+        status: "pass",
+        authority: "delivery",
+        reason: "raw CAW receipt bundle ingested and canonicalized; final proof remains fail-closed",
+        evidenceEventId: event.eventId,
+      });
+      return event;
     });
     return {
       ok: true,
@@ -1737,6 +1784,11 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
 function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBundleView {
   const events = listEvents(ctx, sessionId, 0, 200);
   const mcpAdapterCalls = listMcpAdapterCalls(ctx, sessionId, 200);
+  const sources = listSources(ctx, sessionId, 200);
+  const spends = listSpends(ctx, sessionId, 200);
+  const artifactPreflights = listArtifactPreflights(ctx, sessionId, 200);
+  const quotes = listQuotes(ctx, sessionId, 200);
+  const artifactAccessTokens = listArtifactAccessTokens(ctx, sessionId, 200);
   const cawReceiptOperations = listCawReceiptOperations(ctx, sessionId, 200);
   const rawCawReceiptBundles = listRawCawReceiptBundles(ctx, sessionId, 200);
   const canonicalCawReceipts = listCanonicalCawReceipts(ctx, sessionId, 200);
@@ -1752,6 +1804,11 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBun
     eventRoot: hashJson(events.map((event) => event.eventHash)),
     agentTranscriptHash: hashJson(agentTranscript),
     events,
+    sources,
+    spends,
+    artifactPreflights,
+    quotes,
+    artifactAccessTokens,
     mcpAdapterCalls,
     cawReceiptOperations,
     rawCawReceiptBundles,
@@ -3683,28 +3740,28 @@ function chainLogMatchesGatePayload(
   },
 ): boolean {
   const txHash = optionalHex(log.transactionHash ?? log.txHash);
-  if (txHash && txHash.toLowerCase() !== payload.txHash.toLowerCase()) {
+  if (!txHash || txHash.toLowerCase() !== payload.txHash.toLowerCase()) {
     return false;
   }
   const logIndex = optionalChainNumber(log.logIndex ?? log.index);
-  if (logIndex !== null && logIndex !== payload.logIndex) {
+  if (logIndex === null || logIndex !== payload.logIndex) {
     return false;
   }
   const blockNumber = optionalChainNumber(log.blockNumber);
-  if (blockNumber !== null && blockNumber !== payload.blockNumber) {
+  if (blockNumber === null || blockNumber !== payload.blockNumber) {
     return false;
   }
   const chainId = optionalString(log.chainId);
   if (chainId && chainId !== payload.chainId) {
     return false;
   }
-  const eventName = optionalString(log.eventName ?? log.event);
-  if (eventName && eventName !== payload.event) {
+  const eventName = semanticEventName(log.eventName ?? log.event ?? log.name);
+  if (eventName !== payload.event) {
     return false;
   }
   const args = log.args && typeof log.args === "object" ? (log.args as Record<string, unknown>) : {};
-  const spendId = optionalHex(log.spendId ?? args.spendId);
-  return !spendId || spendId.toLowerCase() === payload.spendId.toLowerCase();
+  const spendId = optionalHex32(log.spendId ?? args.spendId);
+  return Boolean(spendId && spendId.toLowerCase() === payload.spendId.toLowerCase());
 }
 
 function rawLogHashForChainLog(log: Record<string, unknown>): `0x${string}` {
@@ -4052,10 +4109,57 @@ function requireRegisteredSources(ctx: ServiceCtx, sessionId: string, sourceHash
   }
 }
 
+function assertExistingSpendMatches(
+  row: Row,
+  expected: {
+    pactId: string;
+    toolId: string;
+    payer: string;
+    agentWallet: string;
+    sourceHashesJson: string;
+    sourceSetHash: string;
+    sessionCommitment: string;
+    spendPreimageJson: string;
+    maxPriceAtomic: string;
+    nonce: string;
+  },
+  requestId: string,
+): void {
+  const checks = [
+    ["pact_id", expected.pactId],
+    ["tool_id", expected.toolId],
+    ["payer", expected.payer],
+    ["agent_wallet", expected.agentWallet],
+    ["source_hashes_json", expected.sourceHashesJson],
+    ["source_set_hash", expected.sourceSetHash],
+    ["session_commitment", expected.sessionCommitment],
+    ["spend_preimage_json", expected.spendPreimageJson],
+    ["max_price_atomic", expected.maxPriceAtomic],
+    ["nonce", expected.nonce],
+  ] as const;
+  const changed = checks.find(([column, expectedValue]) => String(row[column]) !== expectedValue);
+  if (changed) {
+    throw Object.assign(new Error("registered spend cannot be rebound with different fields"), {
+      apiError: proofBlockedError(requestId, "registered spend cannot be rebound with different fields", {
+        spendId: String(row.spend_id),
+        field: changed[0],
+      }),
+    });
+  }
+}
+
 function spendBindingFor(
   session: Row,
   sessionId: string,
-  spend: { pactId: string; toolId: string; sourceHashes: string[]; agentWallet: string; nonce: string },
+  spend: {
+    pactId: string;
+    toolId: string;
+    sourceHashes: string[];
+    payer: string;
+    agentWallet: string;
+    maxPriceAtomic: string;
+    nonce: string;
+  },
 ): {
   spendId: string;
   sourceSetHash: string;
@@ -4071,7 +4175,9 @@ function spendBindingFor(
     pactId: spend.pactId,
     toolId: spend.toolId,
     sourceSetHash,
+    payer: spend.payer.toLowerCase(),
     agentWallet: spend.agentWallet.toLowerCase(),
+    maxPriceAtomic: spend.maxPriceAtomic,
     nonce: spend.nonce,
   };
   return {
@@ -4262,9 +4368,9 @@ function updateJudgeCheckRow(
   ctx: ServiceCtx,
   sessionId: string,
   input: {
-    rowId: "source_challenge" | "ab_trip" | "c_settlement" | "artifact_access" | "lease_execution";
-    status: "pass" | "pending" | "blocked";
-    authority: "proof" | "delivery" | "operator" | "advisory";
+    rowId: "caw_boundary" | "source_challenge" | "ab_trip" | "c_settlement" | "artifact_access" | "lease_execution";
+    status: "pass" | "pending" | "blocked" | "manual" | "fixture";
+    authority: "proof" | "delivery" | "operator" | "advisory" | "fixture";
     reason: string;
     evidenceEventId: string;
   },
@@ -4275,7 +4381,7 @@ function updateJudgeCheckRow(
        SET status = ?, authority = ?, reason = ?, evidence_event_id = ?
        WHERE session_id = ?
          AND row_id = ?
-         AND status IN ('pending', 'blocked')`,
+         AND status IN ('pending', 'blocked', 'manual', 'fixture')`,
     )
     .run(input.status, input.authority, input.reason, input.evidenceEventId, sessionId, input.rowId);
 }
@@ -4306,6 +4412,142 @@ function listEvents(ctx: ServiceCtx, sessionId: string, afterSeq: number, limit:
     )
     .all(sessionId, afterSeq, limit) as Row[];
   return rows.map(evidenceEventFromRow);
+}
+
+function listSources(ctx: ServiceCtx, sessionId: string, limit: number) {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM sources
+       WHERE session_id = ?
+       ORDER BY created_at ASC, source_hash ASC
+       LIMIT ?`,
+    )
+    .all(sessionId, limit) as Row[];
+  return rows.map((row) =>
+    SourceViewSchema.parse({
+      sourceId: row.source_id,
+      sessionId: row.session_id,
+      sourceHash: row.source_hash,
+      manifestUrl: row.manifest_url,
+      manifestHash: row.manifest_hash,
+      issuer: row.issuer ?? null,
+      signature: row.signature ?? null,
+      capabilityVector: JSON.parse(String(row.capability_vector_json)),
+      proofStatus: row.proof_status,
+      createdAt: row.created_at,
+    }),
+  );
+}
+
+function listSpends(ctx: ServiceCtx, sessionId: string, limit: number) {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM spends
+       WHERE session_id = ?
+       ORDER BY created_at ASC, spend_id ASC
+       LIMIT ?`,
+    )
+    .all(sessionId, limit) as Row[];
+  return rows.map((row) =>
+    SpendViewSchema.parse({
+      spendId: row.spend_id,
+      sessionId: row.session_id,
+      pactId: row.pact_id,
+      toolId: row.tool_id,
+      payer: row.payer,
+      agentWallet: row.agent_wallet,
+      sourceHashes: JSON.parse(String(row.source_hashes_json)),
+      sourceSetHash: row.source_set_hash,
+      sessionCommitment: row.session_commitment,
+      spendPreimage: JSON.parse(String(row.spend_preimage_json)),
+      maxPriceAtomic: row.max_price_atomic,
+      nonce: row.nonce,
+      status: row.status,
+      createdAt: row.created_at,
+    }),
+  );
+}
+
+function listArtifactPreflights(ctx: ServiceCtx, sessionId: string, limit: number) {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM artifact_preflights
+       WHERE session_id = ?
+       ORDER BY created_at ASC, preflight_id ASC
+       LIMIT ?`,
+    )
+    .all(sessionId, limit) as Row[];
+  return rows.map((row) =>
+    ArtifactPreflightViewSchema.parse({
+      preflightId: row.preflight_id,
+      sessionId: row.session_id,
+      spendId: row.spend_id,
+      artifactHashPreview: row.artifact_hash_preview,
+      endpointUrl: row.endpoint_url,
+      priceDisclosureHash: row.price_disclosure_hash,
+      sourceStateSnapshotHash: row.source_state_snapshot_hash,
+      status: row.status,
+      createdAt: row.created_at,
+    }),
+  );
+}
+
+function listQuotes(ctx: ServiceCtx, sessionId: string, limit: number) {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM quotes
+       WHERE session_id = ?
+       ORDER BY created_at ASC, quote_id ASC
+       LIMIT ?`,
+    )
+    .all(sessionId, limit) as Row[];
+  return rows.map((row) =>
+    QuoteViewSchema.parse({
+      quoteId: row.quote_id,
+      sessionId: row.session_id,
+      spendId: row.spend_id,
+      preflightId: row.preflight_id,
+      artifactCommitment: row.artifact_commitment,
+      priceDisclosureHash: row.price_disclosure_hash,
+      sourceStateSnapshotHash: row.source_state_snapshot_hash,
+      priceAtomic: row.price_atomic,
+      quoteNonce: row.quote_nonce,
+      validUntilBlock: row.valid_until_block,
+      quoteHash: row.quote_hash,
+      status: row.status,
+      createdAt: row.created_at,
+    }),
+  );
+}
+
+function listArtifactAccessTokens(ctx: ServiceCtx, sessionId: string, limit: number) {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM artifact_access_tokens
+       WHERE session_id = ?
+       ORDER BY created_at ASC, token_id ASC
+       LIMIT ?`,
+    )
+    .all(sessionId, limit) as Row[];
+  return rows.map((row) =>
+    ArtifactAccessTokenViewSchema.parse({
+      tokenId: row.token_id,
+      sessionId: row.session_id,
+      spendId: row.spend_id,
+      payer: row.payer,
+      artifactHash: row.artifact_hash,
+      tokenHash: row.token_hash,
+      status: row.status,
+      issuedByVerifierRunId: row.issued_by_verifier_run_id ?? null,
+      settlementEventId: row.settlement_event_id ?? null,
+      createdAt: row.created_at,
+    }),
+  );
 }
 
 function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number) {
@@ -4930,6 +5172,11 @@ function verifyReplayBundleBindings(
     errors.push("replayBundle.agentTranscriptHash does not match the server transcript snapshot");
   }
   compareReplaySnapshot(errors, "replayBundle.events", bundle.events, expectedEvents);
+  compareReplaySnapshot(errors, "replayBundle.sources", bundle.sources, listSources(ctx, sessionId, 200));
+  compareReplaySnapshot(errors, "replayBundle.spends", bundle.spends, listSpends(ctx, sessionId, 200));
+  compareReplaySnapshot(errors, "replayBundle.artifactPreflights", bundle.artifactPreflights, listArtifactPreflights(ctx, sessionId, 200));
+  compareReplaySnapshot(errors, "replayBundle.quotes", bundle.quotes, listQuotes(ctx, sessionId, 200));
+  compareReplaySnapshot(errors, "replayBundle.artifactAccessTokens", bundle.artifactAccessTokens, listArtifactAccessTokens(ctx, sessionId, 200));
   compareReplaySnapshot(errors, "replayBundle.mcpAdapterCalls", bundle.mcpAdapterCalls, listMcpAdapterCalls(ctx, sessionId, asOfCount));
   compareReplaySnapshot(errors, "replayBundle.cawReceiptOperations", bundle.cawReceiptOperations, listCawReceiptOperations(ctx, sessionId, 200));
   compareReplaySnapshot(errors, "replayBundle.rawCawReceiptBundles", bundle.rawCawReceiptBundles, listRawCawReceiptBundles(ctx, sessionId, 200));

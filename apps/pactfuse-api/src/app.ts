@@ -401,10 +401,12 @@ function authorizeGateEventIngest(c: Context, ctx: ServiceCtx, payload: unknown)
 
 function authorizeCawReceiptIngest(c: Context, ctx: ServiceCtx): void {
   const token = ctx.cawIngestToken;
-  if (!token) {
-    return;
-  }
   const requestId = newRequestId("caw_ingest_auth");
+  if (!token) {
+    throw Object.assign(new Error("CAW receipt ingest token is not configured"), {
+      apiError: forbiddenError(requestId, "CAW receipt ingest token is not configured"),
+    });
+  }
   const bearer = bearerTokenFor(c);
   if (!bearer || !secureEqualText(bearer, token)) {
     throw Object.assign(new Error("CAW receipt ingest token is invalid"), {
@@ -523,7 +525,31 @@ function buildOpenApi(): Record<string, unknown> {
           additionalProperties: false,
           properties: {
             idempotencyKey: { type: "string", minLength: 4, maxLength: 160, pattern: "^[a-z][a-z0-9:_-]+$" },
-            payload: { type: "object", additionalProperties: true },
+            payload: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                label: { type: "string", minLength: 1, maxLength: 120 },
+                targetRepo: { type: "string", minLength: 1, maxLength: 400 },
+                targetCommit: { type: "string", minLength: 6, maxLength: 128 },
+                authorizedQuoteSignerSetHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                finalityDepth: { type: "integer", minimum: 1, maximum: 128, default: 2 },
+                modes: { $ref: "#/components/schemas/RuntimeModes" },
+                metadata: { type: "object", additionalProperties: true, default: {} },
+              },
+            },
+          },
+        },
+        RuntimeModes: {
+          type: "object",
+          required: ["CLAIM_MODE", "PAYMENT_MODE", "TOKEN_MODE", "IDENTITY_MODE", "WINNER_CLAIM_ALLOWED"],
+          additionalProperties: false,
+          properties: {
+            CLAIM_MODE: { const: "simulated" },
+            PAYMENT_MODE: { const: "mocked" },
+            TOKEN_MODE: { const: "local-mocked" },
+            IDENTITY_MODE: { const: "pending" },
+            WINNER_CLAIM_ALLOWED: { const: false },
           },
         },
         SessionScopedEnvelope: {
@@ -1113,6 +1139,11 @@ function buildOpenApi(): Record<string, unknown> {
             "eventRoot",
             "agentTranscriptHash",
             "events",
+            "sources",
+            "spends",
+            "artifactPreflights",
+            "quotes",
+            "artifactAccessTokens",
             "mcpAdapterCalls",
             "cawReceiptOperations",
             "rawCawReceiptBundles",
@@ -1155,6 +1186,168 @@ function buildOpenApi(): Record<string, unknown> {
                   kind: { type: "string" },
                   payloadHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
                   payload: { type: "object", additionalProperties: true },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+            sources: {
+              type: "array",
+              items: {
+                type: "object",
+                required: [
+                  "sourceId",
+                  "sessionId",
+                  "sourceHash",
+                  "manifestUrl",
+                  "manifestHash",
+                  "issuer",
+                  "signature",
+                  "capabilityVector",
+                  "proofStatus",
+                  "createdAt",
+                ],
+                properties: {
+                  sourceId: { type: "string" },
+                  sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sourceHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  manifestUrl: { type: "string" },
+                  manifestHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  issuer: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]+$" }, { type: "null" }] },
+                  signature: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]+$" }, { type: "null" }] },
+                  capabilityVector: { type: "object", additionalProperties: true },
+                  proofStatus: { enum: ["pending", "challenged", "active"] },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+            spends: {
+              type: "array",
+              items: {
+                type: "object",
+                required: [
+                  "spendId",
+                  "sessionId",
+                  "pactId",
+                  "toolId",
+                  "payer",
+                  "agentWallet",
+                  "sourceHashes",
+                  "sourceSetHash",
+                  "sessionCommitment",
+                  "spendPreimage",
+                  "maxPriceAtomic",
+                  "nonce",
+                  "status",
+                  "createdAt",
+                ],
+                properties: {
+                  spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  pactId: { type: "string" },
+                  toolId: { type: "string" },
+                  payer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+                  agentWallet: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+                  sourceHashes: { type: "array", items: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" } },
+                  sourceSetHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sessionCommitment: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  spendPreimage: { type: "object", additionalProperties: true },
+                  maxPriceAtomic: { type: "string", pattern: "^(0|[1-9][0-9]*)$" },
+                  nonce: { type: "string" },
+                  status: { type: "string" },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+            artifactPreflights: {
+              type: "array",
+              items: {
+                type: "object",
+                required: [
+                  "preflightId",
+                  "sessionId",
+                  "spendId",
+                  "artifactHashPreview",
+                  "endpointUrl",
+                  "priceDisclosureHash",
+                  "sourceStateSnapshotHash",
+                  "status",
+                  "createdAt",
+                ],
+                properties: {
+                  preflightId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  artifactHashPreview: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  endpointUrl: { type: "string" },
+                  priceDisclosureHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sourceStateSnapshotHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  status: { enum: ["pending_live_delivery"] },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+            quotes: {
+              type: "array",
+              items: {
+                type: "object",
+                required: [
+                  "quoteId",
+                  "sessionId",
+                  "spendId",
+                  "preflightId",
+                  "artifactCommitment",
+                  "priceDisclosureHash",
+                  "sourceStateSnapshotHash",
+                  "priceAtomic",
+                  "quoteNonce",
+                  "validUntilBlock",
+                  "quoteHash",
+                  "status",
+                  "createdAt",
+                ],
+                properties: {
+                  quoteId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  preflightId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  artifactCommitment: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  priceDisclosureHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sourceStateSnapshotHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  priceAtomic: { type: "string", pattern: "^(0|[1-9][0-9]*)$" },
+                  quoteNonce: { type: "string" },
+                  validUntilBlock: { type: "string", pattern: "^[0-9]+$" },
+                  quoteHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  status: { enum: ["mocked_after_preflight_not_chain_settleable"] },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
+            artifactAccessTokens: {
+              type: "array",
+              items: {
+                type: "object",
+                required: [
+                  "tokenId",
+                  "sessionId",
+                  "spendId",
+                  "payer",
+                  "artifactHash",
+                  "tokenHash",
+                  "status",
+                  "issuedByVerifierRunId",
+                  "settlementEventId",
+                  "createdAt",
+                ],
+                properties: {
+                  tokenId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  payer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+                  artifactHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  tokenHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  status: { enum: ["active"] },
+                  issuedByVerifierRunId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  settlementEventId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
                   createdAt: { type: "string", format: "date-time" },
                 },
               },
@@ -1482,9 +1675,9 @@ function parameterSchemaFor(path: string): Record<string, unknown>[] {
     parameters.push({
       name: "authorization",
       in: "header",
-      required: false,
+      required: true,
       schema: { type: "string", pattern: "^Bearer .+" },
-      description: "Required when PACTFUSE_CAW_INGEST_TOKEN is configured; protects raw/manual CAW receipt ingest writes.",
+      description: "Required for every raw/manual CAW receipt ingest write; configured by PACTFUSE_CAW_INGEST_TOKEN.",
     });
   }
   const apiRole = apiRoleForPath(path);
