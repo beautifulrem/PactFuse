@@ -38,7 +38,7 @@ export const RunConfigSchema = z
     targetRepo: z.string().min(1).max(400).optional(),
     targetCommit: z.string().min(6).max(128).optional(),
     authorizedQuoteSignerSetHash: Hex32Schema.optional(),
-    finalityDepth: z.number().int().min(0).max(128).default(0),
+    finalityDepth: z.number().int().min(1).max(128).default(2),
     modes: RuntimeModesSchema.default(LOCKED_RUNTIME_MODES),
     metadata: JsonObjectSchema.default({}),
   })
@@ -190,6 +190,24 @@ export const LeaseExecuteEnvelopeSchema = SessionScopedEnvelopeSchema.extend({
   payload: LeaseExecutePayloadSchema,
 }).strict();
 
+export const GateEventIngestPayloadSchema = z
+  .object({
+    event: z.enum(["SpendTripped", "SpendSettled"]),
+    spendId: Hex32Schema,
+    txHash: Hex32Schema,
+    logIndex: z.number().int().min(0).max(1_000_000),
+    chainId: DecimalStringSchema,
+    blockNumber: z.number().int().min(0),
+    currentBlockNumber: z.number().int().min(0),
+    rawLogHash: Hex32Schema,
+    reorged: z.boolean().default(false),
+  })
+  .strict()
+  .refine((payload) => payload.reorged || payload.currentBlockNumber >= payload.blockNumber, {
+    message: "currentBlockNumber must be >= blockNumber unless the log is reorged",
+    path: ["currentBlockNumber"],
+  });
+
 export const VerifyEvidencePayloadSchema = z
   .object({
     receipt: JsonObjectSchema.optional(),
@@ -220,6 +238,11 @@ export const EvidenceEventKindSchema = z.enum([
   "artifact.preflight.pending",
   "quote.signed.mocked",
   "artifact.refund.pending",
+  "gate.spend_tripped.observed",
+  "gate.spend_settled.observed",
+  "gate.spend_tripped",
+  "gate.spend_settled",
+  "reorg.invalidated",
   "lease.execution.blocked",
   "verifier.fail_closed",
   "judge_check.pending",

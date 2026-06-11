@@ -6,6 +6,7 @@ import {
   CawReceiptIngestPayloadSchema,
   CreateSessionInputSchema,
   EvidenceEventSchema,
+  GateEventIngestPayloadSchema,
   Hex32Schema,
   JudgeCheckViewSchema,
   LeaseExecutePayloadSchema,
@@ -423,6 +424,151 @@ export async function ingestCawReceiptBundle(
   });
 }
 
+export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(GateEventIngestPayloadSchema, envelope.payload);
+  return withIdempotency(ctx, scoped("gate:events:ingest", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
+    const session = requireSessionRow(ctx, envelope.sessionId, requestId);
+    assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    return withImmediateTransaction(ctx, () => {
+      const finalityDepth = finalityDepthForSession(session);
+      const confirmations = payload.reorged ? 0 : payload.currentBlockNumber - payload.blockNumber + 1;
+      const gateEventId = hashJson({
+        sessionId: envelope.sessionId,
+        event: payload.event,
+        spendId: payload.spendId,
+        txHash: payload.txHash,
+        logIndex: payload.logIndex,
+        chainId: payload.chainId,
+        rawLogHash: payload.rawLogHash,
+      });
+      const existing = ctx.db.sqlite
+        .prepare(
+          `SELECT *
+           FROM gate_chain_events
+           WHERE session_id = ? AND tx_hash = ? AND log_index = ? AND event_kind = ?`,
+        )
+        .get(envelope.sessionId, payload.txHash, payload.logIndex, payload.event) as Row | undefined;
+      if (existing) {
+        assertGateEventRowMatches(existing, payload, gateEventId, requestId);
+      }
+      if (payload.reorged) {
+        return recordGateReorg(ctx, {
+          requestId,
+          sessionId: envelope.sessionId,
+          payload,
+          existing,
+          gateEventId,
+          finalityDepth,
+          confirmations,
+        });
+      }
+      if (existing && (existing.status === "reorg_invalidated" || typeof existing.reorg_event_id === "string")) {
+        throw Object.assign(new Error("cannot revive a reorg-invalidated gate event"), {
+          apiError: proofBlockedError(requestId, "cannot revive a reorg-invalidated gate event"),
+        });
+      }
+
+      const observedEventId =
+        typeof existing?.observed_event_id === "string"
+          ? existing.observed_event_id
+          : appendGateObservedEvent(ctx, envelope.sessionId, payload, gateEventId, finalityDepth, confirmations).eventId;
+      if (!existing) {
+        ctx.db.sqlite
+          .prepare(
+            `INSERT INTO gate_chain_events
+              (gate_event_id, session_id, spend_id, event_kind, tx_hash, log_index, chain_id, block_number, current_block_number,
+               finality_depth, confirmations, raw_log_hash, status, observed_event_id, finalized_event_id, reorg_event_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'observed_finalizing', ?, NULL, NULL, ?, ?)`,
+          )
+          .run(
+            gateEventId,
+            envelope.sessionId,
+            payload.spendId,
+            payload.event,
+            payload.txHash,
+            payload.logIndex,
+            payload.chainId,
+            payload.blockNumber,
+            payload.currentBlockNumber,
+            finalityDepth,
+            confirmations,
+            payload.rawLogHash,
+            observedEventId,
+            ctx.clock.now().toISOString(),
+            ctx.clock.now().toISOString(),
+          );
+      }
+
+      if (confirmations < finalityDepth) {
+        if (existing) {
+          ctx.db.sqlite
+            .prepare(
+              `UPDATE gate_chain_events
+               SET current_block_number = ?, confirmations = ?, updated_at = ?
+               WHERE gate_event_id = ?`,
+            )
+            .run(payload.currentBlockNumber, confirmations, ctx.clock.now().toISOString(), gateEventId);
+        }
+        return {
+          ok: true,
+          requestId,
+          evidenceEventId: observedEventId,
+          data: {
+            gateEventId,
+            spendId: payload.spendId,
+            event: payload.event,
+            finalityStatus: "observed_finalizing",
+            confirmations,
+            finalityDepth,
+            observedEventId,
+            finalizedEventId: null,
+            proofAuthority: false,
+            winnerClaimAllowed: false,
+          },
+        };
+      }
+
+      const finalizedEventId =
+        typeof existing?.finalized_event_id === "string"
+          ? existing.finalized_event_id
+          : appendGateFinalizedEvent(ctx, envelope.sessionId, payload, gateEventId, observedEventId, finalityDepth, confirmations).eventId;
+      const finalizeResult = ctx.db.sqlite
+        .prepare(
+          `UPDATE gate_chain_events
+           SET current_block_number = ?, confirmations = ?, status = 'finalized', finalized_event_id = ?, updated_at = ?
+           WHERE gate_event_id = ?`,
+        )
+        .run(payload.currentBlockNumber, confirmations, finalizedEventId, ctx.clock.now().toISOString(), gateEventId);
+      if (finalizeResult.changes !== 1) {
+        throw Object.assign(new Error("finalized gate event did not update the observed gate row"), {
+          apiError: proofBlockedError(requestId, "finalized gate event did not update the observed gate row"),
+        });
+      }
+      ctx.db.sqlite
+        .prepare("UPDATE spends SET status = ? WHERE session_id = ? AND spend_id = ?")
+        .run(gateSpendStatus(payload.event, "finalized"), envelope.sessionId, payload.spendId);
+      return {
+        ok: true,
+        requestId,
+        evidenceEventId: finalizedEventId,
+        data: {
+          gateEventId,
+          spendId: payload.spendId,
+          event: payload.event,
+          finalityStatus: "finalized",
+          confirmations,
+          finalityDepth,
+          observedEventId,
+          finalizedEventId,
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        },
+      };
+    });
+  });
+}
+
 export async function runArtifactPreflight(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
   const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
   const payload = parseStrict(ArtifactPreflightPayloadSchema, envelope.payload);
@@ -616,6 +762,7 @@ export async function executeLease(
       assertSession(ctx, envelope.sessionId, requestId);
       const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
       const payer = requireSpendPayer(spend, payload.payer, requestId);
+      requireFinalizedSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
       requireActiveArtifactAccess(
         ctx,
         {
@@ -698,6 +845,7 @@ export async function verifyEvidenceForSession(
     const eventLogErrors = [
       ...verifyEventLogIntegrity(ctx, envelope.sessionId),
       ...verifyMcpAdapterCallIntegrity(ctx, envelope.sessionId),
+      ...verifyGateFinalityIntegrity(ctx, envelope.sessionId),
       ...verifyReplayBundleBindings(ctx, envelope.sessionId, payload),
     ];
     const rawErrors = toStringArray(raw.errors);
@@ -880,6 +1028,7 @@ export async function readArtifactAccess(
   assertSession(ctx, sessionId, requestId);
   const spend = assertSpend(ctx, sessionId, spendId, requestId);
   const payer = requireSpendPayer(spend, input.payer, requestId);
+  requireFinalizedSettlement(ctx, sessionId, spendId, requestId);
   requireActiveArtifactAccess(ctx, { ...input, sessionId, spendId, payer, artifactHash }, requestId);
   return {
     ok: true,
@@ -1103,6 +1252,11 @@ export function appendEvidenceEvent(
       | "artifact.preflight.pending"
       | "quote.signed.mocked"
       | "artifact.refund.pending"
+      | "gate.spend_tripped.observed"
+      | "gate.spend_settled.observed"
+      | "gate.spend_tripped"
+      | "gate.spend_settled"
+      | "reorg.invalidated"
       | "lease.execution.blocked"
       | "verifier.fail_closed"
       | "judge_check.pending"
@@ -1399,6 +1553,300 @@ function requireSpendPayer(spend: Row, payer: string, requestId: string): string
   return registeredPayer;
 }
 
+function requireFinalizedSettlement(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): void {
+  const invalidated = ctx.db.sqlite
+    .prepare(
+      `SELECT tx_hash, log_index
+       FROM gate_chain_events
+       WHERE session_id = ? AND spend_id = ? AND event_kind = 'SpendSettled'
+         AND (status = 'reorg_invalidated' OR reorg_event_id IS NOT NULL)
+       LIMIT 1`,
+    )
+    .get(sessionId, spendId) as Row | undefined;
+  if (invalidated) {
+    throw Object.assign(new Error("settlement gate event was reorg-invalidated"), {
+      apiError: proofBlockedError(requestId, "settlement gate event was reorg-invalidated"),
+    });
+  }
+
+  const settlement = ctx.db.sqlite
+    .prepare(
+      `SELECT status, observed_event_id, finalized_event_id, finality_depth, confirmations
+       FROM gate_chain_events
+       WHERE session_id = ? AND spend_id = ? AND event_kind = 'SpendSettled'
+       ORDER BY block_number DESC, log_index DESC
+       LIMIT 1`,
+    )
+    .get(sessionId, spendId) as Row | undefined;
+  if (!settlement || settlement.status !== "finalized" || typeof settlement.finalized_event_id !== "string") {
+    throw Object.assign(new Error("finalized SpendSettled gate proof is required before artifact access"), {
+      apiError: proofPendingError(requestId, "finalized SpendSettled gate proof is required before artifact access"),
+    });
+  }
+  if (!settlement.observed_event_id || Number(settlement.confirmations) < Number(settlement.finality_depth)) {
+    throw Object.assign(new Error("finalized SpendSettled gate proof is internally inconsistent"), {
+      apiError: proofBlockedError(requestId, "finalized SpendSettled gate proof is internally inconsistent"),
+    });
+  }
+}
+
+function finalityDepthForSession(session: Row): number {
+  const parsed = JSON.parse(String(session.run_config_json)) as { finalityDepth?: unknown };
+  return typeof parsed.finalityDepth === "number" && Number.isInteger(parsed.finalityDepth)
+    ? Math.max(1, Math.min(parsed.finalityDepth, 128))
+    : 2;
+}
+
+function assertGateEventRowMatches(
+  existing: Row,
+  payload: {
+    event: "SpendTripped" | "SpendSettled";
+    spendId: string;
+    txHash: string;
+    logIndex: number;
+    chainId: string;
+    blockNumber: number;
+    rawLogHash: string;
+  },
+  gateEventId: string,
+  requestId: string,
+): void {
+  const mismatches: Record<string, JsonValue> = {};
+  const checkString = (field: string, expected: string, actual: unknown) => {
+    if (String(actual) !== expected) {
+      mismatches[field] = { expected, actual: actual === null || actual === undefined ? null : String(actual) };
+    }
+  };
+  const checkNumber = (field: string, expected: number, actual: unknown) => {
+    if (Number(actual) !== expected) {
+      mismatches[field] = {
+        expected,
+        actual: actual === null || actual === undefined || Number.isNaN(Number(actual)) ? null : Number(actual),
+      };
+    }
+  };
+
+  checkString("gateEventId", gateEventId, existing.gate_event_id);
+  checkString("spendId", payload.spendId, existing.spend_id);
+  checkString("event", payload.event, existing.event_kind);
+  checkString("txHash", payload.txHash, existing.tx_hash);
+  checkNumber("logIndex", payload.logIndex, existing.log_index);
+  checkString("chainId", payload.chainId, existing.chain_id);
+  checkNumber("blockNumber", payload.blockNumber, existing.block_number);
+  checkString("rawLogHash", payload.rawLogHash, existing.raw_log_hash);
+  if (Object.keys(mismatches).length > 0) {
+    throw Object.assign(new Error("gate event replay does not match the previously observed log"), {
+      apiError: proofBlockedError(requestId, "gate event replay does not match the previously observed log", { mismatches }),
+    });
+  }
+}
+
+function gateObservedKind(event: "SpendTripped" | "SpendSettled"): "gate.spend_tripped.observed" | "gate.spend_settled.observed" {
+  return event === "SpendTripped" ? "gate.spend_tripped.observed" : "gate.spend_settled.observed";
+}
+
+function gateFinalizedKind(event: "SpendTripped" | "SpendSettled"): "gate.spend_tripped" | "gate.spend_settled" {
+  return event === "SpendTripped" ? "gate.spend_tripped" : "gate.spend_settled";
+}
+
+function gateSpendStatus(event: "SpendTripped" | "SpendSettled", finality: "observed" | "finalized" | "reorg"): string {
+  const prefix = event === "SpendTripped" ? "tripped" : "settled";
+  if (finality === "reorg") {
+    return `${prefix}_reorg_invalidated`;
+  }
+  return `${prefix}_${finality === "observed" ? "observed_finalizing" : "finalized"}`;
+}
+
+function gateEventPayload(
+  payload: {
+    event: "SpendTripped" | "SpendSettled";
+    spendId: string;
+    txHash: string;
+    logIndex: number;
+    chainId: string;
+    blockNumber: number;
+    currentBlockNumber: number;
+    rawLogHash: string;
+  },
+  gateEventId: string,
+  finalityDepth: number,
+  confirmations: number,
+  finalityStatus: "observed_finalizing" | "finalized",
+  observedEventId: string | null,
+): Record<string, JsonValue> {
+  return {
+    gateEventId,
+    event: payload.event,
+    spendId: payload.spendId,
+    txHash: payload.txHash,
+    logIndex: payload.logIndex,
+    chainId: payload.chainId,
+    blockNumber: payload.blockNumber,
+    currentBlockNumber: payload.currentBlockNumber,
+    rawLogHash: payload.rawLogHash,
+    confirmations,
+    finalityDepth,
+    finalityStatus,
+    observedEventId,
+    proofAuthority: finalityStatus === "finalized",
+    winnerClaimAllowed: false,
+  };
+}
+
+function appendGateObservedEvent(
+  ctx: ServiceCtx,
+  sessionId: string,
+  payload: {
+    event: "SpendTripped" | "SpendSettled";
+    spendId: string;
+    txHash: string;
+    logIndex: number;
+    chainId: string;
+    blockNumber: number;
+    currentBlockNumber: number;
+    rawLogHash: string;
+  },
+  gateEventId: string,
+  finalityDepth: number,
+  confirmations: number,
+): EvidenceEvent {
+  const event = appendEvidenceEvent(ctx, {
+    sessionId,
+    authority: "delivery",
+    kind: gateObservedKind(payload.event),
+    payload: gateEventPayload(payload, gateEventId, finalityDepth, confirmations, "observed_finalizing", null),
+  });
+  ctx.db.sqlite
+    .prepare("UPDATE spends SET status = ? WHERE session_id = ? AND spend_id = ?")
+    .run(gateSpendStatus(payload.event, "observed"), sessionId, payload.spendId);
+  return event;
+}
+
+function appendGateFinalizedEvent(
+  ctx: ServiceCtx,
+  sessionId: string,
+  payload: {
+    event: "SpendTripped" | "SpendSettled";
+    spendId: string;
+    txHash: string;
+    logIndex: number;
+    chainId: string;
+    blockNumber: number;
+    currentBlockNumber: number;
+    rawLogHash: string;
+  },
+  gateEventId: string,
+  observedEventId: string,
+  finalityDepth: number,
+  confirmations: number,
+): EvidenceEvent {
+  return appendEvidenceEvent(ctx, {
+    sessionId,
+    authority: "proof",
+    kind: gateFinalizedKind(payload.event),
+    payload: gateEventPayload(payload, gateEventId, finalityDepth, confirmations, "finalized", observedEventId),
+  });
+}
+
+function recordGateReorg(
+  ctx: ServiceCtx,
+  input: {
+    requestId: string;
+    sessionId: string;
+    payload: {
+      event: "SpendTripped" | "SpendSettled";
+      spendId: string;
+      txHash: string;
+      logIndex: number;
+      chainId: string;
+      blockNumber: number;
+      currentBlockNumber: number;
+      rawLogHash: string;
+    };
+    existing: Row | undefined;
+    gateEventId: string;
+    finalityDepth: number;
+    confirmations: number;
+  },
+): ServiceResult<unknown> {
+  if (!input.existing) {
+    throw Object.assign(new Error("cannot invalidate a gate event that was never observed"), {
+      apiError: proofPendingError(input.requestId, "cannot invalidate a gate event that was never observed"),
+    });
+  }
+  if (typeof input.existing.reorg_event_id === "string") {
+    return {
+      ok: true,
+      requestId: input.requestId,
+      evidenceEventId: input.existing.reorg_event_id,
+      data: {
+        gateEventId: input.gateEventId,
+        spendId: input.payload.spendId,
+        event: input.payload.event,
+        finalityStatus: "reorg_invalidated",
+        reorgEventId: input.existing.reorg_event_id,
+        proofAuthority: typeof input.existing.finalized_event_id === "string",
+        winnerClaimAllowed: false,
+      },
+    };
+  }
+  const finalizedEventId = typeof input.existing.finalized_event_id === "string" ? input.existing.finalized_event_id : null;
+  const observedEventId = typeof input.existing.observed_event_id === "string" ? input.existing.observed_event_id : null;
+  const invalidatedEventId =
+    typeof input.existing.finalized_event_id === "string" ? input.existing.finalized_event_id : observedEventId;
+  if (!invalidatedEventId) {
+    throw Object.assign(new Error("gate event has no observed or finalized evidence event to invalidate"), {
+      apiError: proofPendingError(input.requestId, "gate event has no observed or finalized evidence event to invalidate"),
+    });
+  }
+  const reorgAuthority = finalizedEventId ? "proof" : "delivery";
+  const reorgEvent = appendEvidenceEvent(ctx, {
+    sessionId: input.sessionId,
+    authority: reorgAuthority,
+    kind: "reorg.invalidated",
+    payload: {
+      gateEventId: input.gateEventId,
+      event: input.payload.event,
+      spendId: input.payload.spendId,
+      txHash: input.payload.txHash,
+      logIndex: input.payload.logIndex,
+      chainId: input.payload.chainId,
+      invalidatedEventId,
+      invalidatedFinalizedEventId: finalizedEventId,
+      invalidatedObservedEventId: observedEventId,
+      finalityDepth: input.finalityDepth,
+      confirmations: input.confirmations,
+      finalityStatus: "reorg_invalidated",
+      winnerClaimAllowed: false,
+    },
+  });
+  ctx.db.sqlite
+    .prepare(
+      `UPDATE gate_chain_events
+       SET status = 'reorg_invalidated', reorg_event_id = ?, current_block_number = ?, confirmations = 0, updated_at = ?
+       WHERE gate_event_id = ?`,
+    )
+    .run(reorgEvent.eventId, input.payload.currentBlockNumber, ctx.clock.now().toISOString(), input.gateEventId);
+  ctx.db.sqlite
+    .prepare("UPDATE spends SET status = ? WHERE session_id = ? AND spend_id = ?")
+    .run(gateSpendStatus(input.payload.event, "reorg"), input.sessionId, input.payload.spendId);
+  return {
+    ok: true,
+    requestId: input.requestId,
+    evidenceEventId: reorgEvent.eventId,
+    data: {
+      gateEventId: input.gateEventId,
+      spendId: input.payload.spendId,
+      event: input.payload.event,
+      finalityStatus: "reorg_invalidated",
+      reorgEventId: reorgEvent.eventId,
+      invalidatedEventId,
+      proofAuthority: reorgAuthority === "proof",
+      winnerClaimAllowed: false,
+    },
+  };
+}
+
 function normalizedSourceHashes(sourceHashes: string[]): string[] {
   return [...sourceHashes].map((sourceHash) => sourceHash.toLowerCase()).sort();
 }
@@ -1568,6 +2016,21 @@ function readJudgeCheckData(sessionId: string, ctx: ServiceCtx): JudgeCheckView 
   });
 }
 
+function evidenceEventFromRow(row: Row): EvidenceEvent {
+  return EvidenceEventSchema.parse({
+    sessionId: row.session_id,
+    eventId: row.event_id,
+    eventSeq: row.event_seq,
+    eventHash: row.event_hash,
+    prevProofEventHash: row.prev_proof_event_hash,
+    authority: row.authority,
+    kind: row.kind,
+    payloadHash: row.payload_hash,
+    payload: JSON.parse(String(row.payload_json)),
+    createdAt: row.created_at,
+  });
+}
+
 function listEvents(ctx: ServiceCtx, sessionId: string, afterSeq: number, limit: number): EvidenceEvent[] {
   const rows = ctx.db.sqlite
     .prepare(
@@ -1578,20 +2041,7 @@ function listEvents(ctx: ServiceCtx, sessionId: string, afterSeq: number, limit:
        LIMIT ?`,
     )
     .all(sessionId, afterSeq, limit) as Row[];
-  return rows.map((row) =>
-    EvidenceEventSchema.parse({
-      sessionId: row.session_id,
-      eventId: row.event_id,
-      eventSeq: row.event_seq,
-      eventHash: row.event_hash,
-      prevProofEventHash: row.prev_proof_event_hash,
-      authority: row.authority,
-      kind: row.kind,
-      payloadHash: row.payload_hash,
-      payload: JSON.parse(String(row.payload_json)),
-      createdAt: row.created_at,
-    }),
-  );
+  return rows.map(evidenceEventFromRow);
 }
 
 function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number) {
@@ -1676,6 +2126,91 @@ function verifyMcpAdapterCallIntegrity(ctx: ServiceCtx, sessionId: string): stri
   for (const callId of calls.keys()) {
     if (!eventCallIds.has(callId)) {
       errors.push(`mcp adapter call row ${callId} has no matching evidence event`);
+    }
+  }
+  return errors;
+}
+
+function verifyGateFinalityIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  const errors: string[] = [];
+  const gateEvents = (
+    ctx.db.sqlite
+      .prepare(
+        `SELECT *
+         FROM evidence_events
+         WHERE session_id = ?
+           AND kind IN ('reorg.invalidated', 'gate.spend_tripped', 'gate.spend_settled')
+         ORDER BY event_seq ASC`,
+      )
+      .all(sessionId) as Row[]
+  ).map(evidenceEventFromRow);
+  const reorgs = gateEvents.filter((event) => event.kind === "reorg.invalidated");
+  for (const reorg of reorgs) {
+    errors.push(`session contains reorg.invalidated event ${reorg.eventId}; winner claim is blocked`);
+  }
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT gate_event_id, spend_id, event_kind, tx_hash, log_index, chain_id, block_number, raw_log_hash,
+              status, observed_event_id, finalized_event_id, reorg_event_id, finality_depth, confirmations
+       FROM gate_chain_events
+       WHERE session_id = ?`,
+    )
+    .all(sessionId) as Row[];
+  const rowsByFinalizedEventId = new Map<string, Row>();
+  for (const row of rows) {
+    if (typeof row.finalized_event_id === "string") {
+      rowsByFinalizedEventId.set(row.finalized_event_id, row);
+    }
+    if (row.status === "reorg_invalidated" || row.reorg_event_id) {
+      errors.push(`gate ${row.event_kind} ${row.tx_hash}:${row.log_index} is reorg_invalidated; winner claim is blocked`);
+    }
+    if (row.status === "finalized" && !row.finalized_event_id) {
+      errors.push(`gate ${row.event_kind} ${row.tx_hash}:${row.log_index} is finalized without a proof event`);
+    }
+    if (row.finalized_event_id && Number(row.confirmations) < Number(row.finality_depth)) {
+      errors.push(`gate ${row.event_kind} ${row.tx_hash}:${row.log_index} finalized below required finality depth`);
+    }
+    if (!row.observed_event_id) {
+      errors.push(`gate ${row.event_kind} ${row.tx_hash}:${row.log_index} has no observed delivery event`);
+    }
+  }
+  for (const event of gateEvents.filter((candidate) => candidate.kind === "gate.spend_tripped" || candidate.kind === "gate.spend_settled")) {
+    const row = rowsByFinalizedEventId.get(event.eventId);
+    if (!row) {
+      errors.push(`gate proof event ${event.eventId} has no matching finalized gate row`);
+      continue;
+    }
+    const payload = event.payload;
+    const expectedKind = row.event_kind === "SpendTripped" ? "gate.spend_tripped" : "gate.spend_settled";
+    if (event.kind !== expectedKind) {
+      errors.push(`gate proof event ${event.eventId} kind does not match row event kind`);
+    }
+    const stringChecks = [
+      ["gateEventId", row.gate_event_id],
+      ["spendId", row.spend_id],
+      ["event", row.event_kind],
+      ["txHash", row.tx_hash],
+      ["chainId", row.chain_id],
+      ["rawLogHash", row.raw_log_hash],
+      ["observedEventId", row.observed_event_id],
+    ] as const;
+    for (const [field, expected] of stringChecks) {
+      if (payload[field] !== expected) {
+        errors.push(`gate proof event ${event.eventId} payload.${field} does not match gate row`);
+      }
+    }
+    const numberChecks = [
+      ["logIndex", row.log_index],
+      ["blockNumber", row.block_number],
+      ["finalityDepth", row.finality_depth],
+    ] as const;
+    for (const [field, expected] of numberChecks) {
+      if (Number(payload[field]) !== Number(expected)) {
+        errors.push(`gate proof event ${event.eventId} payload.${field} does not match gate row`);
+      }
+    }
+    if (payload.finalityStatus !== "finalized" || payload.proofAuthority !== true) {
+      errors.push(`gate proof event ${event.eventId} does not carry finalized proof authority payload`);
     }
   }
   return errors;

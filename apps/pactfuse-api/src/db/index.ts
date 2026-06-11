@@ -161,6 +161,28 @@ CREATE TABLE IF NOT EXISTS lease_runs (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS gate_chain_events (
+  gate_event_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  spend_id TEXT NOT NULL,
+  event_kind TEXT NOT NULL,
+  tx_hash TEXT NOT NULL,
+  log_index INTEGER NOT NULL,
+  chain_id TEXT NOT NULL,
+  block_number INTEGER NOT NULL,
+  current_block_number INTEGER NOT NULL,
+  finality_depth INTEGER NOT NULL,
+  confirmations INTEGER NOT NULL,
+  raw_log_hash TEXT NOT NULL,
+  status TEXT NOT NULL,
+  observed_event_id TEXT,
+  finalized_event_id TEXT,
+  reorg_event_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(session_id, tx_hash, log_index, event_kind)
+);
+
 CREATE TABLE IF NOT EXISTS mcp_adapter_calls (
   call_id TEXT PRIMARY KEY,
   session_id TEXT,

@@ -18,6 +18,7 @@ import {
   createSession,
   executeLease,
   getSession,
+  ingestGateEvent,
   ingestCawReceiptBundle,
   listEventsAfterEventId,
   readAgentTranscript,
@@ -50,6 +51,7 @@ const ROUTES = [
   { method: "POST", path: "/api/v1/spends/register-batch", okStatus: 201 },
   { method: "POST", path: "/api/v1/caw/operations/build", okStatus: 201 },
   { method: "POST", path: "/api/v1/caw/receipts/ingest", okStatus: 202 },
+  { method: "POST", path: "/api/v1/gate/events/ingest", okStatus: 202 },
   { method: "POST", path: "/api/v1/artifacts/preflight", okStatus: 202 },
   { method: "POST", path: "/api/v1/quotes", okStatus: 201 },
   { method: "GET", path: "/api/v1/artifacts/{sessionId}/{spendId}/{payer}/{artifactHash}", okStatus: 200 },
@@ -66,6 +68,7 @@ const ROUTES = [
 
 const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/caw/receipts/ingest": ["proofAuthority", "winnerClaimAllowed"],
+  "/api/v1/gate/events/ingest": ["finalityStatus", "confirmations", "finalityDepth", "proofAuthority", "winnerClaimAllowed"],
   "/api/v1/artifacts/preflight": ["preflightId", "artifactHashPreview", "priceDisclosureHash", "winnerClaimAllowed"],
   "/api/v1/quotes": ["preflightId", "quoteSignedAfterPreflight", "priceDisclosureHash", "winnerClaimAllowed"],
   "/api/v1/artifacts/refund": ["spendId", "quoteId", "status", "winnerClaimAllowed"],
@@ -155,6 +158,12 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.post("/api/v1/caw/receipts/ingest", async (c) =>
     send(c, await ingestCawReceiptBundle(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202),
   );
+
+  app.post("/api/v1/gate/events/ingest", async (c) => {
+    const body = SessionScopedEnvelopeSchema.parse(await readJson(c));
+    authorizeGateEventIngest(c, ctx, body);
+    return send(c, await ingestGateEvent(body, ctx), 202);
+  });
 
   app.post("/api/v1/artifacts/preflight", async (c) =>
     send(c, await runArtifactPreflight(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202),
@@ -278,6 +287,22 @@ function authorizeMcpAudit(c: Context, ctx: ServiceCtx, payload: unknown): unkno
     });
   }
   return payload;
+}
+
+function authorizeGateEventIngest(c: Context, ctx: ServiceCtx, payload: unknown): void {
+  const requestId = newRequestId("gate_event_auth");
+  const secret = ctx.mcpAuditSecret;
+  const signature = c.req.header("x-pactfuse-gate-signature") ?? "";
+  if (!secret) {
+    throw Object.assign(new Error("Gate event ingest token is not configured"), {
+      apiError: forbiddenError(requestId, "Gate event ingest token is not configured"),
+    });
+  }
+  if (!signature || !secureEqualHex(signature, signMcpAuditPayload(secret, payload))) {
+    throw Object.assign(new Error("Gate event ingest token is invalid"), {
+      apiError: forbiddenError(requestId, "Gate event ingest signature is invalid"),
+    });
+  }
 }
 
 function signMcpAuditPayload(secret: string, payload: unknown): `0x${string}` {
@@ -419,6 +444,32 @@ function buildOpenApi(): Record<string, unknown> {
             targetCommit: { type: "string", minLength: 6, maxLength: 128 },
           },
         },
+        GateEventIngestInput: {
+          type: "object",
+          required: ["sessionId", "idempotencyKey", "payload"],
+          additionalProperties: false,
+          properties: {
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            idempotencyKey: { type: "string", minLength: 4, maxLength: 160, pattern: "^[a-z][a-z0-9:_-]+$" },
+            payload: { $ref: "#/components/schemas/GateEventIngestPayload" },
+          },
+        },
+        GateEventIngestPayload: {
+          type: "object",
+          required: ["event", "spendId", "txHash", "logIndex", "chainId", "blockNumber", "currentBlockNumber", "rawLogHash"],
+          additionalProperties: false,
+          properties: {
+            event: { enum: ["SpendTripped", "SpendSettled"] },
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            txHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            logIndex: { type: "integer", minimum: 0, maximum: 1_000_000 },
+            chainId: { type: "string", pattern: "^(0|[1-9][0-9]*)$" },
+            blockNumber: { type: "integer", minimum: 0 },
+            currentBlockNumber: { type: "integer", minimum: 0 },
+            rawLogHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            reorged: { type: "boolean", default: false },
+          },
+        },
         McpAdapterAuditPayload: {
           type: "object",
           required: ["auditNonce", "toolName", "request", "response", "status"],
@@ -498,6 +549,33 @@ function buildOpenApi(): Record<string, unknown> {
             operationId: { anyOf: [{ type: "string" }, { type: "null" }] },
             receiptCount: { type: "integer", minimum: 1, maximum: 64 },
             proofAuthority: { const: false },
+            winnerClaimAllowed: { const: false },
+          },
+        }),
+        GateEventIngestResponse: serviceResponseSchema({
+          type: "object",
+          required: [
+            "gateEventId",
+            "spendId",
+            "event",
+            "finalityStatus",
+            "confirmations",
+            "finalityDepth",
+            "proofAuthority",
+            "winnerClaimAllowed",
+          ],
+          properties: {
+            gateEventId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            event: { enum: ["SpendTripped", "SpendSettled"] },
+            finalityStatus: { enum: ["observed_finalizing", "finalized", "reorg_invalidated"] },
+            confirmations: { type: "integer", minimum: 0 },
+            finalityDepth: { type: "integer", minimum: 1, maximum: 128 },
+            observedEventId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            finalizedEventId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            reorgEventId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            invalidatedEventId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            proofAuthority: { type: "boolean" },
             winnerClaimAllowed: { const: false },
           },
         }),
@@ -754,6 +832,9 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   if (path === "/api/v1/lease/execute") {
     return jsonRequestBody({ $ref: "#/components/schemas/LeaseExecuteInput" });
   }
+  if (path === "/api/v1/gate/events/ingest") {
+    return jsonRequestBody({ $ref: "#/components/schemas/GateEventIngestInput" });
+  }
   if (path === "/api/v1/artifacts/refund") {
     return jsonRequestBody({ $ref: "#/components/schemas/ArtifactRefundInput" });
   }
@@ -772,6 +853,15 @@ function parameterSchemaFor(path: string): Record<string, unknown>[] {
       required: true,
       schema: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
       description: "HMAC-SHA256 over the canonical JSON audit payload using PACTFUSE_MCP_AUDIT_TOKEN.",
+    });
+  }
+  if (path === "/api/v1/gate/events/ingest") {
+    parameters.push({
+      name: "x-pactfuse-gate-signature",
+      in: "header",
+      required: true,
+      schema: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+      description: "HMAC-SHA256 over the canonical JSON gate ingest payload using the internal gate ingest token.",
     });
   }
   if (path === "/api/v1/lease/execute" || path === "/api/v1/artifacts/{sessionId}/{spendId}/{payer}/{artifactHash}") {
@@ -832,6 +922,8 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/JudgeCheckResponse" };
     case "/api/v1/caw/receipts/ingest":
       return { $ref: "#/components/schemas/CawReceiptIngestResponse" };
+    case "/api/v1/gate/events/ingest":
+      return { $ref: "#/components/schemas/GateEventIngestResponse" };
     case "/api/v1/artifacts/preflight":
       return { $ref: "#/components/schemas/ArtifactPreflightResponse" };
     case "/api/v1/quotes":

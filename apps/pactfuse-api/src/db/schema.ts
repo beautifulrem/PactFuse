@@ -45,3 +45,35 @@ export const evidenceEvents = sqliteTable(
     sessionHash: uniqueIndex("evidence_events_session_hash").on(table.sessionId, table.eventHash),
   }),
 );
+
+export const gateChainEvents = sqliteTable(
+  "gate_chain_events",
+  {
+    gateEventId: text("gate_event_id").primaryKey(),
+    sessionId: text("session_id").notNull(),
+    spendId: text("spend_id").notNull(),
+    eventKind: text("event_kind").notNull(),
+    txHash: text("tx_hash").notNull(),
+    logIndex: integer("log_index").notNull(),
+    chainId: text("chain_id").notNull(),
+    blockNumber: integer("block_number").notNull(),
+    currentBlockNumber: integer("current_block_number").notNull(),
+    finalityDepth: integer("finality_depth").notNull(),
+    confirmations: integer("confirmations").notNull(),
+    rawLogHash: text("raw_log_hash").notNull(),
+    status: text("status").notNull(),
+    observedEventId: text("observed_event_id"),
+    finalizedEventId: text("finalized_event_id"),
+    reorgEventId: text("reorg_event_id"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => ({
+    sessionTxLogKind: uniqueIndex("gate_chain_events_session_tx_log_kind").on(
+      table.sessionId,
+      table.txHash,
+      table.logIndex,
+      table.eventKind,
+    ),
+  }),
+);

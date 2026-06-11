@@ -252,6 +252,36 @@ describe("pactfuse-api P0", () => {
       "proofAuthority",
       "winnerClaimAllowed",
     ]);
+    expect(json.paths["/api/v1/gate/events/ingest"].post["x-pactfuse-proof-fields"]).toEqual([
+      "finalityStatus",
+      "confirmations",
+      "finalityDepth",
+      "proofAuthority",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/gate/events/ingest"].post.parameters).toEqual([
+      expect.objectContaining({
+        name: "x-pactfuse-gate-signature",
+        in: "header",
+        required: true,
+      }),
+    ]);
+    expect(json.paths["/api/v1/gate/events/ingest"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/GateEventIngestInput",
+    );
+    expect(json.paths["/api/v1/gate/events/ingest"].post.responses["202"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/GateEventIngestResponse",
+    );
+    expect(json.components.schemas.GateEventIngestPayload.required).toEqual([
+      "event",
+      "spendId",
+      "txHash",
+      "logIndex",
+      "chainId",
+      "blockNumber",
+      "currentBlockNumber",
+      "rawLogHash",
+    ]);
     expect(json.paths["/api/v1/artifacts/preflight"].post["x-pactfuse-proof-fields"]).toEqual([
       "preflightId",
       "artifactHashPreview",
@@ -588,6 +618,205 @@ describe("pactfuse-api P0", () => {
     expect(event.payload.receiptCount).toBe(1);
   });
 
+  it("requires signed gate event ingest before accepting observed logs", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-gate-auth");
+    const spendId = await registerSpend(app, sessionId);
+    const body = gateEventEnvelope(sessionId, spendId, "gate-auth-observed");
+
+    const unsigned = await post(app, "/api/v1/gate/events/ingest", body);
+    const signed = await postSignedGateEvent(app, body);
+
+    expect(unsigned.status).toBe(403);
+    expect(unsigned.json.error.code).toBe("forbidden");
+    expect(signed.status).toBe(202);
+    expect(signed.json.data.finalityStatus).toBe("observed_finalizing");
+    expect(signed.json.data.proofAuthority).toBe(false);
+  });
+
+  it("keeps sub-finality gate observations out of the proof chain", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-gate-observed", { finalityDepth: 3 });
+    const spendId = await registerSpend(app, sessionId);
+    const body = gateEventEnvelope(sessionId, spendId, "gate-observed-subd", {
+      blockNumber: 100,
+      currentBlockNumber: 101,
+      txHash: hex32("gate-observed-tx"),
+      rawLogHash: hex32("gate-observed-log"),
+    });
+
+    const observed = await postSignedGateEvent(app, body);
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const events = replayJson.data.events as Array<{
+      kind: string;
+      authority: string;
+      prevProofEventHash: string | null;
+      payload: Record<string, unknown>;
+    }>;
+    const observedEvent = events.find((event) => event.kind === "gate.spend_settled.observed");
+
+    expect(observed.status).toBe(202);
+    expect(observed.json.data.finalityStatus).toBe("observed_finalizing");
+    expect(observed.json.data.confirmations).toBe(2);
+    expect(observed.json.data.finalityDepth).toBe(3);
+    expect(observed.json.data.proofAuthority).toBe(false);
+    expect(observed.json.data.winnerClaimAllowed).toBe(false);
+    expect(observedEvent).toEqual(
+      expect.objectContaining({
+        authority: "delivery",
+        prevProofEventHash: null,
+      }),
+    );
+    expect(events.map((event) => event.kind)).not.toContain("gate.spend_settled");
+  });
+
+  it("finalizes gate settlement only at configured depth and records a matching proof row", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-gate-finalized", { finalityDepth: 2 });
+    const spendId = await registerSpend(app, sessionId);
+    const observedBody = gateEventEnvelope(sessionId, spendId, "gate-finalized-observed", {
+      blockNumber: 100,
+      currentBlockNumber: 100,
+      txHash: hex32("gate-finalized-tx"),
+      rawLogHash: hex32("gate-finalized-log"),
+    });
+    const finalizedBody = {
+      ...observedBody,
+      idempotencyKey: "gate-finalized-depth",
+      payload: { ...observedBody.payload, currentBlockNumber: 101 },
+    };
+
+    const observed = await postSignedGateEvent(app, observedBody);
+    const finalized = await postSignedGateEvent(app, finalizedBody);
+    const row = ctx.db.sqlite
+      .prepare("SELECT * FROM gate_chain_events WHERE session_id = ? AND spend_id = ?")
+      .get(sessionId, spendId) as Record<string, unknown>;
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const events = replayJson.data.events as Array<{
+      eventId: string;
+      kind: string;
+      authority: string;
+      prevProofEventHash: string | null;
+      payload: Record<string, unknown>;
+    }>;
+    const observedEvent = events.find((event) => event.kind === "gate.spend_settled.observed");
+    const proofEvent = events.find((event) => event.kind === "gate.spend_settled");
+
+    expect(observed.status).toBe(202);
+    expect(observed.json.data.finalityStatus).toBe("observed_finalizing");
+    expect(finalized.status).toBe(202);
+    expect(finalized.json.data.finalityStatus).toBe("finalized");
+    expect(finalized.json.data.confirmations).toBe(2);
+    expect(finalized.json.data.proofAuthority).toBe(true);
+    expect(row.status).toBe("finalized");
+    expect(row.observed_event_id).toBe(observed.json.data.observedEventId);
+    expect(row.finalized_event_id).toBe(finalized.json.data.finalizedEventId);
+    expect(proofEvent).toEqual(
+      expect.objectContaining({
+        eventId: finalized.json.data.finalizedEventId,
+        authority: "proof",
+      }),
+    );
+    expect(proofEvent?.prevProofEventHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(proofEvent?.payload).toEqual(
+      expect.objectContaining({
+        gateEventId: finalized.json.data.gateEventId,
+        observedEventId: observedEvent?.eventId,
+        finalityStatus: "finalized",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      }),
+    );
+  });
+
+  it("blocks mutated gate log replay for the same tx/log/event identity", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-gate-mutated", { finalityDepth: 2 });
+    const spendId = await registerSpend(app, sessionId);
+    const observedBody = gateEventEnvelope(sessionId, spendId, "gate-mutated-observed", {
+      txHash: hex32("gate-mutated-tx"),
+      rawLogHash: hex32("gate-mutated-log-a"),
+      blockNumber: 100,
+      currentBlockNumber: 100,
+    });
+    const mutatedBody = {
+      ...observedBody,
+      idempotencyKey: "gate-mutated-finalize",
+      payload: {
+        ...observedBody.payload,
+        currentBlockNumber: 101,
+        rawLogHash: hex32("gate-mutated-log-b"),
+      },
+    };
+
+    const observed = await postSignedGateEvent(app, observedBody);
+    const mutated = await postSignedGateEvent(app, mutatedBody);
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const kinds = replayJson.data.events.map((event: { kind: string }) => event.kind);
+
+    expect(observed.status).toBe(202);
+    expect(mutated.status).toBe(422);
+    expect(mutated.json.error.code).toBe("proof_blocked");
+    expect(kinds).toContain("gate.spend_settled.observed");
+    expect(kinds).not.toContain("gate.spend_settled");
+  });
+
+  it("blocks verifier and same-log revival after a finalized gate reorg", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-gate-reorg", { finalityDepth: 2 });
+    const spendId = await registerSpend(app, sessionId);
+    const finalized = await finalizeSpendSettlement(app, sessionId, spendId, "gate-reorg");
+    const reorgBody = gateEventEnvelope(sessionId, spendId, "gate-reorg-invalidated", {
+      txHash: hex32("gate-reorg-tx"),
+      rawLogHash: hex32("gate-reorg-log"),
+      blockNumber: 100,
+      currentBlockNumber: 101,
+      reorged: true,
+    });
+    const reviveBody = {
+      ...reorgBody,
+      idempotencyKey: "gate-reorg-revive",
+      payload: { ...reorgBody.payload, reorged: false, currentBlockNumber: 102 },
+    };
+
+    const reorg = await postSignedGateEvent(app, reorgBody);
+    const revive = await postSignedGateEvent(app, reviveBody);
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-gate-reorg",
+      payload: {
+        schemaOnly: true,
+        receipt: schemaValidWinnerRequestedReceipt(),
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const reorgEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "reorg.invalidated");
+
+    expect(reorg.status).toBe(202);
+    expect(reorg.json.data.finalityStatus).toBe("reorg_invalidated");
+    expect(reorg.json.data.proofAuthority).toBe(true);
+    expect(reorgEvent).toEqual(
+      expect.objectContaining({
+        authority: "proof",
+        payload: expect.objectContaining({
+          invalidatedFinalizedEventId: finalized.finalizedEventId,
+          finalityStatus: "reorg_invalidated",
+          winnerClaimAllowed: false,
+        }),
+      }),
+    );
+    expect(revive.status).toBe(422);
+    expect(revive.json.error.code).toBe("proof_blocked");
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.schemaOk).toBe(false);
+    expect(verify.json.data.winnerClaimAllowed).toBe(false);
+    expect(verify.json.data.errors.some((error: string) => error.includes("reorg.invalidated"))).toBe(true);
+  });
+
   it("keeps artifact reads bearer-bound and validates path parameters", async () => {
     const { app, ctx } = makeApp();
     const sessionId = await createSession(app, "sess-artifact");
@@ -603,6 +832,7 @@ describe("pactfuse-api P0", () => {
     const pendingJson = await pending.json();
     const invalidPayer = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/not-a-hex/${artifactHash}`);
     const invalidJson = await invalidPayer.json();
+    await finalizeSpendSettlement(app, sessionId, spendId, "artifact-settlement");
     ctx.db.sqlite
       .prepare(
         `INSERT INTO artifact_access_tokens
@@ -1407,6 +1637,7 @@ describe("pactfuse-api P0", () => {
     const artifactHash = hex32("lease-artifact-active");
     const bearerToken = "lease-access-token";
     const wrongPayerToken = "lease-wrong-payer-token";
+    await finalizeSpendSettlement(app, sessionId, spendId, "lease-settlement");
     ctx.db.sqlite
       .prepare(
         `INSERT INTO artifact_access_tokens
@@ -1630,8 +1861,8 @@ describe("pactfuse-api P0", () => {
   });
 });
 
-async function createSession(app: ReturnType<typeof createApp>, key: string): Promise<string> {
-  const res = await post(app, "/api/v1/sessions", { idempotencyKey: key, payload: { label: key } });
+async function createSession(app: ReturnType<typeof createApp>, key: string, payload: Record<string, unknown> = {}): Promise<string> {
+  const res = await post(app, "/api/v1/sessions", { idempotencyKey: key, payload: { label: key, ...payload } });
   expect(res.status).toBe(201);
   return res.json.data.sessionId;
 }
@@ -1675,6 +1906,64 @@ async function registerSpend(app: ReturnType<typeof createApp>, sessionId: strin
   });
   expect(res.status).toBe(201);
   return spendId;
+}
+
+function gateEventEnvelope(
+  sessionId: string,
+  spendId: string,
+  idempotencyKey: string,
+  payload: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    sessionId,
+    idempotencyKey,
+    payload: {
+      event: "SpendSettled",
+      spendId,
+      txHash: hex32(`${idempotencyKey}-tx`),
+      logIndex: 0,
+      chainId: "84532",
+      blockNumber: 100,
+      currentBlockNumber: 100,
+      rawLogHash: hex32(`${idempotencyKey}-log`),
+      ...payload,
+    },
+  };
+}
+
+async function postSignedGateEvent(app: ReturnType<typeof createApp>, body: Record<string, unknown>) {
+  return post(app, "/api/v1/gate/events/ingest", body, {
+    "x-pactfuse-gate-signature": signAuditPayload(MCP_AUDIT_TOKEN, body),
+  });
+}
+
+async function finalizeSpendSettlement(
+  app: ReturnType<typeof createApp>,
+  sessionId: string,
+  spendId: string,
+  key: string,
+): Promise<Record<string, unknown>> {
+  const observedBody = gateEventEnvelope(sessionId, spendId, `${key}-observed`, {
+    txHash: hex32(`${key}-tx`),
+    rawLogHash: hex32(`${key}-log`),
+    blockNumber: 100,
+    currentBlockNumber: 100,
+  });
+  const finalizedBody = {
+    ...observedBody,
+    idempotencyKey: `${key}-finalized`,
+    payload: {
+      ...(observedBody.payload as Record<string, unknown>),
+      currentBlockNumber: 101,
+    },
+  };
+  const observed = await postSignedGateEvent(app, observedBody);
+  const finalized = await postSignedGateEvent(app, finalizedBody);
+
+  expect(observed.status).toBe(202);
+  expect(finalized.status).toBe(202);
+  expect(finalized.json.data.finalityStatus).toBe("finalized");
+  return finalized.json.data;
 }
 
 async function computeSpendIdForTest(
