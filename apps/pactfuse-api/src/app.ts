@@ -22,6 +22,7 @@ import {
   ingestGateEvent,
   ingestCawReceiptBundle,
   indexChainWindow,
+  issueArtifactAccessToken,
   listEventsAfterEventId,
   readAgentTranscript,
   readArtifactAccess,
@@ -58,6 +59,7 @@ const ROUTES = [
   { method: "POST", path: "/api/v1/indexer/backfill", okStatus: 202 },
   { method: "POST", path: "/api/v1/artifacts/preflight", okStatus: 202 },
   { method: "POST", path: "/api/v1/quotes", okStatus: 201 },
+  { method: "POST", path: "/api/v1/artifacts/access-token", okStatus: 202 },
   { method: "GET", path: "/api/v1/artifacts/{sessionId}/{spendId}/{payer}/{artifactHash}", okStatus: 200 },
   { method: "POST", path: "/api/v1/artifacts/refund", okStatus: 202 },
   { method: "POST", path: "/api/v1/lease/execute", okStatus: 202 },
@@ -78,6 +80,7 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/indexer/backfill": ["cursor.status", "cursor.lastIndexedBlock", "insertedLogCount", "proofAuthority", "winnerClaimAllowed"],
   "/api/v1/artifacts/preflight": ["preflightId", "artifactHashPreview", "priceDisclosureHash", "winnerClaimAllowed"],
   "/api/v1/quotes": ["preflightId", "quoteSignedAfterPreflight", "priceDisclosureHash", "winnerClaimAllowed"],
+  "/api/v1/artifacts/access-token": ["tokenId", "tokenHash", "verifierRunId", "settlementEventId", "bearerBound", "winnerClaimAllowed"],
   "/api/v1/artifacts/refund": ["spendId", "quoteId", "status", "winnerClaimAllowed"],
   "/api/v1/lease/execute": ["leaseRunId", "bearerBound", "artifactHash", "winnerClaimAllowed"],
   "/api/v1/mcp/audit": ["proofAuthority", "winnerClaimAllowed", "requestHash", "responseHash"],
@@ -211,6 +214,11 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.post("/api/v1/quotes", async (c) => {
     authorizeApiRole(c, ctx, "artifact_signer");
     return send(c, await signArtifactQuote(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201);
+  });
+
+  app.post("/api/v1/artifacts/access-token", async (c) => {
+    authorizeApiRole(c, ctx, "artifact_signer");
+    return send(c, await issueArtifactAccessToken(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
   });
 
   app.get("/api/v1/artifacts/:sessionId/:spendId/:payer/:artifactHash", async (c) => {
@@ -821,6 +829,57 @@ function buildOpenApi(): Record<string, unknown> {
             winnerClaimAllowed: { const: false },
           },
         }),
+        ArtifactAccessIssueInput: {
+          type: "object",
+          required: ["sessionId", "idempotencyKey", "payload"],
+          additionalProperties: false,
+          properties: {
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            idempotencyKey: { type: "string", minLength: 4, maxLength: 160, pattern: "^[a-z][a-z0-9:_-]+$" },
+            payload: { $ref: "#/components/schemas/ArtifactAccessIssuePayload" },
+          },
+        },
+        ArtifactAccessIssuePayload: {
+          type: "object",
+          required: ["spendId", "payer", "artifactHash"],
+          additionalProperties: false,
+          properties: {
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            payer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+            artifactHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+          },
+        },
+        ArtifactAccessIssueResponse: serviceResponseSchema({
+          type: "object",
+          required: [
+            "tokenId",
+            "accessToken",
+            "tokenHash",
+            "spendId",
+            "payer",
+            "artifactHash",
+            "verifierRunId",
+            "settlementEventId",
+            "bearerBound",
+            "status",
+            "proofAuthority",
+            "winnerClaimAllowed",
+          ],
+          properties: {
+            tokenId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            accessToken: { type: "string", pattern: "^pf_at_[0-9a-fA-F]{64}$" },
+            tokenHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            payer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+            artifactHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            verifierRunId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            settlementEventId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            bearerBound: { const: true },
+            status: { enum: ["active_demo_verifier_gated"] },
+            proofAuthority: { const: false },
+            winnerClaimAllowed: { const: false },
+          },
+        }),
         ArtifactRefundInput: {
           type: "object",
           required: ["sessionId", "idempotencyKey", "payload"],
@@ -1154,6 +1213,9 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   if (path === "/api/v1/artifacts/refund") {
     return jsonRequestBody({ $ref: "#/components/schemas/ArtifactRefundInput" });
   }
+  if (path === "/api/v1/artifacts/access-token") {
+    return jsonRequestBody({ $ref: "#/components/schemas/ArtifactAccessIssueInput" });
+  }
   if (path.startsWith("/api/v1/") && !path.includes("{")) {
     return jsonRequestBody({ $ref: "#/components/schemas/SessionScopedEnvelope" });
   }
@@ -1225,6 +1287,7 @@ function apiRoleForPath(path: string): ApiRole | null {
       return "challenge_submitter";
     case "/api/v1/quotes":
     case "/api/v1/artifacts/refund":
+    case "/api/v1/artifacts/access-token":
       return "artifact_signer";
     default:
       return null;
@@ -1298,6 +1361,8 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/QuoteResponse" };
     case "/api/v1/artifacts/refund":
       return { $ref: "#/components/schemas/ArtifactRefundResponse" };
+    case "/api/v1/artifacts/access-token":
+      return { $ref: "#/components/schemas/ArtifactAccessIssueResponse" };
     case "/api/v1/lease/execute":
       return { $ref: "#/components/schemas/LeaseExecuteResponse" };
     case "/api/v1/mcp/audit":

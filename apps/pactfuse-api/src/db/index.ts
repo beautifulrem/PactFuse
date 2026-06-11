@@ -184,6 +184,8 @@ CREATE TABLE IF NOT EXISTS artifact_access_tokens (
   artifact_hash TEXT NOT NULL,
   token_hash TEXT NOT NULL,
   status TEXT NOT NULL,
+  issued_by_verifier_run_id TEXT,
+  settlement_event_id TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -328,7 +330,12 @@ CREATE TABLE IF NOT EXISTS judge_check_rows (
   ensureColumn(sqlite, "quotes", "preflight_id", "TEXT");
   ensureColumn(sqlite, "quotes", "price_disclosure_hash", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
   ensureColumn(sqlite, "quotes", "source_state_snapshot_hash", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
+  ensureColumn(sqlite, "artifact_access_tokens", "issued_by_verifier_run_id", "TEXT");
+  ensureColumn(sqlite, "artifact_access_tokens", "settlement_event_id", "TEXT");
   sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS mcp_adapter_calls_audit_nonce_idx ON mcp_adapter_calls(audit_nonce) WHERE audit_nonce IS NOT NULL");
+  sqlite.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS artifact_access_tokens_active_tuple_idx ON artifact_access_tokens(session_id, spend_id, payer, artifact_hash) WHERE status = 'active'",
+  );
 }
 
 function ensureColumn(sqlite: DatabaseSync, table: string, column: string, ddl: string): void {

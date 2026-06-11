@@ -536,6 +536,43 @@ describe("pactfuse-api P0", () => {
       "priceDisclosureHash",
       "winnerClaimAllowed",
     ]);
+    expect(json.paths["/api/v1/artifacts/access-token"].post["x-pactfuse-proof-fields"]).toEqual([
+      "tokenId",
+      "tokenHash",
+      "verifierRunId",
+      "settlementEventId",
+      "bearerBound",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/artifacts/access-token"].post.parameters).toEqual([
+      expect.objectContaining({
+        name: "authorization",
+        in: "header",
+        required: false,
+        description: expect.stringContaining("PACTFUSE_ARTIFACT_SIGNER_TOKEN"),
+      }),
+    ]);
+    expect(json.paths["/api/v1/artifacts/access-token"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ArtifactAccessIssueInput",
+    );
+    expect(json.paths["/api/v1/artifacts/access-token"].post.responses["202"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ArtifactAccessIssueResponse",
+    );
+    expect(json.components.schemas.ArtifactAccessIssuePayload.required).toEqual(["spendId", "payer", "artifactHash"]);
+    expect(json.components.schemas.ArtifactAccessIssueResponse.oneOf[0].properties.data.required).toEqual([
+      "tokenId",
+      "accessToken",
+      "tokenHash",
+      "spendId",
+      "payer",
+      "artifactHash",
+      "verifierRunId",
+      "settlementEventId",
+      "bearerBound",
+      "status",
+      "proofAuthority",
+      "winnerClaimAllowed",
+    ]);
     expect(json.paths["/api/v1/artifacts/refund"].post["x-pactfuse-proof-fields"]).toEqual([
       "spendId",
       "quoteId",
@@ -1679,56 +1716,96 @@ describe("pactfuse-api P0", () => {
     const spendId = await registerSpend(app, sessionId);
     const artifactHash = hex32("artifact");
     const payer = "0x1234";
-    const bearerToken = "artifact-access-token";
     const artifactUrl = `/api/v1/artifacts/${sessionId}/${spendId}/${payer}/${artifactHash}`;
     const wrongPayer = "0xabcd";
-    const wrongPayerToken = "wrong-payer-artifact-token";
 
     const pending = await app.request(artifactUrl);
     const pendingJson = await pending.json();
     const invalidPayer = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/not-a-hex/${artifactHash}`);
     const invalidJson = await invalidPayer.json();
     await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-settlement");
-    ctx.db.sqlite
-      .prepare(
-        `INSERT INTO artifact_access_tokens
-          (token_id, session_id, spend_id, payer, artifact_hash, token_hash, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
-      )
-      .run(
-        hex32("artifact-token-row"),
-        sessionId,
+    const issued = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-artifact-token",
+      payload: {
         spendId,
         payer,
         artifactHash,
-        hex32(bearerToken),
-        "2026-06-11T00:00:00.000Z",
-      );
+      },
+    });
+    const bearerToken = issued.json.data.accessToken as string;
+    const issuedReplay = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-artifact-token",
+      payload: {
+        spendId,
+        payer,
+        artifactHash,
+      },
+    });
+    const duplicateIssue = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-artifact-token-duplicate",
+      payload: {
+        spendId,
+        payer,
+        artifactHash,
+      },
+    });
+    const tokenRow = ctx.db.sqlite
+      .prepare("SELECT issued_by_verifier_run_id, settlement_event_id FROM artifact_access_tokens WHERE token_id = ?")
+      .get(issued.json.data.tokenId) as { issued_by_verifier_run_id: string; settlement_event_id: string } | undefined;
+    const verifierRun = ctx.db.sqlite
+      .prepare("SELECT schema_ok FROM verifier_runs WHERE session_id = ? AND verifier_run_id = ?")
+      .get(sessionId, issued.json.data.verifierRunId) as { schema_ok: number } | undefined;
+    const issuedEvent = ctx.db.sqlite
+      .prepare("SELECT kind, authority, payload_json FROM evidence_events WHERE event_id = ?")
+      .get(issued.json.evidenceEventId) as { kind: string; authority: string; payload_json: string } | undefined;
+    const issuedPayload = issuedEvent ? (JSON.parse(issuedEvent.payload_json) as Record<string, unknown>) : {};
     const missingBearer = await app.request(artifactUrl);
     const missingBearerJson = await missingBearer.json();
     const wrongBearer = await app.request(artifactUrl, { headers: { authorization: "Bearer wrong-token" } });
     const wrongBearerJson = await wrongBearer.json();
     const allowed = await app.request(artifactUrl, { headers: { authorization: `Bearer ${bearerToken}` } });
     const allowedJson = await allowed.json();
-    ctx.db.sqlite
-      .prepare(
-        `INSERT INTO artifact_access_tokens
-          (token_id, session_id, spend_id, payer, artifact_hash, token_hash, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
-      )
-      .run(
-        hex32("artifact-wrong-payer-token-row"),
-        sessionId,
-        spendId,
-        wrongPayer,
-        artifactHash,
-        hex32(wrongPayerToken),
-        "2026-06-11T00:00:00.000Z",
-      );
     const payerMismatch = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/${wrongPayer}/${artifactHash}`, {
-      headers: { authorization: `Bearer ${wrongPayerToken}` },
+      headers: { authorization: `Bearer ${bearerToken}` },
     });
     const payerMismatchJson = await payerMismatch.json();
+
+    expect(issued.status).toBe(202);
+    expect(issuedReplay.status).toBe(202);
+    expect(issuedReplay.json.requestId).toBe(issued.json.requestId);
+    expect(duplicateIssue.status).toBe(409);
+    expect(duplicateIssue.json.error.code).toBe("idempotency_conflict");
+    expect(issued.json.data).toEqual(
+      expect.objectContaining({
+        spendId,
+        payer,
+        artifactHash,
+        tokenHash: hex32(bearerToken),
+        bearerBound: true,
+        proofAuthority: false,
+        winnerClaimAllowed: false,
+      }),
+    );
+    expect(tokenRow).toEqual(
+      expect.objectContaining({
+        issued_by_verifier_run_id: issued.json.data.verifierRunId,
+        settlement_event_id: issued.json.data.settlementEventId,
+      }),
+    );
+    expect(verifierRun?.schema_ok).toBe(1);
+    expect(issuedEvent).toEqual(expect.objectContaining({ kind: "artifact.access_token.issued", authority: "delivery" }));
+    expect(issuedPayload).toEqual(
+      expect.objectContaining({
+        tokenId: issued.json.data.tokenId,
+        tokenHash: issued.json.data.tokenHash,
+        verifierRunId: issued.json.data.verifierRunId,
+        settlementEventId: issued.json.data.settlementEventId,
+        winnerClaimAllowed: false,
+      }),
+    );
 
     expect(pending.status).toBe(423);
     expect(pendingJson.error.code).toBe("proof_pending");
@@ -1750,6 +1827,45 @@ describe("pactfuse-api P0", () => {
     );
     expect(payerMismatch.status).toBe(422);
     expect(payerMismatchJson.error.code).toBe("proof_blocked");
+  });
+
+  it("rejects hand-written artifact token rows without verifier issuance evidence", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const sessionId = await createSession(app, "sess-artifact-token-tamper");
+    const spendId = await registerSpend(app, sessionId);
+    const artifactHash = hex32("artifact-token-tamper");
+    const payer = "0x1234";
+    const bearerToken = "manual-artifact-access-token";
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-token-tamper");
+    ctx.db.sqlite
+      .prepare(
+        `INSERT INTO artifact_access_tokens
+          (token_id, session_id, spend_id, payer, artifact_hash, token_hash, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
+      )
+      .run(
+        hex32("manual-artifact-token-row"),
+        sessionId,
+        spendId,
+        payer,
+        artifactHash,
+        hex32(bearerToken),
+        "2026-06-11T00:00:00.000Z",
+      );
+
+    const read = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/${payer}/${artifactHash}`, {
+      headers: { authorization: `Bearer ${bearerToken}` },
+    });
+    const readJson = await read.json();
+    const verify = await app.request(`/api/v1/evidence/${sessionId}/verify`);
+    const verifyJson = await verify.json();
+
+    expect(read.status).toBe(423);
+    expect(readJson.error.code).toBe("proof_pending");
+    expect(verify.status).toBe(200);
+    expect(verifyJson.data.schemaOk).toBe(false);
+    expect(verifyJson.data.errors.some((error: string) => error.includes("missing issued_by_verifier_run_id"))).toBe(true);
   });
 
   it("requires registered spends before artifact preflight", async () => {
@@ -2025,6 +2141,109 @@ describe("pactfuse-api P0", () => {
         winnerClaimAllowed: false,
       }),
     );
+  });
+
+  it("keeps artifact access issuance and refund evidence mutually exclusive", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const sessionId = await createSession(app, "sess-refund-token-exclusive");
+    const spendId = await registerSpend(app, sessionId);
+    const artifactHash = hex32("refund-token-artifact");
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "exclusive-preflight",
+      payload: {
+        spendId,
+        artifactHashPreview: artifactHash,
+        endpointUrl: "https://example.com/artifact",
+        priceDisclosureHash: hex32("exclusive-price-disclosure"),
+        sourceStateSnapshotHash: hex32("exclusive-source-state"),
+      },
+    });
+    const quote = await post(app, "/api/v1/quotes", {
+      sessionId,
+      idempotencyKey: "exclusive-quote",
+      payload: {
+        spendId,
+        preflightId: preflight.json.data.preflightId,
+        artifactCommitment: artifactHash,
+        priceAtomic: "1000",
+        quoteNonce: "exclusive-quote-nonce",
+        validUntilBlock: "123",
+      },
+    });
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "exclusive-token-first");
+    const issue = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "exclusive-issue-token",
+      payload: {
+        spendId,
+        payer: "0x1234",
+        artifactHash,
+      },
+    });
+    const refundAfterToken = await post(app, "/api/v1/artifacts/refund", {
+      sessionId,
+      idempotencyKey: "exclusive-refund-after-token",
+      payload: {
+        spendId,
+        quoteId: quote.json.data.quoteId,
+        reason: "delivery timeout",
+      },
+    });
+
+    const secondSessionId = await createSession(app, "sess-token-refund-exclusive");
+    const secondSpendId = await registerSpend(app, secondSessionId);
+    const secondArtifactHash = hex32("token-refund-artifact");
+    const secondPreflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId: secondSessionId,
+      idempotencyKey: "exclusive-second-preflight",
+      payload: {
+        spendId: secondSpendId,
+        artifactHashPreview: secondArtifactHash,
+        endpointUrl: "https://example.com/artifact-2",
+        priceDisclosureHash: hex32("exclusive-second-price-disclosure"),
+        sourceStateSnapshotHash: hex32("exclusive-second-source-state"),
+      },
+    });
+    const secondQuote = await post(app, "/api/v1/quotes", {
+      sessionId: secondSessionId,
+      idempotencyKey: "exclusive-second-quote",
+      payload: {
+        spendId: secondSpendId,
+        preflightId: secondPreflight.json.data.preflightId,
+        artifactCommitment: secondArtifactHash,
+        priceAtomic: "1000",
+        quoteNonce: "exclusive-second-quote-nonce",
+        validUntilBlock: "123",
+      },
+    });
+    const refundBeforeToken = await post(app, "/api/v1/artifacts/refund", {
+      sessionId: secondSessionId,
+      idempotencyKey: "exclusive-refund-before-token",
+      payload: {
+        spendId: secondSpendId,
+        quoteId: secondQuote.json.data.quoteId,
+        reason: "delivery timeout",
+      },
+    });
+    await finalizeSpendSettlement(app, ctx, logs, secondSessionId, secondSpendId, "exclusive-refund-first");
+    const issueAfterRefund = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId: secondSessionId,
+      idempotencyKey: "exclusive-issue-after-refund",
+      payload: {
+        spendId: secondSpendId,
+        payer: "0x1234",
+        artifactHash: secondArtifactHash,
+      },
+    });
+
+    expect(issue.status).toBe(202);
+    expect(refundAfterToken.status).toBe(409);
+    expect(refundAfterToken.json.error.code).toBe("idempotency_conflict");
+    expect(refundBeforeToken.status).toBe(202);
+    expect(issueAfterRefund.status).toBe(422);
+    expect(issueAfterRefund.json.error.code).toBe("proof_blocked");
   });
 
   it("persists sessions across database reopen", async () => {
@@ -3003,31 +3222,29 @@ describe("pactfuse-api P0", () => {
     const payer = "0x1234";
     const wrongPayer = "0xabcd";
     const artifactHash = hex32("lease-artifact-active");
-    const bearerToken = "lease-access-token";
-    const wrongPayerToken = "lease-wrong-payer-token";
     await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-settlement");
-    ctx.db.sqlite
-      .prepare(
-        `INSERT INTO artifact_access_tokens
-          (token_id, session_id, spend_id, payer, artifact_hash, token_hash, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
-      )
-      .run(hex32("lease-token-row"), sessionId, spendId, payer, artifactHash, hex32(bearerToken), "2026-06-11T00:00:00.000Z");
-    ctx.db.sqlite
-      .prepare(
-        `INSERT INTO artifact_access_tokens
-          (token_id, session_id, spend_id, payer, artifact_hash, token_hash, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
-      )
-      .run(
-        hex32("lease-wrong-payer-token-row"),
-        sessionId,
+    const issued = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-lease-artifact-token",
+      payload: {
         spendId,
-        wrongPayer,
+        payer,
         artifactHash,
-        hex32(wrongPayerToken),
-        "2026-06-11T00:00:00.000Z",
-      );
+      },
+    });
+    const bearerToken = issued.json.data.accessToken as string;
+
+    expect(issued.status).toBe(202);
+    expect(issued.json.data).toEqual(
+      expect.objectContaining({
+        spendId,
+        payer,
+        artifactHash,
+        tokenHash: hex32(bearerToken),
+        bearerBound: true,
+        winnerClaimAllowed: false,
+      }),
+    );
 
     const missingToken = await post(app, "/api/v1/lease/execute", {
       sessionId,
@@ -3070,7 +3287,7 @@ describe("pactfuse-api P0", () => {
           targetCommit: "abcdef123456",
         },
       },
-      { authorization: `Bearer ${wrongPayerToken}` },
+      { authorization: `Bearer ${bearerToken}` },
     );
     const lease = await post(
       app,

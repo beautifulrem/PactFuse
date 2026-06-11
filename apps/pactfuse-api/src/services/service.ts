@@ -1,5 +1,6 @@
 import {
   AgentTranscriptViewSchema,
+  ArtifactAccessIssuePayloadSchema,
   ArtifactPreflightPayloadSchema,
   ArtifactRefundPayloadSchema,
   CawOperationBuildPayloadSchema,
@@ -1170,6 +1171,7 @@ export async function refundUndeliveredArtifact(
         apiError: proofPendingError(requestId, "artifact refund requires a quoted paid artifact commitment"),
       });
     }
+    assertNoActiveArtifactToken(ctx, envelope.sessionId, payload.spendId, requestId);
     const event = appendEvidenceEvent(ctx, {
       sessionId: envelope.sessionId,
       authority: "operator",
@@ -1193,6 +1195,107 @@ export async function refundUndeliveredArtifact(
         quoteId: String(quote.quote_id),
         preflightId: String(quote.preflight_id),
         status: "pending_live_settlement",
+        winnerClaimAllowed: false,
+      },
+    };
+  });
+}
+
+export async function issueArtifactAccessToken(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(ArtifactAccessIssuePayloadSchema, envelope.payload);
+  return withIdempotency(ctx, scoped("artifacts:access-token:issue", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
+    assertSession(ctx, envelope.sessionId, requestId);
+    const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    const payer = requireSpendPayer(spend, payload.payer, requestId);
+    const settlement = requireFinalizedSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
+    assertNoArtifactRefundPending(ctx, envelope.sessionId, payload.spendId, requestId);
+    assertNoActiveArtifactToken(ctx, envelope.sessionId, payload.spendId, requestId);
+
+    const replayBundle = assembleReplayBundleData(envelope.sessionId, ctx);
+    const { view, verifierInput } = await buildVerifierRunView(ctx, envelope.sessionId, {
+      replayBundle: replayBundle as unknown as Record<string, JsonValue>,
+      schemaOnly: true,
+    });
+    if (!view.schemaOk) {
+      throw Object.assign(new Error("artifact access token requires a schema-clean verifier run"), {
+        apiError: proofBlockedError(requestId, "artifact access token requires a schema-clean verifier run", { errors: view.errors }),
+      });
+    }
+
+    const inputHash = hashJson(verifierInput);
+    const verifierRunId = hashJson({ sessionId: envelope.sessionId, inputHash, scope: "artifact_access_token", requestId });
+    const accessToken = `pf_at_${hashJson({ sessionId: envelope.sessionId, payload, verifierRunId, requestId }).slice(2)}`;
+    const tokenHash = sha256Hex(accessToken);
+    const tokenId = hashJson({ sessionId: envelope.sessionId, spendId: payload.spendId, payer, artifactHash: payload.artifactHash, tokenHash });
+    const event = withImmediateTransaction(ctx, () => {
+      ctx.db.sqlite
+        .prepare(
+          `INSERT INTO verifier_runs
+            (verifier_run_id, session_id, input_hash, result_json, schema_ok, proof_chip_allowed, winner_claim_allowed, final_verifier_complete, created_at)
+           VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)`,
+        )
+        .run(verifierRunId, envelope.sessionId, inputHash, canonicalizeJson(view), view.schemaOk ? 1 : 0, ctx.clock.now().toISOString());
+      ctx.db.sqlite
+        .prepare(
+          `INSERT INTO artifact_access_tokens
+            (token_id, session_id, spend_id, payer, artifact_hash, token_hash, status, issued_by_verifier_run_id, settlement_event_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+        )
+        .run(
+          tokenId,
+          envelope.sessionId,
+          payload.spendId,
+          payer,
+          payload.artifactHash,
+          tokenHash,
+          verifierRunId,
+          settlement.finalizedEventId,
+          ctx.clock.now().toISOString(),
+        );
+      const issued = appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "delivery",
+        kind: "artifact.access_token.issued",
+        payload: {
+          tokenId,
+          spendId: payload.spendId,
+          payer,
+          artifactHash: payload.artifactHash,
+          tokenHash,
+          verifierRunId,
+          settlementEventId: settlement.finalizedEventId,
+          status: "active_demo_verifier_gated",
+          proofAuthority: false,
+          winnerClaimAllowed: false,
+        },
+      });
+      updateJudgeCheckRow(ctx, envelope.sessionId, {
+        rowId: "artifact_access",
+        status: "pass",
+        authority: "delivery",
+        reason: "bearer token issued after finalized settlement and schema-clean verifier run",
+        evidenceEventId: issued.eventId,
+      });
+      return issued;
+    });
+
+    return {
+      ok: true,
+      requestId,
+      evidenceEventId: event.eventId,
+      data: {
+        tokenId,
+        accessToken,
+        tokenHash,
+        spendId: payload.spendId,
+        payer,
+        artifactHash: payload.artifactHash,
+        verifierRunId,
+        settlementEventId: settlement.finalizedEventId,
+        bearerBound: true,
+        status: "active_demo_verifier_gated",
+        proofAuthority: false,
         winnerClaimAllowed: false,
       },
     };
@@ -1351,6 +1454,7 @@ async function buildVerifierRunView(
     ...verifyEventLogIntegrity(ctx, sessionId),
     ...verifyMcpAdapterCallIntegrity(ctx, sessionId),
     ...verifyGateFinalityIntegrity(ctx, sessionId),
+    ...verifyArtifactAccessTokenIntegrity(ctx, sessionId),
     ...(await verifyIndexerCursorIntegrity(ctx, proofProviders)),
     ...verifyReplayBundleBindings(ctx, sessionId, payload),
   ];
@@ -1751,6 +1855,7 @@ export function appendEvidenceEvent(
       | "caw.receipt.ingested.fixture"
       | "caw.receipt.ingested.raw"
       | "artifact.preflight.pending"
+      | "artifact.access_token.issued"
       | "quote.signed.mocked"
       | "artifact.refund.pending"
       | "operator.key_used"
@@ -2790,7 +2895,12 @@ function recordOperatorKeyUse(
   });
 }
 
-function requireFinalizedSettlement(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): void {
+function requireFinalizedSettlement(
+  ctx: ServiceCtx,
+  sessionId: string,
+  spendId: string,
+  requestId: string,
+): { finalizedEventId: string; observedEventId: string } {
   const invalidated = ctx.db.sqlite
     .prepare(
       `SELECT tx_hash, log_index
@@ -2825,6 +2935,10 @@ function requireFinalizedSettlement(ctx: ServiceCtx, sessionId: string, spendId:
       apiError: proofBlockedError(requestId, "finalized SpendSettled gate proof is internally inconsistent"),
     });
   }
+  return {
+    finalizedEventId: String(settlement.finalized_event_id),
+    observedEventId: String(settlement.observed_event_id),
+  };
 }
 
 async function verifyGateEventWithChain(
@@ -3748,7 +3862,7 @@ function requireActiveArtifactAccess(
 ): Row {
   const rows = ctx.db.sqlite
     .prepare(
-      `SELECT token_id, token_hash, status
+      `SELECT token_id, token_hash, status, issued_by_verifier_run_id, settlement_event_id
        FROM artifact_access_tokens
        WHERE session_id = ? AND spend_id = ? AND payer = ? AND artifact_hash = ?`,
     )
@@ -3764,13 +3878,68 @@ function requireActiveArtifactAccess(
     });
   }
   const tokenHash = sha256Hex(input.bearerToken);
-  const active = rows.find((row) => row.status === "active" && row.token_hash === tokenHash);
+  const active = rows.find(
+    (row) =>
+      row.status === "active" &&
+      row.token_hash === tokenHash &&
+      typeof row.issued_by_verifier_run_id === "string" &&
+      typeof row.settlement_event_id === "string",
+  );
   if (!active) {
     throw Object.assign(new Error("artifact bearer token is not active for tuple"), {
       apiError: proofPendingError(requestId, "artifact bearer token is not backed by a proof-valid active access row"),
     });
   }
+  const activeVerifierRunId = String(active.issued_by_verifier_run_id);
+  const verifierRun = ctx.db.sqlite
+    .prepare("SELECT schema_ok FROM verifier_runs WHERE session_id = ? AND verifier_run_id = ?")
+    .get(input.sessionId, activeVerifierRunId) as Row | undefined;
+  if (!verifierRun || Number(verifierRun.schema_ok) !== 1) {
+    throw Object.assign(new Error("artifact bearer token verifier run is missing or failed"), {
+      apiError: proofBlockedError(requestId, "artifact bearer token verifier run is missing or failed"),
+    });
+  }
   return active;
+}
+
+function assertNoArtifactRefundPending(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): void {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT payload_json
+       FROM evidence_events
+       WHERE session_id = ? AND kind = 'artifact.refund.pending'
+       ORDER BY event_seq ASC`,
+    )
+    .all(sessionId) as Row[];
+  const hasRefund = rows.some((row) => {
+    try {
+      const payload = JSON.parse(String(row.payload_json)) as { spendId?: unknown };
+      return payload.spendId === spendId;
+    } catch {
+      return false;
+    }
+  });
+  if (hasRefund) {
+    throw Object.assign(new Error("artifact access token cannot be issued after refund evidence exists"), {
+      apiError: proofBlockedError(requestId, "artifact access token cannot be issued after refund evidence exists"),
+    });
+  }
+}
+
+function assertNoActiveArtifactToken(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): void {
+  const row = ctx.db.sqlite
+    .prepare(
+      `SELECT token_id
+       FROM artifact_access_tokens
+       WHERE session_id = ? AND spend_id = ? AND status = 'active'
+       LIMIT 1`,
+    )
+    .get(sessionId, spendId) as Row | undefined;
+  if (row) {
+    throw Object.assign(new Error("active artifact access token already exists for spend"), {
+      apiError: conflictError(requestId, "active artifact access token already exists for spend"),
+    });
+  }
 }
 
 function requireQuotePreflight(
@@ -3860,9 +4029,9 @@ function updateJudgeCheckRow(
   ctx: ServiceCtx,
   sessionId: string,
   input: {
-    rowId: "source_challenge" | "ab_trip" | "c_settlement";
+    rowId: "source_challenge" | "ab_trip" | "c_settlement" | "artifact_access";
     status: "pass" | "pending" | "blocked";
-    authority: "proof" | "advisory";
+    authority: "proof" | "delivery" | "advisory";
     reason: string;
     evidenceEventId: string;
   },
@@ -4191,6 +4360,84 @@ function verifyGateFinalityIntegrity(ctx: ServiceCtx, sessionId: string): string
           errors.push(`gate proof event ${event.eventId} log position does not match indexed log`);
         }
       }
+    }
+  }
+  return errors;
+}
+
+function verifyArtifactAccessTokenIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  const errors: string[] = [];
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT token_id, spend_id, payer, artifact_hash, token_hash, status, issued_by_verifier_run_id, settlement_event_id
+       FROM artifact_access_tokens
+       WHERE session_id = ? AND status = 'active'
+       ORDER BY created_at ASC`,
+    )
+    .all(sessionId) as Row[];
+  const issuedEvents = listEvents(ctx, sessionId, 0, 200).filter((event) => event.kind === "artifact.access_token.issued");
+  const issuedByTokenId = new Map(
+    issuedEvents
+      .map((event) => {
+        const tokenId = typeof event.payload.tokenId === "string" ? event.payload.tokenId : null;
+        return tokenId ? [tokenId, event] : null;
+      })
+      .filter((entry): entry is [string, EvidenceEvent] => Boolean(entry)),
+  );
+  for (const row of rows) {
+    const tokenId = String(row.token_id);
+    const verifierRunId = typeof row.issued_by_verifier_run_id === "string" ? row.issued_by_verifier_run_id : null;
+    const settlementEventId = typeof row.settlement_event_id === "string" ? row.settlement_event_id : null;
+    if (!verifierRunId) {
+      errors.push(`active artifact token ${tokenId} is missing issued_by_verifier_run_id`);
+      continue;
+    }
+    if (!settlementEventId) {
+      errors.push(`active artifact token ${tokenId} is missing settlement_event_id`);
+      continue;
+    }
+    const verifierRun = ctx.db.sqlite
+      .prepare("SELECT schema_ok FROM verifier_runs WHERE session_id = ? AND verifier_run_id = ?")
+      .get(sessionId, verifierRunId) as Row | undefined;
+    if (!verifierRun || Number(verifierRun.schema_ok) !== 1) {
+      errors.push(`active artifact token ${tokenId} references missing or failed verifier run`);
+    }
+    const settlement = ctx.db.sqlite
+      .prepare(
+        `SELECT spend_id, event_kind, status, finalized_event_id
+         FROM gate_chain_events
+         WHERE session_id = ? AND finalized_event_id = ?`,
+      )
+      .get(sessionId, settlementEventId) as Row | undefined;
+    if (
+      !settlement ||
+      settlement.spend_id !== row.spend_id ||
+      settlement.event_kind !== "SpendSettled" ||
+      settlement.status !== "finalized"
+    ) {
+      errors.push(`active artifact token ${tokenId} is not bound to a finalized SpendSettled event`);
+    }
+    const event = issuedByTokenId.get(tokenId);
+    if (!event) {
+      errors.push(`active artifact token ${tokenId} has no artifact.access_token.issued evidence event`);
+      continue;
+    }
+    const expectedFields = [
+      ["spendId", row.spend_id],
+      ["payer", row.payer],
+      ["artifactHash", row.artifact_hash],
+      ["tokenHash", row.token_hash],
+      ["verifierRunId", verifierRunId],
+      ["settlementEventId", settlementEventId],
+      ["status", "active_demo_verifier_gated"],
+    ] as const;
+    for (const [field, expected] of expectedFields) {
+      if (event.payload[field] !== expected) {
+        errors.push(`artifact access token event ${event.eventId} payload.${field} does not match active token row`);
+      }
+    }
+    if (event.authority !== "delivery" || event.payload.proofAuthority !== false || event.payload.winnerClaimAllowed !== false) {
+      errors.push(`artifact access token event ${event.eventId} does not carry delivery-only fail-closed payload`);
     }
   }
   return errors;

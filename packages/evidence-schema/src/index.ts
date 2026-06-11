@@ -180,6 +180,14 @@ export const ArtifactRefundPayloadSchema = z
   })
   .strict();
 
+export const ArtifactAccessIssuePayloadSchema = z
+  .object({
+    spendId: Hex32Schema,
+    payer: HexSchema,
+    artifactHash: Hex32Schema,
+  })
+  .strict();
+
 export const LeaseExecutePayloadSchema = z
   .object({
     spendId: Hex32Schema,
@@ -311,6 +319,7 @@ export const EvidenceEventKindSchema = z.enum([
   "caw.receipt.ingested.fixture",
   "caw.receipt.ingested.raw",
   "artifact.preflight.pending",
+  "artifact.access_token.issued",
   "quote.signed.mocked",
   "artifact.refund.pending",
   "operator.key_used",

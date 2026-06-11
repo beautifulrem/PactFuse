@@ -133,6 +133,19 @@ export const gateChainEvents = sqliteTable(
   }),
 );
 
+export const artifactAccessTokens = sqliteTable("artifact_access_tokens", {
+  tokenId: text("token_id").primaryKey(),
+  sessionId: text("session_id").notNull(),
+  spendId: text("spend_id").notNull(),
+  payer: text("payer").notNull(),
+  artifactHash: text("artifact_hash").notNull(),
+  tokenHash: text("token_hash").notNull(),
+  status: text("status").notNull(),
+  issuedByVerifierRunId: text("issued_by_verifier_run_id"),
+  settlementEventId: text("settlement_event_id"),
+  createdAt: text("created_at").notNull(),
+});
+
 export const chainIndexerCursors = sqliteTable("chain_indexer_cursors", {
   cursorId: text("cursor_id").primaryKey(),
   chainId: text("chain_id").notNull(),
