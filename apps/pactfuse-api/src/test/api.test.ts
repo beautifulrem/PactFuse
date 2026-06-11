@@ -462,6 +462,174 @@ describe("pactfuse-api P0", () => {
     );
   });
 
+  it("authorizes a public claim through the HTTP evidence flow when every live gate passes", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const tokenBalances: Record<string, string> = {};
+    const cawReceipts: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", {
+      caw: createFakeCawReceiptSource({ receipts: cawReceipts, mode: "live" }),
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 130, logs, tokenBalances }),
+      mcpLease: createFakeMcpLeaseClient("pactfuse_code_scan", "live"),
+    });
+    const sessionId = await createSession(app, "sess-public-claim-authorized");
+    const spendId = await registerSpendWithKeyForTest(app, sessionId, "public-claim-c");
+    const tripA = await registerSpendWithKeyForTest(app, sessionId, "public-claim-trip-a", {
+      artifactHash: hex32("public-claim-trip-a-artifact"),
+      nonce: "trip-a",
+    });
+    const tripB = await registerSpendWithKeyForTest(app, sessionId, "public-claim-trip-b", {
+      artifactHash: hex32("public-claim-trip-b-artifact"),
+      nonce: "trip-b",
+    });
+    const quoted = await quoteArtifactForTest(app, sessionId, spendId, "public-claim-artifact", {
+      artifactPayload: TEST_ARTIFACT_PAYLOAD,
+      settlementMode: "chain_settleable_after_preflight",
+    });
+    const identity = await post(app, "/api/v1/caw/live/identity/probe", {
+      sessionId,
+      idempotencyKey: "public-claim-caw-identity",
+      payload: {
+        walletId: "wallet-live-1",
+        expectedWalletAddress: TEST_PAYER_ADDRESS,
+        identityMode: "p0-floor-one-wallet",
+      },
+    });
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "public-claim-settle");
+    await finalizeSpendTripForTest(app, ctx, logs, sessionId, tripA, "public-claim-trip-a", 101);
+    await finalizeSpendTripForTest(app, ctx, logs, sessionId, tripB, "public-claim-trip-b", 102);
+    await finalizeSourceChallengeForTest(app, ctx, logs, sessionId, "public-claim-source", 103);
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "public-claim-settle", finalized);
+    const denyProbe = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "public-claim-deny-probe",
+        payload: {
+          spendId,
+          operationKind: "deny_probe",
+          pactId: "pact-live-1",
+          walletId: "wallet-live-1",
+          chainId: "84532",
+          contractAddress: TEST_MARKET_ADDRESS,
+          calldata: cawApproveCalldataForTest(TEST_MARKET_ADDRESS, "1000"),
+          requestId: "public-claim-deny-probe",
+          description: "PactFuse wrong-target deny proof",
+        },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const denyAudit = await post(app, "/api/v1/caw/live/audit/sync", {
+      sessionId,
+      idempotencyKey: "public-claim-deny-audit",
+      payload: { walletId: "wallet-live-1", action: "wrong_target.deny_probe", result: "denied", limit: 20 },
+    });
+    cawReceipts.push(
+      cawReceiptFields("public-claim-deny", {
+        operationKind: "deny_probe",
+        target: TEST_MARKET_ADDRESS,
+        selector: ERC20_APPROVE_SELECTOR,
+        requestId: "public-claim-deny-probe",
+        effect: "deny",
+        status: "denied",
+        txHash: null,
+        txCount: "0",
+      }),
+      cawReceiptFields("public-claim-approve", {
+        operationKind: "approve",
+        target: TEST_PAYMENT_TOKEN_ADDRESS,
+        selector: ERC20_APPROVE_SELECTOR,
+        requestId: "public-claim-settle-approve",
+        txHash: hex32("caw-live-contract:public-claim-settle-approve"),
+      }),
+      cawReceiptFields("public-claim-activate", {
+        operationKind: "activate_tool",
+        target: INDEXER_ADDRESS,
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+        requestId: String(finalized.txHash),
+        txHash: finalized.txHash,
+      }),
+    );
+    await buildAndIngestCawReceiptForTest(app, sessionId, spendId, "public-claim-deny-receipt", {
+      operationKind: "deny_probe",
+      target: TEST_MARKET_ADDRESS,
+      selector: ERC20_APPROVE_SELECTOR,
+    });
+    await buildAndIngestCawReceiptForTest(app, sessionId, spendId, "public-claim-approve-receipt", {
+      operationKind: "approve",
+      target: TEST_PAYMENT_TOKEN_ADDRESS,
+      selector: ERC20_APPROVE_SELECTOR,
+    });
+    await buildAndIngestCawReceiptForTest(app, sessionId, spendId, "public-claim-activate-receipt", {
+      operationKind: "activate_tool",
+      target: INDEXER_ADDRESS,
+      selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+    });
+    await catchUpIndexerCursorForTest(ctx, "gate:public-claim-settle", 100);
+    await catchUpIndexerCursorForTest(ctx, "gate:public-claim-trip-a", 101);
+    await catchUpIndexerCursorForTest(ctx, "gate:public-claim-trip-b", 102);
+    await catchUpIndexerCursorForTest(ctx, "source:public-claim-source", 103);
+    const issued = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "public-claim-artifact-token",
+      payload: {
+        spendId,
+        payer: TEST_PAYER_ADDRESS,
+        quoteId: quoted.quoteId,
+        artifactHash: quoted.artifactHash,
+        artifactPayload: quoted.artifactPayload,
+      },
+    });
+    expect(issued.status, JSON.stringify(issued.json)).toBe(202);
+    const lease = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId,
+        idempotencyKey: "public-claim-lease",
+        payload: {
+          spendId,
+          payer: TEST_PAYER_ADDRESS,
+          artifactHash: quoted.artifactHash,
+          targetRepo: "https://github.com/example/public-claim-target",
+          targetCommit: "abcdef123456",
+        },
+      },
+      { authorization: `Bearer ${issued.json.data.accessToken}` },
+    );
+    const readiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const readinessJson = await readiness.json();
+    const claim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`);
+    const claimJson = await claim.json();
+
+    expect(identity.status).toBe(202);
+    expect(denyProbe.status, JSON.stringify(denyProbe.json)).toBe(202);
+    expect(denyAudit.status).toBe(202);
+    expect(lease.status).toBe(202);
+    expect(readiness.status).toBe(200);
+    expect(readinessJson.data.blockers).toEqual([]);
+    expect(readinessJson.data.requiredExternalInputs).toEqual([]);
+    expect(readinessJson.data.winnerClaimAllowed).toBe(true);
+    expect(readinessJson.data.verifierRun.proofLevel).toBe("final_replay_claim");
+    expect(readinessJson.data.verifierRun.finalVerifierComplete).toBe(true);
+    expect(readinessJson.data.verifierRun.winnerClaimAllowed).toBe(true);
+    expect(claim.status).toBe(200);
+    expect(claimJson.data).toEqual(
+      expect.objectContaining({
+        claimStatus: "authorized_public_claim",
+        claimMode: "caw-target-real",
+        paymentMode: "gate-paid-artifact-real",
+        tokenMode: "mock-test-token",
+        identityMode: "p0-floor-one-wallet",
+        proofChipAllowed: true,
+        finalVerifierComplete: true,
+        winnerClaimAllowed: true,
+      }),
+    );
+    expect(claimJson.data.publicClaimHash).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
   it("fails verifier closed when a required indexer cursor is missing", async () => {
     const { app } = makeApp(":memory:", {
       cawLive: createFakeCawLiveClient(),
@@ -7190,6 +7358,36 @@ async function registerSpend(
   return spendId;
 }
 
+async function registerSpendWithKeyForTest(
+  app: ReturnType<typeof createApp>,
+  sessionId: string,
+  key: string,
+  spendOverrides: Partial<{
+    agentWallet: string;
+    paymentToken: string;
+    artifactHash: string;
+    market: string;
+    maxPriceAtomic: string;
+    nonce: string;
+  }> = {},
+  capabilityVector: Record<string, unknown> = defaultSourceCapabilityForTest(),
+): Promise<string> {
+  await registerSource(app, sessionId, capabilityVector);
+  const sourceHashes = [hex32("source")];
+  const spendId = await computeSpendIdForTest(app, sessionId, sourceHashes, capabilityVector, spendOverrides);
+  const res = await post(app, "/api/v1/spends/register-batch", {
+    sessionId,
+    idempotencyKey: `${key}-spend-register`,
+    payload: {
+      spends: [
+        spendRegistrationForTest(spendId, { sourceHashes, ...spendOverrides }),
+      ],
+    },
+  });
+  expect(res.status).toBe(201);
+  return spendId;
+}
+
 function artifactCidForTest(artifactHash: string): string {
   return `sha256:${artifactHash.toLowerCase()}`;
 }
@@ -7203,7 +7401,7 @@ async function quoteArtifactForTest(
   sessionId: string,
   spendId: string,
   seed: string,
-  options: { artifactPayload?: Record<string, unknown>; priceAtomic?: string; validUntilBlock?: string } = {},
+  options: { artifactPayload?: Record<string, unknown>; priceAtomic?: string; validUntilBlock?: string; settlementMode?: "chain_settleable_after_preflight" } = {},
 ): Promise<{
   artifactPayload: Record<string, unknown>;
   artifactHash: `0x${string}`;
@@ -7230,15 +7428,16 @@ async function quoteArtifactForTest(
   const quote = await post(app, "/api/v1/quotes", {
     sessionId,
     idempotencyKey: `${seed}-quote`,
-    payload: {
-      spendId,
-      preflightId: preflight.json.data.preflightId,
-      artifactCommitment: artifactHash,
-      priceAtomic: options.priceAtomic ?? "1000",
-      quoteNonce: `${seed}-quote-nonce`,
-      validUntilBlock: options.validUntilBlock ?? "1000000",
-    },
-  });
+      payload: {
+        spendId,
+        preflightId: preflight.json.data.preflightId,
+        artifactCommitment: artifactHash,
+        priceAtomic: options.priceAtomic ?? "1000",
+        quoteNonce: `${seed}-quote-nonce`,
+        validUntilBlock: options.validUntilBlock ?? "1000000",
+        ...(options.settlementMode ? { settlementMode: options.settlementMode } : {}),
+      },
+    });
   expect(quote.status).toBe(201);
   return {
     artifactPayload,
@@ -7747,13 +7946,137 @@ async function finalizeSpendSettlement(
   });
 
   expect(observed.status).toBe(202);
-  expect(worker.status).toBe("succeeded");
+  expect(worker.status, JSON.stringify(worker)).toBe("succeeded");
   expect(proofEvent).toEqual(expect.objectContaining({ authority: "proof" }));
   return {
     ...(proofEvent.payload as Record<string, unknown>),
     finalizedEventId: proofEvent.eventId,
     observedEventId: observed.json.data.observedEventId,
   };
+}
+
+async function finalizeSpendTripForTest(
+  app: ReturnType<typeof createApp>,
+  ctx: ServiceCtx,
+  logs: Array<Record<string, unknown>>,
+  sessionId: string,
+  spendId: string,
+  key: string,
+  blockNumber: number,
+): Promise<Record<string, unknown>> {
+  const observedBody = gateEventEnvelope(sessionId, spendId, `${key}-observed`, {
+    event: "SpendTripped",
+    txHash: hex32(`${key}-tx`),
+    rawLogHash: hex32(`${key}-log`),
+    blockNumber,
+    currentBlockNumber: blockNumber,
+  });
+  const observed = await postSignedGateEvent(app, observedBody);
+  const contractArgs = contractRegisteredSpendArgsForTest(ctx, sessionId, spendId);
+  logs.push(
+    indexerLog(key, blockNumber, {
+      eventName: "SpendTripped",
+      event: "SpendTripped",
+      sessionId,
+      spendId,
+      args: { sessionId, spendId, ...contractArgs },
+      transactionHash: hex32(`${key}-tx`),
+      rawLogHash: hex32(`${key}-log`),
+    }),
+  );
+  const worker = await runIndexerWorkerOnce(ctx, {
+    cursors: [{ cursorId: `gate:${key}`, chainId: "84532", startBlock: blockNumber, finalityDepth: 2, maxWindowBlocks: 1, address: INDEXER_ADDRESS }],
+  });
+  const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+  const replayJson = await replay.json();
+  const proofEvent = replayJson.data.events.find((event: { kind: string; payload: Record<string, unknown> }) => {
+    return event.kind === "gate.spend_tripped" && event.payload.spendId === spendId;
+  });
+
+  expect(observed.status).toBe(202);
+  expect(worker.status, JSON.stringify(worker)).toBe("succeeded");
+  expect(proofEvent).toEqual(expect.objectContaining({ authority: "proof" }));
+  return {
+    ...(proofEvent.payload as Record<string, unknown>),
+    finalizedEventId: proofEvent.eventId,
+    observedEventId: observed.json.data.observedEventId,
+  };
+}
+
+async function catchUpIndexerCursorForTest(ctx: ServiceCtx, cursorId: string, startBlock: number): Promise<void> {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const worker = await runIndexerWorkerOnce(ctx, {
+      cursors: [{ cursorId, chainId: "84532", startBlock, finalityDepth: 2, maxWindowBlocks: 64, address: INDEXER_ADDRESS }],
+    });
+    if (worker.status === "idle") {
+      return;
+    }
+    expect(worker.status, JSON.stringify(worker)).toBe("succeeded");
+  }
+}
+
+function contractRegisteredSpendArgsForTest(ctx: ServiceCtx, sessionId: string, spendId: string): Record<string, unknown> {
+  const row = ctx.db.sqlite
+    .prepare(
+      `SELECT pact_id, tool_id, source_set_hash, agent_wallet, payment_token, max_price_atomic, artifact_hash, market
+       FROM spends
+       WHERE session_id = ? AND spend_id = ?`,
+    )
+    .get(sessionId, spendId) as Record<string, unknown> | undefined;
+  expect(row).toBeTruthy();
+  return {
+    pactId: row?.pact_id,
+    toolId: row?.tool_id,
+    sourceSetHash: row?.source_set_hash,
+    agentWallet: row?.agent_wallet,
+    paymentToken: row?.payment_token,
+    price: row?.max_price_atomic,
+    artifactHash: row?.artifact_hash,
+    market: row?.market,
+  };
+}
+
+async function finalizeSourceChallengeForTest(
+  app: ReturnType<typeof createApp>,
+  ctx: ServiceCtx,
+  logs: Array<Record<string, unknown>>,
+  sessionId: string,
+  key: string,
+  blockNumber: number,
+): Promise<Record<string, unknown>> {
+  const reasonHash = hex32(`${key}-reason`);
+  const challenge = await post(app, "/api/v1/sources/challenge", {
+    sessionId,
+    idempotencyKey: `${key}-challenge`,
+    payload: {
+      sourceHash: hex32("source"),
+      reasonHash,
+      evidenceRef: `https://example.com/${key}.json`,
+    },
+  });
+  logs.push(
+    indexerLog(key, blockNumber, {
+      eventName: "SourceChallenged",
+      event: "SourceChallenged",
+      sessionId,
+      sourceHash: hex32("source"),
+      reasonHash,
+      args: { sessionId, sourceHash: hex32("source"), reasonHash },
+      transactionHash: hex32(`${key}-tx`),
+      rawLogHash: hex32(`${key}-log`),
+    }),
+  );
+  const worker = await runIndexerWorkerOnce(ctx, {
+    cursors: [{ cursorId: `source:${key}`, chainId: "84532", startBlock: blockNumber, finalityDepth: 2, maxWindowBlocks: 1, address: INDEXER_ADDRESS }],
+  });
+  const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+  const replayJson = await replay.json();
+  const proofEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "source.challenge.confirmed");
+
+  expect(challenge.status).toBe(202);
+  expect(worker.status).toBe("succeeded");
+  expect(proofEvent).toEqual(expect.objectContaining({ authority: "proof" }));
+  return proofEvent.payload as Record<string, unknown>;
 }
 
 async function verifyTokenBalanceDeltaForTest(
@@ -8168,6 +8491,42 @@ function cawReceiptFields(seed: string, overrides: Record<string, unknown> = {})
   };
 }
 
+async function buildAndIngestCawReceiptForTest(
+  app: ReturnType<typeof createApp>,
+  sessionId: string,
+  spendId: string,
+  key: string,
+  payload: {
+    operationKind: "deny_probe" | "approve" | "activate_tool";
+    target: string;
+    selector: string;
+  },
+): Promise<Record<string, unknown>> {
+  const operation = await post(app, "/api/v1/caw/operations/build", {
+    sessionId,
+    idempotencyKey: `${key}-build`,
+    payload: {
+      spendId,
+      operationKind: payload.operationKind,
+      target: payload.target,
+      selector: payload.selector,
+    },
+  });
+  expect(operation.status).toBe(201);
+  const ingest = await post(app, "/api/v1/caw/receipts/ingest", {
+    sessionId,
+    idempotencyKey: `${key}-ingest`,
+    payload: {
+      sourceLabel: "caw-api",
+      operationId: operation.json.data.operationId,
+      manual: false,
+    },
+  });
+  expect(ingest.status).toBe(202);
+  expect(ingest.json.data.canonicalReceiptCount).toBe(1);
+  return ingest.json.data as Record<string, unknown>;
+}
+
 function createFakeCawLiveClient(
   options: Partial<{
     includePolicyBinding: boolean;
@@ -8289,12 +8648,12 @@ function keccakJsonForTest(value: unknown): `0x${string}` {
   return keccak256(toBytes(canonicalizeJson(value)));
 }
 
-function createFakeMcpLeaseClient(toolName = "pactfuse_code_scan"): McpLeaseClient {
+function createFakeMcpLeaseClient(toolName = "pactfuse_code_scan", mode: "fixture" | "live" = "fixture"): McpLeaseClient {
   return {
     async status() {
       return {
         name: "mcp_lease",
-        mode: "fixture",
+        mode,
         ready: true,
         reason: "fake MCP lease client",
       };

@@ -1468,7 +1468,9 @@ export async function submitCawLiveContractCall(
       } else {
         assertCawPactAllowsContractCall(activePact, normalized, requestId);
       }
-      assertCawPactRequestCapacity(ctx, envelope.sessionId, activePact, normalized, requestId);
+      if (normalized.operationKind !== "deny_probe") {
+        assertCawPactRequestCapacity(ctx, envelope.sessionId, activePact, normalized, requestId);
+      }
       const request = cawLiveContractCallRequest(normalized);
       const response = await ctx.cawLive.contractCall({
         walletId: normalized.walletId,
@@ -10081,14 +10083,14 @@ function verifyCawLiveAuditUsageIntegrity(ctx: ServiceCtx, sessionId: string): s
     if (payload.pactPolicyDigest !== payload.policyDigest) {
       errors.push(`${label} pactPolicyDigest must match audit policyDigest`);
     }
-    if (!optionalHex32(payload.txHash)) {
-      errors.push(`${label} requires txHash`);
-    }
     if (!optionalHex32(payload.auditLogHash)) {
       errors.push(`${label} requires auditLogHash`);
     }
     if (payload.result !== "allowed" && payload.result !== "denied") {
       errors.push(`${label} result must be allowed or denied`);
+    }
+    if (payload.result === "allowed" && !optionalHex32(payload.txHash)) {
+      errors.push(`${label} allowed result requires txHash`);
     }
     const auditEvent = eventsById.get(String(payload.auditEventId));
     if (!auditEvent || auditEvent.kind !== "caw.live.audit.synced" || auditEvent.authority !== "proof") {
@@ -10111,7 +10113,6 @@ function verifyCawLiveAuditUsageIntegrity(ctx: ServiceCtx, sessionId: string): s
       for (const [field, expected] of [
         ["interactionId", payload.interactionId],
         ["operationKind", payload.operationKind],
-        ["txHash", payload.txHash],
         ["pactPolicyDigest", payload.policyDigest],
         ["requestHash", payload.requestHash],
         ["responseHash", payload.responseHash],
@@ -10119,6 +10120,12 @@ function verifyCawLiveAuditUsageIntegrity(ctx: ServiceCtx, sessionId: string): s
         if (String(contractEvent.payload[field] ?? "").toLowerCase() !== String(expected ?? "").toLowerCase()) {
           errors.push(`${label} contract call event payload.${field} does not match usage proof`);
         }
+      }
+      if (
+        payload.result === "allowed" &&
+        String(contractEvent.payload.txHash ?? "").toLowerCase() !== String(payload.txHash ?? "").toLowerCase()
+      ) {
+        errors.push(`${label} contract call event payload.txHash does not match usage proof`);
       }
     }
     const pactSyncEvent = eventsById.get(String(payload.pactSyncEventId));
