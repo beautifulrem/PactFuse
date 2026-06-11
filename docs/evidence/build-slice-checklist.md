@@ -47,7 +47,7 @@ Purpose: keep implementation aligned with the proof gates. This checklist is not
    - Generate Source-Bound Code-Scan MCP Lease receipt pack.
    - Hash artifact payload and receipt pack separately.
    - Include `priceDisclosure` and `deliveryPreflight` in the receipt pack and verify their hashes against displayed UI values.
-   - Include `agentTranscript` in the receipt pack for any "agent used what it bought" chip: MCP JSON-RPC `tools/list`, `tools/call`, transcript hash, and pinned-manifest binding.
+   - Include `agentTranscript` in the receipt pack for any "agent used what it bought" chip: MCP JSON-RPC `tools/list`, `tools/call`, transcript hash, pinned-manifest binding, and `consumedArtifactPayloadHash` from the verified artifact access token.
    - Include `cawReceiptIngest` and the `PACTFUSE_EVIDENCE_V1` replay bundle hash before any CAW or winner proof chip can pass.
    - `/api/evidence/verify` validates source proof, CAW receipts/operations, payment proof, trip/settle events, balance delta, artifact hash, and block window.
    - `/api/evidence/judge-check` returns pass/fail rows backed by raw evidence links; no row can pass from prose-only evidence.
@@ -83,7 +83,7 @@ Purpose: keep implementation aligned with the proof gates. This checklist is not
 - If artifact preflight is missing or failed, do not sign quotes and do not show a paid-content-unlock claim.
 - If any Judge Check row is not `pass`, remove that row's proof chip from the winner script.
 - If CAW receipts are manually entered or not present in the ingest bundle, remove the CAW proof chip.
-- If the Agent Transcript is missing or not bound to the pinned manifest, remove the "agent used what it bought" chip.
+- If the Agent Transcript is missing, lacks the consumed artifact payload hash, or is not bound to the pinned manifest, remove the "agent used what it bought" chip.
 - If the scan target is team-owned, label it and remove the external-workflow proof chip.
 - If the replay bundle cannot bind all winner rows to one `sessionId`, keep `WINNER_CLAIM_ALLOWED: false`.
 
@@ -101,5 +101,5 @@ Purpose: keep implementation aligned with the proof gates. This checklist is not
 - Judge Check URL / JSON.
 - Runner heartbeat log hash for the clean recovery path.
 - CAW receipt ingest bundle hash.
-- Raw MCP Agent Transcript hash.
+- Raw MCP Agent Transcript hash plus consumed artifact payload hash.
 - `PACTFUSE_EVIDENCE_V1` replay bundle hash.

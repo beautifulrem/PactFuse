@@ -306,6 +306,7 @@ export const leaseRuns = sqliteTable("lease_runs", {
   spendId: text("spend_id").notNull(),
   payer: text("payer"),
   artifactHash: text("artifact_hash"),
+  consumedArtifactPayloadHash: text("consumed_artifact_payload_hash"),
   targetRepo: text("target_repo").notNull(),
   targetCommit: text("target_commit").notNull(),
   status: text("status").notNull(),

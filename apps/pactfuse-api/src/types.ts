@@ -140,6 +140,8 @@ export type McpLeaseExecutionInput = {
   spendId: string;
   payer: string;
   artifactHash: string;
+  artifactPayloadHash: string;
+  artifactPayload: Record<string, unknown>;
   targetRepo: string;
   targetCommit: string;
   pinnedManifestTools: Array<Record<string, unknown>>;

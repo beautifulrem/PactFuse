@@ -226,6 +226,7 @@ CREATE TABLE IF NOT EXISTS lease_runs (
   spend_id TEXT NOT NULL,
   payer TEXT,
   artifact_hash TEXT,
+  consumed_artifact_payload_hash TEXT,
   target_repo TEXT NOT NULL,
   target_commit TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -393,6 +394,7 @@ CREATE TABLE IF NOT EXISTS judge_check_rows (
   ensureColumn(sqlite, "quotes", "chain_id", "TEXT");
   ensureColumn(sqlite, "lease_runs", "payer", "TEXT");
   ensureColumn(sqlite, "lease_runs", "artifact_hash", "TEXT");
+  ensureColumn(sqlite, "lease_runs", "consumed_artifact_payload_hash", "TEXT");
   ensureColumn(sqlite, "lease_runs", "tools_list_hash", "TEXT");
   ensureColumn(sqlite, "lease_runs", "tools_call_hash", "TEXT");
   ensureColumn(sqlite, "lease_runs", "output_hash", "TEXT");

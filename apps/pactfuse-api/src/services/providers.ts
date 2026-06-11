@@ -55,7 +55,17 @@ export const PACTFUSE_CHAIN_EVENT_ABI = [
   },
 ] as const;
 const MAX_MCP_RESPONSE_BYTES = 512 * 1024;
-const REQUIRED_LEASE_TOOL_ARGUMENTS = ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"] as const;
+const REQUIRED_LEASE_TOOL_ARGUMENTS = [
+  "sessionId",
+  "leaseRunId",
+  "spendId",
+  "payer",
+  "artifactHash",
+  "artifactPayloadHash",
+  "artifactPayload",
+  "targetRepo",
+  "targetCommit",
+] as const;
 const DANGEROUS_TOOL_NAME_PATTERN =
   /(write|edit|delete|remove|shell|exec|terminal|command|commit|push|deploy|transfer|send|apply|patch|modify|create|move|copy|rename|upload|download|file|fs|process|subprocess)/;
 
@@ -629,6 +639,8 @@ export function createHttpJsonRpcMcpLeaseClient(input: {
           spendId: leaseInput.spendId,
           payer: leaseInput.payer,
           artifactHash: leaseInput.artifactHash,
+          artifactPayloadHash: leaseInput.artifactPayloadHash,
+          artifactPayload: leaseInput.artifactPayload,
           targetRepo: leaseInput.targetRepo,
           targetCommit: leaseInput.targetCommit,
         },

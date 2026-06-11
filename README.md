@@ -246,7 +246,7 @@ The replay verifier checks:
 - quote and artifact preflight bindings
 - bearer-bound artifact access proofs
 - MCP request/response hashes
-- exact pinned-manifest lease transcript boundaries
+- exact pinned-manifest lease transcript boundaries plus `consumedArtifactPayloadHash`
 - final replay blockers for live proof providers, CAW identity, wrong-target deny, live quote status, token settlement, Judge Check, and lease execution
 - public-claim authorization remains closed unless the backend can emit `authorized_public_claim`
 - paged replay roots plus embedded page bodies for large evidence collections

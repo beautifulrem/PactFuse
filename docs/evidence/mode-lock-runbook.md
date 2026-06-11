@@ -83,7 +83,7 @@ Required winner inputs:
 - A and B have real `SpendTripped` events, canonical tx ordering, and no token movement.
 - C has a real `SpendSettled` event plus ERC20 `Transfer` and balance delta from `agentWallet` to market, verified through a live chain provider; `payer` must equal `agentWallet` until wallet ownership proof exists.
 - Artifact quote was signed only after preflight passed, has `chain_settleable_after_preflight` status for winner mode, its `quoteHash` binds status, chain id, payer, agent wallet, token, market, price, and preflight fields, and its chain id plus expiry match the token settlement.
-- Agent Transcript includes raw MCP JSON-RPC `tools/list` and `tools/call` hashes, bounded to the pinned manifest, before any "agent used what it bought" chip is shown.
+- Agent Transcript includes raw MCP JSON-RPC `tools/list` and `tools/call` hashes, the consumed artifact payload hash, and pinned-manifest binding before any "agent used what it bought" chip is shown.
 - Lease target is an independent pinned public repo/commit for the external-workflow chip; team-owned target requires a visible downgrade.
 - `PACTFUSE_EVIDENCE_V1` replay bundle binds run config, raw CAW receipts, tx/log refs, source proof, artifact preflight, agent transcript, lease run, Judge Check, and verifier output under one `sessionId`.
 - Receipt pack is verified by the full chain/signature/hash verifier, not only `schemaOk`; replay verification must have no `proofCompletenessErrors` before `finalVerifierComplete` can become true.
@@ -114,7 +114,7 @@ WINNER_CLAIM_ALLOWED: true
 - Do not present source challenge as independent fraud detection; it is issuer-declared source freshness at settlement.
 - Do not show a paid-content-unlock claim if artifact delivery is missing. Use `artifact-hash-proof` only.
 - Do not show a CAW proof chip from hand-entered receipts.
-- Do not show "agent used what it bought" without a raw MCP Agent Transcript.
+- Do not show "agent used what it bought" without a raw MCP Agent Transcript that binds `tools/call` to `consumedArtifactPayloadHash`.
 - Do not show an external-workflow chip for a team-owned target repo.
 - Do not show speculative loss-prevented numbers; only observed blocked spend amount and denied capability delta are allowed.
 
@@ -127,8 +127,8 @@ Use this order in the live demo and README top links:
 3. A/B trip: two `SpendTripped` events, no token delta, event-reconstructed affected set.
 4. C settlement: `SpendSettled` tx, ERC20 `Transfer`, `agentWallet`/market balance delta, quote price.
 5. Artifact receipt: preflight proof, artifact hash, receipt pack hash, verifier output, Bearer-token access proof.
-6. Agent transcript: MCP `tools/list` + `tools/call` transcript hash, pinned-manifest tool set, independent target repo/commit.
-7. Lease execution: scan output on the pinned target repo + `leaseRunHash` (or honest `lease-execution-pending`).
+6. Agent transcript: MCP `tools/list` + `tools/call` transcript hash, consumed artifact payload hash, pinned-manifest tool set, independent target repo/commit.
+7. Lease execution: scan output on the pinned target repo + `consumedArtifactPayloadHash` + `leaseRunHash` (or honest `lease-execution-pending`).
 8. Judge Check + replay bundle: pass/fail rows matching the raw proof links, plus `PACTFUSE_EVIDENCE_V1` bundle hash.
 
 ## Winning-Pattern Mapping

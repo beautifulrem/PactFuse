@@ -3907,6 +3907,8 @@ export async function executeLease(
         },
         requestId,
       );
+      const consumedArtifactPayloadHash = String(activeToken.artifact_payload_hash).toLowerCase();
+      const consumedArtifactPayload = JSON.parse(String(activeToken.artifact_payload_json)) as Record<string, unknown>;
       return withProcessLock(`artifact-token-lease:${envelope.sessionId}:${String(activeToken.token_id)}`, async () => {
         const artifactTokenId = String(activeToken.token_id);
         assertArtifactTokenUnusedForLease(ctx, envelope.sessionId, artifactTokenId, requestId);
@@ -3922,6 +3924,7 @@ export async function executeLease(
             spendId: payload.spendId,
             payer,
             artifactHash,
+            consumedArtifactPayloadHash,
             targetRepo: payload.targetRepo,
             targetCommit: payload.targetCommit,
             settlementEventId: settlement.tokenBalanceEventId,
@@ -3936,6 +3939,8 @@ export async function executeLease(
             spendId: payload.spendId,
             payer,
             artifactHash,
+            artifactPayloadHash: consumedArtifactPayloadHash,
+            artifactPayload: consumedArtifactPayload,
             targetRepo: payload.targetRepo,
             targetCommit: payload.targetCommit,
             pinnedManifestTools: pinnedManifest.tools,
@@ -3953,6 +3958,7 @@ export async function executeLease(
             spendId: payload.spendId,
             payer,
             artifactHash,
+            consumedArtifactPayloadHash,
             targetRepo: payload.targetRepo,
             targetCommit: payload.targetCommit,
             leaseRunId,
@@ -4014,6 +4020,7 @@ export async function executeLease(
           spendId: payload.spendId,
           payer,
           artifactHash,
+          consumedArtifactPayloadHash,
           targetRepo: payload.targetRepo,
           targetCommit: payload.targetCommit,
           settlementEventId: settlement.tokenBalanceEventId,
@@ -4027,9 +4034,9 @@ export async function executeLease(
           ctx.db.sqlite
             .prepare(
               `INSERT INTO lease_runs
-                (lease_run_id, session_id, spend_id, payer, artifact_hash, target_repo, target_commit, status, transcript_hash,
+                (lease_run_id, session_id, spend_id, payer, artifact_hash, consumed_artifact_payload_hash, target_repo, target_commit, status, transcript_hash,
                  tools_list_hash, tools_call_hash, output_hash, lease_run_hash, settlement_event_id, artifact_token_id, completed_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'succeeded_live_mcp_transcript', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'succeeded_live_mcp_transcript', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
               leaseRunId,
@@ -4037,6 +4044,7 @@ export async function executeLease(
               payload.spendId,
               payer,
               artifactHash,
+              consumedArtifactPayloadHash,
               payload.targetRepo,
               payload.targetCommit,
               transcriptHash,
@@ -4058,6 +4066,7 @@ export async function executeLease(
               spendId: payload.spendId,
               payer,
               artifactHash,
+              consumedArtifactPayloadHash,
               targetRepo: payload.targetRepo,
               targetCommit: payload.targetCommit,
               settlementEventId: settlement.tokenBalanceEventId,
@@ -4109,6 +4118,7 @@ export async function executeLease(
             leaseRunId,
             payer,
             artifactHash,
+            consumedArtifactPayloadHash,
             bearerBound: true,
             transcriptHash,
             toolsListHash,
@@ -4136,6 +4146,7 @@ function recordBlockedLeaseExecution(
     spendId: string;
     payer: string;
     artifactHash: string;
+    consumedArtifactPayloadHash: string;
     targetRepo: string;
     targetCommit: string;
     leaseRunId: string;
@@ -4149,9 +4160,9 @@ function recordBlockedLeaseExecution(
   ctx.db.sqlite
     .prepare(
       `INSERT INTO lease_runs
-        (lease_run_id, session_id, spend_id, payer, artifact_hash, target_repo, target_commit, status, transcript_hash,
+        (lease_run_id, session_id, spend_id, payer, artifact_hash, consumed_artifact_payload_hash, target_repo, target_commit, status, transcript_hash,
          tools_list_hash, tools_call_hash, output_hash, lease_run_hash, settlement_event_id, artifact_token_id, completed_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL, ?)`,
     )
     .run(
       input.leaseRunId,
@@ -4159,6 +4170,7 @@ function recordBlockedLeaseExecution(
       input.spendId,
       input.payer,
       input.artifactHash,
+      input.consumedArtifactPayloadHash,
       input.targetRepo,
       input.targetCommit,
       input.status,
@@ -4175,6 +4187,7 @@ function recordBlockedLeaseExecution(
       spendId: input.spendId,
       payer: input.payer,
       artifactHash: input.artifactHash,
+      consumedArtifactPayloadHash: input.consumedArtifactPayloadHash,
       targetRepo: input.targetRepo,
       targetCommit: input.targetCommit,
       settlementEventId: input.settlementEventId,
@@ -4200,6 +4213,7 @@ function recordBlockedLeaseExecution(
       leaseRunId: input.leaseRunId,
       payer: input.payer,
       artifactHash: input.artifactHash,
+      consumedArtifactPayloadHash: input.consumedArtifactPayloadHash,
       bearerBound: true,
       transcriptHash: null,
       toolsListHash: null,
@@ -9653,7 +9667,7 @@ function reconcileExpiredArtifactTokenLeaseClaims(ctx: ServiceCtx, sessionId: st
   const nowMs = ctx.clock.now().getTime();
   const rows = ctx.db.sqlite
     .prepare(
-      `SELECT token_id, lease_claim_json, lease_claimed_at
+      `SELECT token_id, artifact_payload_hash, lease_claim_json, lease_claimed_at
        FROM artifact_access_tokens
        WHERE session_id = ? AND status = 'consuming'`,
     )
@@ -9677,6 +9691,7 @@ function reconcileExpiredArtifactTokenLeaseClaims(ctx: ServiceCtx, sessionId: st
       spendId: String(claim?.spendId ?? ZERO_HASH),
       payer: String(claim?.payer ?? "0x0"),
       artifactHash: String(claim?.artifactHash ?? ZERO_HASH),
+      consumedArtifactPayloadHash: String(claim?.consumedArtifactPayloadHash ?? row.artifact_payload_hash ?? ZERO_HASH),
       targetRepo: String(claim?.targetRepo ?? "unknown"),
       targetCommit: String(claim?.targetCommit ?? "unknown"),
       leaseRunId: String(claim?.leaseRunId ?? hashJson({ sessionId, tokenId: row.token_id, expiredLeaseClaim: true })),
@@ -10416,6 +10431,7 @@ function listLeaseRuns(ctx: ServiceCtx, sessionId: string, limit: number, offset
       spendId: row.spend_id,
       payer: row.payer ?? null,
       artifactHash: row.artifact_hash ?? null,
+      consumedArtifactPayloadHash: row.consumed_artifact_payload_hash ?? null,
       targetRepo: row.target_repo,
       targetCommit: row.target_commit,
       status: row.status,
@@ -11767,7 +11783,7 @@ function verifyLeaseRunIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT lease_run_id, spend_id, payer, artifact_hash, target_repo, target_commit, status, transcript_hash,
-              tools_list_hash, tools_call_hash, output_hash, lease_run_hash, settlement_event_id, artifact_token_id
+              consumed_artifact_payload_hash, tools_list_hash, tools_call_hash, output_hash, lease_run_hash, settlement_event_id, artifact_token_id
        FROM lease_runs
        WHERE session_id = ?
        ORDER BY created_at ASC`,
@@ -11788,6 +11804,7 @@ function verifyLeaseRunIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
     const required = [
       "payer",
       "artifact_hash",
+      "consumed_artifact_payload_hash",
       "transcript_hash",
       "tools_list_hash",
       "tools_call_hash",
@@ -11813,6 +11830,16 @@ function verifyLeaseRunIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
     const expectedToolsListHash = hashJson({ requestHash: listCall.requestHash, responseHash: listCall.responseHash });
     const expectedToolsCallHash = hashJson({ requestHash: toolCall.requestHash, responseHash: toolCall.responseHash });
     const expectedOutputHash = hashJson(toolCall.response);
+    const toolCallParams = jsonRecord(toolCall.request.params);
+    const toolCallArguments = jsonRecord(toolCallParams.arguments);
+    const consumedArtifactPayloadHash =
+      "artifactPayload" in toolCallArguments ? hashJson(toolCallArguments.artifactPayload) : null;
+    if (toolCallArguments.artifactPayloadHash !== row.consumed_artifact_payload_hash) {
+      errors.push(`succeeded lease run ${leaseRunId} tools/call artifactPayloadHash does not match lease run row`);
+    }
+    if (!consumedArtifactPayloadHash || consumedArtifactPayloadHash !== row.consumed_artifact_payload_hash) {
+      errors.push(`succeeded lease run ${leaseRunId} tools/call artifactPayload hash does not match consumed_artifact_payload_hash`);
+    }
     const expectedTranscriptHash = hashJson({
       format: "mcp-json-rpc",
       sessionId,
@@ -11829,6 +11856,7 @@ function verifyLeaseRunIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
       spendId: row.spend_id,
       payer: row.payer,
       artifactHash: row.artifact_hash,
+      consumedArtifactPayloadHash: row.consumed_artifact_payload_hash,
       targetRepo: row.target_repo,
       targetCommit: row.target_commit,
       settlementEventId: row.settlement_event_id,
@@ -11857,6 +11885,7 @@ function verifyLeaseRunIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
       ["spendId", row.spend_id],
       ["payer", row.payer],
       ["artifactHash", row.artifact_hash],
+      ["consumedArtifactPayloadHash", row.consumed_artifact_payload_hash],
       ["targetRepo", row.target_repo],
       ["targetCommit", row.target_commit],
       ["settlementEventId", row.settlement_event_id],

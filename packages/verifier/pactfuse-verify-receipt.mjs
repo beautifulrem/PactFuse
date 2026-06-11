@@ -15,7 +15,17 @@ const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 const MOCK_QUOTE_STATUS = "mocked_after_preflight_not_chain_settleable";
 const CHAIN_SETTLEABLE_QUOTE_STATUS = "chain_settleable_after_preflight";
 const BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
-const REQUIRED_LEASE_TOOL_ARGUMENTS = ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"];
+const REQUIRED_LEASE_TOOL_ARGUMENTS = [
+  "sessionId",
+  "leaseRunId",
+  "spendId",
+  "payer",
+  "artifactHash",
+  "artifactPayloadHash",
+  "artifactPayload",
+  "targetRepo",
+  "targetCommit",
+];
 const SERVER_RUNTIME_PROOF_PROVIDER_TOKENS = new WeakSet();
 const CAW_POLICY_CHAIN_KEYS = ["chain_ids", "chainIds", "allowed_chain_ids", "allowedChainIds", "chains"];
 const CAW_POLICY_CONTRACT_KEYS = [
@@ -965,6 +975,7 @@ function verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors) {
     spendId: lease.spendId,
     payer: lease.payer,
     artifactHash: lease.artifactHash,
+    artifactPayloadHash: lease.consumedArtifactPayloadHash,
     targetRepo: lease.targetRepo,
     targetCommit: lease.targetCommit,
   };
@@ -972,6 +983,10 @@ function verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors) {
     if (argumentsObject[field] !== expected) {
       errors.push(`succeeded lease run ${lease.leaseRunId} tools/call argument ${field} does not match lease run`);
     }
+  }
+  const argumentPayloadHash = safeHashJson(argumentsObject.artifactPayload, `lease run ${lease.leaseRunId} tools/call artifactPayload`, errors);
+  if (argumentPayloadHash && lowerHex(lease.consumedArtifactPayloadHash) !== argumentPayloadHash) {
+    errors.push(`succeeded lease run ${lease.leaseRunId} tools/call artifactPayload hash does not match consumedArtifactPayloadHash`);
   }
   return manifestBinding;
 }
@@ -994,7 +1009,17 @@ function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
     if (lease.status !== "succeeded_live_mcp_transcript") {
       continue;
     }
-    for (const field of ["leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit", "settlementEventId", "artifactTokenId"]) {
+    for (const field of [
+      "leaseRunId",
+      "spendId",
+      "payer",
+      "artifactHash",
+      "consumedArtifactPayloadHash",
+      "targetRepo",
+      "targetCommit",
+      "settlementEventId",
+      "artifactTokenId",
+    ]) {
       requirePath(lease, [field], errors);
     }
     const spend = spendsById.get(lowerHex(lease.spendId));
@@ -1081,7 +1106,11 @@ function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
     const token = artifactTokensById.get(lease.artifactTokenId);
     if (!token) {
       errors.push(`succeeded lease run ${lease.leaseRunId} references missing artifact token`);
-    } else if (token.spendId !== lease.spendId || lowerHex(token.artifactHash) !== lowerHex(lease.artifactHash)) {
+    } else if (
+      token.spendId !== lease.spendId ||
+      lowerHex(token.artifactHash) !== lowerHex(lease.artifactHash) ||
+      lowerHex(token.artifactPayloadHash) !== lowerHex(lease.consumedArtifactPayloadHash)
+    ) {
       errors.push(`succeeded lease run ${lease.leaseRunId} does not match referenced artifact token`);
     }
     const expectedLeaseRunHash = safeHashJson(
@@ -1091,6 +1120,7 @@ function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
         spendId: lease.spendId,
         payer: lease.payer,
         artifactHash: lowerHex(lease.artifactHash),
+        consumedArtifactPayloadHash: lowerHex(lease.consumedArtifactPayloadHash),
         targetRepo: lease.targetRepo,
         targetCommit: lease.targetCommit,
         settlementEventId: lease.settlementEventId,
@@ -1114,6 +1144,7 @@ function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
         "spendId",
         "payer",
         "artifactHash",
+        "consumedArtifactPayloadHash",
         "targetRepo",
         "targetCommit",
         "settlementEventId",

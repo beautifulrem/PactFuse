@@ -729,6 +729,7 @@ export const LeaseRunViewSchema = z
     spendId: Hex32Schema,
     payer: HexSchema.nullable(),
     artifactHash: Hex32Schema.nullable(),
+    consumedArtifactPayloadHash: Hex32Schema.nullable(),
     targetRepo: z.string().min(1).max(500),
     targetCommit: z.string().min(6).max(128),
     status: z.enum(["blocked_missing_runner_execution", "blocked_mcp_execution_failed", "succeeded_live_mcp_transcript"]),

@@ -721,6 +721,14 @@ describe("pactfuse receipt verifier contract", () => {
 	      },
 	      "tools/call argument targetCommit does not match lease run",
 	    ],
+    [
+      "self-consistent MCP artifact payload consumption",
+      (bundle) => {
+        bundle.mcpAdapterCalls[1].request.params.arguments.artifactPayload = { tampered: true };
+        rehashLeaseTranscriptForTest(bundle);
+      },
+      "tools/call artifactPayload hash does not match consumedArtifactPayloadHash",
+    ],
 	    [
 	      "pinned source manifest tools",
 	      (bundle) => {
@@ -2190,6 +2198,8 @@ function replayBundleWithLease() {
   const auditPrefix = leaseRunId.slice(2, 22);
   const pinnedTool = leaseToolDefinitionForTest();
   const sourceHash = hex32("source");
+  const consumedArtifactPayloadHash = bundle.artifactAccessTokens[0].artifactPayloadHash;
+  const consumedArtifactPayload = bundle.artifactAccessTokens[0].artifactPayload;
   const listRequest = { jsonrpc: "2.0", id: "lease-tools-list", method: "tools/list", params: {} };
   const listResponse = {
     jsonrpc: "2.0",
@@ -2208,6 +2218,8 @@ function replayBundleWithLease() {
         spendId: bundle.artifactAccessTokens[0].spendId,
         payer: bundle.artifactAccessTokens[0].payer,
         artifactHash: bundle.artifactAccessTokens[0].artifactHash,
+        artifactPayloadHash: consumedArtifactPayloadHash,
+        artifactPayload: consumedArtifactPayload,
         targetRepo: "https://github.com/example/target",
         targetCommit: "abcdef123456",
       },
@@ -2299,6 +2311,7 @@ function replayBundleWithLease() {
     spendId: bundle.artifactAccessTokens[0].spendId,
     payer: bundle.artifactAccessTokens[0].payer,
     artifactHash: bundle.artifactAccessTokens[0].artifactHash,
+    consumedArtifactPayloadHash,
     targetRepo: "https://github.com/example/target",
     targetCommit: "abcdef123456",
     status: "succeeded_live_mcp_transcript",
@@ -2318,6 +2331,7 @@ function replayBundleWithLease() {
     spendId: leaseRun.spendId,
     payer: leaseRun.payer,
     artifactHash: leaseRun.artifactHash,
+    consumedArtifactPayloadHash: leaseRun.consumedArtifactPayloadHash,
     targetRepo: leaseRun.targetRepo,
     targetCommit: leaseRun.targetCommit,
     settlementEventId: leaseRun.settlementEventId,
@@ -2335,6 +2349,7 @@ function replayBundleWithLease() {
       spendId: leaseRun.spendId,
       payer: leaseRun.payer,
       artifactHash: leaseRun.artifactHash,
+      consumedArtifactPayloadHash: leaseRun.consumedArtifactPayloadHash,
       targetRepo: leaseRun.targetRepo,
       targetCommit: leaseRun.targetCommit,
       settlementEventId: leaseRun.settlementEventId,
@@ -2665,9 +2680,9 @@ function defaultSourceCapabilityForTest(toolName = "pactfuse_code_scan") {
 
 function leaseToolDefinitionForTest(name = "pactfuse_code_scan") {
   const properties = Object.fromEntries(
-    ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"].map((field) => [
+    ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "artifactPayloadHash", "artifactPayload", "targetRepo", "targetCommit"].map((field) => [
       field,
-      { type: "string" },
+      field === "artifactPayload" ? { type: "object" } : { type: "string" },
     ]),
   );
   return {
@@ -2947,6 +2962,7 @@ function rehashLeaseTranscriptForTest(bundle, boundedToPinnedManifest = true) {
     spendId: leaseRun.spendId,
     payer: leaseRun.payer,
     artifactHash: leaseRun.artifactHash,
+    consumedArtifactPayloadHash: leaseRun.consumedArtifactPayloadHash,
     targetRepo: leaseRun.targetRepo,
     targetCommit: leaseRun.targetCommit,
     settlementEventId: leaseRun.settlementEventId,
@@ -2961,6 +2977,7 @@ function rehashLeaseTranscriptForTest(bundle, boundedToPinnedManifest = true) {
   event.payload.toolsCallHash = leaseRun.toolsCallHash;
   event.payload.outputHash = leaseRun.outputHash;
   event.payload.leaseRunHash = leaseRun.leaseRunHash;
+  event.payload.consumedArtifactPayloadHash = leaseRun.consumedArtifactPayloadHash;
   event.payload.pinnedManifestToolsHash = manifestBinding.pinnedManifestToolsHash;
   event.payload.pinnedManifestHashes = manifestBinding.manifestHashes;
   event.payload.manifestBindingHash = manifestBinding.manifestBindingHash;

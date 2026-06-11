@@ -1478,6 +1478,7 @@ describe("pactfuse-api P0", () => {
       "leaseRunId",
       "bearerBound",
       "artifactHash",
+      "consumedArtifactPayloadHash",
       "transcriptHash",
       "leaseRunHash",
       "boundedToPinnedManifest",
@@ -5927,6 +5928,7 @@ describe("pactfuse-api P0", () => {
         spendId,
         payer,
         artifactHash,
+        consumedArtifactPayloadHash: issued.json.data.artifactPayloadHash,
         bearerBound: true,
         status: "blocked_missing_runner_execution",
         winnerClaimAllowed: false,
@@ -6076,6 +6078,12 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(replayJson.data.mcpAdapterCalls).toHaveLength(2);
+    expect(replayJson.data.mcpAdapterCalls[1].request.params.arguments).toEqual(
+      expect.objectContaining({
+        artifactPayloadHash: issued.json.data.artifactPayloadHash,
+        artifactPayload: quoted.artifactPayload,
+      }),
+    );
     expect(replayJson.data.sources).toEqual([
       expect.objectContaining({
         sourceId: "clean-source",
@@ -6111,11 +6119,13 @@ describe("pactfuse-api P0", () => {
         status: "succeeded_live_mcp_transcript",
         transcriptHash: lease.json.data.transcriptHash,
         leaseRunHash: lease.json.data.leaseRunHash,
+        consumedArtifactPayloadHash: issued.json.data.artifactPayloadHash,
       }),
     ]);
     expect(leaseEvent.payload).toEqual(
       expect.objectContaining({
         leaseRunId: lease.json.data.leaseRunId,
+        consumedArtifactPayloadHash: issued.json.data.artifactPayloadHash,
         transcriptHash: lease.json.data.transcriptHash,
         leaseRunHash: lease.json.data.leaseRunHash,
         boundedToPinnedManifest: true,
@@ -6184,10 +6194,12 @@ describe("pactfuse-api P0", () => {
     const pinnedTool = leaseToolDefinitionForTest();
     const leaseInsert = ctx.db.sqlite.prepare(
       `INSERT INTO lease_runs
-        (lease_run_id, session_id, spend_id, payer, artifact_hash, target_repo, target_commit, status, transcript_hash,
+        (lease_run_id, session_id, spend_id, payer, artifact_hash, consumed_artifact_payload_hash, target_repo, target_commit, status, transcript_hash,
          tools_list_hash, tools_call_hash, output_hash, lease_run_hash, settlement_event_id, artifact_token_id, completed_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'succeeded_live_mcp_transcript', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'succeeded_live_mcp_transcript', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
+    const consumedArtifactPayloadHash = artifactHash;
+    const consumedArtifactPayload = TEST_ARTIFACT_PAYLOAD;
 
     for (let index = 0; index < 100; index += 1) {
       const leaseRunId = hex32(`lease-boundary-run-${index}`);
@@ -6208,6 +6220,8 @@ describe("pactfuse-api P0", () => {
             spendId,
             payer,
             artifactHash,
+            artifactPayloadHash: consumedArtifactPayloadHash,
+            artifactPayload: consumedArtifactPayload,
             targetRepo,
             targetCommit,
           },
@@ -6261,6 +6275,7 @@ describe("pactfuse-api P0", () => {
         spendId,
         payer,
         artifactHash,
+        consumedArtifactPayloadHash,
         targetRepo,
         targetCommit,
         settlementEventId,
@@ -6275,6 +6290,7 @@ describe("pactfuse-api P0", () => {
         spendId,
         payer,
         artifactHash,
+        consumedArtifactPayloadHash,
         targetRepo,
         targetCommit,
         transcriptHash,
@@ -9308,6 +9324,8 @@ function createFakeMcpLeaseClient(toolName = "pactfuse_code_scan", mode: "fixtur
             spendId: input.spendId,
             payer: input.payer,
             artifactHash: input.artifactHash,
+            artifactPayloadHash: input.artifactPayloadHash,
+            artifactPayload: input.artifactPayload,
             targetRepo: input.targetRepo,
             targetCommit: input.targetCommit,
           },
@@ -9342,9 +9360,9 @@ function createFakeMcpLeaseClient(toolName = "pactfuse_code_scan", mode: "fixtur
 
 function leaseToolDefinitionForTest(name = "pactfuse_code_scan"): Record<string, unknown> {
   const properties = Object.fromEntries(
-    ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"].map((field) => [
+    ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "artifactPayloadHash", "artifactPayload", "targetRepo", "targetCommit"].map((field) => [
       field,
-      { type: "string" },
+      field === "artifactPayload" ? { type: "object" } : { type: "string" },
     ]),
   );
   return {

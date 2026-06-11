@@ -44,7 +44,7 @@ The reusable primitive is small: PactFuse Guard Kit — a ten-line `SourceFreshG
 - Do not claim the quote was safe unless artifact preflight and price/source disclosure are live.
 - Do not claim a proof chip if the matching Judge Check row is not `pass`.
 - Do not claim a CAW proof chip from hand-entered receipts; require raw CAW ingest.
-- Do not say "agent used what it bought" without a raw MCP Agent Transcript.
+- Do not say "agent used what it bought" without a raw MCP Agent Transcript that includes the consumed artifact payload hash.
 - Do not use a team-owned target repo as an external-workflow proof chip.
 - Do not show speculative loss-prevented numbers; show only observed blocked spend amount and denied capability delta.
 - Do not present `TARGET_*` candidate values as current public modes.

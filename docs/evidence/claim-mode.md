@@ -68,7 +68,7 @@ W1 default order: attempt `p0-win-separate-identities` (separate CAW wallets/ide
 ## Lease Execution Rules (W1)
 
 - Lease-execution evidence (Beat 4): `/api/lease/execute` output on the pinned target repo + recomputed `leaseRunHash`, Bearer-bound to `(sessionId, spendId, payer, artifactHash)`.
-- W3 "agent used what it bought" copy also requires raw MCP Agent Transcript hashes for `tools/list` and `tools/call`, bounded to the pinned manifest.
+- W3 "agent used what it bought" copy also requires raw MCP Agent Transcript hashes for `tools/list` and `tools/call`, `consumedArtifactPayloadHash` matching the verified artifact access token, and a transcript bounded to the pinned manifest.
 - The external-workflow chip requires an independent public target repo/commit. Team-owned targets must be labeled and cannot support that chip.
 - If missing: UI pane and pitch must say `lease-execution-pending`; no "the agent used what it bought" claim.
 - Lease execution is required for the full Economy-track demo story but does not gate `WINNER_CLAIM_ALLOWED` on the payment path itself.
