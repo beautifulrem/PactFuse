@@ -2473,6 +2473,163 @@ function verifyReplayEvents(bundle, events, errors) {
   }
 }
 
+function replayProviderReady(options, name) {
+  const providers = Array.isArray(options.proofProviders) ? options.proofProviders : [];
+  return providers.some((provider) => provider?.name === name && provider.ready === true && provider.mode === "live");
+}
+
+function latestReplayEvent(eventsById, kind, predicate = () => true) {
+  return [...eventsById.values()]
+    .filter((event) => isObject(event) && event.kind === kind && predicate(event))
+    .sort((a, b) => (Number(a.eventSeq) || 0) - (Number(b.eventSeq) || 0))
+    .at(-1);
+}
+
+function replayRowsForCollection(bundle, collection) {
+  const pages = bundle?.replayPages?.[collection];
+  if (!Array.isArray(pages)) {
+    return Array.isArray(bundle?.[collection]) ? bundle[collection] : [];
+  }
+  return pages.flatMap((page) => (Array.isArray(page?.rows) ? page.rows : []));
+}
+
+function replayEventsByIdForFinalGate(bundle, summaryEventsById) {
+  const rows = replayRowsForCollection(bundle, "events");
+  if (rows.length === 0) {
+    return summaryEventsById;
+  }
+  return new Map(rows.filter((event) => isObject(event) && typeof event.eventId === "string").map((event) => [event.eventId, event]));
+}
+
+function replayEventHasProofAuthority(event, winnerClaimAllowed = false) {
+  const payload = isObject(event?.payload) ? event.payload : {};
+  return event?.authority === "proof" && payload.proofAuthority === true && payload.winnerClaimAllowed === winnerClaimAllowed;
+}
+
+function replayGateFinalized(event) {
+  const payload = isObject(event?.payload) ? event.payload : {};
+  return replayEventHasProofAuthority(event, false) && payload.finalityStatus === "finalized" && payload.contractStateVerified === true;
+}
+
+function replayWrongTargetDenyPayload(payload) {
+  const operationKind = asText(payload.operationKind).toLowerCase();
+  const action = asText(payload.action).toLowerCase();
+  return operationKind === "deny_probe" || action.includes("wrong") || action.includes("bypass") || action.includes("deny_probe");
+}
+
+function replayJudgeRowsById(bundle) {
+  return new Map((Array.isArray(bundle.judgeCheck?.rows) ? bundle.judgeCheck.rows : []).filter(isObject).map((row) => [row.rowId, row]));
+}
+
+function replayJudgeRowPasses(rowsById, rowId, allowedAuthorities) {
+  const row = rowsById.get(rowId);
+  return row?.status === "pass" && allowedAuthorities.has(row.authority) && typeof row.evidenceEventId === "string";
+}
+
+function verifyFinalReplayClaimGate(bundle, eventsById, options) {
+  const blockers = [];
+  for (const name of ["chain", "caw", "caw_live", "mcp_lease"]) {
+    if (!replayProviderReady(options, name)) {
+      blockers.push(`final verifier requires live ${name} proof provider`);
+    }
+  }
+
+  const rowsById = replayJudgeRowsById(bundle);
+  const finalEvents = [...eventsById.values()];
+  if (finalEvents.some((event) => event.kind === "reorg.invalidated")) {
+    blockers.push("final verifier refuses replay bundles containing reorg.invalidated events");
+  }
+  if (finalEvents.some((event) => event.kind === "caw.receipt.ingested.fixture")) {
+    blockers.push("final verifier refuses fixture CAW receipt evidence");
+  }
+
+  const proofRows = ["caw_boundary", "source_challenge", "ab_trip", "c_settlement"];
+  const deliveryRows = ["artifact_access", "lease_execution"];
+  for (const rowId of proofRows) {
+    if (!replayJudgeRowPasses(rowsById, rowId, new Set(["proof"]))) {
+      blockers.push(`final verifier requires Judge Check row ${rowId} to pass with proof authority`);
+    }
+  }
+  for (const rowId of deliveryRows) {
+    if (!replayJudgeRowPasses(rowsById, rowId, new Set(["delivery", "proof"]))) {
+      blockers.push(`final verifier requires Judge Check row ${rowId} to pass with delivery or proof authority`);
+    }
+  }
+
+  const cawIdentityProbe = latestReplayEvent(eventsById, "caw.identity.probed", (event) => {
+    const payload = isObject(event.payload) ? event.payload : {};
+    return (
+      event.authority === "proof" &&
+      payload.mode === "real" &&
+      payload.pass === true &&
+      payload.proofAuthority === true &&
+      payload.winnerClaimAllowed === true &&
+      typeof payload.walletId === "string" &&
+      typeof payload.walletAddress === "string"
+    );
+  });
+  if (!cawIdentityProbe) {
+    blockers.push(
+      "final verifier requires caw.identity.probed with mode=real, pass=true, walletAddress, proofAuthority=true, and winnerClaimAllowed=true",
+    );
+  }
+
+  const cawWrongTargetDeny = latestReplayEvent(eventsById, "caw.live.audit.usage.verified", (event) => {
+    const payload = isObject(event.payload) ? event.payload : {};
+    return replayEventHasProofAuthority(event, false) && payload.result === "denied" && replayWrongTargetDenyPayload(payload);
+  });
+  if (!cawWrongTargetDeny) {
+    blockers.push("final verifier requires denied caw.live.audit.usage.verified wrong-target proof");
+  }
+
+  if (!latestReplayEvent(eventsById, "caw.allowance.verified", (event) => replayEventHasProofAuthority(event, false))) {
+    blockers.push("final verifier requires caw.allowance.verified proof event");
+  }
+  if (!latestReplayEvent(eventsById, "caw.activation.verified", (event) => replayEventHasProofAuthority(event, false))) {
+    blockers.push("final verifier requires caw.activation.verified proof event");
+  }
+  if (!latestReplayEvent(eventsById, "gate.spend_tripped", replayGateFinalized)) {
+    blockers.push("final verifier requires finalized gate.spend_tripped proof event");
+  }
+  if (!latestReplayEvent(eventsById, "gate.spend_settled", replayGateFinalized)) {
+    blockers.push("final verifier requires finalized gate.spend_settled proof event");
+  }
+  if (!latestReplayEvent(eventsById, "source.challenge.confirmed", replayGateFinalized)) {
+    blockers.push("final verifier requires finalized source.challenge.confirmed proof event");
+  }
+  if (!latestReplayEvent(eventsById, "token.balance_delta.verified", (event) => replayEventHasProofAuthority(event, false))) {
+    blockers.push("final verifier requires token.balance_delta.verified proof event");
+  }
+  if (!latestReplayEvent(eventsById, "artifact.access_token.issued", (event) => event.authority === "delivery")) {
+    blockers.push("final verifier requires artifact.access_token.issued delivery event");
+  }
+  const leaseSucceeded = latestReplayEvent(eventsById, "lease.execution.succeeded", (event) => {
+    const payload = isObject(event.payload) ? event.payload : {};
+    return (
+      event.authority === "delivery" &&
+      payload.status === "succeeded_live_mcp_transcript" &&
+      payload.boundedToPinnedManifest === true &&
+      payload.bearerBound === true &&
+      payload.winnerClaimAllowed === false
+    );
+  });
+  if (!leaseSucceeded) {
+    blockers.push("final verifier requires bearer-bound lease.execution.succeeded with a pinned MCP transcript");
+  }
+
+  const quotes = Array.isArray(bundle.quotes) ? bundle.quotes : [];
+  if (quotes.length === 0) {
+    blockers.push("final verifier requires at least one artifact quote bound to the payment");
+  } else if (quotes.some((quote) => quote?.status === "mocked_after_preflight_not_chain_settleable")) {
+    blockers.push("final verifier refuses mocked_after_preflight_not_chain_settleable quotes");
+  }
+
+  if (bundle.winnerClaimAllowed === true && blockers.length > 0) {
+    blockers.push("replay bundle requested winnerClaimAllowed=true before every final verifier gate passed");
+  }
+  return blockers;
+}
+
 function verifyReplayBundleEvidence(bundle, options = {}) {
   const errors = [];
   const warnings = [];
@@ -2518,8 +2675,9 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   if (!Number.isInteger(bundle.asOfMcpAdapterCallCount) || bundle.asOfMcpAdapterCallCount < 0 || bundle.asOfMcpAdapterCallCount > 200) {
     errors.push("asOfMcpAdapterCallCount must be an integer in [0,200]");
   }
-  if (bundle.winnerClaimAllowed !== false) {
-    errors.push("replay bundle winnerClaimAllowed must be false unless the final verifier is complete");
+  const requestedWinnerClaimAllowed = bundle.winnerClaimAllowed === true;
+  if (bundle.winnerClaimAllowed !== false && bundle.winnerClaimAllowed !== true) {
+    errors.push("replay bundle winnerClaimAllowed must be boolean");
   }
   verifyReplayPageIndex(bundle, errors, warnings);
   let eventsById = new Map();
@@ -2746,24 +2904,28 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
       errors.push(`canonical CAW allow receipt ${canonicalReceiptHash ?? "-"} requires txHash`);
     }
   }
-  errors.push(
-    "current replay verifier preflight is structural-only; final chain, signature, CAW policy authority, tx/log, and Judge Check recomputation is incomplete",
-  );
+  const schemaErrors = [...errors];
+  const finalEventsById = replayEventsByIdForFinalGate(bundle, eventsById);
+  const proofCompletenessErrors = schemaErrors.length === 0 ? verifyFinalReplayClaimGate(bundle, finalEventsById, options) : [];
+  const finalVerifierComplete = options.cliMode !== "schema-only" && schemaErrors.length === 0 && proofCompletenessErrors.length === 0;
+  const proofChipAllowed = finalVerifierComplete;
+  const winnerClaimAllowed = finalVerifierComplete && requestedWinnerClaimAllowed;
+  const allErrors = [...schemaErrors, ...proofCompletenessErrors];
   return {
-    schemaOk: errors.length === 1,
-    proofChipAllowed: false,
-    winnerClaimAllowed: false,
-    requestedWinnerClaimAllowed: bundle.winnerClaimAllowed === true,
-    finalVerifierComplete: false,
+    schemaOk: schemaErrors.length === 0,
+    proofChipAllowed,
+    winnerClaimAllowed,
+    requestedWinnerClaimAllowed,
+    finalVerifierComplete,
     file: options.file ?? null,
     cliMode: options.cliMode ?? null,
     paymentProofMode: null,
     warnings,
-    schemaErrors: errors.filter((error) => !error.startsWith("current replay verifier preflight")),
-    proofCompletenessErrors: errors.filter((error) => error.startsWith("current replay verifier preflight")),
-    proofChipErrors: errors,
+    schemaErrors,
+    proofCompletenessErrors,
+    proofChipErrors: allErrors,
     winnerClaimErrors: [],
-    errors,
+    errors: allErrors,
   };
 }
 

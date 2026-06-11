@@ -53,7 +53,7 @@ Purpose: keep implementation aligned with the proof gates. This checklist is not
    - `/api/evidence/judge-check` returns pass/fail rows backed by raw evidence links; no row can pass from prose-only evidence.
    - Reuse `verifyEvidence(input, chainClient)` from `packages/verifier/pactfuse-verify-receipt.mjs` in both CLI and `/api/evidence/verify`.
    - Use `--schema-only` only for structural preflight; default CLI mode must fail closed unless `proofChipAllowed: true`.
-   - Upgrade the verifier or pair it with the app verifier before any winner claim; current `schemaOk` is structural only and the scaffold keeps `finalVerifierComplete: false`.
+   - Keep winner claims blocked unless the replay verifier reports no `proofCompletenessErrors` and the app verifier accepts the same evidence snapshot.
    - Implement one paid-but-undelivered negative path: either `QuoteVoided` before settlement or `ArtifactRefunded` after settlement.
 
 7. Fusebox UI (W5/W6 surface)

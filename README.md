@@ -232,7 +232,7 @@ Expected behavior:
 
 - `--schema-only` accepts the pending structure.
 - full verifier mode rejects it because the example is pending, not final proof.
-- `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` remain `false`.
+- `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` remain `false` until every final replay gate passes.
 
 The replay verifier checks:
 
@@ -243,6 +243,7 @@ The replay verifier checks:
 - bearer-bound artifact access proofs
 - MCP request/response hashes
 - exact pinned-manifest lease transcript boundaries
+- final replay blockers for live proof providers, CAW identity, wrong-target deny, live quote status, token settlement, Judge Check, and lease execution
 - paged replay roots plus embedded page bodies for large evidence collections
 - Judge Check row references
 

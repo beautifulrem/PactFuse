@@ -3986,23 +3986,29 @@ async function buildVerifierRunView(
     ...verifyReplayBundleBindings(ctx, sessionId, payload),
   ];
   const rawErrors = toStringArray(raw.errors);
+  const schemaOk = Boolean(raw.schemaOk) && eventLogErrors.length === 0;
+  const finalVerifierComplete = schemaOk && Boolean(raw.finalVerifierComplete);
+  const proofChipAllowed = finalVerifierComplete && Boolean(raw.proofChipAllowed);
+  const winnerClaimAllowed = proofChipAllowed && Boolean(raw.winnerClaimAllowed);
   const view = VerifierRunViewSchema.parse({
     sessionId,
-    proofLevel: payload.schemaOnly ? "schema_only_no_claim" : "fail_closed_no_claim",
+    proofLevel: payload.schemaOnly ? "schema_only_no_claim" : finalVerifierComplete ? "final_replay_claim" : "fail_closed_no_claim",
     claimMode: ctx.config.claimMode,
     paymentMode: ctx.config.paymentMode,
     tokenMode: ctx.config.tokenMode,
     identityMode: ctx.config.identityMode,
-    schemaOk: Boolean(raw.schemaOk) && eventLogErrors.length === 0,
-    proofChipAllowed: false,
-    winnerClaimAllowed: false,
+    schemaOk,
+    proofChipAllowed,
+    winnerClaimAllowed,
     requestedWinnerClaimAllowed: Boolean(raw.requestedWinnerClaimAllowed),
-    finalVerifierComplete: false,
+    finalVerifierComplete,
     errors: [...rawErrors, ...eventLogErrors],
     warnings: [
       ...toStringArray(raw.warnings),
       ...proofProviderWarnings(proofProviders),
-      "P0 route wraps the structural verifier fail-closed; final chain/signature/hash verifier is incomplete",
+      ...(finalVerifierComplete
+        ? []
+        : ["P0 route wraps the replay verifier fail-closed until final proof completeness gates pass"]),
     ],
     raw: jsonRecord({ ...raw, proofProviders, pactTemplates: ctx.templates.list() }),
   });
@@ -4034,12 +4040,14 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
       event.kind === "caw.live.audit.usage.verified" &&
       event.authority === "proof" &&
       payload.result === "denied" &&
-      payload.proofAuthority === true
+      payload.proofAuthority === true &&
+      isWrongTargetDenyPayload(payload)
     );
   });
   const cawAllowance = latestKind("caw.allowance.verified");
   const cawActivation = latestKind("caw.activation.verified");
   const tokenDelta = latestKind("token.balance_delta.verified");
+  const liveArtifactQuote = hasLiveArtifactQuote(replayBundle);
   const gates = [
     providerGate(proofProviders, "chain", ["paymentMode", "tokenMode", "winnerClaimAllowed"]),
     providerGate(proofProviders, "caw_live", ["claimMode", "paymentMode", "identityMode", "winnerClaimAllowed"]),
@@ -4084,6 +4092,15 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
     judgeGate(rowsById, "source_challenge", ["claimMode", "winnerClaimAllowed"]),
     judgeGate(rowsById, "ab_trip", ["claimMode", "winnerClaimAllowed"]),
     judgeGate(rowsById, "c_settlement", ["paymentMode", "tokenMode", "winnerClaimAllowed"]),
+    verifierGate(
+      "artifact_quote_live",
+      "Live artifact quote",
+      liveArtifactQuote,
+      ["paymentMode", "winnerClaimAllowed"],
+      liveArtifactQuote
+        ? "artifact quote is chain-settleable"
+        : "artifact quote is still mocked_after_preflight_not_chain_settleable",
+    ),
     eventGate(
       "token_balance_delta",
       "Token balance delta",
@@ -4120,7 +4137,8 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
     gatePassed("caw_allowance_proof") &&
     gatePassed("caw_activation_proof") &&
     ["caw_boundary", "source_challenge", "ab_trip"].every((id) => rowsById.get(id)?.status === "pass");
-  const gatePaidReady = cawTargetReady && gatePassed("token_balance_delta") && rowsById.get("c_settlement")?.status === "pass";
+  const gatePaidReady =
+    cawTargetReady && gatePassed("artifact_quote_live") && gatePassed("token_balance_delta") && rowsById.get("c_settlement")?.status === "pass";
   const tokenMode = tokenTargetMode(tokenDelta);
   const targetIdentityMode = cawIdentityProbe ? identityTargetMode(cawIdentityProbe) : null;
   const winnerClaimAllowed = gates.every((gate) => gate.status === "pass");
@@ -4213,6 +4231,23 @@ function verifierGate(gateId: string, label: string, pass: boolean, blocks: Clai
   };
 }
 
+function isWrongTargetDenyPayload(payload: Record<string, unknown>): boolean {
+  const operationKind = String(payload.operationKind ?? "").toLowerCase();
+  const action = String(payload.action ?? "").toLowerCase();
+  return operationKind === "deny_probe" || action.includes("wrong") || action.includes("bypass") || action.includes("deny_probe");
+}
+
+function hasLiveArtifactQuote(replayBundle: unknown): boolean {
+  const quotes = Array.isArray((replayBundle as { quotes?: unknown })?.quotes) ? (replayBundle as { quotes: unknown[] }).quotes : [];
+  return quotes.some((quote) => {
+    if (!quote || typeof quote !== "object" || Array.isArray(quote)) {
+      return false;
+    }
+    const status = String((quote as { status?: unknown }).status ?? "").toLowerCase();
+    return status.length > 0 && !status.includes("mocked") && !status.includes("not_chain_settleable");
+  });
+}
+
 function tokenTargetMode(event: EvidenceEvent | null): "official-testnet-usdc" | "mock-test-token" | null {
   if (!event) {
     return null;
@@ -4257,6 +4292,9 @@ function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: C
     }
     if (gate.gateId === "token_balance_delta") {
       inputs.add("public ERC20 token tx/log/balance evidence for the finalized settlement");
+    }
+    if (gate.gateId === "artifact_quote_live") {
+      inputs.add("chain-settleable artifact quote issued after preflight");
     }
     if (gate.gateId === "final_verifier_complete" || gate.gateId === "proof_chip_allowed") {
       inputs.add("full chain/signature/hash verifier that can set finalVerifierComplete=true");

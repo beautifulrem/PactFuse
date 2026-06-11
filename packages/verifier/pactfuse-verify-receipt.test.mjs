@@ -15,6 +15,15 @@ const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a116
 const ERC20_APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 
+function liveProofProvidersForTest() {
+  return ["chain", "caw", "caw_live", "mcp_lease"].map((name) => ({
+    name,
+    mode: "live",
+    ready: true,
+    reason: "test live provider",
+  }));
+}
+
 describe("pactfuse receipt verifier contract", () => {
   it("keeps schema-only separate from proof-chip authority", () => {
     const receipt = pendingReceipt();
@@ -69,10 +78,23 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.schemaOk).toBe(true);
     expect(result.proofChipAllowed).toBe(false);
     expect(result.finalVerifierComplete).toBe(false);
-    expect(result.errors).toContain(
-      "current replay verifier preflight is structural-only; final chain, signature, CAW policy authority, tx/log, and Judge Check recomputation is incomplete",
-    );
+    expect(result.proofCompletenessErrors).toContain("final verifier requires live chain proof provider");
+    expect(result.proofCompletenessErrors).toContain("final verifier requires caw.identity.probed with mode=real, pass=true, walletAddress, proofAuthority=true, and winnerClaimAllowed=true");
+    expect(result.proofCompletenessErrors).toContain("final verifier refuses mocked_after_preflight_not_chain_settleable quotes");
     expect(result.schemaErrors).toEqual([]);
+  });
+
+  it("rejects replay winner claims until every final gate passes", () => {
+    const bundle = replayBundle();
+    bundle.winnerClaimAllowed = true;
+    refreshReplayPagingForTest(bundle);
+    const result = verifyEvidence(bundle, { cliMode: "proof-chip", proofProviders: liveProofProvidersForTest() });
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.requestedWinnerClaimAllowed).toBe(true);
+    expect(result.winnerClaimAllowed).toBe(false);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofCompletenessErrors).toContain("replay bundle requested winnerClaimAllowed=true before every final verifier gate passed");
   });
 
   it("rejects replay bundles missing a page beyond the summary rows", () => {
@@ -84,6 +106,29 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.schemaOk).toBe(false);
     expect(result.proofChipAllowed).toBe(false);
     expect(result.errors).toContain("replayPages.events must contain exactly 2 page(s)");
+  });
+
+  it("keeps final authority closed when a later replay page contains a reorg", () => {
+    const bundle = replayBundle();
+    addSecondReplayEventPageForTest(bundle);
+    const orderBy = replayCollectionOrderByForTest("events");
+    bundle.replayPages.events[1].rows[0] = replayEventForSeqTest(bundle.sessionId, 201, "reorg.invalidated", {
+      gateEventId: hex32("late-reorg-gate-event"),
+      invalidatedEventId: hex32("late-reorg-invalidated-event"),
+      winnerClaimAllowed: false,
+    });
+    bundle.replayPages.events[1].pageHash = replayPageHashForTest(bundle.sessionId, "events", 1, orderBy, bundle.replayPages.events[1].rows);
+    bundle.replayPageIndex.collections.events.pageHashes[1] = bundle.replayPages.events[1].pageHash;
+    bundle.replayPageIndex.collections.events.pageRoot = hashJson(bundle.replayPageIndex.collections.events.pageHashes);
+    bundle.replayPageIndex.pageRoot = hashJson(
+      Object.entries(bundle.replayPageIndex.collections).map(([name, collection]) => ({ name, pageRoot: collection.pageRoot })),
+    );
+    bundle.fullReplayRoot = bundle.replayPageIndex.pageRoot;
+    const result = verifyEvidence(bundle, { cliMode: "proof-chip", proofProviders: liveProofProvidersForTest() });
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofCompletenessErrors).toContain("final verifier refuses replay bundles containing reorg.invalidated events");
   });
 
   it("accepts replay contract state proof markers while keeping final authority closed", () => {
@@ -469,7 +514,7 @@ describe("pactfuse receipt verifier contract", () => {
 	    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
 
 	    expect(result.schemaOk).toBe(true);
-	    expect(result.errors.some((error) => error.includes("artifact"))).toBe(false);
+	    expect(result.schemaErrors.some((error) => error.includes("artifact"))).toBe(false);
 	  });
 
 	  it("accepts replay bundles with MCP lease transcript hashes while keeping proof-chip authority closed", () => {

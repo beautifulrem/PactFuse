@@ -38,7 +38,7 @@ WINNER_CLAIM_ALLOWED: false
 ## Reusable Verification
 
 - `receipt-verifier.md`: minimal P0 `pactfuse verify receipt.json` verifier spec and implementation boundary.
-- `../../packages/verifier/pactfuse-verify-receipt.mjs`: importable `verifyEvidence()` plus CLI for receipt-pack mode branches, pending markers, A/B/C proof cardinality, and gate-paid CAW allowlist shape; default mode is a proof-chip gate, `--schema-only` is structural preflight, and the scaffold reports `schemaOk`, `proofChipAllowed`, `finalVerifierComplete`, and refuses `winnerClaimAllowed: true`.
+- `../../packages/verifier/pactfuse-verify-receipt.mjs`: importable `verifyEvidence()` plus CLI for receipt-pack mode branches, pending markers, A/B/C proof cardinality, replay-page hashes, CAW allowlist shape, and final replay claim blockers; default mode is a proof-chip gate, `--schema-only` is structural preflight, and the verifier reports `schemaOk`, `proofChipAllowed`, `finalVerifierComplete`, `winnerClaimAllowed`, and `proofCompletenessErrors`.
 - `/api/v1/evidence/claim-readiness`: derives current and target public modes from live evidence gates; it is a readiness report, not a manual mode override.
 - Receipt-pack hashes must bind CAW policy receipts, CAW operations, payment proof, source proof, chain events, artifact hash, and block window into one `PACTFUSE_EVIDENCE_V1` transcript.
 - W2 receipt-pack hashes also bind `priceDisclosure`, `deliveryPreflight`, optional `leaseRunHash`, and Judge Check rows through app-level evidence records before any paid-content-unlock or "used what it bought" claim.

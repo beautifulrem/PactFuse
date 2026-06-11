@@ -86,7 +86,7 @@ Required winner inputs:
 - Agent Transcript includes raw MCP JSON-RPC `tools/list` and `tools/call` hashes, bounded to the pinned manifest, before any "agent used what it bought" chip is shown.
 - Lease target is an independent pinned public repo/commit for the external-workflow chip; team-owned target requires a visible downgrade.
 - `PACTFUSE_EVIDENCE_V1` replay bundle binds run config, raw CAW receipts, tx/log refs, source proof, artifact preflight, agent transcript, lease run, Judge Check, and verifier output under one `sessionId`.
-- Receipt pack is verified by the full chain/signature/hash verifier, not only `schemaOk`; the current local scaffold keeps `finalVerifierComplete: false`.
+- Receipt pack is verified by the full chain/signature/hash verifier, not only `schemaOk`; replay verification must have no `proofCompletenessErrors` before `finalVerifierComplete` can become true.
 - Artifact API returns full payload only with a verifier-issued Bearer token bound to `(sessionId, spendId, payer, artifactHash)`.
 - If artifact delivery fails after settlement, `ArtifactRefunded` or equivalent refund evidence is shown and paid-content-unlock is removed from the winner script.
 - `/api/evidence/judge-check` returns six rows and every public proof chip row is `pass`.
@@ -110,7 +110,7 @@ WINNER_CLAIM_ALLOWED: true
 - Do not claim `gate-paid-artifact-real` without same-wallet proof and CAW approve evidence.
 - Do not claim `permit-payment-real` without CAW `message_sign` receipts for both `GatePaymentAuthorization` and EIP-2612 Permit.
 - Do not use EIP-3009 in P0 winner copy.
-- Do not treat `packages/verifier/pactfuse-verify-receipt.mjs` as winner-grade verification while it refuses `winnerClaimAllowed: true`.
+- Do not treat `packages/verifier/pactfuse-verify-receipt.mjs` as winner-grade verification while it reports any final replay blocker or keeps `proofChipAllowed=false`.
 - Do not present source challenge as independent fraud detection; it is issuer-declared source freshness at settlement.
 - Do not show a paid-content-unlock claim if artifact delivery is missing. Use `artifact-hash-proof` only.
 - Do not show a CAW proof chip from hand-entered receipts.

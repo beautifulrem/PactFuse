@@ -613,6 +613,8 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(json.data.blockers).toContain("final_verifier_complete: current verifier still reports finalVerifierComplete=false");
+    expect(json.data.blockers).toContain("artifact_quote_live: artifact quote is still mocked_after_preflight_not_chain_settleable");
+    expect(json.data.requiredExternalInputs).toContain("chain-settleable artifact quote issued after preflight");
     expect(json.data.requiredExternalInputs).toContain("full chain/signature/hash verifier that can set finalVerifierComplete=true");
     expect(json.data.verifierRun.winnerClaimAllowed).toBe(false);
     expect(json.data.replayBundleHash).toMatch(/^0x[0-9a-f]{64}$/);
@@ -1250,15 +1252,16 @@ describe("pactfuse-api P0", () => {
       "mcp-json-rpc",
     );
     expect(json.components.schemas.AgentTranscriptResponse.oneOf[0].properties.data.properties.boundedToPinnedManifest.type).toBe("boolean");
-    expect(json.components.schemas.FailClosedProofState.properties.proofChipAllowed.const).toBe(false);
-    expect(json.components.schemas.FailClosedProofState.properties.winnerClaimAllowed.const).toBe(false);
-    expect(json.components.schemas.FailClosedProofState.properties.finalVerifierComplete.const).toBe(false);
+    expect(json.components.schemas.FailClosedProofState.properties.proofChipAllowed.type).toBe("boolean");
+    expect(json.components.schemas.FailClosedProofState.properties.winnerClaimAllowed.type).toBe("boolean");
+    expect(json.components.schemas.FailClosedProofState.properties.finalVerifierComplete.type).toBe("boolean");
     expect(json.components.schemas.FailClosedProofState.properties.proofLevel.enum).toEqual([
       "schema_only_no_claim",
       "fail_closed_no_claim",
+      "final_replay_claim",
     ]);
-    expect(json.components.schemas.FailClosedProofState.properties.claimMode.const).toBe("simulated");
-    expect(json.components.schemas.FailClosedProofState.properties.paymentMode.const).toBe("mocked");
+    expect(json.components.schemas.FailClosedProofState.properties.claimMode.enum).toContain("simulated");
+    expect(json.components.schemas.FailClosedProofState.properties.paymentMode.enum).toContain("mocked");
     expect(serialized).not.toContain('"verified"');
   });
 
