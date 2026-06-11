@@ -10,6 +10,8 @@
   "scripts": {
     "build": "turbo run build",
     "test": "turbo run test",
+    "build:contracts": "forge build",
+    "test:contracts": "forge test",
     "dev:api": "pnpm --filter @pactfuse/api dev",
     "start:api": "pnpm --filter @pactfuse/api start"
   },
