@@ -8,7 +8,8 @@ This folder separates current checked-in status from future winner-claim evidenc
 - `mock-token.json`: pending public testnet mock ERC20 deployment evidence; not real evidence yet.
 - `caw-policy-receipt.example.json`: template for normalized CAW receipt capture.
 - `receipt-pack.pending.example.json`: schema-only example only; not real evidence yet.
-- Artifact preflight / Judge Check / runner heartbeat / CAW receipt ingest / Agent Transcript / replay bundle records are not present yet; their proof rows remain pending until the app API exists.
+- Artifact preflight / Judge Check / runner heartbeat / CAW receipt ingest / Agent Transcript / replay bundle records are API-backed, but checked-in public evidence remains pending until live Cobo identity, deployed token, and external-chain receipts are captured.
+- The backend now requires `caw.allowance.verified` before `token.balance_delta.verified`: CAW live approve call evidence, approve tx receipt, ERC20 `Approval(owner=agentWallet, spender=ProcurementGate)`, and block-level `allowance` state must all match the registered spend.
 
 Current checked-in public modes stay:
 

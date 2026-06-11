@@ -32,6 +32,7 @@ const CAW_INGEST_TOKEN = "test-caw-ingest-token";
 const ZERO_HASH = `0x${"0".repeat(64)}`;
 const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
 const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const ERC20_APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 const ERC20_APPROVE_ABI = [
   {
@@ -371,6 +372,7 @@ describe("pactfuse-api P0", () => {
 
   it("fails verifier closed when a required indexer cursor is missing", async () => {
     const { app } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 105, logs: [] }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
@@ -394,6 +396,7 @@ describe("pactfuse-api P0", () => {
   it("fails verifier closed when a required indexer cursor filter does not match the initialized cursor", async () => {
     const requiredAddress = "0x9999999999999999999999999999999999999999";
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ chainId: "84532", currentBlockNumber: 201, logs: [] }),
       requiredIndexerCursors: [
         {
@@ -423,6 +426,7 @@ describe("pactfuse-api P0", () => {
 
   it("fails verifier closed when indexed cursor chain or head conflicts with the provider", async () => {
     const mismatched = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ chainId: "1", currentBlockNumber: 201, logs: [] }),
     });
     const mismatchSessionId = await createSession(mismatched.app, "sess-indexer-chain-mismatch-verify");
@@ -434,6 +438,7 @@ describe("pactfuse-api P0", () => {
     });
 
     const rollback = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ chainId: "84532", currentBlockNumber: 150, logs: [] }),
     });
     const rollbackSessionId = await createSession(rollback.app, "sess-indexer-head-rollback-verify");
@@ -479,6 +484,7 @@ describe("pactfuse-api P0", () => {
   it("treats required indexer cursor topics as lower-case canonical filters", async () => {
     const topic = hex32("required-mixed-case-topic");
     const { app } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ chainId: "84532", currentBlockNumber: 105, logs: [] }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", topics: [topic.toLowerCase()], finalityDepth: 2 }],
     });
@@ -543,7 +549,7 @@ describe("pactfuse-api P0", () => {
 
   it("keeps gate ingest and MCP audit HMAC secrets separated", async () => {
     const logs: Array<Record<string, unknown>> = [];
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-gate-secret-split");
     const spendId = await registerSpend(app, sessionId);
     const body = gateEventEnvelope(sessionId, spendId, "gate-secret-split");
@@ -979,6 +985,7 @@ describe("pactfuse-api P0", () => {
       "contractAddress",
       "selector",
       "cawRequestId",
+      "txHash",
       "pactScopedApiKeyHash",
       "requestHash",
       "responseHash",
@@ -987,6 +994,24 @@ describe("pactfuse-api P0", () => {
     ]);
     expect(json.paths["/api/v1/caw/live/contracts/call"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/CawLiveContractCallInput",
+    );
+    expect(json.paths["/api/v1/caw/live/allowances/verify"].post["x-pactfuse-proof-fields"]).toEqual([
+      "spendId",
+      "approveInteractionId",
+      "cawContractCallEventId",
+      "approveTxHash",
+      "paymentToken",
+      "owner",
+      "spender",
+      "amountAtomic",
+      "allowanceBefore",
+      "allowanceAfter",
+      "approvalRawLogHash",
+      "proofAuthority",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/caw/live/allowances/verify"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/CawAllowanceVerifyInput",
     );
     expect(json.paths["/api/v1/caw/live/contracts/call"].post.parameters).toEqual(
       expect.arrayContaining([
@@ -2144,7 +2169,7 @@ describe("pactfuse-api P0", () => {
 
   it("finalizes gate settlement only from indexed public-chain logs and records a matching proof row", async () => {
     const logs: Array<Record<string, unknown>> = [];
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-gate-finalized", { finalityDepth: 2 });
     const spendId = await registerSpend(app, sessionId);
     const observedBody = gateEventEnvelope(sessionId, spendId, "gate-finalized-observed", {
@@ -2284,6 +2309,7 @@ describe("pactfuse-api P0", () => {
     const observed = await postSignedGateEvent(gateApp, observedBody);
     const finalized = await postSignedGateEvent(gateApp, finalizedBody);
     const indexerApp = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({
         chainId: "1",
         currentBlockNumber: 101,
@@ -2306,7 +2332,7 @@ describe("pactfuse-api P0", () => {
 
   it("blocks verifier and same-log revival after a finalized gate reorg", async () => {
     const logs: Array<Record<string, unknown>> = [];
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-gate-reorg", { finalityDepth: 2 });
     const spendId = await registerSpend(app, sessionId);
     const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "gate-reorg");
@@ -2371,7 +2397,7 @@ describe("pactfuse-api P0", () => {
   it("keeps artifact reads bearer-bound and validates path parameters", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-artifact");
     const spendId = await registerSpend(app, sessionId);
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact");
@@ -2512,7 +2538,7 @@ describe("pactfuse-api P0", () => {
 
   it("rejects hand-written artifact token rows without verifier issuance evidence", async () => {
     const logs: Array<Record<string, unknown>> = [];
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-artifact-token-tamper");
     const spendId = await registerSpend(app, sessionId);
     const artifactHash = hex32("artifact-token-tamper");
@@ -2552,7 +2578,7 @@ describe("pactfuse-api P0", () => {
   it("blocks artifact access issuance when the requested artifact diverges from the quote", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-artifact-quote-mismatch");
     const spendId = await registerSpend(app, sessionId);
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact-quote-bound");
@@ -2581,7 +2607,7 @@ describe("pactfuse-api P0", () => {
   it("blocks artifact access issuance for overpriced or expired quotes", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const overpricedSessionId = await createSession(app, "sess-artifact-overpriced-quote");
     const overpricedSpendId = await registerSpend(app, overpricedSessionId);
     const overpricedPreflight = await post(app, "/api/v1/artifacts/preflight", {
@@ -2638,7 +2664,7 @@ describe("pactfuse-api P0", () => {
   it("blocks oversized artifact payloads before issuing bearer access", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-artifact-large-payload");
     const artifactPayload = { artifactType: "source-bound-code-scan-mcp-lease", content: "x".repeat(300 * 1024) };
     const artifactHash = hashForTestJson(artifactPayload);
@@ -2667,7 +2693,7 @@ describe("pactfuse-api P0", () => {
   it("keeps artifact token issuance live when replay rows exceed the summary page", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-artifact-summary-cap");
     const spendId = await registerSpend(app, sessionId);
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact-summary-cap");
@@ -2985,7 +3011,7 @@ describe("pactfuse-api P0", () => {
   it("keeps artifact access issuance and refund evidence mutually exclusive", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-refund-token-exclusive");
     const artifactPayload = artifactPayloadForTest("refund-token-artifact");
     const artifactHash = hashForTestJson(artifactPayload);
@@ -3165,6 +3191,7 @@ describe("pactfuse-api P0", () => {
   it("runs the indexer worker from configured cursors and advances startup windows without manual HTTP backfill", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 105, logs }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
@@ -3282,6 +3309,7 @@ describe("pactfuse-api P0", () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
     });
     const sessionId = await createSession(app, "sess-token-balance-delta");
@@ -3330,12 +3358,16 @@ describe("pactfuse-api P0", () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs, tokenBalances }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
     const sessionId = await createSession(app, "sess-token-delta-missing-transfer");
     const spendId = await registerSpend(app, sessionId);
     const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "token-delta-missing-transfer");
+    await verifyCawAllowanceForTest(app, logs, tokenBalances, sessionId, spendId, "token-delta-missing-transfer", {
+      blockNumber: Number(finalized.blockNumber) - 1,
+    });
     tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_PAYER_ADDRESS, 99)] = "5000";
     tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_PAYER_ADDRESS, 100)] = "4000";
     tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_MARKET_ADDRESS, 99)] = "10";
@@ -3356,12 +3388,16 @@ describe("pactfuse-api P0", () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs, tokenBalances }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
     const sessionId = await createSession(app, "sess-token-delta-wrong-transfer");
     const spendId = await registerSpend(app, sessionId);
     const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "token-delta-wrong-transfer");
+    await verifyCawAllowanceForTest(app, logs, tokenBalances, sessionId, spendId, "token-delta-wrong-transfer", {
+      blockNumber: Number(finalized.blockNumber) - 1,
+    });
     tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_PAYER_ADDRESS, 99)] = "5000";
     tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_PAYER_ADDRESS, 100)] = "4000";
     tokenBalances[balanceKeyForTest(TEST_PAYMENT_TOKEN_ADDRESS, TEST_MARKET_ADDRESS, 99)] = "10";
@@ -3389,6 +3425,7 @@ describe("pactfuse-api P0", () => {
     const logs: Array<Record<string, unknown>> = [];
     const contractSpendStates: Record<string, number> = {};
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs, contractSpendStates }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
@@ -3422,6 +3459,7 @@ describe("pactfuse-api P0", () => {
   it("blocks indexed SpendSettled logs when ProcurementGate registeredSpend tuple diverges", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({
         currentBlockNumber: 103,
         logs,
@@ -3458,6 +3496,7 @@ describe("pactfuse-api P0", () => {
   it("blocks indexed SpendSettled proofs from cursors without a pinned gate address", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs }),
     });
     const sessionId = await createSession(app, "sess-indexer-unpinned-gate-address");
@@ -3487,6 +3526,7 @@ describe("pactfuse-api P0", () => {
     const logs: Array<Record<string, unknown>> = [];
     const wrongAddress = "0x2222222222222222222222222222222222222222";
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs, ignoreAddressFilter: true }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
@@ -3517,6 +3557,7 @@ describe("pactfuse-api P0", () => {
   it("blocks deterministic contract read failures instead of retrying forever", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({
         currentBlockNumber: 103,
         logs,
@@ -3551,6 +3592,7 @@ describe("pactfuse-api P0", () => {
     const logs: Array<Record<string, unknown>> = [];
     const sourceStates: Record<string, number> = {};
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs, sourceStates }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
@@ -3597,6 +3639,7 @@ describe("pactfuse-api P0", () => {
   it("blocks indexed SourceChallenged logs for unregistered or unbound sources", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
@@ -3645,6 +3688,7 @@ describe("pactfuse-api P0", () => {
   it("blocks indexed SourceChallenged logs for registered sources that are not spend-bound", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
@@ -3687,6 +3731,7 @@ describe("pactfuse-api P0", () => {
   it("blocks indexed SourceChallenged logs without a pending operator challenge", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
@@ -3719,6 +3764,7 @@ describe("pactfuse-api P0", () => {
   it("normalizes uppercase indexed SourceChallenged hashes before updating source proof status", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
@@ -3770,6 +3816,7 @@ describe("pactfuse-api P0", () => {
 
   it("keeps indexer worker lease recovery scoped and blocks malformed indexer jobs", async () => {
     const { ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 50, logs: [] }),
     });
     const nonIndexerJob = enqueueJob(ctx, {
@@ -3802,6 +3849,7 @@ describe("pactfuse-api P0", () => {
 
   it("keeps global indexer retry and blocked states out of unrelated session replay", async () => {
     const retryingApp = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({
         currentBlockNumber: 105,
         logs: [indexerLog("retry-worker", 100)],
@@ -3820,6 +3868,7 @@ describe("pactfuse-api P0", () => {
     const retryJudgeJson = await retryJudge.json();
 
     const blockedApp = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 105, logs: [] }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", topics: [], finalityDepth: 2 }],
     });
@@ -3851,6 +3900,7 @@ describe("pactfuse-api P0", () => {
     const logs = [100, 101, 102, 103, 104].map((block) => indexerLog(`window-${block}`, block));
     const firstLogTxHash = String(logs[0]?.transactionHash);
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 105, logs }),
     });
     const first = await post(app, "/api/v1/indexer/backfill", {
@@ -3925,7 +3975,8 @@ describe("pactfuse-api P0", () => {
     const logs = [indexerLog("persist-100", 100), indexerLog("persist-101", 101)];
     try {
       const first = makeApp(dbPath, {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 102, logs }),
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 102, logs }),
       });
       const firstBackfill = await post(first.app, "/api/v1/indexer/backfill", {
         idempotencyKey: "indexer-persist-first",
@@ -3934,7 +3985,8 @@ describe("pactfuse-api P0", () => {
       first.ctx.db.sqlite.close();
 
       const second = makeApp(dbPath, {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 102, logs }),
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 102, logs }),
       });
       const status = await second.app.request("/api/v1/evidence/indexer-status");
       const statusJson = await status.json();
@@ -3961,6 +4013,7 @@ describe("pactfuse-api P0", () => {
   it("serializes same-cursor concurrent backfills so the cursor does not regress", async () => {
     const logs = Array.from({ length: 101 }, (_, index) => indexerLog(`concurrent-${index}`, 100 + index));
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 201, logs }),
     });
     const seed = await post(app, "/api/v1/indexer/backfill", {
@@ -3998,6 +4051,7 @@ describe("pactfuse-api P0", () => {
     const originalConflictLog = indexerLog("conflict", 100, { rawLogHash: hex32("indexer-conflict-raw-a") });
     const mutableLogs = [originalConflictLog];
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs: mutableLogs }),
     });
     const first = await post(app, "/api/v1/indexer/backfill", {
@@ -4041,6 +4095,7 @@ describe("pactfuse-api P0", () => {
 
 	  it("marks indexer provider failures degraded and keeps verifier output fail-closed", async () => {
     const offline = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ ready: false, reason: "rpc offline" }),
     }).app;
     const offlineBackfill = await post(offline, "/api/v1/indexer/backfill", {
@@ -4050,6 +4105,7 @@ describe("pactfuse-api P0", () => {
     const offlineStatus = await offline.request("/api/v1/evidence/indexer-status");
     const offlineStatusJson = await offlineStatus.json();
     const { app } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({
         currentBlockNumber: 105,
         logs: [indexerLog("provider-failure", 100)],
@@ -4623,7 +4679,7 @@ describe("pactfuse-api P0", () => {
   it("requires a matching bearer-bound artifact token before lease execution", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }) });
     const sessionId = await createSession(app, "sess-lease-bearer-bound");
     const spendId = await registerSpend(app, sessionId);
     const payer = "0x1000000000000000000000000000000000000001";
@@ -4782,6 +4838,7 @@ describe("pactfuse-api P0", () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
       mcpLease: createFakeMcpLeaseClient(),
     });
@@ -5188,7 +5245,8 @@ describe("pactfuse-api P0", () => {
       const logs: Array<Record<string, unknown>> = [];
       const tokenBalances: Record<string, string> = {};
       const { app, ctx } = makeApp(":memory:", {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
       });
       const sessionId = await createSession(app, "sess-lease-http-mcp-success");
@@ -5257,7 +5315,8 @@ describe("pactfuse-api P0", () => {
       const logs: Array<Record<string, unknown>> = [];
       const tokenBalances: Record<string, string> = {};
       const { app, ctx } = makeApp(":memory:", {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
       });
       const sessionId = await createSession(app, "sess-lease-pinned-manifest-mismatch");
@@ -5330,7 +5389,8 @@ describe("pactfuse-api P0", () => {
       const logs: Array<Record<string, unknown>> = [];
       const tokenBalances: Record<string, string> = {};
       const { app, ctx } = makeApp(":memory:", {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
       });
       const sessionId = await createSession(app, "sess-lease-call-failure-blocks-token");
@@ -5398,6 +5458,7 @@ describe("pactfuse-api P0", () => {
       },
     };
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
       mcpLease,
     });
@@ -5502,7 +5563,8 @@ describe("pactfuse-api P0", () => {
       const logs: Array<Record<string, unknown>> = [];
       const tokenBalances: Record<string, string> = {};
       const { app, ctx } = makeApp(":memory:", {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
       });
       const sessionId = await createSession(app, "sess-lease-dangerous-tools");
@@ -5574,7 +5636,8 @@ describe("pactfuse-api P0", () => {
       const logs: Array<Record<string, unknown>> = [];
       const tokenBalances: Record<string, string> = {};
       const { app, ctx } = makeApp(":memory:", {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
       });
       const sessionId = await createSession(app, "sess-lease-missing-tool-metadata");
@@ -5651,6 +5714,7 @@ describe("pactfuse-api P0", () => {
       },
     };
     const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
       mcpLease,
     });
@@ -5730,7 +5794,8 @@ describe("pactfuse-api P0", () => {
         },
       };
       const first = makeApp(dbPath, {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease,
       });
       const sessionId = await createSession(first.app, "sess-cross-instance-lease-claim");
@@ -5751,7 +5816,8 @@ describe("pactfuse-api P0", () => {
         },
       });
       const second = makeApp(dbPath, {
-        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
         mcpLease: createFakeMcpLeaseClient(),
       });
       const body = (idempotencyKey: string) => ({
@@ -6666,6 +6732,17 @@ function createFakeIndexerChainClient(config: {
         }
         return balance;
       }
+      if (input.functionName === "allowance") {
+        const token = input.address.toLowerCase();
+        const owner = String(args[0] ?? "").toLowerCase();
+        const spender = String(args[1] ?? "").toLowerCase();
+        const blockNumber = input.blockNumber ?? 0;
+        const allowance = config.tokenBalances?.[allowanceKeyForTest(token, owner, spender, blockNumber)];
+        if (allowance === undefined) {
+          throw new Error(`missing fake allowance for ${token}:${owner}:${spender}:${blockNumber}`);
+        }
+        return allowance;
+      }
       throw new Error(`unsupported fake contract read: ${input.functionName}`);
     },
   };
@@ -6714,6 +6791,35 @@ function erc20TransferLogForTest(
   };
 }
 
+function erc20ApprovalLogForTest(
+  seed: string,
+  input: {
+    txHash: string;
+    blockNumber: number;
+    logIndex?: number;
+    token?: string;
+    owner?: string;
+    spender?: string;
+    value?: string;
+  },
+): Record<string, unknown> {
+  const value = input.value ?? "1000";
+  return {
+    transactionHash: input.txHash,
+    logIndex: input.logIndex ?? 10,
+    chainId: "84532",
+    blockNumber: input.blockNumber,
+    address: input.token ?? TEST_PAYMENT_TOKEN_ADDRESS,
+    topics: [
+      ERC20_APPROVAL_TOPIC,
+      evmAddressTopicForTest(input.owner ?? TEST_PAYER_ADDRESS),
+      evmAddressTopicForTest(input.spender ?? INDEXER_ADDRESS),
+    ],
+    data: uint256DataForTest(value),
+    rawLogHash: hex32(`erc20-approval:${seed}:raw`),
+  };
+}
+
 function evmAddressTopicForTest(address: string): `0x${string}` {
   return `0x${address.toLowerCase().replace(/^0x/, "").padStart(64, "0")}`;
 }
@@ -6724,6 +6830,10 @@ function uint256DataForTest(value: string): `0x${string}` {
 
 function balanceKeyForTest(token: string, account: string, blockNumber: number): string {
   return `${token.toLowerCase()}:${account.toLowerCase()}:${blockNumber}`;
+}
+
+function allowanceKeyForTest(token: string, owner: string, spender: string, blockNumber: number): string {
+  return `allowance:${token.toLowerCase()}:${owner.toLowerCase()}:${spender.toLowerCase()}:${blockNumber}`;
 }
 
 function insertCaughtUpIndexerCursor(
@@ -6943,6 +7053,12 @@ async function verifyTokenBalanceDeltaForTest(
   const amountAtomic = overrides.amountAtomic ?? "1000";
   const blockNumber = Number(finalized.blockNumber);
   const preBlockNumber = blockNumber - 1;
+  await verifyCawAllowanceForTest(app, logs, tokenBalances, sessionId, spendId, key, {
+    paymentToken,
+    agentWallet,
+    amountAtomic,
+    blockNumber: Math.max(1, preBlockNumber),
+  });
   const agentWalletBefore = BigInt(overrides.agentWalletBefore ?? "5000");
   const marketBefore = BigInt(overrides.marketBefore ?? "10");
   tokenBalances[balanceKeyForTest(paymentToken, agentWallet, preBlockNumber)] = agentWalletBefore.toString();
@@ -6966,6 +7082,90 @@ async function verifyTokenBalanceDeltaForTest(
   });
   expect(verified.status).toBe(202);
   return verified.json.data as Record<string, unknown>;
+}
+
+async function verifyCawAllowanceForTest(
+  app: ReturnType<typeof createApp>,
+  logs: Array<Record<string, unknown>>,
+  tokenBalances: Record<string, string>,
+  sessionId: string,
+  spendId: string,
+  key: string,
+  overrides: Partial<{
+    paymentToken: string;
+    agentWallet: string;
+    procurementGateAddress: string;
+    amountAtomic: string;
+    blockNumber: number;
+  }> = {},
+): Promise<Record<string, unknown>> {
+  const paymentToken = overrides.paymentToken ?? TEST_PAYMENT_TOKEN_ADDRESS;
+  const agentWallet = overrides.agentWallet ?? TEST_PAYER_ADDRESS;
+  const procurementGateAddress = overrides.procurementGateAddress ?? INDEXER_ADDRESS;
+  const amountAtomic = overrides.amountAtomic ?? "1000";
+  const blockNumber = overrides.blockNumber ?? 99;
+  const preBlockNumber = blockNumber - 1;
+  const walletId = "wallet-live-1";
+  const pactId = "pact-live-1";
+  const pactKey = "pact-scoped-secret";
+  const pactSubmit = await post(app, "/api/v1/caw/live/pacts/submit", {
+    sessionId,
+    idempotencyKey: `${key}-caw-pact-submit`,
+    payload: {
+      walletId,
+      intent: `PactFuse test allowance ${key}`,
+      spec: { policies: [{ type: "contract_call", effect: "allow" }] },
+    },
+  });
+  expect(pactSubmit.status).toBe(202);
+  const pactSync = await post(app, "/api/v1/caw/live/pacts/sync", {
+    sessionId,
+    idempotencyKey: `${key}-caw-pact-sync`,
+    payload: { pactId },
+  });
+  expect(pactSync.status).toBe(202);
+  const approve = await post(
+    app,
+    "/api/v1/caw/live/contracts/call",
+    {
+      sessionId,
+      idempotencyKey: `${key}-caw-approve`,
+      payload: {
+        spendId,
+        operationKind: "approve",
+        pactId,
+        walletId,
+        chainId: "84532",
+        contractAddress: paymentToken,
+        procurementGateAddress,
+        calldata: cawApproveCalldataForTest(procurementGateAddress, amountAtomic),
+        requestId: `${key}-approve`,
+        description: `PactFuse test approve ${key}`,
+      },
+    },
+    { "x-pactfuse-caw-pact-api-key": pactKey },
+  );
+  expect(approve.status).toBe(202);
+  const approveTxHash = String(approve.json.data.txHash);
+  logs.push(
+    erc20ApprovalLogForTest(key, {
+      txHash: approveTxHash,
+      blockNumber,
+      token: paymentToken,
+      owner: agentWallet,
+      spender: procurementGateAddress,
+      value: amountAtomic,
+    }),
+  );
+  tokenBalances[allowanceKeyForTest(paymentToken, agentWallet, procurementGateAddress, preBlockNumber)] = "0";
+  tokenBalances[allowanceKeyForTest(paymentToken, agentWallet, procurementGateAddress, blockNumber)] = amountAtomic;
+  const allowance = await post(app, "/api/v1/caw/live/allowances/verify", {
+    sessionId,
+    idempotencyKey: `${key}-caw-allowance`,
+    payload: { spendId, approveInteractionId: approve.json.data.interactionId },
+  });
+  expect(allowance.status).toBe(202);
+  return allowance.json.data as Record<string, unknown>;
 }
 
 async function computeSpendIdForTest(
@@ -7223,7 +7423,7 @@ function createFakeCawLiveClient(): CawLiveClient {
           wallet_id: input.walletId,
           request_id: input.requestId,
           status: "submitted",
-          transaction_hash: null,
+          transaction_hash: hex32(`caw-live-contract:${input.requestId ?? "default"}`),
         },
       };
     },

@@ -12,6 +12,7 @@ import {
   ChainIndexerStatusViewSchema,
   CanonicalCawReceiptViewSchema,
   CawLiveAuditSyncPayloadSchema,
+  CawAllowanceVerifyPayloadSchema,
   CawLiveContractCallSubmitPayloadSchema,
   CawLiveInteractionViewSchema,
   CawLivePactSubmitPayloadSchema,
@@ -58,6 +59,7 @@ import {
   type SessionView,
   type ChainIndexerBackfillInput,
   type CawLiveAuditSyncPayload,
+  type CawAllowanceVerifyPayload,
   type CawLiveContractCallSubmitPayload,
   type CawLivePactSubmitPayload,
   type CawLiveTransferSubmitPayload,
@@ -123,6 +125,7 @@ const REPLAY_COLLECTION_NAMES: ReplayCollectionName[] = [
 const ARTIFACT_PAYLOAD_REPLAY_MAX_BYTES = 256 * 1024;
 const ARTIFACT_TOKEN_LEASE_CLAIM_TTL_MS = 5 * 60 * 1000;
 const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const ERC20_APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 type ChainIndexerBackfillPayload = ChainIndexerBackfillInput["payload"];
 type NormalizedIndexedChainLog = {
   logId: `0x${string}`;
@@ -237,6 +240,18 @@ const ERC20_BALANCE_OF_ABI = [
     name: "balanceOf",
     stateMutability: "view",
     inputs: [{ name: "account", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+] as const;
+const ERC20_ALLOWANCE_ABI = [
+  {
+    type: "function",
+    name: "allowance",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
     outputs: [{ name: "", type: "uint256" }],
   },
 ] as const;
@@ -1378,6 +1393,7 @@ export async function submitCawLiveContractCall(
         status,
         authKeyHash: pactKeyHash,
       });
+      const txHash = cawLiveTxHash(response);
       const event = appendEvidenceEvent(ctx, {
         sessionId: envelope.sessionId,
         authority: "proof",
@@ -1393,6 +1409,7 @@ export async function submitCawLiveContractCall(
           cawRequestId,
           chainId: normalized.chainId,
           valueAtomic: normalized.valueAtomic,
+          txHash,
           requestHash: saved.requestHash,
           responseHash: saved.responseHash,
           pactScopedApiKeyHash: saved.authKeyHash,
@@ -1425,10 +1442,126 @@ export async function submitCawLiveContractCall(
           selector: normalized.selector,
           chainId: normalized.chainId,
           valueAtomic: normalized.valueAtomic,
+          txHash,
           requestHash: saved.requestHash,
           responseHash: saved.responseHash,
           pactScopedApiKeyHash: saved.authKeyHash,
           status,
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        },
+      };
+    },
+  );
+}
+
+export async function verifyCawAllowance(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(CawAllowanceVerifyPayloadSchema, envelope.payload);
+  return withIdempotency(
+    ctx,
+    scoped("caw:allowance:verify", envelope.sessionId),
+    envelope.idempotencyKey,
+    envelope,
+    async (requestId) => {
+      assertSession(ctx, envelope.sessionId, requestId);
+      const spend = requireSpendForBalanceDelta(ctx, envelope.sessionId, payload.spendId, requestId);
+      if (spend.payer !== spend.agentWallet) {
+        throw Object.assign(new Error("CAW allowance proof requires payer to match agentWallet until wallet ownership proof exists"), {
+          apiError: proofBlockedError(requestId, "CAW allowance proof requires payer to match agentWallet until wallet ownership proof exists", {
+            payer: spend.payer,
+            agentWallet: spend.agentWallet,
+          }),
+        });
+      }
+      const approve = requireCawApproveInteractionForAllowance(ctx, envelope.sessionId, payload, spend, requestId);
+      await requireChainReadyForBalanceDelta(ctx, approve.chainId, requestId);
+      const blockNumber = await requireTransactionReceiptBlock(ctx, approve.txHash, requestId, "CAW approve");
+      if (blockNumber <= 0) {
+        throw Object.assign(new Error("CAW allowance proof requires a non-genesis approve block"), {
+          apiError: proofBlockedError(requestId, "CAW allowance proof requires a non-genesis approve block", { blockNumber }),
+        });
+      }
+      const approvalLog = await requireErc20ApprovalLogForAllowance(ctx, approve, spend, blockNumber, BigInt(spend.maxPriceAtomic), requestId);
+      const allowanceBefore = await readErc20Allowance(ctx, spend.paymentToken, spend.agentWallet, approve.procurementGateAddress, blockNumber - 1, requestId);
+      const allowanceAfter = await readErc20Allowance(ctx, spend.paymentToken, spend.agentWallet, approve.procurementGateAddress, blockNumber, requestId);
+      const amount = BigInt(spend.maxPriceAtomic);
+      if (allowanceAfter !== amount) {
+        throw Object.assign(new Error("ERC20 allowance after CAW approve does not match registered spend price"), {
+          apiError: proofBlockedError(requestId, "ERC20 allowance after CAW approve does not match registered spend price", {
+            spendId: payload.spendId,
+            expectedAmount: amount.toString(),
+            allowanceBefore: allowanceBefore.toString(),
+            allowanceAfter: allowanceAfter.toString(),
+          }),
+        });
+      }
+      const event = appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "proof",
+        kind: "caw.allowance.verified",
+        payload: {
+          spendId: payload.spendId,
+          approveInteractionId: approve.interactionId,
+          cawContractCallEventId: approve.eventId,
+          walletId: approve.walletId,
+          pactId: approve.pactId,
+          cawRequestId: approve.cawRequestId,
+          approveTxHash: approve.txHash,
+          chainId: approve.chainId,
+          blockNumber,
+          preBlockNumber: blockNumber - 1,
+          approvalLogIndex: approvalLog.logIndex,
+          approvalRawLogHash: approvalLog.rawLogHash,
+          approvalTopics: approvalLog.topics,
+          approvalData: approvalLog.data,
+          paymentToken: spend.paymentToken,
+          payer: spend.payer,
+          agentWallet: spend.agentWallet,
+          owner: spend.agentWallet,
+          payerAgentWalletSame: true,
+          procurementGateAddress: approve.procurementGateAddress,
+          spender: approve.procurementGateAddress,
+          amountAtomic: amount.toString(),
+          allowanceBefore: allowanceBefore.toString(),
+          allowanceAfter: allowanceAfter.toString(),
+          requestHash: approve.requestHash,
+          responseHash: approve.responseHash,
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        },
+      });
+      replaceJudgeCheckRow(ctx, envelope.sessionId, {
+        rowId: "caw_boundary",
+        status: "pass",
+        authority: "proof",
+        reason: "CAW approve tx, ERC20 Approval log, and allowance state verified",
+        evidenceEventId: event.eventId,
+      });
+      return {
+        ok: true,
+        requestId,
+        evidenceEventId: event.eventId,
+        data: {
+          spendId: payload.spendId,
+          approveInteractionId: approve.interactionId,
+          cawContractCallEventId: approve.eventId,
+          approveTxHash: approve.txHash,
+          chainId: approve.chainId,
+          blockNumber,
+          preBlockNumber: blockNumber - 1,
+          approvalLogIndex: approvalLog.logIndex,
+          approvalRawLogHash: approvalLog.rawLogHash,
+          paymentToken: spend.paymentToken,
+          payer: spend.payer,
+          agentWallet: spend.agentWallet,
+          owner: spend.agentWallet,
+          payerAgentWalletSame: true,
+          procurementGateAddress: approve.procurementGateAddress,
+          spender: approve.procurementGateAddress,
+          amountAtomic: amount.toString(),
+          allowanceBefore: allowanceBefore.toString(),
+          allowanceAfter: allowanceAfter.toString(),
           proofAuthority: true,
           winnerClaimAllowed: false,
         },
@@ -1853,6 +1986,11 @@ function optionalStringFromCaw(response: Record<string, unknown>, keys: string[]
   return null;
 }
 
+function cawLiveTxHash(response: Record<string, unknown>): string | null {
+  const txHash = optionalStringFromCaw(response, ["txHash", "tx_hash", "transactionHash", "transaction_hash", "hash"]);
+  return txHash && /^0x[0-9a-fA-F]{64}$/.test(txHash) ? txHash.toLowerCase() : null;
+}
+
 function objectChild(parent: Record<string, unknown> | null, key: string): Record<string, unknown> | null {
   const value = parent?.[key];
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
@@ -2120,6 +2258,7 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
     async (requestId) => {
       assertSession(ctx, envelope.sessionId, requestId);
       const spend = requireSpendForBalanceDelta(ctx, envelope.sessionId, payload.spendId, requestId);
+      const allowance = requireVerifiedCawAllowance(ctx, envelope.sessionId, payload.spendId, requestId);
       const settlement = requireSettlementForBalanceDelta(ctx, envelope.sessionId, payload, requestId);
       if (spend.payer !== spend.agentWallet) {
         throw Object.assign(new Error("token balance delta requires payer to match agentWallet until wallet ownership proof exists"), {
@@ -2161,6 +2300,9 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
         kind: "token.balance_delta.verified",
         payload: {
           spendId: payload.spendId,
+          allowanceEventId: allowance.allowanceEventId,
+          approveInteractionId: allowance.approveInteractionId,
+          approveTxHash: allowance.approveTxHash,
           settlementEventId: settlement.finalizedEventId,
           gateEventId: settlement.gateEventId,
           txHash: settlement.txHash,
@@ -2200,6 +2342,9 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
         evidenceEventId: event.eventId,
         data: {
           spendId: payload.spendId,
+          allowanceEventId: allowance.allowanceEventId,
+          approveInteractionId: allowance.approveInteractionId,
+          approveTxHash: allowance.approveTxHash,
           settlementEventId: settlement.finalizedEventId,
           txHash: settlement.txHash,
           chainId: settlement.chainId,
@@ -3191,6 +3336,7 @@ async function buildVerifierRunView(
     ...verifySpendBindingIntegrity(ctx, sessionId),
     ...verifyMcpAdapterCallIntegrity(ctx, sessionId),
     ...verifyCawLiveInteractionIntegrity(ctx, sessionId),
+    ...verifyCawAllowanceIntegrity(ctx, sessionId),
     ...verifyGateFinalityIntegrity(ctx, sessionId),
     ...verifyTokenBalanceDeltaIntegrity(ctx, sessionId),
     ...verifyArtifactAccessTokenIntegrity(ctx, sessionId),
@@ -3859,6 +4005,7 @@ export function appendEvidenceEvent(
       | "caw.live.pact.synced"
       | "caw.live.transfer.submitted"
       | "caw.live.contract_call.submitted"
+      | "caw.allowance.verified"
       | "caw.live.audit.synced"
       | "caw.receipt.ingested.fixture"
       | "caw.receipt.ingested.raw"
@@ -5167,6 +5314,51 @@ function requireVerifiedTokenSettlement(
   });
 }
 
+function requireVerifiedCawAllowance(
+  ctx: ServiceCtx,
+  sessionId: string,
+  spendId: string,
+  requestId: string,
+): { allowanceEventId: string; approveInteractionId: string; approveTxHash: string } {
+  const integrityErrors = verifyCawAllowanceIntegrity(ctx, sessionId);
+  if (integrityErrors.length > 0) {
+    throw Object.assign(new Error("CAW allowance proof is internally inconsistent"), {
+      apiError: proofBlockedError(requestId, "CAW allowance proof is internally inconsistent", { errors: integrityErrors }),
+    });
+  }
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT event_id, payload_json
+       FROM evidence_events
+       WHERE session_id = ? AND kind = 'caw.allowance.verified' AND authority = 'proof'
+       ORDER BY event_seq DESC`,
+    )
+    .all(sessionId) as Row[];
+  for (const row of rows) {
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (
+      payload.spendId === spendId &&
+      payload.proofAuthority === true &&
+      typeof payload.approveInteractionId === "string" &&
+      typeof payload.approveTxHash === "string"
+    ) {
+      return {
+        allowanceEventId: String(row.event_id),
+        approveInteractionId: payload.approveInteractionId,
+        approveTxHash: payload.approveTxHash,
+      };
+    }
+  }
+  throw Object.assign(new Error("CAW approve allowance proof is required before token balance delta proof"), {
+    apiError: proofPendingError(requestId, "CAW approve allowance proof is required before token balance delta proof"),
+  });
+}
+
 type BalanceDeltaSpend = {
   spendId: string;
   payer: `0x${string}`;
@@ -5182,6 +5374,19 @@ type BalanceDeltaSettlement = {
   txHash: string;
   chainId: string;
   blockNumber: number;
+};
+
+type CawApproveInteractionForAllowance = {
+  interactionId: string;
+  eventId: string;
+  txHash: `0x${string}`;
+  chainId: string;
+  procurementGateAddress: `0x${string}`;
+  walletId: string;
+  pactId: string;
+  cawRequestId: string | null;
+  requestHash: string;
+  responseHash: string;
 };
 
 function requireSpendForBalanceDelta(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): BalanceDeltaSpend {
@@ -5276,6 +5481,167 @@ function requireSettlementForBalanceDelta(
   };
 }
 
+function requireCawApproveInteractionForAllowance(
+  ctx: ServiceCtx,
+  sessionId: string,
+  payload: CawAllowanceVerifyPayload,
+  spend: BalanceDeltaSpend,
+  requestId: string,
+): CawApproveInteractionForAllowance {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT interaction_id, wallet_id, pact_id, caw_request_id, request_hash, response_hash, request_json, response_json, status
+       FROM caw_live_interactions
+       WHERE session_id = ? AND kind = 'contract_call'
+       ORDER BY created_at DESC, interaction_id DESC`,
+    )
+    .all(sessionId) as Row[];
+  const eventRows = ctx.db.sqlite
+    .prepare(
+      `SELECT event_id, authority, payload_json
+       FROM evidence_events
+       WHERE session_id = ? AND kind = 'caw.live.contract_call.submitted'
+       ORDER BY event_seq DESC`,
+    )
+    .all(sessionId) as Row[];
+  const eventsByInteractionId = new Map<string, { eventId: string; authority: string; payload: Record<string, unknown> }>();
+  for (const row of eventRows) {
+    try {
+      const eventPayload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+      if (typeof eventPayload.interactionId === "string") {
+        eventsByInteractionId.set(eventPayload.interactionId, {
+          eventId: String(row.event_id),
+          authority: String(row.authority),
+          payload: eventPayload,
+        });
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  for (const row of rows) {
+    const interactionId = String(row.interaction_id);
+    if (payload.approveInteractionId && interactionId !== payload.approveInteractionId) {
+      continue;
+    }
+    let request: Record<string, unknown>;
+    let response: Record<string, unknown>;
+    try {
+      request = JSON.parse(String(row.request_json)) as Record<string, unknown>;
+      response = JSON.parse(String(row.response_json)) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (request.operation_kind !== "approve" || request.spend_id !== spend.spendId) {
+      continue;
+    }
+    const procurementGateAddress = requiredCawApproveProcurementGateAddress(request, spend, requestId);
+    const expectedAmount = BigInt(spend.maxPriceAtomic).toString();
+    const expectedCalldata = expectedApproveCalldata(procurementGateAddress, expectedAmount).toLowerCase();
+    if (
+      String(request.contract_addr ?? "").toLowerCase() !== spend.paymentToken ||
+      String(request.spender_addr ?? "").toLowerCase() !== procurementGateAddress ||
+      safeDecimalString(request.amount) !== expectedAmount ||
+      String(request.calldata ?? "").toLowerCase() !== expectedCalldata ||
+      String(request.selector ?? "").toLowerCase() !== ERC20_APPROVE_SELECTOR
+    ) {
+      continue;
+    }
+    const status = String(row.status ?? "");
+    if (status === "live_denied" || status === "live_failed") {
+      throw Object.assign(new Error("CAW approve contract call was denied or failed"), {
+        apiError: proofBlockedError(requestId, "CAW approve contract call was denied or failed", { approveInteractionId: interactionId, status }),
+      });
+    }
+    const event = eventsByInteractionId.get(interactionId);
+    if (!event || event.authority !== "proof" || event.payload.proofAuthority !== true || event.payload.winnerClaimAllowed !== false) {
+      throw Object.assign(new Error("CAW approve interaction is missing proof-authority contract call evidence"), {
+        apiError: proofBlockedError(requestId, "CAW approve interaction is missing proof-authority contract call evidence", {
+          approveInteractionId: interactionId,
+        }),
+      });
+    }
+    const txHash = requiredChainHex32(event.payload.txHash ?? response.txHash ?? response.tx_hash ?? response.transactionHash, "CAW approve txHash", requestId);
+    for (const [field, expected] of [
+      ["spendId", spend.spendId],
+      ["operationKind", "approve"],
+      ["contractAddress", spend.paymentToken],
+      ["selector", ERC20_APPROVE_SELECTOR],
+      ["chainId", request.chain_id],
+      ["valueAtomic", "0"],
+    ] as const) {
+      if (String(event.payload[field] ?? "").toLowerCase() !== String(expected ?? "").toLowerCase()) {
+        throw Object.assign(new Error("CAW approve contract call event does not match the recorded approve request"), {
+          apiError: proofBlockedError(requestId, "CAW approve contract call event does not match the recorded approve request", {
+            approveInteractionId: interactionId,
+            field,
+          }),
+        });
+      }
+    }
+    return {
+      interactionId,
+      eventId: event.eventId,
+      txHash,
+      chainId: String(request.chain_id),
+      procurementGateAddress,
+      walletId: String(row.wallet_id),
+      pactId: String(row.pact_id),
+      cawRequestId: row.caw_request_id ? String(row.caw_request_id) : null,
+      requestHash: String(row.request_hash),
+      responseHash: String(row.response_hash),
+    };
+  }
+  throw Object.assign(new Error("CAW allowance proof requires a matching CAW live approve contract call"), {
+    apiError: proofPendingError(requestId, "CAW allowance proof requires a matching CAW live approve contract call"),
+  });
+}
+
+function requiredCawApproveProcurementGateAddress(
+  request: Record<string, unknown>,
+  spend: BalanceDeltaSpend,
+  requestId: string,
+): `0x${string}` {
+  const procurementGateAddress = String(request.procurement_gate_addr ?? "").toLowerCase();
+  if (!isEvmAddressText(procurementGateAddress)) {
+    throw Object.assign(new Error("CAW approve request requires a valid ProcurementGate address"), {
+      apiError: proofBlockedError(requestId, "CAW approve request requires a valid ProcurementGate address", { spendId: spend.spendId }),
+    });
+  }
+  return procurementGateAddress as `0x${string}`;
+}
+
+async function requireTransactionReceiptBlock(ctx: ServiceCtx, txHash: `0x${string}`, requestId: string, label: string): Promise<number> {
+  let receipt: Record<string, unknown>;
+  try {
+    receipt = await ctx.chain.getTransactionReceipt(txHash);
+  } catch (error) {
+    throw Object.assign(new Error(`failed to fetch ${label} transaction receipt`), {
+      apiError: proofPendingError(requestId, chainFailureMessage(`failed to fetch ${label} transaction receipt`, error)),
+    });
+  }
+  const receiptTxHash = optionalHex(receipt.transactionHash ?? receipt.txHash ?? receipt.hash);
+  if (receiptTxHash && receiptTxHash.toLowerCase() !== txHash.toLowerCase()) {
+    throw Object.assign(new Error(`${label} transaction receipt hash mismatch`), {
+      apiError: proofBlockedError(requestId, `${label} transaction receipt hash mismatch`, { expected: txHash, actual: receiptTxHash }),
+    });
+  }
+  const status = receipt.status;
+  if (status === "reverted" || status === "0x0" || status === 0 || status === false) {
+    throw Object.assign(new Error(`${label} transaction receipt is reverted`), {
+      apiError: proofBlockedError(requestId, `${label} transaction receipt is reverted`, { txHash }),
+    });
+  }
+  const blockNumber = optionalChainNumber(receipt.blockNumber);
+  if (blockNumber === null) {
+    throw Object.assign(new Error(`${label} transaction receipt is not mined yet`), {
+      apiError: proofPendingError(requestId, `${label} transaction receipt is not mined yet`),
+    });
+  }
+  return blockNumber;
+}
+
 async function requireChainReadyForBalanceDelta(ctx: ServiceCtx, chainId: string, requestId: string): Promise<void> {
   let status;
   try {
@@ -5349,6 +5715,63 @@ async function requireErc20TransferLogForBalanceDelta(
   };
 }
 
+async function requireErc20ApprovalLogForAllowance(
+  ctx: ServiceCtx,
+  approve: CawApproveInteractionForAllowance,
+  spend: BalanceDeltaSpend,
+  blockNumber: number,
+  amount: bigint,
+  requestId: string,
+): Promise<{ logIndex: number; rawLogHash: `0x${string}`; topics: string[]; data: string }> {
+  const ownerTopic = evmAddressTopic(spend.agentWallet);
+  const spenderTopic = evmAddressTopic(approve.procurementGateAddress);
+  let logs: Record<string, unknown>[];
+  try {
+    logs = await ctx.chain.getLogs({
+      chainId: approve.chainId,
+      blockNumber,
+      txHash: approve.txHash,
+      address: spend.paymentToken,
+      topics: [ERC20_APPROVAL_TOPIC, ownerTopic, spenderTopic],
+    });
+  } catch (error) {
+    throw Object.assign(new Error("failed to fetch ERC20 Approval logs for CAW allowance proof"), {
+      apiError: proofPendingError(requestId, chainFailureMessage("failed to fetch ERC20 Approval logs for CAW allowance proof", error)),
+    });
+  }
+  const matching = logs.filter((log) => erc20ApprovalLogMatchesAllowance(log, approve, spend, blockNumber, amount, requestId));
+  if (matching.length !== 1) {
+    throw Object.assign(new Error("CAW allowance proof requires exactly one matching ERC20 Approval log in the approve transaction"), {
+      apiError: proofBlockedError(requestId, "CAW allowance proof requires exactly one matching ERC20 Approval log in the approve transaction", {
+        txHash: approve.txHash,
+        paymentToken: spend.paymentToken,
+        owner: spend.agentWallet,
+        spender: approve.procurementGateAddress,
+        amountAtomic: amount.toString(),
+        matchingApprovalLogCount: matching.length,
+      }),
+    });
+  }
+  const log = matching[0];
+  if (!log) {
+    throw Object.assign(new Error("CAW allowance matching Approval log disappeared during validation"), {
+      apiError: proofBlockedError(requestId, "CAW allowance matching Approval log disappeared during validation"),
+    });
+  }
+  const logIndex = optionalChainNumber(log.logIndex ?? log.index);
+  if (logIndex === null) {
+    throw Object.assign(new Error("matching ERC20 Approval log is missing logIndex"), {
+      apiError: proofBlockedError(requestId, "matching ERC20 Approval log is missing logIndex"),
+    });
+  }
+  return {
+    logIndex,
+    rawLogHash: rawLogHashForChainLog(log),
+    topics: chainLogTopics(log.topics, requestId).map((topic) => topic.toLowerCase()),
+    data: (optionalHex(log.data) ?? "0x").toLowerCase(),
+  };
+}
+
 function erc20TransferLogMatchesBalanceDelta(
   log: Record<string, unknown>,
   settlement: BalanceDeltaSettlement,
@@ -5380,7 +5803,58 @@ function erc20TransferLogMatchesBalanceDelta(
   return transferAmount !== null && transferAmount === amount;
 }
 
+function erc20ApprovalLogMatchesAllowance(
+  log: Record<string, unknown>,
+  approve: CawApproveInteractionForAllowance,
+  spend: BalanceDeltaSpend,
+  blockNumber: number,
+  amount: bigint,
+  requestId: string,
+): boolean {
+  const txHash = optionalHex(log.transactionHash ?? log.txHash ?? log.hash);
+  if (!txHash || txHash.toLowerCase() !== approve.txHash.toLowerCase()) {
+    return false;
+  }
+  const logBlockNumber = optionalChainNumber(log.blockNumber);
+  if (logBlockNumber === null || logBlockNumber !== blockNumber) {
+    return false;
+  }
+  const address = optionalHex(log.address);
+  if (!address || address.toLowerCase() !== spend.paymentToken.toLowerCase()) {
+    return false;
+  }
+  const topics = chainLogTopics(log.topics, requestId).map((topic) => topic.toLowerCase());
+  if (
+    topics[0] !== ERC20_APPROVAL_TOPIC ||
+    topics[1] !== evmAddressTopic(spend.agentWallet) ||
+    topics[2] !== evmAddressTopic(approve.procurementGateAddress)
+  ) {
+    return false;
+  }
+  const approvalAmount = erc20ApprovalAmount(log);
+  return approvalAmount !== null && approvalAmount === amount;
+}
+
 function erc20TransferAmount(log: Record<string, unknown>): bigint | null {
+  const args = log.args && typeof log.args === "object" && !Array.isArray(log.args) ? (log.args as Record<string, unknown>) : {};
+  const decodedValue = args.value ?? args.amount;
+  if (typeof decodedValue === "bigint" && decodedValue >= 0n) {
+    return decodedValue;
+  }
+  if (typeof decodedValue === "number" && Number.isSafeInteger(decodedValue) && decodedValue >= 0) {
+    return BigInt(decodedValue);
+  }
+  if (typeof decodedValue === "string" && /^(0|[1-9][0-9]*)$/.test(decodedValue)) {
+    return BigInt(decodedValue);
+  }
+  const data = optionalHex(log.data);
+  if (!data || !/^0x[0-9a-fA-F]{64}$/.test(data)) {
+    return null;
+  }
+  return BigInt(data);
+}
+
+function erc20ApprovalAmount(log: Record<string, unknown>): bigint | null {
   const args = log.args && typeof log.args === "object" && !Array.isArray(log.args) ? (log.args as Record<string, unknown>) : {};
   const decodedValue = args.value ?? args.amount;
   if (typeof decodedValue === "bigint" && decodedValue >= 0n) {
@@ -5401,6 +5875,29 @@ function erc20TransferAmount(log: Record<string, unknown>): bigint | null {
 
 function evmAddressTopic(address: string): string {
   return `0x${address.toLowerCase().replace(/^0x/, "").padStart(64, "0")}`;
+}
+
+async function readErc20Allowance(
+  ctx: ServiceCtx,
+  paymentToken: `0x${string}`,
+  owner: `0x${string}`,
+  spender: `0x${string}`,
+  blockNumber: number,
+  requestId: string,
+): Promise<bigint> {
+  let result: unknown;
+  try {
+    result = await ctx.chain.readContract({
+      address: paymentToken,
+      abi: ERC20_ALLOWANCE_ABI,
+      functionName: "allowance",
+      args: [owner, spender],
+      blockNumber,
+    });
+  } catch (error) {
+    throw contractReadApiError("failed to read ERC20 allowance for CAW allowance proof", error, requestId);
+  }
+  return contractUintBigInt(result, "ERC20.allowance", requestId);
 }
 
 async function readErc20Balance(
@@ -7377,6 +7874,26 @@ function updateJudgeCheckRow(
     .run(input.status, input.authority, input.reason, input.evidenceEventId, sessionId, input.rowId);
 }
 
+function replaceJudgeCheckRow(
+  ctx: ServiceCtx,
+  sessionId: string,
+  input: {
+    rowId: "caw_boundary" | "source_challenge" | "ab_trip" | "c_settlement" | "artifact_access" | "lease_execution";
+    status: "pass" | "pending" | "blocked" | "manual" | "fixture";
+    authority: "proof" | "delivery" | "operator" | "advisory" | "fixture";
+    reason: string;
+    evidenceEventId: string;
+  },
+): void {
+  ctx.db.sqlite
+    .prepare(
+      `UPDATE judge_check_rows
+       SET status = ?, authority = ?, reason = ?, evidence_event_id = ?
+       WHERE session_id = ? AND row_id = ?`,
+    )
+    .run(input.status, input.authority, input.reason, input.evidenceEventId, sessionId, input.rowId);
+}
+
 function blockJudgeCheckRow(
   ctx: ServiceCtx,
   sessionId: string,
@@ -7927,6 +8444,152 @@ function verifyMcpAdapterCallIntegrity(ctx: ServiceCtx, sessionId: string): stri
   return errors;
 }
 
+function verifyCawAllowanceIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  const errors: string[] = [];
+  const events = listEvents(ctx, sessionId, 0, 200);
+  const eventsById = new Map(events.map((event) => [event.eventId, event]));
+  const cawEventsByInteractionId = new Map(
+    events
+      .filter((event) => event.kind === "caw.live.contract_call.submitted" && typeof event.payload.interactionId === "string")
+      .map((event) => [String(event.payload.interactionId), event]),
+  );
+  const allowanceEvents = events.filter((event) => event.kind === "caw.allowance.verified");
+  for (const event of allowanceEvents) {
+    const payload = event.payload;
+    const label = `CAW allowance event ${event.eventId}`;
+    if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
+      errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
+    }
+    const spendId = typeof payload.spendId === "string" ? payload.spendId : "";
+    const spend = ctx.db.sqlite
+      .prepare(
+        `SELECT spend_id, payer, agent_wallet, payment_token, market, max_price_atomic
+         FROM spends
+         WHERE session_id = ? AND spend_id = ?`,
+      )
+      .get(sessionId, spendId) as Row | undefined;
+    if (!spend) {
+      errors.push(`${label} references missing registered spend`);
+      continue;
+    }
+    const amount = safeDecimalString(payload.amountAtomic);
+    const expectedAmount = BigInt(String(spend.max_price_atomic)).toString();
+    if (amount !== expectedAmount) {
+      errors.push(`${label} amountAtomic does not match registered spend price`);
+    }
+    for (const [field, expected] of [
+      ["paymentToken", spend.payment_token],
+      ["payer", spend.payer],
+      ["agentWallet", spend.agent_wallet],
+      ["owner", spend.agent_wallet],
+    ] as const) {
+      if (String(payload[field] ?? "").toLowerCase() !== String(expected).toLowerCase()) {
+        errors.push(`${label} payload.${field} does not match registered spend`);
+      }
+    }
+    if (String(spend.payer).toLowerCase() !== String(spend.agent_wallet).toLowerCase() || payload.payerAgentWalletSame !== true) {
+      errors.push(`${label} requires payerAgentWalletSame=true until wallet ownership proof exists`);
+    }
+    const procurementGateAddress = String(payload.procurementGateAddress ?? "").toLowerCase();
+    if (!isEvmAddressText(procurementGateAddress) || String(payload.spender ?? "").toLowerCase() !== procurementGateAddress) {
+      errors.push(`${label} requires spender to equal a valid ProcurementGate address`);
+    }
+    if (safeDecimalString(payload.allowanceAfter) !== expectedAmount) {
+      errors.push(`${label} allowanceAfter must equal registered spend price`);
+    }
+    if (safeDecimalString(payload.allowanceBefore) === "") {
+      errors.push(`${label} allowanceBefore must be a decimal uint string`);
+    }
+    if (Number(payload.preBlockNumber) !== Number(payload.blockNumber) - 1) {
+      errors.push(`${label} preBlockNumber must equal blockNumber - 1`);
+    }
+    if (!optionalHex32(payload.approveTxHash)) {
+      errors.push(`${label} approveTxHash must be 32-byte hex`);
+    }
+    if (!optionalHex32(payload.approvalRawLogHash)) {
+      errors.push(`${label} approvalRawLogHash must be 32-byte hex`);
+    }
+    const topics = Array.isArray(payload.approvalTopics) ? payload.approvalTopics.map((topic) => String(topic).toLowerCase()) : [];
+    if (
+      topics[0] !== ERC20_APPROVAL_TOPIC ||
+      topics[1] !== evmAddressTopic(String(spend.agent_wallet)) ||
+      topics[2] !== evmAddressTopic(procurementGateAddress)
+    ) {
+      errors.push(`${label} approvalTopics must encode ERC20 Approval(owner=agentWallet, spender=ProcurementGate)`);
+    }
+    if (String(payload.approvalData ?? "").toLowerCase() !== uint256DataWord(expectedAmount)) {
+      errors.push(`${label} approvalData must encode the registered spend price`);
+    }
+    const cawEvent = eventsById.get(String(payload.cawContractCallEventId)) ?? cawEventsByInteractionId.get(String(payload.approveInteractionId));
+    if (!cawEvent || cawEvent.kind !== "caw.live.contract_call.submitted" || cawEvent.authority !== "proof") {
+      errors.push(`${label} references missing proof-authority CAW live approve contract call event`);
+      continue;
+    }
+    for (const [field, expected] of [
+      ["interactionId", payload.approveInteractionId],
+      ["spendId", spendId],
+      ["operationKind", "approve"],
+      ["contractAddress", String(spend.payment_token).toLowerCase()],
+      ["selector", ERC20_APPROVE_SELECTOR],
+      ["txHash", payload.approveTxHash],
+      ["requestHash", payload.requestHash],
+      ["responseHash", payload.responseHash],
+    ] as const) {
+      if (String(cawEvent.payload[field] ?? "").toLowerCase() !== String(expected ?? "").toLowerCase()) {
+        errors.push(`${label} CAW contract call event payload.${field} does not match allowance proof`);
+      }
+    }
+    const approveInteractionId = typeof payload.approveInteractionId === "string" ? payload.approveInteractionId : null;
+    if (!approveInteractionId) {
+      errors.push(`${label} requires approveInteractionId`);
+      continue;
+    }
+    const interaction = ctx.db.sqlite
+      .prepare(
+        `SELECT request_hash, response_hash, request_json, status
+         FROM caw_live_interactions
+         WHERE session_id = ? AND interaction_id = ? AND kind = 'contract_call'
+         LIMIT 1`,
+      )
+      .get(sessionId, approveInteractionId) as Row | undefined;
+    if (!interaction) {
+      errors.push(`${label} references missing CAW live approve interaction row`);
+      continue;
+    }
+    if (String(interaction.request_hash) !== payload.requestHash || String(interaction.response_hash) !== payload.responseHash) {
+      errors.push(`${label} requestHash/responseHash do not match the CAW live interaction row`);
+    }
+    if (interaction.status === "live_denied" || interaction.status === "live_failed") {
+      errors.push(`${label} cannot reference denied or failed CAW live approve interaction`);
+    }
+    let request: Record<string, unknown> | null = null;
+    try {
+      request = JSON.parse(String(interaction.request_json)) as Record<string, unknown>;
+    } catch {
+      errors.push(`${label} CAW live approve interaction has invalid request_json`);
+    }
+    if (request) {
+      const expectedCalldata = isEvmAddressText(procurementGateAddress) ? expectedApproveCalldata(procurementGateAddress, expectedAmount).toLowerCase() : "";
+      for (const [field, expected] of [
+        ["operation_kind", "approve"],
+        ["spend_id", spendId],
+        ["contract_addr", String(spend.payment_token).toLowerCase()],
+        ["selector", ERC20_APPROVE_SELECTOR],
+        ["spender_addr", procurementGateAddress],
+        ["procurement_gate_addr", procurementGateAddress],
+        ["amount", expectedAmount],
+        ["calldata", expectedCalldata],
+      ] as const) {
+        const actual = field === "amount" ? safeDecimalString(request[field]) : String(request[field] ?? "").toLowerCase();
+        if (actual !== String(expected).toLowerCase()) {
+          errors.push(`${label} CAW live approve request.${field} does not match allowance proof`);
+        }
+      }
+    }
+  }
+  return errors;
+}
+
 function verifyCawLiveInteractionIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   const errors: string[] = [];
   const rows = ctx.db.sqlite
@@ -8190,6 +8853,10 @@ function safeDecimalString(value: unknown): string {
     return "";
   }
   return BigInt(value).toString();
+}
+
+function uint256DataWord(value: string): string {
+  return `0x${BigInt(value).toString(16).padStart(64, "0")}`;
 }
 
 function verifyGateFinalityIntegrity(ctx: ServiceCtx, sessionId: string): string[] {

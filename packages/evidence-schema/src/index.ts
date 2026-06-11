@@ -212,6 +212,13 @@ export const CawLiveContractCallSubmitPayloadSchema = z
   })
   .strict();
 
+export const CawAllowanceVerifyPayloadSchema = z
+  .object({
+    spendId: Hex32Schema,
+    approveInteractionId: Hex32Schema.optional(),
+  })
+  .strict();
+
 export const CawLiveAuditSyncPayloadSchema = z
   .object({
     walletId: z.string().min(1).max(160).optional(),
@@ -409,6 +416,7 @@ export const EvidenceEventKindSchema = z.enum([
   "caw.live.pact.synced",
   "caw.live.transfer.submitted",
   "caw.live.contract_call.submitted",
+  "caw.allowance.verified",
   "caw.live.audit.synced",
   "caw.receipt.ingested.fixture",
   "caw.receipt.ingested.raw",
@@ -885,5 +893,6 @@ export type CawLivePactSubmitPayload = z.infer<typeof CawLivePactSubmitPayloadSc
 export type CawLivePactSyncPayload = z.infer<typeof CawLivePactSyncPayloadSchema>;
 export type CawLiveTransferSubmitPayload = z.infer<typeof CawLiveTransferSubmitPayloadSchema>;
 export type CawLiveContractCallSubmitPayload = z.infer<typeof CawLiveContractCallSubmitPayloadSchema>;
+export type CawAllowanceVerifyPayload = z.infer<typeof CawAllowanceVerifyPayloadSchema>;
 export type CawLiveAuditSyncPayload = z.infer<typeof CawLiveAuditSyncPayloadSchema>;
 export type TokenBalanceDeltaVerifyPayload = z.infer<typeof TokenBalanceDeltaVerifyPayloadSchema>;

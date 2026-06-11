@@ -10,6 +10,7 @@ const HEX32_RE = /^0x[0-9a-fA-F]{64}$/;
 const ZERO_HASH = `0x${"0".repeat(64)}`;
 const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
 const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const ERC20_APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 const REQUIRED_LEASE_TOOL_ARGUMENTS = ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"];
 const DANGEROUS_TOOL_NAME_PATTERN =
@@ -628,6 +629,7 @@ const JUDGE_ROW_EVENT_KINDS = {
     "caw.live.pact.synced",
     "caw.live.transfer.submitted",
     "caw.live.audit.synced",
+    "caw.allowance.verified",
   ]),
   source_challenge: new Set(["source.challenge.confirmed"]),
   ab_trip: new Set(["gate.spend_tripped", "reorg.invalidated"]),
@@ -1181,6 +1183,9 @@ function verifyJudgeCheck(bundle, eventsById, errors) {
     if (row.status === "pass" && row.authority === "delivery" && event.authority && event.authority !== "delivery") {
       errors.push(`judgeCheck delivery pass row ${row.rowId} references non-delivery event ${row.evidenceEventId}`);
     }
+    if (row.rowId === "caw_boundary" && row.status === "pass" && event.kind !== "caw.allowance.verified") {
+      errors.push("judgeCheck pass row caw_boundary must reference caw.allowance.verified");
+    }
     if (row.rowId === "c_settlement" && row.status === "pass" && event.kind !== "token.balance_delta.verified") {
       errors.push("judgeCheck pass row c_settlement must reference token.balance_delta.verified");
     }
@@ -1196,6 +1201,125 @@ function verifyContractStateProofEvents(bundle, events, errors) {
       verifyGateContractStateProofEvent(bundle, event, errors);
     } else if (event.kind === "source.challenge.confirmed") {
       verifySourceContractStateProofEvent(bundle, event, errors);
+    }
+  }
+}
+
+function verifyCawAllowanceEvents(eventsById, spendsById, interactionsById, errors) {
+  for (const event of eventsById.values()) {
+    if (!isObject(event) || event.kind !== "caw.allowance.verified") {
+      continue;
+    }
+    const payload = isObject(event.payload) ? event.payload : null;
+    const label = `CAW allowance event ${event.eventId ?? "-"}`;
+    if (!payload) {
+      errors.push(`${label} requires payload`);
+      continue;
+    }
+    if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
+      errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
+    }
+    const spend = spendsById.get(lowerHex(payload.spendId));
+    if (!spend) {
+      errors.push(`${label} references missing registered spend`);
+      continue;
+    }
+    const amount = decimal(payload.amountAtomic);
+    const spendAmount = decimal(spend.maxPriceAtomic);
+    if (amount === null || spendAmount === null || amount !== spendAmount) {
+      errors.push(`${label} amountAtomic does not match registered spend price`);
+    }
+    for (const [field, expected] of [
+      ["paymentToken", spend.paymentToken],
+      ["payer", spend.payer],
+      ["agentWallet", spend.agentWallet],
+      ["owner", spend.agentWallet],
+    ]) {
+      if (lowerHex(payload[field]) !== lowerHex(expected)) {
+        errors.push(`${label} payload.${field} does not match registered spend`);
+      }
+    }
+    if (lowerHex(spend.payer) !== lowerHex(spend.agentWallet) || payload.payerAgentWalletSame !== true) {
+      errors.push(`${label} requires payerAgentWalletSame=true until wallet ownership proof exists`);
+    }
+    const spender = lowerHex(payload.spender);
+    const gate = lowerHex(payload.procurementGateAddress);
+    if (!isEvmAddress(spender) || spender !== gate) {
+      errors.push(`${label} spender must equal ProcurementGate address`);
+    }
+    if (decimal(payload.allowanceAfter) !== spendAmount) {
+      errors.push(`${label} allowanceAfter must equal registered spend price`);
+    }
+    if (decimal(payload.allowanceBefore) === null) {
+      errors.push(`${label} allowanceBefore must be a decimal uint string`);
+    }
+    if (Number(payload.preBlockNumber) !== Number(payload.blockNumber) - 1) {
+      errors.push(`${label} preBlockNumber must equal blockNumber - 1`);
+    }
+    if (!isHex32(payload.approveTxHash)) {
+      errors.push(`${label} requires approveTxHash`);
+    }
+    if (!isHex32(payload.approvalRawLogHash)) {
+      errors.push(`${label} requires approvalRawLogHash`);
+    }
+    const topics = Array.isArray(payload.approvalTopics) ? payload.approvalTopics.map((topic) => asText(topic).toLowerCase()) : [];
+    if (
+      topics[0] !== ERC20_APPROVAL_TOPIC ||
+      topics[1] !== evmAddressTopic(spend.agentWallet) ||
+      topics[2] !== evmAddressTopic(gate)
+    ) {
+      errors.push(`${label} approvalTopics do not bind ERC20 Approval(owner=agentWallet,spender=ProcurementGate)`);
+    }
+    if (amount !== null && asText(payload.approvalData).toLowerCase() !== `0x${uint256Word(amount)}`) {
+      errors.push(`${label} approvalData does not encode amountAtomic`);
+    }
+    const cawEvent = eventsById.get(payload.cawContractCallEventId);
+    if (!isObject(cawEvent) || cawEvent.kind !== "caw.live.contract_call.submitted" || cawEvent.authority !== "proof") {
+      errors.push(`${label} references missing proof-authority CAW contract call event`);
+    } else {
+      for (const [field, expected] of [
+        ["interactionId", payload.approveInteractionId],
+        ["spendId", payload.spendId],
+        ["operationKind", "approve"],
+        ["contractAddress", spend.paymentToken],
+        ["selector", ERC20_APPROVE_SELECTOR],
+        ["txHash", payload.approveTxHash],
+        ["requestHash", payload.requestHash],
+        ["responseHash", payload.responseHash],
+      ]) {
+        if (lowerHex(cawEvent.payload?.[field]) !== lowerHex(expected)) {
+          errors.push(`${label} CAW contract call event payload.${field} does not match allowance proof`);
+        }
+      }
+    }
+    const interaction = interactionsById.get(payload.approveInteractionId);
+    if (!interaction || interaction.kind !== "contract_call") {
+      errors.push(`${label} references missing CAW live approve interaction`);
+      continue;
+    }
+    if (interaction.status === "live_denied" || interaction.status === "live_failed") {
+      errors.push(`${label} cannot reference denied or failed CAW live approve interaction`);
+    }
+    if (interaction.requestHash !== payload.requestHash || interaction.responseHash !== payload.responseHash) {
+      errors.push(`${label} requestHash/responseHash do not match CAW live interaction`);
+    }
+    if (interaction.request?.operation_kind !== "approve") {
+      errors.push(`${label} CAW interaction must be an approve contract call`);
+    }
+    const expectedCalldata = expectedApproveCalldata(gate, asText(spend.maxPriceAtomic));
+    for (const [field, expected] of [
+      ["spend_id", payload.spendId],
+      ["contract_addr", spend.paymentToken],
+      ["selector", ERC20_APPROVE_SELECTOR],
+      ["spender_addr", gate],
+      ["procurement_gate_addr", gate],
+      ["amount", asText(spend.maxPriceAtomic)],
+      ["calldata", expectedCalldata],
+    ]) {
+      const actual = field === "amount" ? (decimal(interaction.request?.[field]) ?? -1n).toString() : asText(interaction.request?.[field]).toLowerCase();
+      if (actual !== asText(expected).toLowerCase()) {
+        errors.push(`${label} CAW approve request.${field} does not match allowance proof`);
+      }
     }
   }
 }
@@ -1236,6 +1360,31 @@ function verifyTokenBalanceDeltaEvents(eventsById, spendsById, errors) {
     }
     if (lowerHex(spend.payer) !== lowerHex(spend.agentWallet) || payload.payerAgentWalletSame !== true) {
       errors.push(`${label} requires payerAgentWalletSame=true until wallet ownership proof exists`);
+    }
+    const allowanceEvent = eventsById.get(payload.allowanceEventId);
+    const allowancePayload = isObject(allowanceEvent?.payload) ? allowanceEvent.payload : null;
+    if (
+      !isObject(allowanceEvent) ||
+      allowanceEvent.kind !== "caw.allowance.verified" ||
+      allowanceEvent.authority !== "proof" ||
+      !allowancePayload ||
+      allowancePayload.spendId !== payload.spendId ||
+      allowancePayload.proofAuthority !== true
+    ) {
+      errors.push(`${label} references missing proof-authority caw.allowance.verified allowanceEventId`);
+    } else {
+      for (const [field, expected] of [
+        ["approveInteractionId", allowancePayload.approveInteractionId],
+        ["approveTxHash", allowancePayload.approveTxHash],
+        ["paymentToken", allowancePayload.paymentToken],
+        ["payer", allowancePayload.payer],
+        ["agentWallet", allowancePayload.agentWallet],
+        ["amountAtomic", allowancePayload.amountAtomic],
+      ]) {
+        if (lowerHex(payload[field]) !== lowerHex(expected)) {
+          errors.push(`${label} payload.${field} does not match allowance proof`);
+        }
+      }
     }
     const settlementEvent = eventsById.get(payload.settlementEventId);
     const settlementPayload = isObject(settlementEvent?.payload) ? settlementEvent.payload : null;
@@ -1490,7 +1639,7 @@ function verifyCawLiveContractCallInteraction(interaction, spendsById, eventsByI
     return;
   }
   if (operationKind === "activate_tool") {
-    verifyCawLiveActivateToolCall(interaction, spend, spendId, eventsById, contractAddress, selector, calldata, errors);
+    verifyCawLiveActivateToolCall(interaction, spend, spendId, eventsById, event, contractAddress, selector, calldata, errors);
     return;
   }
   errors.push(`${label} has unsupported operation_kind`);
@@ -1522,7 +1671,7 @@ function verifyCawLiveApproveCall(interaction, spend, contractAddress, selector,
   }
 }
 
-function verifyCawLiveActivateToolCall(interaction, spend, spendId, eventsById, contractAddress, selector, calldata, errors) {
+function verifyCawLiveActivateToolCall(interaction, spend, spendId, eventsById, event, contractAddress, selector, calldata, errors) {
   const label = `CAW live activate_tool ${interaction.interactionId ?? "-"}`;
   if (!isEvmAddress(contractAddress)) {
     errors.push(`${label} requires contract_addr`);
@@ -1563,6 +1712,13 @@ function verifyCawLiveActivateToolCall(interaction, spend, spendId, eventsById, 
   });
   if (!settled) {
     errors.push(`${label} does not match a finalized SpendSettled proof event by spendId and contractAddress`);
+    return;
+  }
+  const settledPayload = isObject(settled.payload) ? settled.payload : {};
+  if (!event || !isHex32(event.payload?.txHash)) {
+    errors.push(`${label} requires CAW contract call event txHash`);
+  } else if (lowerHex(event.payload.txHash) !== lowerHex(settledPayload.txHash)) {
+    errors.push(`${label} txHash must match finalized SpendSettled txHash`);
   }
 }
 
@@ -1982,6 +2138,8 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   verifyContractStateProofEvents(bundle, Array.isArray(bundle.events) ? bundle.events : [], errors);
   verifySourceIdentityBindings(bundle, errors);
   const spendsById = new Map(spends.filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]));
+  const cawLiveInteractionsById = new Map(cawLiveInteractions.filter(isObject).map((interaction) => [interaction.interactionId, interaction]));
+  verifyCawAllowanceEvents(eventsById, spendsById, cawLiveInteractionsById, errors);
   verifyTokenBalanceDeltaEvents(eventsById, spendsById, errors);
   verifyCawLiveInteractions(cawLiveInteractions, spendsById, eventsById, errors);
   const preflightsById = new Map(preflights.filter(isObject).map((preflight) => [preflight.preflightId, preflight]));

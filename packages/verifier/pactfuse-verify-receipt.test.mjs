@@ -12,6 +12,7 @@ const verifierFile = fileURLToPath(verifierPath);
 const ZERO_HASH = `0x${"0".repeat(64)}`;
 const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
 const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const ERC20_APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 
 describe("pactfuse receipt verifier contract", () => {
@@ -843,12 +844,17 @@ function replayBundle() {
   ];
   sealReplayBundleForTest(bundle);
   const gateEvent = bundle.events.find((event) => event.kind === "gate.spend_settled");
+  const cawCalls = appendCawLiveContractCallsForTest(bundle);
+  const allowanceEvent = appendCawAllowanceEventForTest(bundle, cawCalls.approve);
   bundle.events.push({
     eventSeq: bundle.events.length + 1,
     authority: "proof",
     kind: "token.balance_delta.verified",
     payload: {
       spendId,
+      allowanceEventId: allowanceEvent.eventId,
+      approveInteractionId: cawCalls.approve.interactionId,
+      approveTxHash: cawCalls.approve.response.result.transaction_hash,
       settlementEventId: gateEvent.eventId,
       gateEventId: gateEvent.payload.gateEventId,
       txHash: gateEvent.payload.txHash,
@@ -1135,7 +1141,7 @@ function appendCawLiveContractCallsForTest(bundle) {
     request: activateRequest,
     createdAt,
   });
-  bundle.cawLiveInteractions = [pactSync, approve, activate];
+  bundle.cawLiveInteractions = [...bundle.cawLiveInteractions, pactSync, approve, activate];
   bundle.events = [
     ...bundle.events,
     {
@@ -1162,13 +1168,67 @@ function appendCawLiveContractCallsForTest(bundle) {
   return { pactSync, approve, activate };
 }
 
+function appendCawAllowanceEventForTest(bundle, approve) {
+  const spend = bundle.spends[0];
+  const cawEvent = bundle.events.find((candidate) => candidate.payload?.interactionId === approve.interactionId);
+  const gateAddress = approve.request.procurement_gate_addr.toLowerCase();
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "proof",
+    kind: "caw.allowance.verified",
+    payload: {
+      spendId: spend.spendId,
+      approveInteractionId: approve.interactionId,
+      cawContractCallEventId: cawEvent.eventId,
+      walletId: approve.walletId,
+      pactId: approve.pactId,
+      cawRequestId: approve.cawRequestId,
+      approveTxHash: approve.response.result.transaction_hash,
+      chainId: approve.request.chain_id,
+      blockNumber: 99,
+      preBlockNumber: 98,
+      approvalLogIndex: 1,
+      approvalRawLogHash: hex32("base-caw-approval-log"),
+      approvalTopics: [ERC20_APPROVAL_TOPIC, evmAddressTopic(spend.agentWallet), evmAddressTopic(gateAddress)],
+      approvalData: `0x${uint256Word(spend.maxPriceAtomic)}`,
+      paymentToken: spend.paymentToken,
+      payer: spend.agentWallet,
+      agentWallet: spend.agentWallet,
+      owner: spend.agentWallet,
+      payerAgentWalletSame: true,
+      procurementGateAddress: gateAddress,
+      spender: gateAddress,
+      amountAtomic: spend.maxPriceAtomic,
+      allowanceBefore: "0",
+      allowanceAfter: spend.maxPriceAtomic,
+      requestHash: approve.requestHash,
+      responseHash: approve.responseHash,
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+    createdAt: "2026-06-11T00:00:02.500Z",
+  });
+  sealReplayBundleForTest(bundle);
+  const allowanceEvent = bundle.events.find((candidate) => candidate.kind === "caw.allowance.verified" && candidate.payload.approveInteractionId === approve.interactionId);
+  const row = bundle.judgeCheck.rows.find((candidate) => candidate.rowId === "caw_boundary");
+  row.status = "pass";
+  row.authority = "proof";
+  row.reason = "CAW approve tx, ERC20 Approval log, and allowance state verified";
+  row.evidenceEventId = allowanceEvent.eventId;
+  bundle.replayPageIndex = replayPageIndexForTest(bundle);
+  return allowanceEvent;
+}
+
 function cawLiveContractInteractionForTest({ seed, bundle, walletId, pactId, authKeyHash, request, createdAt }) {
+  const gateEvent = bundle.events.find((candidate) => candidate.kind === "gate.spend_settled");
+  const txHash = request.operation_kind === "activate_tool" && gateEvent ? gateEvent.payload.txHash : hex32(`caw-live-contract-${seed}-tx`);
   const response = {
     result: {
       id: `contract-live-${seed}`,
       wallet_id: walletId,
       request_id: request.request_id,
       status: "submitted",
+      transaction_hash: txHash,
     },
   };
   return {
@@ -1206,6 +1266,7 @@ function cawLiveContractEventForTest(bundle, interaction, createdAt) {
       cawRequestId: interaction.cawRequestId,
       chainId: interaction.request.chain_id,
       valueAtomic: interaction.request.value,
+      txHash: interaction.response.result.transaction_hash,
       requestHash: interaction.requestHash,
       responseHash: interaction.responseHash,
       pactScopedApiKeyHash: interaction.authKeyHash,

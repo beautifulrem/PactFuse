@@ -43,6 +43,7 @@ import {
   submitCawLiveTransfer,
   syncCawLiveAudit,
   syncCawLivePact,
+  verifyCawAllowance,
   verifyTokenBalanceDelta,
   verifyEvidenceForSession,
 } from "./services/service.js";
@@ -66,6 +67,7 @@ const ROUTES = [
   { method: "POST", path: "/api/v1/caw/live/pacts/sync", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/live/transfers/submit", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/live/contracts/call", okStatus: 202 },
+  { method: "POST", path: "/api/v1/caw/live/allowances/verify", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/live/audit/sync", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/receipts/ingest", okStatus: 202 },
   { method: "POST", path: "/api/v1/gate/events/ingest", okStatus: 202 },
@@ -113,9 +115,25 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "contractAddress",
     "selector",
     "cawRequestId",
+    "txHash",
     "pactScopedApiKeyHash",
     "requestHash",
     "responseHash",
+    "proofAuthority",
+    "winnerClaimAllowed",
+  ],
+  "/api/v1/caw/live/allowances/verify": [
+    "spendId",
+    "approveInteractionId",
+    "cawContractCallEventId",
+    "approveTxHash",
+    "paymentToken",
+    "owner",
+    "spender",
+    "amountAtomic",
+    "allowanceBefore",
+    "allowanceAfter",
+    "approvalRawLogHash",
     "proofAuthority",
     "winnerClaimAllowed",
   ],
@@ -300,6 +318,11 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.post("/api/v1/caw/live/contracts/call", async (c) => {
     authorizeApiRole(c, ctx, "operator");
     return send(c, await submitCawLiveContractCall(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx, c.req.header("x-pactfuse-caw-pact-api-key") ?? null), 202);
+  });
+
+  app.post("/api/v1/caw/live/allowances/verify", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await verifyCawAllowance(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
   });
 
   app.post("/api/v1/caw/live/audit/sync", async (c) => {
@@ -810,6 +833,16 @@ function buildOpenApi(): Record<string, unknown> {
             gasProvider: { type: "string", minLength: 1, maxLength: 120 },
             description: { type: "string", minLength: 1, maxLength: 240 },
             fee: { anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }] },
+          },
+        },
+        CawAllowanceVerifyInput: sessionEnvelopeSchema("#/components/schemas/CawAllowanceVerifyPayload"),
+        CawAllowanceVerifyPayload: {
+          type: "object",
+          required: ["spendId"],
+          additionalProperties: false,
+          properties: {
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            approveInteractionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
           },
         },
         TokenBalanceDeltaVerifyInput: sessionEnvelopeSchema("#/components/schemas/TokenBalanceDeltaVerifyPayload"),
@@ -1963,6 +1996,9 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   if (path === "/api/v1/caw/live/contracts/call") {
     return jsonRequestBody({ $ref: "#/components/schemas/CawLiveContractCallInput" });
   }
+  if (path === "/api/v1/caw/live/allowances/verify") {
+    return jsonRequestBody({ $ref: "#/components/schemas/CawAllowanceVerifyInput" });
+  }
   if (path === "/api/v1/caw/receipts/ingest") {
     return jsonRequestBody({ $ref: "#/components/schemas/CawReceiptIngestInput" });
   }
@@ -2069,6 +2105,7 @@ function apiRoleForPath(path: string): ApiRole | null {
     case "/api/v1/caw/live/pacts/sync":
     case "/api/v1/caw/live/transfers/submit":
     case "/api/v1/caw/live/contracts/call":
+    case "/api/v1/caw/live/allowances/verify":
     case "/api/v1/caw/live/audit/sync":
     case "/api/v1/indexer/backfill":
     case "/api/v1/token/balance-deltas/verify":

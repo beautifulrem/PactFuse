@@ -88,7 +88,8 @@ WINNER_CLAIM_ALLOWED: false
 | --- | --- | --- |
 | Cobo wallet identity | Pending probe | No |
 | Payment settlement | Mocked/local | No real-token claim |
-| Token balance delta proof | Implemented with finalized `SpendSettled`, ERC20 `Transfer`, and block-level `balanceOf` checks in local mocked mode | No public token-settlement claim |
+| CAW allowance proof | Implemented with CAW live approve call evidence, approve tx receipt, ERC20 `Approval` log, and block-level `allowance` checks in local mocked mode | No public Cobo-payment claim |
+| Token balance delta proof | Implemented with finalized `SpendSettled`, prior `caw.allowance.verified`, ERC20 `Transfer`, and block-level `balanceOf` checks in local mocked mode | No public token-settlement claim |
 | Token delivery | Local mocked | No public token-delivery claim |
 | Fusebox app | Fixture preview | No proof authority |
 | Receipt verifier | Fail-closed structural verifier | No public proof claim |
@@ -194,9 +195,11 @@ Important `/api/v1` routes:
 | `POST /api/v1/sources/challenge` | Record source challenge evidence |
 | `POST /api/v1/spends/register-batch` | Register source-bound spends |
 | `POST /api/v1/caw/operations/build` | Build CAW operation envelopes |
+| `POST /api/v1/caw/live/contracts/call` | Record CAW live approve or `activate_tool` contract-call evidence |
+| `POST /api/v1/caw/live/allowances/verify` | Verify CAW approve tx, ERC20 `Approval` log, and on-chain allowance state |
 | `POST /api/v1/caw/receipts/ingest` | Ingest raw CAW receipt exports |
 | `POST /api/v1/gate/events/ingest` | Ingest gate/indexer events |
-| `POST /api/v1/token/balance-deltas/verify` | Verify finalized settlement against ERC20 balance deltas and matching `Transfer` log |
+| `POST /api/v1/token/balance-deltas/verify` | Verify finalized settlement against CAW allowance proof, ERC20 balance deltas, and matching `Transfer` log |
 | `POST /api/v1/artifacts/preflight` | Preflight delivery before quote signing |
 | `POST /api/v1/quotes` | Sign mocked quotes after preflight |
 | `POST /api/v1/artifacts/access-token` | Issue bearer-bound artifact access tokens |
