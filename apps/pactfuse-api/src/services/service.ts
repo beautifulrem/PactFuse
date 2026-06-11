@@ -4609,7 +4609,7 @@ function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: C
     inputs.add("PACTFUSE_CAW_EXPORT_URL or equivalent raw CAW receipt export source");
   }
   if (provider("mcp_lease")?.ready !== true || provider("mcp_lease")?.mode !== "live") {
-    inputs.add("PACTFUSE_MCP_LEASE_URL for a live MCP lease runner");
+    inputs.add("PACTFUSE_LEASE_MCP_URL for a live MCP lease runner");
   }
   for (const gate of gates) {
     if (gate.status === "pass") {

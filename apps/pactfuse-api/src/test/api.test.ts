@@ -457,7 +457,7 @@ describe("pactfuse-api P0", () => {
         "PACTFUSE_CAW_EXPORT_URL or equivalent raw CAW receipt export source",
         "PACTFUSE_CAW_LIVE_API_URL, PACTFUSE_CAW_LIVE_API_KEY, and a CAW wallet id",
         "PACTFUSE_CHAIN_RPC_URL and PACTFUSE_CHAIN_ID for a live public testnet RPC",
-        "PACTFUSE_MCP_LEASE_URL for a live MCP lease runner",
+        "PACTFUSE_LEASE_MCP_URL for a live MCP lease runner",
       ]),
     );
   });
@@ -876,7 +876,7 @@ describe("pactfuse-api P0", () => {
     expect(json.data.blockers).toContain("caw_raw_receipts: missing raw and canonical CAW receipts for deny_probe, approve, and activate_tool");
     expect(json.data.blockers).toContain("artifact_quote_live: artifact quote is still mocked_after_preflight_not_chain_settleable");
     expect(json.data.requiredExternalInputs).toContain("chain-settleable artifact quote issued after preflight");
-    expect(json.data.requiredExternalInputs).toContain("PACTFUSE_MCP_LEASE_URL for a live MCP lease runner");
+    expect(json.data.requiredExternalInputs).toContain("PACTFUSE_LEASE_MCP_URL for a live MCP lease runner");
     expect(json.data.requiredExternalInputs).toContain("raw CAW API/export receipts canonicalized for deny_probe, approve, and activate_tool");
     expect(json.data.requiredExternalInputs).toContain("full chain/signature/hash verifier that can set finalVerifierComplete=true");
     expect(json.data.verifierRun.winnerClaimAllowed).toBe(false);
