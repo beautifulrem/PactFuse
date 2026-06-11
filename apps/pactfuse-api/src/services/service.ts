@@ -516,43 +516,30 @@ export async function refundUndeliveredArtifact(
   const payload = parseStrict(ArtifactRefundPayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("artifacts:refund", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
+    assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    const quote = ctx.db.sqlite
+      .prepare(
+        `SELECT quote_id, preflight_id, artifact_commitment
+         FROM quotes
+         WHERE session_id = ? AND spend_id = ? AND quote_id = ?`,
+      )
+      .get(envelope.sessionId, payload.spendId, payload.quoteId) as Row | undefined;
+    if (!quote) {
+      throw Object.assign(new Error("artifact refund requires a quoted paid artifact commitment"), {
+        apiError: proofPendingError(requestId, "artifact refund requires a quoted paid artifact commitment"),
+      });
+    }
     const event = appendEvidenceEvent(ctx, {
       sessionId: envelope.sessionId,
       authority: "operator",
       kind: "artifact.refund.pending",
-      payload: { spendId: payload.spendId, reason: payload.reason, status: "pending_live_settlement" },
-    });
-    return {
-      ok: true,
-      requestId,
-      evidenceEventId: event.eventId,
-      data: { status: "pending_live_settlement", winnerClaimAllowed: false },
-    };
-  });
-}
-
-export async function executeLease(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
-  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
-  const payload = parseStrict(LeaseExecutePayloadSchema, envelope.payload);
-  return withIdempotency(ctx, scoped("lease:execute", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
-    assertSession(ctx, envelope.sessionId, requestId);
-    const createdAt = ctx.clock.now().toISOString();
-    const leaseRunId = hashJson({ sessionId: envelope.sessionId, payload, requestId });
-    ctx.db.sqlite
-      .prepare(
-        `INSERT INTO lease_runs
-          (lease_run_id, session_id, spend_id, target_repo, target_commit, status, transcript_hash, created_at)
-         VALUES (?, ?, ?, ?, ?, 'blocked_missing_finalized_settlement', NULL, ?)`,
-      )
-      .run(leaseRunId, envelope.sessionId, payload.spendId, payload.targetRepo, payload.targetCommit, createdAt);
-    const event = appendEvidenceEvent(ctx, {
-      sessionId: envelope.sessionId,
-      authority: "operator",
-      kind: "lease.execution.blocked",
       payload: {
-        leaseRunId,
         spendId: payload.spendId,
-        status: "blocked_missing_finalized_settlement",
+        quoteId: String(quote.quote_id),
+        preflightId: String(quote.preflight_id),
+        artifactCommitment: String(quote.artifact_commitment),
+        reason: payload.reason,
+        status: "pending_live_settlement",
         winnerClaimAllowed: false,
       },
     });
@@ -561,12 +548,83 @@ export async function executeLease(input: SessionScopedEnvelope, ctx: ServiceCtx
       requestId,
       evidenceEventId: event.eventId,
       data: {
-        leaseRunId,
-        status: "blocked_missing_finalized_settlement",
+        spendId: payload.spendId,
+        quoteId: String(quote.quote_id),
+        preflightId: String(quote.preflight_id),
+        status: "pending_live_settlement",
         winnerClaimAllowed: false,
       },
     };
   });
+}
+
+export async function executeLease(
+  input: SessionScopedEnvelope,
+  ctx: ServiceCtx,
+  bearerToken: string | null,
+): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(LeaseExecutePayloadSchema, envelope.payload);
+  return withIdempotency(
+    ctx,
+    scoped("lease:execute", envelope.sessionId),
+    envelope.idempotencyKey,
+    { envelope, bearerTokenHash: bearerToken ? sha256Hex(bearerToken) : null },
+    async (requestId) => {
+      assertSession(ctx, envelope.sessionId, requestId);
+      const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+      const payer = requireSpendPayer(spend, payload.payer, requestId);
+      requireActiveArtifactAccess(
+        ctx,
+        {
+          sessionId: envelope.sessionId,
+          spendId: payload.spendId,
+          payer,
+          artifactHash: payload.artifactHash,
+          bearerToken,
+        },
+        requestId,
+      );
+      const createdAt = ctx.clock.now().toISOString();
+      const leaseRunId = hashJson({ sessionId: envelope.sessionId, payload, requestId });
+      ctx.db.sqlite
+        .prepare(
+          `INSERT INTO lease_runs
+            (lease_run_id, session_id, spend_id, target_repo, target_commit, status, transcript_hash, created_at)
+           VALUES (?, ?, ?, ?, ?, 'blocked_missing_runner_execution', NULL, ?)`,
+        )
+        .run(leaseRunId, envelope.sessionId, payload.spendId, payload.targetRepo, payload.targetCommit, createdAt);
+      const event = appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "operator",
+        kind: "lease.execution.blocked",
+        payload: {
+          leaseRunId,
+          spendId: payload.spendId,
+          payer,
+          artifactHash: payload.artifactHash,
+          targetRepo: payload.targetRepo,
+          targetCommit: payload.targetCommit,
+          bearerBound: true,
+          status: "blocked_missing_runner_execution",
+          winnerClaimAllowed: false,
+        },
+      });
+      return {
+        ok: true,
+        requestId,
+        evidenceEventId: event.eventId,
+        data: {
+          leaseRunId,
+          payer,
+          artifactHash: payload.artifactHash,
+          bearerBound: true,
+          status: "blocked_missing_runner_execution",
+          winnerClaimAllowed: false,
+        },
+      };
+    },
+  );
 }
 
 export async function verifyEvidenceForSession(
@@ -773,36 +831,9 @@ export async function readArtifactAccess(
   const spendId = parseStrict(Hex32Schema, input.spendId);
   const artifactHash = parseStrict(Hex32Schema, input.artifactHash);
   assertSession(ctx, sessionId, requestId);
-  const rows = ctx.db.sqlite
-    .prepare(
-      `SELECT token_hash, status
-       FROM artifact_access_tokens
-       WHERE session_id = ? AND spend_id = ? AND payer = ? AND artifact_hash = ?`,
-    )
-    .all(sessionId, spendId, input.payer, artifactHash) as Row[];
-  if (rows.length === 0) {
-    return {
-      ok: false,
-      requestId,
-      error: proofPendingError(requestId, "artifact access is pending live settlement and bearer-token proof"),
-    };
-  }
-  if (!input.bearerToken) {
-    return {
-      ok: false,
-      requestId,
-      error: proofPendingError(requestId, "artifact bearer token is required but no proof-valid token is active"),
-    };
-  }
-  const tokenHash = sha256Hex(input.bearerToken);
-  const active = rows.find((row) => row.status === "active" && row.token_hash === tokenHash);
-  if (!active) {
-    return {
-      ok: false,
-      requestId,
-      error: proofPendingError(requestId, "artifact bearer token is not backed by a proof-valid active access row"),
-    };
-  }
+  const spend = assertSpend(ctx, sessionId, spendId, requestId);
+  const payer = requireSpendPayer(spend, input.payer, requestId);
+  requireActiveArtifactAccess(ctx, { ...input, sessionId, spendId, payer, artifactHash }, requestId);
   return {
     ok: true,
     requestId,
@@ -1295,13 +1326,62 @@ function assertSession(ctx: ServiceCtx, sessionId: string, requestId: string): v
   }
 }
 
-function assertSpend(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): void {
+function assertSpend(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): Row {
   const spend = ctx.db.sqlite
-    .prepare("SELECT spend_id FROM spends WHERE session_id = ? AND spend_id = ?")
+    .prepare("SELECT spend_id, payer FROM spends WHERE session_id = ? AND spend_id = ?")
     .get(sessionId, spendId) as Row | undefined;
   if (!spend) {
     throw Object.assign(new Error("spend not found"), { apiError: notFoundError(requestId, "spend") });
   }
+  return spend;
+}
+
+function requireSpendPayer(spend: Row, payer: string, requestId: string): string {
+  const registeredPayer = String(spend.payer);
+  if (registeredPayer.toLowerCase() !== payer.toLowerCase()) {
+    throw Object.assign(new Error("payer does not match registered spend payer"), {
+      apiError: proofBlockedError(requestId, "payer does not match registered spend payer"),
+    });
+  }
+  return registeredPayer;
+}
+
+function requireActiveArtifactAccess(
+  ctx: ServiceCtx,
+  input: {
+    sessionId: string;
+    spendId: string;
+    payer: string;
+    artifactHash: string;
+    bearerToken: string | null;
+  },
+  requestId: string,
+): Row {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT token_id, token_hash, status
+       FROM artifact_access_tokens
+       WHERE session_id = ? AND spend_id = ? AND payer = ? AND artifact_hash = ?`,
+    )
+    .all(input.sessionId, input.spendId, input.payer, input.artifactHash) as Row[];
+  if (rows.length === 0) {
+    throw Object.assign(new Error("artifact access is pending live settlement and bearer-token proof"), {
+      apiError: proofPendingError(requestId, "artifact access is pending live settlement and bearer-token proof"),
+    });
+  }
+  if (!input.bearerToken) {
+    throw Object.assign(new Error("artifact bearer token is required"), {
+      apiError: proofPendingError(requestId, "artifact bearer token is required but no proof-valid token is active"),
+    });
+  }
+  const tokenHash = sha256Hex(input.bearerToken);
+  const active = rows.find((row) => row.status === "active" && row.token_hash === tokenHash);
+  if (!active) {
+    throw Object.assign(new Error("artifact bearer token is not active for tuple"), {
+      apiError: proofPendingError(requestId, "artifact bearer token is not backed by a proof-valid active access row"),
+    });
+  }
+  return active;
 }
 
 function requireQuotePreflight(

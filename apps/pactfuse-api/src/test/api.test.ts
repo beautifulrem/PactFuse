@@ -236,6 +236,57 @@ describe("pactfuse-api P0", () => {
       "priceDisclosureHash",
       "winnerClaimAllowed",
     ]);
+    expect(json.paths["/api/v1/artifacts/refund"].post["x-pactfuse-proof-fields"]).toEqual([
+      "spendId",
+      "quoteId",
+      "status",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/artifacts/refund"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ArtifactRefundInput",
+    );
+    expect(json.paths["/api/v1/artifacts/refund"].post.responses["202"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ArtifactRefundResponse",
+    );
+    expect(json.components.schemas.ArtifactRefundPayload.required).toEqual(["spendId", "quoteId", "reason"]);
+    expect(json.paths["/api/v1/lease/execute"].post["x-pactfuse-proof-fields"]).toEqual([
+      "leaseRunId",
+      "bearerBound",
+      "artifactHash",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/lease/execute"].post.parameters).toEqual([
+      expect.objectContaining({
+        name: "authorization",
+        in: "header",
+        required: true,
+      }),
+    ]);
+    expect(json.paths["/api/v1/lease/execute"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/LeaseExecuteInput",
+    );
+    expect(json.components.schemas.LeaseExecuteInput.properties.payload.$ref).toBe(
+      "#/components/schemas/LeaseExecutePayload",
+    );
+    expect(json.components.schemas.LeaseExecutePayload.required).toEqual([
+      "spendId",
+      "payer",
+      "artifactHash",
+      "targetRepo",
+      "targetCommit",
+    ]);
+    expect(json.paths["/api/v1/lease/execute"].post.responses["202"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/LeaseExecuteResponse",
+    );
+    expect(json.paths["/api/v1/artifacts/{sessionId}/{spendId}/{payer}/{artifactHash}"].get.parameters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "authorization",
+          in: "header",
+          required: true,
+        }),
+      ]),
+    );
     expect(json.paths["/api/v1/quotes"].post.responses["201"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/QuoteResponse",
     );
@@ -443,21 +494,82 @@ describe("pactfuse-api P0", () => {
     expect(event.payload.receiptCount).toBe(1);
   });
 
-  it("keeps artifact reads fail-closed and validates path parameters", async () => {
-    const { app } = makeApp();
+  it("keeps artifact reads bearer-bound and validates path parameters", async () => {
+    const { app, ctx } = makeApp();
     const sessionId = await createSession(app, "sess-artifact");
-    const spendId = hex32("artifact-spend");
+    const spendId = await registerSpend(app, sessionId);
     const artifactHash = hex32("artifact");
+    const payer = "0x1234";
+    const bearerToken = "artifact-access-token";
+    const artifactUrl = `/api/v1/artifacts/${sessionId}/${spendId}/${payer}/${artifactHash}`;
+    const wrongPayer = "0xabcd";
+    const wrongPayerToken = "wrong-payer-artifact-token";
 
-    const pending = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/0x1234/${artifactHash}`);
+    const pending = await app.request(artifactUrl);
     const pendingJson = await pending.json();
     const invalidPayer = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/not-a-hex/${artifactHash}`);
     const invalidJson = await invalidPayer.json();
+    ctx.db.sqlite
+      .prepare(
+        `INSERT INTO artifact_access_tokens
+          (token_id, session_id, spend_id, payer, artifact_hash, token_hash, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
+      )
+      .run(
+        hex32("artifact-token-row"),
+        sessionId,
+        spendId,
+        payer,
+        artifactHash,
+        hex32(bearerToken),
+        "2026-06-11T00:00:00.000Z",
+      );
+    const missingBearer = await app.request(artifactUrl);
+    const missingBearerJson = await missingBearer.json();
+    const wrongBearer = await app.request(artifactUrl, { headers: { authorization: "Bearer wrong-token" } });
+    const wrongBearerJson = await wrongBearer.json();
+    const allowed = await app.request(artifactUrl, { headers: { authorization: `Bearer ${bearerToken}` } });
+    const allowedJson = await allowed.json();
+    ctx.db.sqlite
+      .prepare(
+        `INSERT INTO artifact_access_tokens
+          (token_id, session_id, spend_id, payer, artifact_hash, token_hash, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
+      )
+      .run(
+        hex32("artifact-wrong-payer-token-row"),
+        sessionId,
+        spendId,
+        wrongPayer,
+        artifactHash,
+        hex32(wrongPayerToken),
+        "2026-06-11T00:00:00.000Z",
+      );
+    const payerMismatch = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/${wrongPayer}/${artifactHash}`, {
+      headers: { authorization: `Bearer ${wrongPayerToken}` },
+    });
+    const payerMismatchJson = await payerMismatch.json();
 
     expect(pending.status).toBe(423);
     expect(pendingJson.error.code).toBe("proof_pending");
     expect(invalidPayer.status).toBe(400);
     expect(invalidJson.error.code).toBe("bad_request");
+    expect(missingBearer.status).toBe(423);
+    expect(missingBearerJson.error.code).toBe("proof_pending");
+    expect(wrongBearer.status).toBe(423);
+    expect(wrongBearerJson.error.code).toBe("proof_pending");
+    expect(allowed.status).toBe(200);
+    expect(allowedJson.data).toEqual(
+      expect.objectContaining({
+        sessionId,
+        spendId,
+        artifactHash,
+        status: "available",
+        winnerClaimAllowed: false,
+      }),
+    );
+    expect(payerMismatch.status).toBe(422);
+    expect(payerMismatchJson.error.code).toBe("proof_blocked");
   });
 
   it("requires registered spends before artifact preflight", async () => {
@@ -592,6 +704,116 @@ describe("pactfuse-api P0", () => {
 
     expect(quote.status).toBe(422);
     expect(quote.json.error.code).toBe("proof_blocked");
+  });
+
+  it("requires a quoted artifact before refunding undelivered delivery", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-refund-unquoted");
+    const spendId = await registerSpend(app, sessionId);
+
+    const refund = await post(app, "/api/v1/artifacts/refund", {
+      sessionId,
+      idempotencyKey: "refund-without-quote",
+      payload: {
+        spendId,
+        quoteId: hex32("missing-refund-quote"),
+        reason: "delivery timeout",
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(refund.status).toBe(423);
+    expect(refund.json.error.code).toBe("proof_pending");
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("artifact.refund.pending");
+  });
+
+  it("records refund evidence for a quoted undelivered artifact without enabling winner claims", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-refund-quoted");
+    const spendId = await registerSpend(app, sessionId);
+    const artifactHashPreview = hex32("refund-artifact-preview");
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "refund-preflight",
+      payload: {
+        spendId,
+        artifactHashPreview,
+        endpointUrl: "https://example.com/artifact",
+        priceDisclosureHash: hex32("refund-price-disclosure"),
+        sourceStateSnapshotHash: hex32("refund-source-state"),
+      },
+    });
+    const quote = await post(app, "/api/v1/quotes", {
+      sessionId,
+      idempotencyKey: "refund-quote",
+      payload: {
+        spendId,
+        preflightId: preflight.json.data.preflightId,
+        artifactCommitment: artifactHashPreview,
+        priceAtomic: "1000",
+        quoteNonce: "refund-quote-nonce",
+        validUntilBlock: "123",
+      },
+    });
+    const secondPreflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "refund-second-preflight",
+      payload: {
+        spendId,
+        artifactHashPreview: hex32("refund-second-artifact-preview"),
+        endpointUrl: "https://example.com/artifact-2",
+        priceDisclosureHash: hex32("refund-second-price-disclosure"),
+        sourceStateSnapshotHash: hex32("refund-second-source-state"),
+      },
+    });
+    const secondQuote = await post(app, "/api/v1/quotes", {
+      sessionId,
+      idempotencyKey: "refund-second-quote",
+      payload: {
+        spendId,
+        preflightId: secondPreflight.json.data.preflightId,
+        artifactCommitment: secondPreflight.json.data.artifactHashPreview,
+        priceAtomic: "2000",
+        quoteNonce: "refund-second-quote-nonce",
+        validUntilBlock: "124",
+      },
+    });
+
+    const refund = await post(app, "/api/v1/artifacts/refund", {
+      sessionId,
+      idempotencyKey: "refund-after-quote",
+      payload: {
+        spendId,
+        quoteId: quote.json.data.quoteId,
+        reason: "delivery timeout",
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const refundEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "artifact.refund.pending");
+
+    expect(secondQuote.status).toBe(201);
+    expect(refund.status).toBe(202);
+    expect(refund.json.data).toEqual(
+      expect.objectContaining({
+        spendId,
+        quoteId: quote.json.data.quoteId,
+        preflightId: preflight.json.data.preflightId,
+        status: "pending_live_settlement",
+        winnerClaimAllowed: false,
+      }),
+    );
+    expect(refundEvent.payload).toEqual(
+      expect.objectContaining({
+        spendId,
+        quoteId: quote.json.data.quoteId,
+        preflightId: preflight.json.data.preflightId,
+        artifactCommitment: artifactHashPreview,
+        status: "pending_live_settlement",
+        winnerClaimAllowed: false,
+      }),
+    );
   });
 
   it("persists sessions across database reopen", async () => {
@@ -1059,13 +1281,17 @@ describe("pactfuse-api P0", () => {
   it("keeps missing live evidence from enabling winner claims", async () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-missing-live");
-    const spendId = hex32("spend-live");
+    const spendId = await registerSpend(app, sessionId);
+    const payer = "0x1234";
+    const artifactHash = hex32("lease-artifact-pending");
 
     const lease = await post(app, "/api/v1/lease/execute", {
       sessionId,
       idempotencyKey: "lease-blocked",
       payload: {
         spendId,
+        payer,
+        artifactHash,
         targetRepo: "https://github.com/example/repo",
         targetCommit: "abcdef123456",
       },
@@ -1073,10 +1299,162 @@ describe("pactfuse-api P0", () => {
     const judge = await app.request(`/api/v1/evidence/judge-check?sessionId=${sessionId}`);
     const judgeJson = await judge.json();
 
-    expect(lease.status).toBe(202);
-    expect(lease.json.data.status).toBe("blocked_missing_finalized_settlement");
-    expect(lease.json.data.winnerClaimAllowed).toBe(false);
+    expect(lease.status).toBe(423);
+    expect(lease.json.error.code).toBe("proof_pending");
     expect(judgeJson.data.winnerClaimAllowed).toBe(false);
+  });
+
+  it("requires a matching bearer-bound artifact token before lease execution", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-lease-bearer-bound");
+    const spendId = await registerSpend(app, sessionId);
+    const payer = "0x1234";
+    const wrongPayer = "0xabcd";
+    const artifactHash = hex32("lease-artifact-active");
+    const bearerToken = "lease-access-token";
+    const wrongPayerToken = "lease-wrong-payer-token";
+    ctx.db.sqlite
+      .prepare(
+        `INSERT INTO artifact_access_tokens
+          (token_id, session_id, spend_id, payer, artifact_hash, token_hash, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
+      )
+      .run(hex32("lease-token-row"), sessionId, spendId, payer, artifactHash, hex32(bearerToken), "2026-06-11T00:00:00.000Z");
+    ctx.db.sqlite
+      .prepare(
+        `INSERT INTO artifact_access_tokens
+          (token_id, session_id, spend_id, payer, artifact_hash, token_hash, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
+      )
+      .run(
+        hex32("lease-wrong-payer-token-row"),
+        sessionId,
+        spendId,
+        wrongPayer,
+        artifactHash,
+        hex32(wrongPayerToken),
+        "2026-06-11T00:00:00.000Z",
+      );
+
+    const missingToken = await post(app, "/api/v1/lease/execute", {
+      sessionId,
+      idempotencyKey: "lease-missing-token",
+      payload: {
+        spendId,
+        payer,
+        artifactHash,
+        targetRepo: "https://github.com/example/repo",
+        targetCommit: "abcdef123456",
+      },
+    });
+    const wrongToken = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId,
+        idempotencyKey: "lease-wrong-token",
+        payload: {
+          spendId,
+          payer,
+          artifactHash,
+          targetRepo: "https://github.com/example/repo",
+          targetCommit: "abcdef123456",
+        },
+      },
+      { authorization: "Bearer wrong-token" },
+    );
+    const payerMismatch = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId,
+        idempotencyKey: "lease-wrong-payer",
+        payload: {
+          spendId,
+          payer: wrongPayer,
+          artifactHash,
+          targetRepo: "https://github.com/example/repo",
+          targetCommit: "abcdef123456",
+        },
+      },
+      { authorization: `Bearer ${wrongPayerToken}` },
+    );
+    const lease = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId,
+        idempotencyKey: "lease-active-token",
+        payload: {
+          spendId,
+          payer,
+          artifactHash,
+          targetRepo: "https://github.com/example/repo",
+          targetCommit: "abcdef123456",
+        },
+      },
+      { authorization: `Bearer ${bearerToken}` },
+    );
+    const replayLease = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId,
+        idempotencyKey: "lease-active-token",
+        payload: {
+          spendId,
+          payer,
+          artifactHash,
+          targetRepo: "https://github.com/example/repo",
+          targetCommit: "abcdef123456",
+        },
+      },
+      { authorization: `Bearer ${bearerToken}` },
+    );
+    const tokenConflict = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId,
+        idempotencyKey: "lease-active-token",
+        payload: {
+          spendId,
+          payer,
+          artifactHash,
+          targetRepo: "https://github.com/example/repo",
+          targetCommit: "abcdef123456",
+        },
+      },
+      { authorization: "Bearer wrong-token" },
+    );
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const leaseEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "lease.execution.blocked");
+
+    expect(missingToken.status).toBe(423);
+    expect(missingToken.json.error.code).toBe("proof_pending");
+    expect(wrongToken.status).toBe(423);
+    expect(wrongToken.json.error.code).toBe("proof_pending");
+    expect(payerMismatch.status).toBe(422);
+    expect(payerMismatch.json.error.code).toBe("proof_blocked");
+    expect(lease.status).toBe(202);
+    expect(replayLease.status).toBe(202);
+    expect(replayLease.json.requestId).toBe(lease.json.requestId);
+    expect(tokenConflict.status).toBe(409);
+    expect(tokenConflict.json.error.code).toBe("idempotency_conflict");
+    expect(lease.json.data.bearerBound).toBe(true);
+    expect(lease.json.data.status).toBe("blocked_missing_runner_execution");
+    expect(lease.json.data.winnerClaimAllowed).toBe(false);
+    expect(leaseEvent.payload).toEqual(
+      expect.objectContaining({
+        spendId,
+        payer,
+        artifactHash,
+        bearerBound: true,
+        status: "blocked_missing_runner_execution",
+        winnerClaimAllowed: false,
+      }),
+    );
   });
 
   it("surfaces fail-closed proof providers and binds Pact template hashes", async () => {

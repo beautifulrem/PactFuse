@@ -68,6 +68,8 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/caw/receipts/ingest": ["proofAuthority", "winnerClaimAllowed"],
   "/api/v1/artifacts/preflight": ["preflightId", "artifactHashPreview", "priceDisclosureHash", "winnerClaimAllowed"],
   "/api/v1/quotes": ["preflightId", "quoteSignedAfterPreflight", "priceDisclosureHash", "winnerClaimAllowed"],
+  "/api/v1/artifacts/refund": ["spendId", "quoteId", "status", "winnerClaimAllowed"],
+  "/api/v1/lease/execute": ["leaseRunId", "bearerBound", "artifactHash", "winnerClaimAllowed"],
   "/api/v1/mcp/audit": ["proofAuthority", "winnerClaimAllowed", "requestHash", "responseHash"],
   "/api/v1/evidence/verify": ["schemaOk", "proofChipAllowed", "winnerClaimAllowed", "finalVerifierComplete"],
   "/api/v1/evidence/judge-check": ["winnerClaimAllowed", "rows.status", "rows.authority"],
@@ -167,9 +169,7 @@ export function createApp(ctx: ServiceCtx): Hono {
     const spendId = Hex32Schema.parse(c.req.param("spendId"));
     const payer = HexSchema.parse(c.req.param("payer"));
     const artifactHash = Hex32Schema.parse(c.req.param("artifactHash"));
-    const authorization = c.req.header("authorization") ?? "";
-    const bearerToken = authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : null;
-    return send(c, await readArtifactAccess({ sessionId, spendId, payer, artifactHash, bearerToken }, ctx));
+    return send(c, await readArtifactAccess({ sessionId, spendId, payer, artifactHash, bearerToken: bearerTokenFor(c) }, ctx));
   });
 
   app.post("/api/v1/artifacts/refund", async (c) =>
@@ -177,7 +177,7 @@ export function createApp(ctx: ServiceCtx): Hono {
   );
 
   app.post("/api/v1/lease/execute", async (c) =>
-    send(c, await executeLease(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202),
+    send(c, await executeLease(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx, bearerTokenFor(c)), 202),
   );
 
   app.post("/api/v1/mcp/audit", async (c) =>
@@ -251,6 +251,11 @@ function requiredQuery(c: Context, name: string): string {
     throwBadRequest(`missing query parameter: ${name}`);
   }
   return value;
+}
+
+function bearerTokenFor(c: Context): string | null {
+  const authorization = c.req.header("authorization") ?? "";
+  return authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : null;
 }
 
 function throwBadRequest(message: string, details?: Record<string, unknown>): never {
@@ -392,6 +397,28 @@ function buildOpenApi(): Record<string, unknown> {
             payload: { type: "object", additionalProperties: true },
           },
         },
+        LeaseExecuteInput: {
+          type: "object",
+          required: ["sessionId", "idempotencyKey", "payload"],
+          additionalProperties: false,
+          properties: {
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            idempotencyKey: { type: "string", minLength: 4, maxLength: 160, pattern: "^[a-z][a-z0-9:_-]+$" },
+            payload: { $ref: "#/components/schemas/LeaseExecutePayload" },
+          },
+        },
+        LeaseExecutePayload: {
+          type: "object",
+          required: ["spendId", "payer", "artifactHash", "targetRepo", "targetCommit"],
+          additionalProperties: false,
+          properties: {
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            payer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+            artifactHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            targetRepo: { type: "string", minLength: 1, maxLength: 500 },
+            targetCommit: { type: "string", minLength: 6, maxLength: 128 },
+          },
+        },
         McpAdapterAuditPayload: {
           type: "object",
           required: ["auditNonce", "toolName", "request", "response", "status"],
@@ -499,6 +526,49 @@ function buildOpenApi(): Record<string, unknown> {
             sourceStateSnapshotHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             quoteSignedAfterPreflight: { const: true },
             status: { enum: ["mocked_after_preflight_not_chain_settleable"] },
+            winnerClaimAllowed: { const: false },
+          },
+        }),
+        ArtifactRefundInput: {
+          type: "object",
+          required: ["sessionId", "idempotencyKey", "payload"],
+          additionalProperties: false,
+          properties: {
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            idempotencyKey: { type: "string", minLength: 4, maxLength: 160, pattern: "^[a-z][a-z0-9:_-]+$" },
+            payload: { $ref: "#/components/schemas/ArtifactRefundPayload" },
+          },
+        },
+        ArtifactRefundPayload: {
+          type: "object",
+          required: ["spendId", "quoteId", "reason"],
+          additionalProperties: false,
+          properties: {
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            quoteId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            reason: { type: "string", minLength: 1, maxLength: 240 },
+          },
+        },
+        ArtifactRefundResponse: serviceResponseSchema({
+          type: "object",
+          required: ["spendId", "quoteId", "preflightId", "status", "winnerClaimAllowed"],
+          properties: {
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            quoteId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            preflightId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            status: { enum: ["pending_live_settlement"] },
+            winnerClaimAllowed: { const: false },
+          },
+        }),
+        LeaseExecuteResponse: serviceResponseSchema({
+          type: "object",
+          required: ["leaseRunId", "payer", "artifactHash", "bearerBound", "status", "winnerClaimAllowed"],
+          properties: {
+            leaseRunId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            payer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+            artifactHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            bearerBound: { const: true },
+            status: { enum: ["blocked_missing_runner_execution"] },
             winnerClaimAllowed: { const: false },
           },
         }),
@@ -667,6 +737,12 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   if (path === "/api/v1/sessions") {
     return jsonRequestBody({ $ref: "#/components/schemas/CreateSessionInput" });
   }
+  if (path === "/api/v1/lease/execute") {
+    return jsonRequestBody({ $ref: "#/components/schemas/LeaseExecuteInput" });
+  }
+  if (path === "/api/v1/artifacts/refund") {
+    return jsonRequestBody({ $ref: "#/components/schemas/ArtifactRefundInput" });
+  }
   if (path.startsWith("/api/v1/") && !path.includes("{")) {
     return jsonRequestBody({ $ref: "#/components/schemas/SessionScopedEnvelope" });
   }
@@ -674,18 +750,53 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
 }
 
 function parameterSchemaFor(path: string): Record<string, unknown>[] {
-  if (path !== "/api/v1/mcp/audit") {
-    return [];
-  }
-  return [
-    {
+  const parameters = pathParameterSchemas(path);
+  if (path === "/api/v1/mcp/audit") {
+    parameters.push({
       name: "x-pactfuse-audit-signature",
       in: "header",
       required: true,
       schema: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
       description: "HMAC-SHA256 over the canonical JSON audit payload using PACTFUSE_MCP_AUDIT_TOKEN.",
-    },
-  ];
+    });
+  }
+  if (path === "/api/v1/lease/execute" || path === "/api/v1/artifacts/{sessionId}/{spendId}/{payer}/{artifactHash}") {
+    parameters.push({
+      name: "authorization",
+      in: "header",
+      required: true,
+      schema: { type: "string", pattern: "^Bearer .+" },
+      description: "Bearer token bound to the artifact access tuple: sessionId, spendId, payer, artifactHash.",
+    });
+  }
+  return parameters;
+}
+
+function pathParameterSchemas(path: string): Record<string, unknown>[] {
+  const parameters: Record<string, unknown>[] = [];
+  for (const match of path.matchAll(/\{([^}]+)\}/g)) {
+    const name = match[1];
+    if (!name) {
+      continue;
+    }
+    parameters.push({
+      name,
+      in: "path",
+      required: true,
+      schema: parameterValueSchema(name),
+    });
+  }
+  return parameters;
+}
+
+function parameterValueSchema(name: string): Record<string, unknown> {
+  if (name === "sessionId" || name === "spendId" || name === "artifactHash") {
+    return { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" };
+  }
+  if (name === "payer") {
+    return { type: "string", pattern: "^0x[0-9a-fA-F]+$" };
+  }
+  return { type: "string" };
 }
 
 function jsonRequestBody(schema: Record<string, unknown>): Record<string, unknown> {
@@ -711,6 +822,10 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/ArtifactPreflightResponse" };
     case "/api/v1/quotes":
       return { $ref: "#/components/schemas/QuoteResponse" };
+    case "/api/v1/artifacts/refund":
+      return { $ref: "#/components/schemas/ArtifactRefundResponse" };
+    case "/api/v1/lease/execute":
+      return { $ref: "#/components/schemas/LeaseExecuteResponse" };
     case "/api/v1/mcp/audit":
       return { $ref: "#/components/schemas/McpAuditResponse" };
     case "/api/v1/evidence/replay-bundle":

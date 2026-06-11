@@ -171,6 +171,7 @@ export const QuotePayloadSchema = z
 export const ArtifactRefundPayloadSchema = z
   .object({
     spendId: Hex32Schema,
+    quoteId: Hex32Schema,
     reason: z.string().min(1).max(240),
   })
   .strict();
@@ -178,10 +179,16 @@ export const ArtifactRefundPayloadSchema = z
 export const LeaseExecutePayloadSchema = z
   .object({
     spendId: Hex32Schema,
+    payer: HexSchema,
+    artifactHash: Hex32Schema,
     targetRepo: z.string().min(1).max(500),
     targetCommit: z.string().min(6).max(128),
   })
   .strict();
+
+export const LeaseExecuteEnvelopeSchema = SessionScopedEnvelopeSchema.extend({
+  payload: LeaseExecutePayloadSchema,
+}).strict();
 
 export const VerifyEvidencePayloadSchema = z
   .object({

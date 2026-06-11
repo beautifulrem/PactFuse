@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   CreateSessionInputSchema,
   Hex32Schema,
+  LeaseExecuteEnvelopeSchema,
   type JsonValue,
   SessionScopedEnvelopeSchema,
   canonicalizeJson,
@@ -12,6 +13,7 @@ import {
 export type PactFuseMcpClient = {
   baseUrl: string;
   auditToken?: string;
+  artifactBearerToken?: string;
   fetch?: typeof fetch;
 };
 
@@ -53,8 +55,9 @@ export function createPactFuseTools(client: PactFuseMcpClient): PactFuseTool[] {
     {
       name: "pactfuse_execute_clean_lease",
       description: "Attempt clean lease execution; P0 blocks unless finalized settlement proof exists.",
-      inputSchema: SessionScopedEnvelopeSchema,
-      invoke: (input) => post(client, "/api/v1/lease/execute", SessionScopedEnvelopeSchema.parse(input)),
+      inputSchema: LeaseExecuteEnvelopeSchema,
+      invoke: (input) =>
+        post(client, "/api/v1/lease/execute", LeaseExecuteEnvelopeSchema.parse(input), artifactAuthorizationHeader(client)),
     },
     {
       name: "pactfuse_get_judge_check",
@@ -108,13 +111,17 @@ export function createPactFuseMcpServer(client: PactFuseMcpClient): McpServer {
   return server;
 }
 
-async function post(client: PactFuseMcpClient, path: string, body: unknown): Promise<unknown> {
+async function post(client: PactFuseMcpClient, path: string, body: unknown, headers: Record<string, string> = {}): Promise<unknown> {
   const res = await request(client, path, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
   return res.json();
+}
+
+function artifactAuthorizationHeader(client: PactFuseMcpClient): Record<string, string> {
+  return client.artifactBearerToken ? { authorization: `Bearer ${client.artifactBearerToken}` } : {};
 }
 
 async function invokeWithAudit(client: PactFuseMcpClient, tool: PactFuseTool, input: unknown): Promise<unknown> {

@@ -79,16 +79,32 @@ describe("pactfuse MCP tools", () => {
         },
       },
     ]);
-    const tool = createPactFuseTools({ baseUrl: "http://pactfuse.test", auditToken: "audit-token", fetch }).find(
-      (candidate) => candidate.name === "pactfuse_execute_clean_lease",
-    );
+    const tool = createPactFuseTools({
+      baseUrl: "http://pactfuse.test",
+      auditToken: "audit-token",
+      artifactBearerToken: "lease-access-token",
+      fetch,
+    }).find((candidate) => candidate.name === "pactfuse_execute_clean_lease");
 
     expect(tool).toBeDefined();
+    expect(
+      tool!.inputSchema.safeParse({
+        sessionId: SESSION_ID,
+        idempotencyKey: "mcp-lease-missing-fields",
+        payload: {
+          spendId: "0x8888888888888888888888888888888888888888888888888888888888888888",
+          targetRepo: "https://github.com/example/repo",
+          targetCommit: "abcdef123456",
+        },
+      }).success,
+    ).toBe(false);
     const result = (await tool!.invoke({
       sessionId: SESSION_ID,
       idempotencyKey: "mcp-lease",
       payload: {
         spendId: "0x8888888888888888888888888888888888888888888888888888888888888888",
+        payer: "0x1234",
+        artifactHash: "0x9999999999999999999999999999999999999999999999999999999999999999",
         targetRepo: "https://github.com/example/repo",
         targetCommit: "abcdef123456",
       },
@@ -99,6 +115,7 @@ describe("pactfuse MCP tools", () => {
     const auditBody = auditCall.body as Record<string, any>;
 
     expect(businessCall.url).toBe("http://pactfuse.test/api/v1/lease/execute");
+    expect((businessCall.init.headers as Record<string, string>).authorization).toBe("Bearer lease-access-token");
     expect(auditCall.url).toBe("http://pactfuse.test/api/v1/mcp/audit");
     expect(auditBody.sessionId).toBe(SESSION_ID);
     expect(auditBody.auditNonce).toMatch(/^mcp_/);
