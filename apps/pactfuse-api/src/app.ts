@@ -31,6 +31,7 @@ import {
   readClaimReadiness,
   readJudgeCheck,
   readProofProviderStatus,
+  readLiveProofPreflight,
   readReplayPage,
   readRunnerHeartbeat,
   recordMcpAdapterAudit,
@@ -88,6 +89,7 @@ const ROUTES = [
   { method: "GET", path: "/api/v1/evidence/{sessionId}/verify", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/judge-check", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/claim-readiness", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/live-preflight", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/public-claim", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/replay-bundle", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/replay-page", okStatus: 200 },
@@ -248,6 +250,16 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "finalVerifierComplete",
     "gates.status",
     "blockers",
+  ],
+  "/api/v1/evidence/live-preflight": [
+    "status",
+    "readyForPublicClaim",
+    "providerStatuses.ready",
+    "security.allowInsecureMissingRoleTokens",
+    "indexer.status",
+    "blockingReasons",
+    "requiredExternalInputs",
+    "winnerClaimAllowed",
   ],
   "/api/v1/evidence/public-claim": [
     "claimStatus",
@@ -482,6 +494,11 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.get("/api/v1/evidence/claim-readiness", async (c) => {
     const sessionId = requiredQuery(c, "sessionId");
     return send(c, await readClaimReadiness(sessionId, ctx));
+  });
+
+  app.get("/api/v1/evidence/live-preflight", async (c) => {
+    const sessionId = requiredQuery(c, "sessionId");
+    return send(c, await readLiveProofPreflight(sessionId, ctx));
   });
 
   app.get("/api/v1/evidence/public-claim", async (c) => {
@@ -1244,6 +1261,105 @@ function buildOpenApi(): Record<string, unknown> {
             requiredExternalInputs: { type: "array", items: { type: "string" } },
             replayBundleHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
             verifierRun: { $ref: "#/components/schemas/FailClosedProofState" },
+          },
+        }),
+        LiveProofPreflightResponse: serviceResponseSchema({
+          type: "object",
+          required: [
+            "sessionId",
+            "status",
+            "readyForPublicClaim",
+            "providerStatuses",
+            "security",
+            "indexer",
+            "checks",
+            "blockingReasons",
+            "requiredExternalInputs",
+            "claimReadiness",
+            "winnerClaimAllowed",
+          ],
+          properties: {
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            status: { enum: ["ready", "blocked"] },
+            readyForPublicClaim: { type: "boolean" },
+            providerStatuses: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["name", "mode", "ready", "reason"],
+                properties: {
+                  name: { enum: ["chain", "caw", "caw_live", "mcp_lease"] },
+                  mode: { enum: ["unconfigured", "fixture", "live"] },
+                  ready: { type: "boolean" },
+                  reason: { type: "string" },
+                  chainId: { type: "string" },
+                  endpoint: { type: "string" },
+                },
+              },
+            },
+            security: {
+              type: "object",
+              required: [
+                "operatorTokenConfigured",
+                "challengeSubmitterTokenConfigured",
+                "artifactSignerTokenConfigured",
+                "roleTokenFallbackToOperator",
+                "allowInsecureMissingRoleTokens",
+                "cawIngestTokenConfigured",
+                "mcpAuditSecretConfigured",
+                "gateIngestSecretConfigured",
+              ],
+              properties: {
+                operatorTokenConfigured: { type: "boolean" },
+                challengeSubmitterTokenConfigured: { type: "boolean" },
+                artifactSignerTokenConfigured: { type: "boolean" },
+                roleTokenFallbackToOperator: { type: "boolean" },
+                allowInsecureMissingRoleTokens: { type: "boolean" },
+                cawIngestTokenConfigured: { type: "boolean" },
+                mcpAuditSecretConfigured: { type: "boolean" },
+                gateIngestSecretConfigured: { type: "boolean" },
+              },
+            },
+            indexer: {
+              type: "object",
+              required: ["requiredCursorCount", "status", "reasons"],
+              properties: {
+                requiredCursorCount: { type: "integer", minimum: 0 },
+                status: { enum: ["pass", "pending", "blocked"] },
+                reasons: { type: "array", items: { type: "string" } },
+              },
+            },
+            checks: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["checkId", "label", "status", "reason", "requiredExternalInputs", "evidenceEventId"],
+                properties: {
+                  checkId: { type: "string" },
+                  label: { type: "string" },
+                  status: { enum: ["pass", "pending", "blocked"] },
+                  reason: { type: "string" },
+                  requiredExternalInputs: { type: "array", items: { type: "string" } },
+                  evidenceEventId: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                },
+              },
+            },
+            blockingReasons: { type: "array", items: { type: "string" } },
+            requiredExternalInputs: { type: "array", items: { type: "string" } },
+            claimReadiness: {
+              type: "object",
+              required: ["sessionId", "winnerClaimAllowed", "gates", "blockers", "requiredExternalInputs", "verifierRun"],
+              additionalProperties: true,
+              properties: {
+                sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                winnerClaimAllowed: { type: "boolean" },
+                gates: { type: "array", items: { type: "object", additionalProperties: true } },
+                blockers: { type: "array", items: { type: "string" } },
+                requiredExternalInputs: { type: "array", items: { type: "string" } },
+                verifierRun: { $ref: "#/components/schemas/FailClosedProofState" },
+              },
+            },
+            winnerClaimAllowed: { type: "boolean" },
           },
         }),
         PublicClaimResponse: serviceResponseSchema({
@@ -2464,6 +2580,8 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/JudgeCheckResponse" };
     case "/api/v1/evidence/claim-readiness":
       return { $ref: "#/components/schemas/ClaimReadinessResponse" };
+    case "/api/v1/evidence/live-preflight":
+      return { $ref: "#/components/schemas/LiveProofPreflightResponse" };
     case "/api/v1/evidence/public-claim":
       return { $ref: "#/components/schemas/PublicClaimResponse" };
     case "/api/v1/caw/receipts/ingest":

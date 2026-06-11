@@ -598,6 +598,8 @@ describe("pactfuse-api P0", () => {
       },
       { authorization: `Bearer ${issued.json.data.accessToken}` },
     );
+    ctx.apiSecurity.operatorToken = "operator-test-token";
+    ctx.apiSecurity.allowInsecureMissingRoleTokens = false;
     const readiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
     const readinessJson = await readiness.json();
     const claim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`);
@@ -883,6 +885,94 @@ describe("pactfuse-api P0", () => {
     expect(json.data.replayBundleHash).toMatch(/^0x[0-9a-f]{64}$/);
   });
 
+  it("blocks live proof preflight when production auth or live providers are not configured", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-live-preflight-blocked");
+
+    const res = await app.request(`/api/v1/evidence/live-preflight?sessionId=${sessionId}`);
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json.data).toEqual(
+      expect.objectContaining({
+        sessionId,
+        status: "blocked",
+        readyForPublicClaim: false,
+        winnerClaimAllowed: false,
+      }),
+    );
+    expect(json.data.security).toEqual(expect.objectContaining({ allowInsecureMissingRoleTokens: true }));
+    expect(json.data.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ checkId: "provider_chain", status: "pending" }),
+        expect.objectContaining({ checkId: "provider_caw_live", status: "pending" }),
+        expect.objectContaining({ checkId: "security_role_tokens", status: "blocked" }),
+        expect.objectContaining({ checkId: "claim_caw_raw_receipts", status: "pending" }),
+      ]),
+    );
+    expect(json.data.blockingReasons).toContain("security_role_tokens: insecure missing-role-token bypass is enabled");
+    expect(json.data.requiredExternalInputs).toContain("PACTFUSE_CHAIN_RPC_URL and PACTFUSE_CHAIN_ID for a live public testnet RPC");
+    expect(json.data.requiredExternalInputs).toContain(
+      "PACTFUSE_OPERATOR_TOKEN plus challenge/artifact role tokens or an intentional operator-token fallback",
+    );
+    expect(json.data.claimReadiness.blockers).toContain(
+      "caw_raw_receipts: missing raw and canonical CAW receipts for deny_probe, approve, and activate_tool",
+    );
+  });
+
+  it("keeps live proof preflight blocked by session evidence after providers and production auth are ready", async () => {
+    const { app } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ mode: "live", chainId: "84532", currentBlockNumber: 120, logs: [] }),
+      caw: createFakeCawReceiptSource({ mode: "live", receipts: [] }),
+      cawLive: createFakeCawLiveClient(),
+      mcpLease: createFakeMcpLeaseClient("pactfuse_code_scan", "live"),
+      apiSecurity: {
+        operatorToken: "operator-test-token",
+        allowInsecureMissingRoleTokens: false,
+      },
+    });
+    const session = await post(
+      app,
+      "/api/v1/sessions",
+      { idempotencyKey: "sess-live-preflight-evidence-blocked", payload: { label: "live-preflight-evidence-blocked" } },
+      { authorization: "Bearer operator-test-token" },
+    );
+    expect(session.status).toBe(201);
+    const sessionId = session.json.data.sessionId;
+
+    const res = await app.request(`/api/v1/evidence/live-preflight?sessionId=${sessionId}`);
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json.data.status).toBe("blocked");
+    expect(json.data.security).toEqual(
+      expect.objectContaining({
+        operatorTokenConfigured: true,
+        roleTokenFallbackToOperator: true,
+        allowInsecureMissingRoleTokens: false,
+        cawIngestTokenConfigured: true,
+        mcpAuditSecretConfigured: true,
+        gateIngestSecretConfigured: true,
+      }),
+    );
+    expect(json.data.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ checkId: "provider_chain", status: "pass" }),
+        expect.objectContaining({ checkId: "provider_caw", status: "pass" }),
+        expect.objectContaining({ checkId: "provider_caw_live", status: "pass" }),
+        expect.objectContaining({ checkId: "provider_mcp_lease", status: "pass" }),
+        expect.objectContaining({ checkId: "security_role_tokens", status: "pass" }),
+        expect.objectContaining({ checkId: "claim_caw_identity_probe", status: "pending" }),
+        expect.objectContaining({ checkId: "claim_final_verifier_complete", status: "blocked" }),
+      ]),
+    );
+    expect(json.data.blockingReasons).toContain(
+      "claim_final_verifier_complete: current verifier still reports finalVerifierComplete=false",
+    );
+    expect(json.data.requiredExternalInputs).toContain("live CAW identity probe evidence with mode=real and same-wallet semantics");
+    expect(json.data.claimReadiness.requiredExternalInputs).not.toContain("PACTFUSE_LEASE_MCP_URL for a live MCP lease runner");
+  });
+
   it("records a live CAW identity probe that can satisfy the readiness identity gate", async () => {
     const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
     const sessionId = await createSession(app, "sess-caw-identity-probe");
@@ -953,6 +1043,20 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/evidence/claim-readiness"].get.responses["200"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/ClaimReadinessResponse",
     );
+    expect(json.paths["/api/v1/evidence/live-preflight"].get["x-pactfuse-proof-fields"]).toEqual([
+      "status",
+      "readyForPublicClaim",
+      "providerStatuses.ready",
+      "security.allowInsecureMissingRoleTokens",
+      "indexer.status",
+      "blockingReasons",
+      "requiredExternalInputs",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/evidence/live-preflight"].get.responses["200"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/LiveProofPreflightResponse",
+    );
+    expect(json.components.schemas.LiveProofPreflightResponse.oneOf[0].properties.data.properties.status.enum).toEqual(["ready", "blocked"]);
     expect(json.paths["/api/v1/evidence/public-claim"].get["x-pactfuse-proof-fields"]).toEqual([
       "claimStatus",
       "claimMode",

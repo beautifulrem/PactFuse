@@ -208,6 +208,7 @@ Important `/api/v1` routes:
 | `POST /api/v1/mcp/audit` | Record audited MCP adapter calls |
 | `GET /api/v1/evidence/judge-check` | Read the six-row Judge Check |
 | `GET /api/v1/evidence/claim-readiness` | Derive current and target claim modes from evidence gates |
+| `GET /api/v1/evidence/live-preflight` | Machine-check live provider, production auth, indexer, and claim-readiness blockers before any public claim |
 | `GET /api/v1/evidence/public-claim` | Fail-closed public-claim authorization gate |
 | `GET /api/v1/evidence/replay-bundle` | Read `PACTFUSE_EVIDENCE_V1` summary plus embedded replay page proofs |
 | `GET /api/v1/evidence/replay-page` | Read paged replay collections |

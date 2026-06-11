@@ -31,6 +31,7 @@ import {
   JudgeCheckViewSchema,
   LeaseExecutePayloadSchema,
   LeaseRunViewSchema,
+  LiveProofPreflightViewSchema,
   LOCKED_RUNTIME_MODES,
   McpAdapterAuditPayloadSchema,
   McpAdapterCallViewSchema,
@@ -58,6 +59,7 @@ import {
   type EvidenceEvent,
   type JsonValue,
   type JudgeCheckView,
+  type LiveProofPreflightView,
   type QuoteStatus,
   type PublicClaimView,
   type ReplayBundleView,
@@ -4255,6 +4257,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
     providerGate(proofProviders, "caw_live", ["claimMode", "paymentMode", "identityMode", "winnerClaimAllowed"]),
     providerGate(proofProviders, "caw", ["claimMode", "winnerClaimAllowed"]),
     providerGate(proofProviders, "mcp_lease", ["winnerClaimAllowed"]),
+    productionSecurityReadinessGate(ctx),
     eventGate(
       "caw_identity_probe",
       "CAW identity probe",
@@ -4460,6 +4463,63 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
   return { ok: true, requestId, data: claim };
 }
 
+export async function readLiveProofPreflight(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<LiveProofPreflightView>> {
+  const requestId = newRequestId("live_preflight");
+  const parsedSessionId = parseStrict(Hex32Schema, sessionId);
+  assertSession(ctx, parsedSessionId, requestId);
+  const readiness = await readClaimReadiness(parsedSessionId, ctx);
+  if (!readiness.ok) {
+    return readiness;
+  }
+  const [providerStatuses, indexerStatus] = await Promise.all([readProofProviderStatus(ctx), readChainIndexerStatus(ctx)]);
+  const security = livePreflightSecurityFromContext(ctx);
+  const indexer = livePreflightIndexerStatus(ctx, indexerStatus.ok ? indexerStatus.data : null);
+  const checks = [
+    ...providerStatuses.map(providerLivePreflightCheck),
+    ...securityLivePreflightChecks(security),
+    {
+      checkId: "indexer_cursors",
+      label: "Chain indexer cursors",
+      status: indexer.status,
+      reason: indexer.reasons.join("; "),
+      requiredExternalInputs: indexer.status === "pass" ? [] : ["PACTFUSE_INDEXER_ENABLED with caught-up live-chain cursors"],
+      evidenceEventId: null,
+    },
+    ...readiness.data.gates.map((gate) => ({
+      checkId: `claim_${gate.gateId}`,
+      label: gate.label,
+      status: gate.status,
+      reason: gate.reason,
+      requiredExternalInputs: gate.status === "pass" ? [] : livePreflightInputsForClaimGate(gate.gateId, readiness.data.requiredExternalInputs),
+      evidenceEventId: gate.evidenceEventId,
+    })),
+  ];
+  const normalizedChecks = checks.map((check) => ({
+    ...check,
+    reason: limitPreflightText(check.reason),
+    requiredExternalInputs: check.requiredExternalInputs.map(limitPreflightInput),
+  }));
+  const blockingReasons = normalizedChecks
+    .filter((check) => check.status !== "pass")
+    .map((check) => `${check.checkId}: ${check.reason}`);
+  const requiredExternalInputs = [...new Set(normalizedChecks.flatMap((check) => check.requiredExternalInputs))].sort();
+  const readyForPublicClaim = readiness.data.winnerClaimAllowed && blockingReasons.length === 0;
+  const data = LiveProofPreflightViewSchema.parse({
+    sessionId: parsedSessionId,
+    status: readyForPublicClaim ? "ready" : "blocked",
+    readyForPublicClaim,
+    providerStatuses,
+    security,
+    indexer,
+    checks: normalizedChecks,
+    blockingReasons,
+    requiredExternalInputs,
+    claimReadiness: readiness.data,
+    winnerClaimAllowed: readyForPublicClaim,
+  });
+  return { ok: true, requestId, data };
+}
+
 type ClaimGateBlock = "claimMode" | "paymentMode" | "tokenMode" | "identityMode" | "winnerClaimAllowed";
 type ClaimReadinessGate = {
   gateId: string;
@@ -4470,6 +4530,179 @@ type ClaimReadinessGate = {
   evidenceEventId: string | null;
 };
 
+type LivePreflightCheck = {
+  checkId: string;
+  label: string;
+  status: "pass" | "pending" | "blocked";
+  reason: string;
+  requiredExternalInputs: string[];
+  evidenceEventId: string | null;
+};
+
+type LivePreflightSecurity = LiveProofPreflightView["security"];
+
+function livePreflightSecurityFromContext(ctx: ServiceCtx): LivePreflightSecurity {
+  return {
+    operatorTokenConfigured: Boolean(ctx.apiSecurity.operatorToken),
+    challengeSubmitterTokenConfigured: Boolean(ctx.apiSecurity.challengeSubmitterToken),
+    artifactSignerTokenConfigured: Boolean(ctx.apiSecurity.artifactSignerToken),
+    roleTokenFallbackToOperator: Boolean(
+      ctx.apiSecurity.operatorToken && (!ctx.apiSecurity.challengeSubmitterToken || !ctx.apiSecurity.artifactSignerToken),
+    ),
+    allowInsecureMissingRoleTokens: ctx.apiSecurity.allowInsecureMissingRoleTokens,
+    cawIngestTokenConfigured: Boolean(ctx.cawIngestToken),
+    mcpAuditSecretConfigured: Boolean(ctx.mcpAuditSecret),
+    gateIngestSecretConfigured: Boolean(ctx.gateIngestSecret),
+  };
+}
+
+function providerLivePreflightCheck(provider: ProofProviderStatus): LivePreflightCheck {
+  const pass = provider.mode === "live" && provider.ready;
+  return {
+    checkId: `provider_${provider.name}`,
+    label: `${provider.name} provider`,
+    status: pass ? "pass" : "pending",
+    reason: pass ? `${provider.name} provider is live and reachable` : provider.reason,
+    requiredExternalInputs: pass ? [] : livePreflightProviderInput(provider.name),
+    evidenceEventId: null,
+  };
+}
+
+function securityLivePreflightChecks(security: LivePreflightSecurity): LivePreflightCheck[] {
+  const roleTokenReady =
+    Boolean(security.operatorTokenConfigured) &&
+    (security.challengeSubmitterTokenConfigured || security.roleTokenFallbackToOperator) &&
+    (security.artifactSignerTokenConfigured || security.roleTokenFallbackToOperator);
+  return [
+    {
+      checkId: "security_role_tokens",
+      label: "Role bearer tokens",
+      status: security.allowInsecureMissingRoleTokens ? "blocked" : roleTokenReady ? "pass" : "pending",
+      reason: security.allowInsecureMissingRoleTokens
+        ? "insecure missing-role-token bypass is enabled"
+        : roleTokenReady
+          ? "operator, challenge, and artifact signer roles are protected"
+          : "operator, challenge, or artifact signer bearer token is not configured",
+      requiredExternalInputs:
+        !security.allowInsecureMissingRoleTokens && roleTokenReady
+          ? []
+          : ["PACTFUSE_OPERATOR_TOKEN plus challenge/artifact role tokens or an intentional operator-token fallback"],
+      evidenceEventId: null,
+    },
+    {
+      checkId: "security_caw_receipt_ingest_token",
+      label: "CAW receipt ingest token",
+      status: security.cawIngestTokenConfigured ? "pass" : "pending",
+      reason: security.cawIngestTokenConfigured
+        ? "CAW receipt ingest endpoint is bearer-protected"
+        : "PACTFUSE_CAW_INGEST_TOKEN is not configured",
+      requiredExternalInputs: security.cawIngestTokenConfigured ? [] : ["PACTFUSE_CAW_INGEST_TOKEN"],
+      evidenceEventId: null,
+    },
+    {
+      checkId: "security_evidence_hmac",
+      label: "Evidence ingest HMAC secrets",
+      status: security.mcpAuditSecretConfigured && security.gateIngestSecretConfigured ? "pass" : "pending",
+      reason:
+        security.mcpAuditSecretConfigured && security.gateIngestSecretConfigured
+          ? "MCP audit and Gate event ingest endpoints are HMAC-protected"
+          : "MCP audit or Gate event ingest HMAC secret is not configured",
+      requiredExternalInputs:
+        security.mcpAuditSecretConfigured && security.gateIngestSecretConfigured
+          ? []
+          : ["PACTFUSE_MCP_AUDIT_TOKEN and PACTFUSE_GATE_INGEST_TOKEN"],
+      evidenceEventId: null,
+    },
+  ];
+}
+
+function livePreflightIndexerStatus(
+  ctx: ServiceCtx,
+  statusData: unknown,
+): LiveProofPreflightView["indexer"] {
+  const requiredCursorCount = ctx.requiredIndexerCursors.length;
+  if (requiredCursorCount === 0) {
+    return {
+      requiredCursorCount,
+      status: "pass",
+      reasons: ["no required indexer cursor configured; claim readiness relies on direct chain-verified evidence"],
+    };
+  }
+  const data = statusData && typeof statusData === "object" && !Array.isArray(statusData) ? (statusData as Record<string, unknown>) : {};
+  const cursors = Array.isArray(data.cursors) ? data.cursors.filter(isPreflightRecord) : [];
+  const requiredIds = new Set(ctx.requiredIndexerCursors.map((cursor) => cursor.cursorId));
+  const requiredRows = cursors.filter((cursor) => requiredIds.has(String(cursor.cursorId ?? "")));
+  const missingIds = [...requiredIds].filter((cursorId) => !requiredRows.some((cursor) => cursor.cursorId === cursorId));
+  const degraded = requiredRows.filter((cursor) => cursor.status === "degraded");
+  const pending = requiredRows.filter((cursor) => cursor.status !== "caught_up" && cursor.status !== "degraded");
+  const reasons = [
+    ...missingIds.map((cursorId) => `required cursor ${cursorId} has not run`),
+    ...degraded.map((cursor) => `required cursor ${String(cursor.cursorId)} is degraded: ${String(cursor.reason ?? "no reason")}`),
+    ...pending.map((cursor) => `required cursor ${String(cursor.cursorId)} is ${String(cursor.status ?? "pending")}: ${String(cursor.reason ?? "no reason")}`),
+  ];
+  return {
+    requiredCursorCount,
+    status: degraded.length > 0 ? "blocked" : reasons.length > 0 ? "pending" : "pass",
+    reasons: reasons.length > 0 ? reasons : [`${requiredCursorCount} required indexer cursor(s) are caught up`],
+  };
+}
+
+function isPreflightRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function livePreflightProviderInput(name: ProofProviderStatus["name"]): string[] {
+  if (name === "chain") {
+    return ["PACTFUSE_CHAIN_RPC_URL and PACTFUSE_CHAIN_ID for a live public testnet RPC"];
+  }
+  if (name === "caw_live") {
+    return ["PACTFUSE_CAW_LIVE_API_URL, PACTFUSE_CAW_LIVE_API_KEY, and a CAW wallet id"];
+  }
+  if (name === "caw") {
+    return ["PACTFUSE_CAW_EXPORT_URL or equivalent raw CAW receipt export source"];
+  }
+  return ["PACTFUSE_LEASE_MCP_URL for a live MCP lease runner"];
+}
+
+function livePreflightInputsForClaimGate(gateId: string, fallback: string[]): string[] {
+  if (gateId.startsWith("provider_")) {
+    const providerName = gateId.slice("provider_".length) as ProofProviderStatus["name"];
+    return livePreflightProviderInput(providerName);
+  }
+  if (gateId === "caw_identity_probe") {
+    return ["live CAW identity probe evidence with mode=real and same-wallet semantics"];
+  }
+  if (gateId === "caw_wrong_target_deny") {
+    return ["real CAW wrong-target deny request id or audit receipt"];
+  }
+  if (gateId === "caw_raw_receipts") {
+    return ["raw CAW API/export receipts canonicalized for deny_probe, approve, and activate_tool"];
+  }
+  if (gateId === "token_balance_delta") {
+    return ["public ERC20 token tx/log/balance evidence for the finalized settlement"];
+  }
+  if (gateId === "artifact_quote_live") {
+    return ["chain-settleable artifact quote issued after preflight"];
+  }
+  if (gateId === "production_security") {
+    return [
+      "PACTFUSE_OPERATOR_TOKEN, PACTFUSE_CAW_INGEST_TOKEN, PACTFUSE_MCP_AUDIT_TOKEN, PACTFUSE_GATE_INGEST_TOKEN, and PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=false",
+    ];
+  }
+  if (gateId === "final_verifier_complete" || gateId === "proof_chip_allowed" || gateId === "verifier_winner_claim") {
+    return ["full chain/signature/hash verifier that can set finalVerifierComplete=true"];
+  }
+  return fallback;
+}
+
+function limitPreflightText(value: string): string {
+  return value.length > 600 ? `${value.slice(0, 597)}...` : value;
+}
+
+function limitPreflightInput(value: string): string {
+  return value.length > 300 ? `${value.slice(0, 297)}...` : value;
+}
+
 function providerGate(providers: ProofProviderStatus[], name: ProofProviderStatus["name"], blocks: ClaimGateBlock[]): ClaimReadinessGate {
   const provider = providers.find((candidate) => candidate.name === name);
   const pass = provider?.ready === true && provider.mode === "live";
@@ -4479,6 +4712,28 @@ function providerGate(providers: ProofProviderStatus[], name: ProofProviderStatu
     status: pass ? "pass" : "pending",
     blocks,
     reason: pass ? `${name} provider is live` : provider?.reason ?? `${name} provider is not configured`,
+    evidenceEventId: null,
+  };
+}
+
+function productionSecurityReadinessGate(ctx: ServiceCtx): ClaimReadinessGate {
+  const security = livePreflightSecurityFromContext(ctx);
+  const roleTokenReady =
+    Boolean(security.operatorTokenConfigured) &&
+    (security.challengeSubmitterTokenConfigured || security.roleTokenFallbackToOperator) &&
+    (security.artifactSignerTokenConfigured || security.roleTokenFallbackToOperator);
+  const hmacReady = security.cawIngestTokenConfigured && security.mcpAuditSecretConfigured && security.gateIngestSecretConfigured;
+  const pass = !security.allowInsecureMissingRoleTokens && roleTokenReady && hmacReady;
+  return {
+    gateId: "production_security",
+    label: "Production proof-surface security",
+    status: pass ? "pass" : security.allowInsecureMissingRoleTokens ? "blocked" : "pending",
+    blocks: ["winnerClaimAllowed"],
+    reason: pass
+      ? "role tokens and evidence ingest secrets are production-configured"
+      : security.allowInsecureMissingRoleTokens
+        ? "insecure missing-role-token bypass is enabled"
+        : "role tokens or evidence ingest secrets are not fully configured",
     evidenceEventId: null,
   };
 }
@@ -4629,6 +4884,11 @@ function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: C
     }
     if (gate.gateId === "artifact_quote_live") {
       inputs.add("chain-settleable artifact quote issued after preflight");
+    }
+    if (gate.gateId === "production_security") {
+      inputs.add(
+        "PACTFUSE_OPERATOR_TOKEN, PACTFUSE_CAW_INGEST_TOKEN, PACTFUSE_MCP_AUDIT_TOKEN, PACTFUSE_GATE_INGEST_TOKEN, and PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=false",
+      );
     }
     if (gate.gateId === "final_verifier_complete" || gate.gateId === "proof_chip_allowed" || gate.gateId === "verifier_winner_claim") {
       inputs.add("full chain/signature/hash verifier that can set finalVerifierComplete=true");

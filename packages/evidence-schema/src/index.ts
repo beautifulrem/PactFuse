@@ -854,6 +854,17 @@ export const VerifierRunViewSchema = z
   })
   .strict();
 
+export const ProofProviderStatusSchema = z
+  .object({
+    name: z.enum(["chain", "caw", "caw_live", "mcp_lease"]),
+    mode: z.enum(["unconfigured", "fixture", "live"]),
+    ready: z.boolean(),
+    reason: z.string().min(1).max(1000),
+    chainId: z.string().min(1).max(80).optional(),
+    endpoint: z.string().min(1).max(1000).optional(),
+  })
+  .strict();
+
 export const ClaimReadinessGateSchema = z
   .object({
     gateId: z.string().min(1).max(80),
@@ -901,6 +912,54 @@ export const PublicClaimViewSchema = z
     finalVerifierComplete: z.literal(true),
     winnerClaimAllowed: z.literal(true),
     publicClaimHash: Hex32Schema,
+  })
+  .strict();
+
+export const LiveProofPreflightCheckSchema = z
+  .object({
+    checkId: z.string().min(1).max(100),
+    label: z.string().min(1).max(160),
+    status: z.enum(["pass", "pending", "blocked"]),
+    reason: z.string().min(1).max(600),
+    requiredExternalInputs: z.array(z.string().min(1).max(300)),
+    evidenceEventId: Hex32Schema.nullable(),
+  })
+  .strict();
+
+export const LiveProofPreflightSecuritySchema = z
+  .object({
+    operatorTokenConfigured: z.boolean(),
+    challengeSubmitterTokenConfigured: z.boolean(),
+    artifactSignerTokenConfigured: z.boolean(),
+    roleTokenFallbackToOperator: z.boolean(),
+    allowInsecureMissingRoleTokens: z.boolean(),
+    cawIngestTokenConfigured: z.boolean(),
+    mcpAuditSecretConfigured: z.boolean(),
+    gateIngestSecretConfigured: z.boolean(),
+  })
+  .strict();
+
+export const LiveProofPreflightIndexerSchema = z
+  .object({
+    requiredCursorCount: z.number().int().min(0).max(32),
+    status: z.enum(["pass", "pending", "blocked"]),
+    reasons: z.array(z.string().min(1).max(600)),
+  })
+  .strict();
+
+export const LiveProofPreflightViewSchema = z
+  .object({
+    sessionId: Hex32Schema,
+    status: z.enum(["ready", "blocked"]),
+    readyForPublicClaim: z.boolean(),
+    providerStatuses: z.array(ProofProviderStatusSchema),
+    security: LiveProofPreflightSecuritySchema,
+    indexer: LiveProofPreflightIndexerSchema,
+    checks: z.array(LiveProofPreflightCheckSchema),
+    blockingReasons: z.array(z.string()),
+    requiredExternalInputs: z.array(z.string()),
+    claimReadiness: ClaimReadinessViewSchema,
+    winnerClaimAllowed: z.boolean(),
   })
   .strict();
 
@@ -961,6 +1020,7 @@ export type JudgeCheckView = z.infer<typeof JudgeCheckViewSchema>;
 export type VerifierRunView = z.infer<typeof VerifierRunViewSchema>;
 export type ClaimReadinessView = z.infer<typeof ClaimReadinessViewSchema>;
 export type PublicClaimView = z.infer<typeof PublicClaimViewSchema>;
+export type LiveProofPreflightView = z.infer<typeof LiveProofPreflightViewSchema>;
 export type ReplayBundleView = z.infer<typeof ReplayBundleViewSchema>;
 export type QuoteStatus = z.infer<typeof QuoteStatusSchema>;
 export type ChainIndexerBackfillInput = z.infer<typeof ChainIndexerBackfillInputSchema>;
