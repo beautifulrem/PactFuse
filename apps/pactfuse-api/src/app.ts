@@ -157,10 +157,11 @@ export function createApp(ctx: ServiceCtx): Hono {
       verifier: "fail-closed-scaffold",
       proofProviders: await readProofProviderStatus(ctx),
       apiSecurity: {
-        mode: "configured-if-env-token-present",
+        mode: "fail-closed-unless-explicit-dev-bypass",
         operatorTokenConfigured: Boolean(ctx.apiSecurity.operatorToken),
         challengeSubmitterTokenConfigured: Boolean(ctx.apiSecurity.challengeSubmitterToken),
         artifactSignerTokenConfigured: Boolean(ctx.apiSecurity.artifactSignerToken),
+        allowInsecureMissingRoleTokens: ctx.apiSecurity.allowInsecureMissingRoleTokens,
         rateLimitWindowMs: ctx.apiSecurity.rateLimitWindowMs,
         defaultRateLimitMax: ctx.apiSecurity.defaultRateLimitMax,
         sessionCreateRateLimitMax: ctx.apiSecurity.sessionCreateRateLimitMax,
@@ -356,7 +357,13 @@ function rateLimitMaxFor(ctx: ServiceCtx, method: string, path: string): number 
 function authorizeApiRole(c: Context, ctx: ServiceCtx, role: ApiRole): void {
   const token = tokenForRole(ctx, role);
   if (!token) {
-    return;
+    if (ctx.apiSecurity.allowInsecureMissingRoleTokens) {
+      return;
+    }
+    const requestId = newRequestId(`${role}_auth_config`);
+    throw Object.assign(new Error(`${role} token is not configured`), {
+      apiError: forbiddenError(requestId, `${role} bearer token is not configured`),
+    });
   }
   const requestId = newRequestId(`${role}_auth`);
   const bearer = bearerTokenFor(c);
@@ -1788,12 +1795,12 @@ function apiRoleForPath(path: string): ApiRole | null {
 
 function apiRoleHeaderDescription(role: ApiRole): string {
   if (role === "challenge_submitter") {
-    return "Required when PACTFUSE_CHALLENGE_SUBMITTER_TOKEN is configured; falls back to PACTFUSE_OPERATOR_TOKEN when only the shared operator token is configured.";
+    return "Required for protected challenge writes; PACTFUSE_CHALLENGE_SUBMITTER_TOKEN falls back to PACTFUSE_OPERATOR_TOKEN, and missing tokens fail closed unless PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=true is set for local development.";
   }
   if (role === "artifact_signer") {
-    return "Required when PACTFUSE_ARTIFACT_SIGNER_TOKEN is configured; falls back to PACTFUSE_OPERATOR_TOKEN when only the shared operator token is configured.";
+    return "Required for protected artifact signer writes; PACTFUSE_ARTIFACT_SIGNER_TOKEN falls back to PACTFUSE_OPERATOR_TOKEN, and missing tokens fail closed unless PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=true is set for local development.";
   }
-  return "Required when PACTFUSE_OPERATOR_TOKEN is configured; protects single-operator demo mutation routes.";
+  return "Required for protected operator writes; missing PACTFUSE_OPERATOR_TOKEN fails closed unless PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=true is set for local development.";
 }
 
 function pathParameterSchemas(path: string): Record<string, unknown>[] {

@@ -16,6 +16,8 @@ W8.1/W9 frontend/UI lock: Fusebox is a procurement breaker panel, not a generic 
 
 Current implementation stack lock: hybrid protocol product, not native app, browser extension, pure CLI, or pure web dashboard. Use Node 22, pnpm + turbo, Hono, zod, Drizzle + `node:sqlite` WAL, viem v2, Foundry, Vite + React 19 SPA, Tailwind v4, shadcn/Radix, TanStack Query, `motion`, and a thin MCP adapter. This supersedes older Next.js App Router / `better-sqlite3` recommendations where they conflict. See `research/pactfuse-stack-form-review-v2-2026-06-10.md`.
 
+Backend mutation routes fail closed unless operator role tokens are configured (`PACTFUSE_OPERATOR_TOKEN`, optional `PACTFUSE_CHALLENGE_SUBMITTER_TOKEN`, optional `PACTFUSE_ARTIFACT_SIGNER_TOKEN`). Local-only test/dev runs can explicitly set `PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=true`; do not use that bypass for public demos or hosted services.
+
 W6 full-stack rereview lock: a fresh winner-corpus pass (twelve closest verified peer winners) closed the defects that survived W1-W5 — deterministic session-create idempotency, an SSE evidence stream with polling fallback and zero proof authority, a binding live-state ladder (CAW-approval/tx-pending/indexing waiting states with timers, error chips, de-energized empty board), a flag-gated advisory manifest drift watcher that can never trip or touch proof rows, issuer-griefing and who-pays hostile-judge answers, deterministic-runner labeling (GLM is P1-only), lease-runner egress and tool-output trust invariants, performance/console acceptance gates, the demo fallback ladder, and a hardened fuse-cartridge visual contract with the fixture redrawn to satisfy it. See `research/pactfuse-w6-fullstack-rereview-2026-06-10.md`.
 
 Current checked-in evidence status:

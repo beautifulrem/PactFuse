@@ -85,13 +85,34 @@ describe("pactfuse receipt verifier contract", () => {
       },
       "canonicalReceiptHash does not recompute",
     ],
-    [
-      "raw receipt membership",
-      (bundle) => {
-        bundle.canonicalCawReceipts[0].rawReceiptHash = hex32("missing-raw");
-      },
-      "does not match any raw receipt hash",
-    ],
+	    [
+	      "raw receipt membership",
+	      (bundle) => {
+	        bundle.canonicalCawReceipts[0].rawReceiptHash = hex32("missing-raw");
+	      },
+	      "does not match any raw receipt hash",
+	    ],
+	    [
+	      "CAW operation target",
+	      (bundle) => {
+	        bundle.cawReceiptOperations[0].target = "0x9999999999999999999999999999999999999999";
+	      },
+	      "target is not bound to CAW operation target",
+	    ],
+	    [
+	      "CAW operation receipt bundle",
+	      (bundle) => {
+	        bundle.cawReceiptOperations[0].receiptBundleHash = null;
+	      },
+	      "requires CAW operation receiptBundleHash",
+	    ],
+	    [
+	      "CAW operation status",
+	      (bundle) => {
+	        bundle.cawReceiptOperations[0].status = "built_mocked";
+	      },
+	      "requires raw-ingested CAW operation status",
+	    ],
     [
       "missing raw bundle body",
       (bundle) => {
@@ -127,6 +148,13 @@ describe("pactfuse receipt verifier contract", () => {
 	      },
 	      "payload hash does not match artifactHash",
 	    ],
+	    [
+	      "agent transcript hash",
+	      (bundle) => {
+	        bundle.agentTranscriptHash = hex32("bad-agent-transcript");
+	      },
+	      "agentTranscriptHash must equal the hash of the replay MCP transcript snapshot",
+	    ],
 	  ])("rejects replay bundles with tampered %s", (_label, mutate, expected) => {
     const bundle = replayBundle();
     mutate(bundle);
@@ -152,6 +180,63 @@ describe("pactfuse receipt verifier contract", () => {
 	    expect(result.schemaOk).toBe(true);
 	    expect(result.errors.some((error) => error.includes("artifact"))).toBe(false);
 	  });
+
+	  it("accepts replay bundles with MCP lease transcript hashes while keeping proof-chip authority closed", () => {
+	    const bundle = replayBundleWithLease();
+	    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+	    expect(result.schemaOk).toBe(true);
+	    expect(result.proofChipAllowed).toBe(false);
+	    expect(result.schemaErrors).toEqual([]);
+	  });
+
+	  it.each([
+	    [
+	      "MCP response body",
+	      (bundle) => {
+	        bundle.mcpAdapterCalls[1].response.result.structuredContent.findingCount = 1;
+	      },
+	      "responseHash does not match response",
+	    ],
+	    [
+	      "lease transcript hash",
+	      (bundle) => {
+	        bundle.leaseRuns[0].transcriptHash = hex32("bad-lease-transcript");
+	      },
+	      "transcriptHash does not recompute from MCP transcript",
+	    ],
+	    [
+	      "lease event payload",
+	      (bundle) => {
+	        const event = bundle.events.find((candidate) => candidate.kind === "lease.execution.succeeded");
+	        event.payload.outputHash = hex32("bad-event-output");
+	      },
+	      "payload.outputHash does not match lease run",
+	    ],
+	    [
+	      "judge row event reference",
+	      (bundle) => {
+	        bundle.judgeCheck.rows.find((row) => row.rowId === "lease_execution").evidenceEventId = hex32("missing-judge-event");
+	      },
+	      "references missing evidence event",
+	    ],
+	    [
+	      "self-consistent MCP call arguments",
+	      (bundle) => {
+	        bundle.mcpAdapterCalls[1].request.params.arguments.targetCommit = "deadbeef0000";
+	        rehashLeaseTranscriptForTest(bundle);
+	      },
+	      "tools/call argument targetCommit does not match lease run",
+	    ],
+	  ])("rejects replay bundles with tampered %s", (_label, mutate, expected) => {
+	    const bundle = replayBundleWithLease();
+	    mutate(bundle);
+	    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+	    expect(result.schemaOk).toBe(false);
+	    expect(result.proofChipAllowed).toBe(false);
+	    expect(result.errors.some((error) => error.includes(expected))).toBe(true);
+	  });
 	});
 
 function pendingReceipt() {
@@ -166,7 +251,7 @@ function replayBundle() {
   const bundleId = hex32("bundle-1");
   const rawReceipt = {
     operationId,
-    operationKind: "activate",
+    operationKind: "activate_tool",
     walletAddress: "0x1111111111111111111111111111111111111111",
     policyDigest: hex32("policy"),
     paramsDigest: hex32("params"),
@@ -184,7 +269,7 @@ function replayBundle() {
     sourceLabel: "caw-api",
     sessionId,
     operationId,
-    operationKind: "activate",
+    operationKind: "activate_tool",
     walletId: "wallet-1",
     fetchedAt,
     exportUrl: "https://caw.example.test/audit",
@@ -196,7 +281,7 @@ function replayBundle() {
     bundleId,
     sessionId,
     operationId,
-    operationKind: "activate",
+    operationKind: "activate_tool",
     sourceLabel: "caw-api",
     fetchedAt,
     rawBundleHash: hashJson(rawBundle),
@@ -207,7 +292,7 @@ function replayBundle() {
     bundleId,
     sessionId,
     operationId,
-    operationKind: "activate",
+    operationKind: "activate_tool",
     sourceLabel: "caw-api",
     walletAddress: rawReceipt.walletAddress,
     target: rawReceipt.target,
@@ -267,7 +352,7 @@ function replayBundle() {
     asOfMcpAdapterCallCount: 0,
     winnerClaimAllowed: false,
     eventRoot: hashJson(events.map((event) => event.eventHash)),
-    agentTranscriptHash: hex32("agent-transcript"),
+    agentTranscriptHash: hashJson(agentTranscriptForTest(sessionId, [])),
     events,
     sources: [],
     spends: [],
@@ -323,7 +408,27 @@ function replayBundle() {
 	      },
 	    ],
     mcpAdapterCalls: [],
-    cawReceiptOperations: [],
+    cawReceiptOperations: [
+      {
+        operationId,
+        sessionId,
+        spendId: hex32("caw-spend"),
+        operationKind: "activate_tool",
+        target: rawReceipt.target,
+        selector: rawReceipt.selector,
+        valueAtomic: "0",
+        request: {
+          spendId: hex32("caw-spend"),
+          operationKind: "activate_tool",
+          target: rawReceipt.target,
+          selector: rawReceipt.selector,
+          valueAtomic: "0",
+        },
+        receiptBundleHash: rawCawReceiptBundle.rawBundleHash,
+        status: "raw_ingested_pending_proof",
+        createdAt,
+      },
+    ],
     rawCawReceiptBundles: [rawCawReceiptBundle],
     canonicalCawReceipts: [canonicalReceipt],
     leaseRuns: [],
@@ -349,6 +454,248 @@ function replayBundle() {
     },
   };
 	}
+
+function replayBundleWithLease() {
+  const bundle = replayBundle();
+  const createdAt = "2026-06-11T00:00:02.000Z";
+  const leaseRunId = hex32("lease-run-1");
+  const listCallId = hex32("lease-list-call");
+  const toolCallId = hex32("lease-tool-call");
+  const auditPrefix = leaseRunId.slice(2, 22);
+  const listRequest = { jsonrpc: "2.0", id: "lease-tools-list", method: "tools/list", params: {} };
+  const listResponse = {
+    jsonrpc: "2.0",
+    id: "lease-tools-list",
+    result: { tools: [{ name: "pactfuse_code_scan", description: "Deterministic code scan" }] },
+  };
+  const callRequest = {
+    jsonrpc: "2.0",
+    id: "lease-tools-call",
+    method: "tools/call",
+    params: {
+      name: "pactfuse_code_scan",
+      arguments: {
+        sessionId: bundle.sessionId,
+        leaseRunId,
+        spendId: bundle.artifactAccessTokens[0].spendId,
+        payer: bundle.artifactAccessTokens[0].payer,
+        artifactHash: bundle.artifactAccessTokens[0].artifactHash,
+        targetRepo: "https://github.com/example/target",
+        targetCommit: "abcdef123456",
+      },
+    },
+  };
+  const callResponse = {
+    jsonrpc: "2.0",
+    id: "lease-tools-call",
+    result: {
+      content: [{ type: "text", text: "scan:https://github.com/example/target@abcdef123456" }],
+      structuredContent: {
+        targetRepo: "https://github.com/example/target",
+        targetCommit: "abcdef123456",
+        findingCount: 0,
+      },
+    },
+  };
+  const mcpAdapterCalls = [
+    mcpCallForTest({
+      callId: listCallId,
+      sessionId: bundle.sessionId,
+      auditNonce: `lease_${auditPrefix}_tools_list`,
+      toolName: "tools/list",
+      request: listRequest,
+      response: listResponse,
+      createdAt,
+    }),
+    mcpCallForTest({
+      callId: toolCallId,
+      sessionId: bundle.sessionId,
+      auditNonce: `lease_${auditPrefix}_tools_call`,
+      toolName: "tools/call",
+      request: callRequest,
+      response: callResponse,
+      createdAt,
+    }),
+  ];
+  const transcriptHash = hashJson({
+    format: "mcp-json-rpc",
+    sessionId: bundle.sessionId,
+    leaseRunId,
+    frameCallIds: [listCallId, toolCallId],
+    frames: [
+      { method: "tools/list", requestHash: mcpAdapterCalls[0].requestHash, responseHash: mcpAdapterCalls[0].responseHash },
+      { method: "tools/call", requestHash: mcpAdapterCalls[1].requestHash, responseHash: mcpAdapterCalls[1].responseHash },
+    ],
+  });
+  const toolsListHash = hashJson({ requestHash: mcpAdapterCalls[0].requestHash, responseHash: mcpAdapterCalls[0].responseHash });
+  const toolsCallHash = hashJson({ requestHash: mcpAdapterCalls[1].requestHash, responseHash: mcpAdapterCalls[1].responseHash });
+  const outputHash = hashJson(callResponse);
+  const leaseRun = {
+    leaseRunId,
+    sessionId: bundle.sessionId,
+    spendId: bundle.artifactAccessTokens[0].spendId,
+    payer: bundle.artifactAccessTokens[0].payer,
+    artifactHash: bundle.artifactAccessTokens[0].artifactHash,
+    targetRepo: "https://github.com/example/target",
+    targetCommit: "abcdef123456",
+    status: "succeeded_live_mcp_transcript",
+    transcriptHash,
+    toolsListHash,
+    toolsCallHash,
+    outputHash,
+    leaseRunHash: null,
+    settlementEventId: bundle.artifactAccessTokens[0].settlementEventId,
+    artifactTokenId: bundle.artifactAccessTokens[0].tokenId,
+    createdAt,
+    completedAt: createdAt,
+  };
+  leaseRun.leaseRunHash = hashJson({
+    sessionId: bundle.sessionId,
+    leaseRunId,
+    spendId: leaseRun.spendId,
+    payer: leaseRun.payer,
+    artifactHash: leaseRun.artifactHash,
+    targetRepo: leaseRun.targetRepo,
+    targetCommit: leaseRun.targetCommit,
+    settlementEventId: leaseRun.settlementEventId,
+    artifactTokenId: leaseRun.artifactTokenId,
+    transcriptHash,
+    outputHash,
+  });
+  const leaseEvent = {
+    eventId: hex32("lease-event-1"),
+    sessionId: bundle.sessionId,
+    authority: "delivery",
+    kind: "lease.execution.succeeded",
+    eventHash: hex32("lease-event-hash-1"),
+    payload: {
+      leaseRunId,
+      spendId: leaseRun.spendId,
+      payer: leaseRun.payer,
+      artifactHash: leaseRun.artifactHash,
+      targetRepo: leaseRun.targetRepo,
+      targetCommit: leaseRun.targetCommit,
+      settlementEventId: leaseRun.settlementEventId,
+      artifactTokenId: leaseRun.artifactTokenId,
+      transcriptHash,
+      toolsListHash,
+      toolsCallHash,
+      outputHash,
+      leaseRunHash: leaseRun.leaseRunHash,
+      status: "succeeded_live_mcp_transcript",
+      proofAuthority: false,
+      winnerClaimAllowed: false,
+    },
+  };
+  bundle.mcpAdapterCalls = mcpAdapterCalls;
+  bundle.asOfMcpAdapterCallCount = mcpAdapterCalls.length;
+  bundle.leaseRuns = [leaseRun];
+  bundle.agentTranscriptHash = hashJson(agentTranscriptForTest(bundle.sessionId, mcpAdapterCalls));
+  bundle.events = [...bundle.events, leaseEvent];
+  bundle.asOfEventSeq = bundle.events.length;
+  bundle.eventRoot = hashJson(bundle.events.map((event) => event.eventHash));
+  const leaseRow = bundle.judgeCheck.rows.find((row) => row.rowId === "lease_execution");
+  leaseRow.status = "pass";
+  leaseRow.authority = "delivery";
+  leaseRow.reason = "MCP transcript recorded";
+  leaseRow.evidenceEventId = leaseEvent.eventId;
+  return bundle;
+}
+
+function mcpCallForTest({ callId, sessionId, auditNonce, toolName, request, response, createdAt }) {
+  return {
+    callId,
+    sessionId,
+    auditNonce,
+    toolName,
+    requestHash: hashJson(request),
+    responseHash: hashJson(response),
+    request,
+    response,
+    status: "succeeded",
+    createdAt,
+    proofAuthority: false,
+  };
+}
+
+function rehashLeaseTranscriptForTest(bundle) {
+  for (const call of bundle.mcpAdapterCalls) {
+    call.requestHash = hashJson(call.request);
+    call.responseHash = hashJson(call.response);
+  }
+  const leaseRun = bundle.leaseRuns[0];
+  const listCall = bundle.mcpAdapterCalls[0];
+  const toolCall = bundle.mcpAdapterCalls[1];
+  leaseRun.toolsListHash = hashJson({ requestHash: listCall.requestHash, responseHash: listCall.responseHash });
+  leaseRun.toolsCallHash = hashJson({ requestHash: toolCall.requestHash, responseHash: toolCall.responseHash });
+  leaseRun.transcriptHash = hashJson({
+    format: "mcp-json-rpc",
+    sessionId: bundle.sessionId,
+    leaseRunId: leaseRun.leaseRunId,
+    frameCallIds: [listCall.callId, toolCall.callId],
+    frames: [
+      { method: "tools/list", requestHash: listCall.requestHash, responseHash: listCall.responseHash },
+      { method: "tools/call", requestHash: toolCall.requestHash, responseHash: toolCall.responseHash },
+    ],
+  });
+  leaseRun.outputHash = hashJson(toolCall.response);
+  leaseRun.leaseRunHash = hashJson({
+    sessionId: bundle.sessionId,
+    leaseRunId: leaseRun.leaseRunId,
+    spendId: leaseRun.spendId,
+    payer: leaseRun.payer,
+    artifactHash: leaseRun.artifactHash,
+    targetRepo: leaseRun.targetRepo,
+    targetCommit: leaseRun.targetCommit,
+    settlementEventId: leaseRun.settlementEventId,
+    artifactTokenId: leaseRun.artifactTokenId,
+    transcriptHash: leaseRun.transcriptHash,
+    outputHash: leaseRun.outputHash,
+  });
+  const event = bundle.events.find((candidate) => candidate.kind === "lease.execution.succeeded");
+  event.payload.transcriptHash = leaseRun.transcriptHash;
+  event.payload.toolsListHash = leaseRun.toolsListHash;
+  event.payload.toolsCallHash = leaseRun.toolsCallHash;
+  event.payload.outputHash = leaseRun.outputHash;
+  event.payload.leaseRunHash = leaseRun.leaseRunHash;
+  bundle.agentTranscriptHash = hashJson(agentTranscriptForTest(bundle.sessionId, bundle.mcpAdapterCalls));
+}
+
+function agentTranscriptForTest(sessionId, calls) {
+  const callSummaries = calls.map((call) => ({
+    callId: call.callId,
+    auditNonce: call.auditNonce,
+    toolName: call.toolName,
+    requestHash: call.requestHash,
+    responseHash: call.responseHash,
+    status: call.status,
+    createdAt: call.createdAt,
+  }));
+  const toolsListHash = calls.length > 0 ? hashJson([...new Set(calls.map((call) => call.toolName))].sort()) : null;
+  const toolsCallHash = calls.length > 0 ? hashJson(callSummaries) : null;
+  const transcriptHash =
+    calls.length > 0
+      ? hashJson({
+          format: "mcp-json-rpc",
+          sessionId,
+          toolsListHash,
+          toolsCallHash,
+          callCount: calls.length,
+        })
+      : null;
+  return {
+    sessionId,
+    status: calls.length > 0 ? "summarized" : "pending",
+    format: "mcp-json-rpc",
+    toolsListHash,
+    toolsCallHash,
+    transcriptHash,
+    boundedToPinnedManifest: false,
+    callCount: calls.length,
+    calls: callSummaries,
+    winnerClaimAllowed: false,
+  };
+}
 
 function lockedRuntimeModes() {
   return {

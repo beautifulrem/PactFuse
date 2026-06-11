@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { keccak256, toBytes } from "viem";
+import { encodeEventTopics, keccak256, toBytes } from "viem";
 import { canonicalizeJson } from "@pactfuse/evidence-schema";
 import { createApp } from "../app.js";
 import { openPactFuseDb } from "../db/index.js";
@@ -17,6 +17,8 @@ import {
   createUnconfiguredCawReceiptSource,
   createUnconfiguredChainClient,
   createUnconfiguredMcpLeaseClient,
+  normalizePactFuseChainLog,
+  PACTFUSE_CHAIN_EVENT_ABI,
 } from "../services/providers.js";
 import { appendEvidenceEvent, recordMcpAdapterCall } from "../services/service.js";
 import { createVerifierAdapter } from "../services/verifier.js";
@@ -45,6 +47,7 @@ function makeApp(
     operatorToken: null,
     challengeSubmitterToken: null,
     artifactSignerToken: null,
+    allowInsecureMissingRoleTokens: true,
     rateLimitWindowMs: 60_000,
     defaultRateLimitMax: 600,
     sessionCreateRateLimitMax: 60,
@@ -177,6 +180,34 @@ describe("pactfuse-api P0", () => {
     expect(allowedIndexerAuth.status).toBe(400);
     expect(invalidJsonWithoutAuth.status).toBe(403);
     expect(invalidJsonWithAuth.status).toBe(400);
+  });
+
+  it("fails closed when protected mutation role tokens are missing unless test/dev mode explicitly opts in", async () => {
+    const secure = makeApp(":memory:", {
+      apiSecurity: {
+        allowInsecureMissingRoleTokens: false,
+      },
+    });
+    const insecure = makeApp(":memory:", {
+      apiSecurity: {
+        allowInsecureMissingRoleTokens: true,
+      },
+    });
+
+    const denied = await post(secure.app, "/api/v1/sessions", { idempotencyKey: "auth-unconfigured-deny", payload: { label: "x" } });
+    const challengeDenied = await post(secure.app, "/api/v1/sources/challenge", {});
+    const artifactDenied = await post(secure.app, "/api/v1/quotes", {});
+    const allowed = await post(insecure.app, "/api/v1/sessions", { idempotencyKey: "auth-unconfigured-allow", payload: { label: "x" } });
+    const ready = await secure.app.request("/readyz");
+
+    expect(denied.status).toBe(403);
+    expect(denied.json.error.message).toContain("operator bearer token is not configured");
+    expect(challengeDenied.status).toBe(403);
+    expect(challengeDenied.json.error.message).toContain("challenge_submitter bearer token is not configured");
+    expect(artifactDenied.status).toBe(403);
+    expect(artifactDenied.json.error.message).toContain("artifact_signer bearer token is not configured");
+    expect(allowed.status).toBe(201);
+    expect((await ready.json()).apiSecurity.allowInsecureMissingRoleTokens).toBe(false);
   });
 
   it("falls back to the shared operator token for specialized roles when no role token is configured", async () => {
@@ -328,6 +359,36 @@ describe("pactfuse-api P0", () => {
     expect(verify.json.data.winnerClaimAllowed).toBe(false);
   });
 
+  it("fails verifier closed when a required indexer cursor filter does not match the initialized cursor", async () => {
+    const requiredAddress = "0x9999999999999999999999999999999999999999";
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ chainId: "84532", currentBlockNumber: 201, logs: [] }),
+      requiredIndexerCursors: [
+        {
+          cursorId: "gate:indexer",
+          chainId: "84532",
+          address: requiredAddress,
+          topics: [hex32("required-topic")],
+          finalityDepth: 3,
+        },
+      ],
+    });
+    const sessionId = await createSession(app, "sess-required-indexer-filter-mismatch");
+    insertCaughtUpIndexerCursor(ctx, { chainId: "84532", lastIndexedBlock: 190, finalizedHeadBlock: 190 });
+
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-required-indexer-filter-mismatch",
+      payload: { schemaOnly: true, receipt: schemaValidWinnerRequestedReceipt() },
+    });
+
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.schemaOk).toBe(false);
+    expect(verify.json.data.errors.some((error: string) => error.includes("required chain indexer cursor gate:indexer address mismatch"))).toBe(true);
+    expect(verify.json.data.errors.some((error: string) => error.includes("required chain indexer cursor gate:indexer topics mismatch"))).toBe(true);
+    expect(verify.json.data.errors.some((error: string) => error.includes("required chain indexer cursor gate:indexer finalityDepth mismatch"))).toBe(true);
+  });
+
   it("fails verifier closed when indexed cursor chain or head conflicts with the provider", async () => {
     const mismatched = makeApp(":memory:", {
       chain: createFakeIndexerChainClient({ chainId: "1", currentBlockNumber: 201, logs: [] }),
@@ -357,6 +418,59 @@ describe("pactfuse-api P0", () => {
     expect(rollbackVerify.status).toBe(200);
     expect(rollbackVerify.json.data.schemaOk).toBe(false);
     expect(rollbackVerify.json.data.errors.some((error: string) => error.includes("ahead of provider finalized head"))).toBe(true);
+  });
+
+  it("decodes raw viem RPC logs into PactFuse semantic event fields before indexer reconciliation", () => {
+    const sessionId = hex32("decoded-log-session");
+    const spendId = hex32("decoded-log-spend");
+    const topics = encodeEventTopics({
+      abi: PACTFUSE_CHAIN_EVENT_ABI,
+      eventName: "SpendSettled",
+      args: { sessionId, spendId },
+    });
+    const rawLog = {
+      address: INDEXER_ADDRESS,
+      blockNumber: "0x64",
+      transactionHash: hex32("decoded-log-tx"),
+      logIndex: "0x0",
+      topics,
+      data: "0x",
+    };
+    const normalized = normalizePactFuseChainLog(rawLog);
+
+    expect(normalized.eventName).toBe("SpendSettled");
+    expect(normalized.event).toBe("SpendSettled");
+    expect(normalized.args).toEqual({ sessionId, spendId });
+    expect(normalized.rawRpcLogHash).toBe(hashForTestJson(rawLog));
+  });
+
+  it("treats required indexer cursor topics as lower-case canonical filters", async () => {
+    const topic = hex32("required-mixed-case-topic");
+    const { app } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ chainId: "84532", currentBlockNumber: 105, logs: [] }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", topics: [topic.toLowerCase()], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-indexer-topic-case");
+    const backfill = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "indexer-topic-case",
+      payload: {
+        cursorId: "gate:indexer",
+        chainId: "84532",
+        fromBlock: 100,
+        toBlock: 100,
+        finalityDepth: 2,
+        topics: [uppercaseHexBody(topic)],
+      },
+    });
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-indexer-topic-case",
+      payload: { schemaOnly: true, receipt: schemaValidWinnerRequestedReceipt() },
+    });
+
+    expect(backfill.status).toBe(202);
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.errors.some((error: string) => error.includes("topics mismatch"))).toBe(false);
   });
 
   it("does not expose MCP audit secrets or derived token hashes in health output", async () => {
@@ -5320,6 +5434,10 @@ async function rawPost(
 
 function hex32(seed: string): `0x${string}` {
   return `0x${createHash("sha256").update(seed).digest("hex")}`;
+}
+
+function uppercaseHexBody(value: string): `0x${string}` {
+  return `0x${value.slice(2).toUpperCase()}`;
 }
 
 function cawReceiptFields(seed: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {

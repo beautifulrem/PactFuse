@@ -2575,7 +2575,7 @@ function assertIndexerCursorMatchesPayload(cursor: Row | undefined, payload: Cha
   if (!cursor) {
     return;
   }
-  const expectedTopics = canonicalizeJson(payload.topics);
+  const expectedTopics = canonicalIndexerTopicsJson(payload.topics);
   const cursorAddress = typeof cursor.address === "string" ? cursor.address.toLowerCase() : null;
   const payloadAddress = payload.address ? payload.address.toLowerCase() : null;
   const mismatches: Record<string, JsonValue> = {};
@@ -2596,6 +2596,10 @@ function assertIndexerCursorMatchesPayload(cursor: Row | undefined, payload: Cha
       apiError: proofBlockedError(requestId, "chain indexer cursor configuration cannot change without a new cursorId", mismatches),
     });
   }
+}
+
+function canonicalIndexerTopicsJson(topics: Array<string | null> = []): string {
+  return canonicalizeJson(topics.map((topic) => (typeof topic === "string" ? topic.toLowerCase() : null)));
 }
 
 function resolveIndexerWindow(
@@ -2768,7 +2772,7 @@ function upsertIndexerCursor(
       input.payload.cursorId,
       input.payload.chainId,
       input.payload.address ?? null,
-      canonicalizeJson(input.payload.topics),
+      canonicalIndexerTopicsJson(input.payload.topics),
       nextLastIndexedBlock,
       input.latestHeadBlock,
       input.finalizedHeadBlock,
@@ -3917,7 +3921,7 @@ function chainLogMatchesGatePayload(
 }
 
 function rawLogHashForChainLog(log: Record<string, unknown>): `0x${string}` {
-  const explicit = optionalHex(log.rawLogHash ?? log.logHash);
+  const explicit = optionalHex(log.rawRpcLogHash ?? log.rawLogHash ?? log.logHash);
   if (explicit && /^0x[0-9a-fA-F]{64}$/.test(explicit)) {
     return explicit as `0x${string}`;
   }
@@ -5755,7 +5759,7 @@ function verifyLeaseRunIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
 async function verifyIndexerCursorIntegrity(ctx: ServiceCtx, proofProviders: ProofProviderStatus[]): Promise<string[]> {
   const rows = ctx.db.sqlite
     .prepare(
-      `SELECT cursor_id, chain_id, last_indexed_block, finalized_head_block, finality_depth, lag_blocks, status, reason
+      `SELECT cursor_id, chain_id, address, topics_json, last_indexed_block, finalized_head_block, finality_depth, lag_blocks, status, reason
        FROM chain_indexer_cursors
        ORDER BY cursor_id ASC`,
     )
@@ -5772,8 +5776,33 @@ async function verifyIndexerCursorIntegrity(ctx: ServiceCtx, proofProviders: Pro
   }
   const rowsByCursorId = new Map(rows.map((row) => [String(row.cursor_id), row]));
   for (const required of ctx.requiredIndexerCursors) {
-    if (!rowsByCursorId.has(required.cursorId)) {
+    const row = rowsByCursorId.get(required.cursorId);
+    if (!row) {
       errors.push(`required chain indexer cursor ${required.cursorId} is missing; proof path is fail-closed`);
+      continue;
+    }
+    const requiredAddress = required.address ?? null;
+    const requiredTopics = canonicalIndexerTopicsJson(required.topics ?? []);
+    const requiredFinalityDepth = required.finalityDepth ?? 2;
+    const cursorAddress = typeof row.address === "string" ? String(row.address).toLowerCase() : null;
+    const expectedAddress = typeof requiredAddress === "string" ? requiredAddress.toLowerCase() : null;
+    if (String(row.chain_id) !== required.chainId) {
+      errors.push(
+        `required chain indexer cursor ${required.cursorId} is for chain ${row.chain_id} but required chain is ${required.chainId}; proof path is fail-closed`,
+      );
+    }
+    if (cursorAddress !== expectedAddress) {
+      errors.push(
+        `required chain indexer cursor ${required.cursorId} address mismatch; expected ${expectedAddress ?? "null"}, got ${cursorAddress ?? "null"}; proof path is fail-closed`,
+      );
+    }
+    if (String(row.topics_json) !== requiredTopics) {
+      errors.push(`required chain indexer cursor ${required.cursorId} topics mismatch; proof path is fail-closed`);
+    }
+    if (Number(row.finality_depth) !== requiredFinalityDepth) {
+      errors.push(
+        `required chain indexer cursor ${required.cursorId} finalityDepth mismatch; expected ${requiredFinalityDepth}, got ${Number(row.finality_depth)}; proof path is fail-closed`,
+      );
     }
   }
   for (const row of rows) {

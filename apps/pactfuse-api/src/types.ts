@@ -101,6 +101,7 @@ export type ApiSecurityConfig = {
   operatorToken: string | null;
   challengeSubmitterToken: string | null;
   artifactSignerToken: string | null;
+  allowInsecureMissingRoleTokens: boolean;
   rateLimitWindowMs: number;
   defaultRateLimitMax: number;
   sessionCreateRateLimitMax: number;

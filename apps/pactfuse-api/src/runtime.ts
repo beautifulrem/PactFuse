@@ -149,6 +149,7 @@ export function createServiceCtx(options: {
       operatorToken: process.env.PACTFUSE_OPERATOR_TOKEN ?? null,
       challengeSubmitterToken: process.env.PACTFUSE_CHALLENGE_SUBMITTER_TOKEN ?? null,
       artifactSignerToken: process.env.PACTFUSE_ARTIFACT_SIGNER_TOKEN ?? null,
+      allowInsecureMissingRoleTokens: booleanEnv("PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS", false),
       rateLimitWindowMs: numberEnv("PACTFUSE_RATE_LIMIT_WINDOW_MS", 60_000),
       defaultRateLimitMax: numberEnv("PACTFUSE_RATE_LIMIT_MAX_REQUESTS", 600),
       sessionCreateRateLimitMax: numberEnv("PACTFUSE_SESSION_RATE_LIMIT_MAX_REQUESTS", 60),

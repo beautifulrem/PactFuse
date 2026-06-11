@@ -611,6 +611,358 @@ function checkPactTemplateBinding(root, errors, options) {
   }
 }
 
+const JUDGE_ROW_IDS = ["caw_boundary", "source_challenge", "ab_trip", "c_settlement", "artifact_access", "lease_execution"];
+
+const JUDGE_ROW_EVENT_KINDS = {
+  caw_boundary: new Set(["caw.receipt.ingested.raw", "caw.receipt.ingested.fixture"]),
+  source_challenge: new Set(["source.challenge.confirmed"]),
+  ab_trip: new Set(["gate.spend_tripped", "reorg.invalidated"]),
+  c_settlement: new Set(["gate.spend_settled", "reorg.invalidated"]),
+  artifact_access: new Set(["artifact.access_token.issued"]),
+  lease_execution: new Set(["lease.execution.succeeded", "lease.execution.blocked"]),
+};
+
+function buildAgentTranscriptSnapshot(sessionId, calls) {
+  const callSummaries = calls.map((call) => ({
+    callId: call.callId,
+    auditNonce: call.auditNonce,
+    toolName: call.toolName,
+    requestHash: call.requestHash,
+    responseHash: call.responseHash,
+    status: call.status,
+    createdAt: call.createdAt,
+  }));
+  const toolsListHash = calls.length > 0 ? hashJson([...new Set(calls.map((call) => call.toolName))].sort()) : null;
+  const toolsCallHash = calls.length > 0 ? hashJson(callSummaries) : null;
+  const transcriptHash =
+    calls.length > 0
+      ? hashJson({
+          format: "mcp-json-rpc",
+          sessionId,
+          toolsListHash,
+          toolsCallHash,
+          callCount: calls.length,
+        })
+      : null;
+  return {
+    sessionId,
+    status: calls.length > 0 ? "summarized" : "pending",
+    format: "mcp-json-rpc",
+    toolsListHash,
+    toolsCallHash,
+    transcriptHash,
+    boundedToPinnedManifest: false,
+    callCount: calls.length,
+    calls: callSummaries,
+    winnerClaimAllowed: false,
+  };
+}
+
+function verifyMcpAdapterCalls(bundle, calls, errors) {
+  const callsByAuditNonce = new Map();
+  for (const call of calls) {
+    if (!isObject(call)) {
+      errors.push("mcpAdapterCalls entries must be objects");
+      continue;
+    }
+    if (call.sessionId !== null && call.sessionId !== bundle.sessionId) {
+      errors.push(`MCP adapter call ${call.callId ?? "-"} sessionId is not bound to replay bundle session`);
+    }
+    if (call.proofAuthority !== false) {
+      errors.push(`MCP adapter call ${call.callId ?? "-"} must carry proofAuthority=false`);
+    }
+    const requestHash = safeHashJson(call.request, `MCP adapter call ${call.callId ?? "-"} request`, errors);
+    const responseHash = safeHashJson(call.response, `MCP adapter call ${call.callId ?? "-"} response`, errors);
+    if (requestHash && lowerHex(call.requestHash) !== requestHash) {
+      errors.push(`MCP adapter call ${call.callId ?? "-"} requestHash does not match request`);
+    }
+    if (responseHash && lowerHex(call.responseHash) !== responseHash) {
+      errors.push(`MCP adapter call ${call.callId ?? "-"} responseHash does not match response`);
+    }
+    if (typeof call.auditNonce === "string") {
+      callsByAuditNonce.set(call.auditNonce, call);
+    }
+  }
+  const transcript = buildAgentTranscriptSnapshot(bundle.sessionId, calls.filter(isObject));
+  const transcriptHash = safeHashJson(transcript, "agent transcript snapshot", errors);
+  if (transcriptHash && lowerHex(bundle.agentTranscriptHash) !== transcriptHash) {
+    errors.push("agentTranscriptHash must equal the hash of the replay MCP transcript snapshot");
+  }
+  return callsByAuditNonce;
+}
+
+function requireLeaseHashField(lease, field, errors) {
+  if (!isHex32(lease[field])) {
+    errors.push(`succeeded lease run ${lease.leaseRunId ?? "-"} requires ${field}`);
+    return null;
+  }
+  return lowerHex(lease[field]);
+}
+
+function jsonPath(root, path) {
+  return path.reduce((value, key) => (value == null ? undefined : value[key]), root);
+}
+
+function verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors) {
+  if (listCall.sessionId !== bundle.sessionId || toolCall.sessionId !== bundle.sessionId) {
+    errors.push(`succeeded lease run ${lease.leaseRunId} MCP transcript frames must be bound to replay bundle session`);
+  }
+  if (listCall.toolName !== "tools/list" || jsonPath(listCall, ["request", "method"]) !== "tools/list") {
+    errors.push(`succeeded lease run ${lease.leaseRunId} tools/list transcript frame has unexpected method`);
+  }
+  if (toolCall.toolName !== "tools/call" || jsonPath(toolCall, ["request", "method"]) !== "tools/call") {
+    errors.push(`succeeded lease run ${lease.leaseRunId} tools/call transcript frame has unexpected method`);
+  }
+  const argumentsObject = jsonPath(toolCall, ["request", "params", "arguments"]);
+  if (!isObject(argumentsObject)) {
+    errors.push(`succeeded lease run ${lease.leaseRunId} tools/call request is missing arguments`);
+    return;
+  }
+  const expectedArguments = {
+    sessionId: bundle.sessionId,
+    leaseRunId: lease.leaseRunId,
+    spendId: lease.spendId,
+    payer: lease.payer,
+    artifactHash: lease.artifactHash,
+    targetRepo: lease.targetRepo,
+    targetCommit: lease.targetCommit,
+  };
+  for (const [field, expected] of Object.entries(expectedArguments)) {
+    if (argumentsObject[field] !== expected) {
+      errors.push(`succeeded lease run ${lease.leaseRunId} tools/call argument ${field} does not match lease run`);
+    }
+  }
+}
+
+function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
+  const artifactTokensById = new Map(
+    (Array.isArray(bundle.artifactAccessTokens) ? bundle.artifactAccessTokens : []).filter(isObject).map((token) => [token.tokenId, token]),
+  );
+  for (const lease of Array.isArray(bundle.leaseRuns) ? bundle.leaseRuns : []) {
+    if (!isObject(lease)) {
+      errors.push("leaseRuns entries must be objects");
+      continue;
+    }
+    if (lease.sessionId !== bundle.sessionId) {
+      errors.push(`lease run ${lease.leaseRunId ?? "-"} sessionId is not bound to replay bundle session`);
+    }
+    if (lease.status !== "succeeded_live_mcp_transcript") {
+      continue;
+    }
+    for (const field of ["leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit", "settlementEventId", "artifactTokenId"]) {
+      requirePath(lease, [field], errors);
+    }
+    const transcriptHash = requireLeaseHashField(lease, "transcriptHash", errors);
+    const toolsListHash = requireLeaseHashField(lease, "toolsListHash", errors);
+    const toolsCallHash = requireLeaseHashField(lease, "toolsCallHash", errors);
+    const outputHash = requireLeaseHashField(lease, "outputHash", errors);
+    const leaseRunHash = requireLeaseHashField(lease, "leaseRunHash", errors);
+    if (!transcriptHash || !toolsListHash || !toolsCallHash || !outputHash || !leaseRunHash || typeof lease.leaseRunId !== "string") {
+      continue;
+    }
+    const prefix = lease.leaseRunId.slice(2, 22);
+    const listCall = callsByAuditNonce.get(`lease_${prefix}_tools_list`);
+    const toolCall = callsByAuditNonce.get(`lease_${prefix}_tools_call`);
+    if (!listCall || !toolCall) {
+      errors.push(`succeeded lease run ${lease.leaseRunId} is missing bound MCP tools/list or tools/call transcript frames`);
+      continue;
+    }
+    verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors);
+    const expectedToolsListHash = safeHashJson(
+      { requestHash: listCall.requestHash, responseHash: listCall.responseHash },
+      `lease run ${lease.leaseRunId} tools/list hash body`,
+      errors,
+    );
+    const expectedToolsCallHash = safeHashJson(
+      { requestHash: toolCall.requestHash, responseHash: toolCall.responseHash },
+      `lease run ${lease.leaseRunId} tools/call hash body`,
+      errors,
+    );
+    const expectedTranscriptHash = safeHashJson(
+      {
+        format: "mcp-json-rpc",
+        sessionId: bundle.sessionId,
+        leaseRunId: lease.leaseRunId,
+        frameCallIds: [listCall.callId, toolCall.callId],
+        frames: [
+          { method: "tools/list", requestHash: listCall.requestHash, responseHash: listCall.responseHash },
+          { method: "tools/call", requestHash: toolCall.requestHash, responseHash: toolCall.responseHash },
+        ],
+      },
+      `lease run ${lease.leaseRunId} transcript hash body`,
+      errors,
+    );
+    const expectedOutputHash = safeHashJson(toolCall.response, `lease run ${lease.leaseRunId} MCP output`, errors);
+    if (expectedToolsListHash && toolsListHash !== expectedToolsListHash) {
+      errors.push(`succeeded lease run ${lease.leaseRunId} toolsListHash does not recompute from MCP transcript`);
+    }
+    if (expectedToolsCallHash && toolsCallHash !== expectedToolsCallHash) {
+      errors.push(`succeeded lease run ${lease.leaseRunId} toolsCallHash does not recompute from MCP transcript`);
+    }
+    if (expectedTranscriptHash && transcriptHash !== expectedTranscriptHash) {
+      errors.push(`succeeded lease run ${lease.leaseRunId} transcriptHash does not recompute from MCP transcript`);
+    }
+    if (expectedOutputHash && outputHash !== expectedOutputHash) {
+      errors.push(`succeeded lease run ${lease.leaseRunId} outputHash does not match MCP tools/call response`);
+    }
+    const token = artifactTokensById.get(lease.artifactTokenId);
+    if (!token) {
+      errors.push(`succeeded lease run ${lease.leaseRunId} references missing artifact token`);
+    } else if (token.spendId !== lease.spendId || lowerHex(token.artifactHash) !== lowerHex(lease.artifactHash)) {
+      errors.push(`succeeded lease run ${lease.leaseRunId} does not match referenced artifact token`);
+    }
+    const expectedLeaseRunHash = safeHashJson(
+      {
+        sessionId: bundle.sessionId,
+        leaseRunId: lease.leaseRunId,
+        spendId: lease.spendId,
+        payer: lease.payer,
+        artifactHash: lowerHex(lease.artifactHash),
+        targetRepo: lease.targetRepo,
+        targetCommit: lease.targetCommit,
+        settlementEventId: lease.settlementEventId,
+        artifactTokenId: lease.artifactTokenId,
+        transcriptHash: lease.transcriptHash,
+        outputHash: lease.outputHash,
+      },
+      `lease run ${lease.leaseRunId} leaseRunHash body`,
+      errors,
+    );
+    if (expectedLeaseRunHash && leaseRunHash !== expectedLeaseRunHash) {
+      errors.push(`succeeded lease run ${lease.leaseRunId} leaseRunHash does not recompute`);
+    }
+    const event = [...eventsById.values()].find(
+      (candidate) => isObject(candidate) && candidate.kind === "lease.execution.succeeded" && candidate.payload?.leaseRunId === lease.leaseRunId,
+    );
+    if (!event) {
+      errors.push(`succeeded lease run ${lease.leaseRunId} has no lease.execution.succeeded event`);
+    } else {
+      for (const field of [
+        "spendId",
+        "payer",
+        "artifactHash",
+        "targetRepo",
+        "targetCommit",
+        "settlementEventId",
+        "artifactTokenId",
+        "transcriptHash",
+        "toolsListHash",
+        "toolsCallHash",
+        "outputHash",
+        "leaseRunHash",
+      ]) {
+        if (event.payload?.[field] !== lease[field]) {
+          errors.push(`lease execution event ${event.eventId ?? "-"} payload.${field} does not match lease run`);
+        }
+      }
+    }
+  }
+}
+
+function verifyJudgeCheck(bundle, eventsById, errors) {
+  const judge = bundle.judgeCheck;
+  if (!isObject(judge) || judge.sessionId !== bundle.sessionId || judge.winnerClaimAllowed !== false) {
+    errors.push("judgeCheck must be bound to the replay bundle session and winnerClaimAllowed=false");
+    return;
+  }
+  if (!Array.isArray(judge.rows) || judge.rows.length !== 6) {
+    errors.push("judgeCheck.rows must contain six rows");
+    return;
+  }
+  const seen = new Set();
+  for (const expectedRowId of JUDGE_ROW_IDS) {
+    if (!judge.rows.some((row) => isObject(row) && row.rowId === expectedRowId)) {
+      errors.push(`judgeCheck.rows is missing ${expectedRowId}`);
+    }
+  }
+  for (const row of judge.rows) {
+    if (!isObject(row)) {
+      errors.push("judgeCheck.rows entries must be objects");
+      continue;
+    }
+    if (seen.has(row.rowId)) {
+      errors.push(`judgeCheck row ${row.rowId} is duplicated`);
+    }
+    seen.add(row.rowId);
+    if (!JUDGE_ROW_IDS.includes(row.rowId)) {
+      errors.push(`judgeCheck row ${row.rowId ?? "-"} is not recognized`);
+    }
+    if (row.status === "pass" && !row.evidenceEventId) {
+      errors.push(`judgeCheck pass row ${row.rowId} requires evidenceEventId`);
+    }
+    if (!row.evidenceEventId) {
+      continue;
+    }
+    const event = eventsById.get(row.evidenceEventId);
+    if (!event) {
+      errors.push(`judgeCheck row ${row.rowId} references missing evidence event ${row.evidenceEventId}`);
+      continue;
+    }
+    if (event.sessionId && event.sessionId !== bundle.sessionId) {
+      errors.push(`judgeCheck row ${row.rowId} evidence event is not bound to replay bundle session`);
+    }
+    const allowedKinds = JUDGE_ROW_EVENT_KINDS[row.rowId];
+    if (allowedKinds && event.kind && !allowedKinds.has(event.kind)) {
+      errors.push(`judgeCheck row ${row.rowId} references unexpected event kind ${event.kind}`);
+    }
+    if (row.status === "pass" && row.authority === "proof" && event.authority && event.authority !== "proof") {
+      errors.push(`judgeCheck proof pass row ${row.rowId} references non-proof event ${row.evidenceEventId}`);
+    }
+    if (row.status === "pass" && row.authority === "delivery" && event.authority && event.authority !== "delivery") {
+      errors.push(`judgeCheck delivery pass row ${row.rowId} references non-delivery event ${row.evidenceEventId}`);
+    }
+  }
+}
+
+function sameNullableLowerHex(left, right) {
+  const normalizedLeft = left == null ? null : asText(left).toLowerCase();
+  const normalizedRight = right == null ? null : asText(right).toLowerCase();
+  return normalizedLeft === normalizedRight;
+}
+
+function verifyCawOperationBinding(canonical, operation, rawBundle, errors) {
+  if (operation.sessionId !== canonical.sessionId) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} is not bound to the CAW operation session`);
+  }
+  if (operation.operationKind !== canonical.operationKind) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} operationKind does not match CAW operation`);
+  }
+  if (!sameNullableLowerHex(operation.target, canonical.target)) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} target is not bound to CAW operation target`);
+  }
+  if (!sameNullableLowerHex(operation.selector, canonical.selector)) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} selector is not bound to CAW operation selector`);
+  }
+  if (operation.status !== "raw_ingested_pending_proof") {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} requires raw-ingested CAW operation status`);
+  }
+  if (!operation.receiptBundleHash) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} requires CAW operation receiptBundleHash`);
+  } else if (operation.receiptBundleHash !== rawBundle.rawBundleHash) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} raw bundle hash does not match CAW operation receiptBundleHash`);
+  }
+  const request = isObject(operation.request) ? operation.request : null;
+  if (!request) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} requires CAW operation request body`);
+    return;
+  }
+  if (request.operationKind !== canonical.operationKind) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} request.operationKind does not match canonical receipt`);
+  }
+  if (!sameNullableLowerHex(request.target, canonical.target)) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} request.target does not match canonical receipt`);
+  }
+  if (!sameNullableLowerHex(request.selector, canonical.selector)) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} request.selector does not match canonical receipt`);
+  }
+  if (String(request.valueAtomic ?? "0") !== String(operation.valueAtomic ?? "0")) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} request.valueAtomic does not match CAW operation`);
+  }
+  if (operation.spendId && request.spendId !== operation.spendId) {
+    errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} request.spendId does not match CAW operation`);
+  }
+}
+
 function verifyReplayBundleEvidence(bundle, options = {}) {
   const errors = [];
   const warnings = [];
@@ -654,11 +1006,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   if (bundle.winnerClaimAllowed !== false) {
     errors.push("replay bundle winnerClaimAllowed must be false unless the final verifier is complete");
   }
-  if (!isObject(bundle.judgeCheck) || bundle.judgeCheck.sessionId !== bundle.sessionId || bundle.judgeCheck.winnerClaimAllowed !== false) {
-    errors.push("judgeCheck must be bound to the replay bundle session and winnerClaimAllowed=false");
-  } else if (!Array.isArray(bundle.judgeCheck.rows) || bundle.judgeCheck.rows.length !== 6) {
-    errors.push("judgeCheck.rows must contain six rows");
-  }
+  let eventsById = new Map();
   if (!Array.isArray(bundle.events)) {
     errors.push("events must be an array");
   } else {
@@ -670,12 +1018,29 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     if (eventRoot && bundle.eventRoot !== eventRoot) {
       errors.push("eventRoot must equal the hash of ordered event hashes");
     }
+    eventsById = new Map(
+      bundle.events
+        .filter((event) => isObject(event) && typeof event.eventId === "string")
+        .map((event) => [event.eventId, event]),
+    );
   }
   const rawBundles = Array.isArray(bundle.rawCawReceiptBundles) ? bundle.rawCawReceiptBundles : [];
   const canonicalReceipts = Array.isArray(bundle.canonicalCawReceipts) ? bundle.canonicalCawReceipts : [];
+  const cawReceiptOperations = Array.isArray(bundle.cawReceiptOperations) ? bundle.cawReceiptOperations : [];
   const preflights = Array.isArray(bundle.artifactPreflights) ? bundle.artifactPreflights : [];
   const quotes = Array.isArray(bundle.quotes) ? bundle.quotes : [];
   const accessTokens = Array.isArray(bundle.artifactAccessTokens) ? bundle.artifactAccessTokens : [];
+  const cawOperationsById = new Map(cawReceiptOperations.filter(isObject).map((operation) => [operation.operationId, operation]));
+  const mcpCalls = Array.isArray(bundle.mcpAdapterCalls) ? bundle.mcpAdapterCalls : [];
+  if (!Array.isArray(bundle.mcpAdapterCalls)) {
+    errors.push("mcpAdapterCalls must be an array");
+  }
+  if (Array.isArray(bundle.mcpAdapterCalls) && bundle.asOfMcpAdapterCallCount !== bundle.mcpAdapterCalls.length) {
+    errors.push("asOfMcpAdapterCallCount must equal mcpAdapterCalls.length in the replay summary");
+  }
+  const callsByAuditNonce = verifyMcpAdapterCalls(bundle, mcpCalls, errors);
+  verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors);
+  verifyJudgeCheck(bundle, eventsById, errors);
   const preflightsById = new Map(preflights.filter(isObject).map((preflight) => [preflight.preflightId, preflight]));
   const quotesById = new Map(quotes.filter(isObject).map((quote) => [quote.quoteId, quote]));
   for (const preflight of preflights) {
@@ -799,6 +1164,12 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     }
     if (canonical.bundleId !== rawMatch.rawBundle.bundleId || canonical.operationId !== rawMatch.rawBundle.operationId) {
       errors.push(`canonical CAW receipt ${canonicalReceiptHash ?? "-"} is not bound to its raw bundle operation`);
+    }
+    const operation = cawOperationsById.get(canonical.operationId);
+    if (!operation) {
+      errors.push(`canonical CAW receipt ${canonicalReceiptHash ?? "-"} references missing CAW operation`);
+    } else {
+      verifyCawOperationBinding(canonical, operation, rawMatch.rawBundle, errors);
     }
     if (canonical.effect === "allow" && !canonical.txHash) {
       errors.push(`canonical CAW allow receipt ${canonicalReceiptHash ?? "-"} requires txHash`);

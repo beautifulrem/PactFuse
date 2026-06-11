@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { createPublicClient, http } from "viem";
+import { createPublicClient, decodeEventLog, http } from "viem";
 import type {
   CawReceiptSource,
   ChainClient,
@@ -17,6 +17,33 @@ const DEFAULT_TEMPLATES: Array<{ mode: PactTemplateBinding["mode"]; path: string
   { mode: "gate-paid-artifact-real", path: "../../../../pact-template/gate-paid-artifact-real.json" },
   { mode: "permit-payment-real", path: "../../../../pact-template/permit-payment-real.appendix.json" },
 ];
+export const PACTFUSE_CHAIN_EVENT_ABI = [
+  {
+    type: "event",
+    name: "SpendTripped",
+    inputs: [
+      { name: "sessionId", type: "bytes32", indexed: true },
+      { name: "spendId", type: "bytes32", indexed: true },
+    ],
+  },
+  {
+    type: "event",
+    name: "SpendSettled",
+    inputs: [
+      { name: "sessionId", type: "bytes32", indexed: true },
+      { name: "spendId", type: "bytes32", indexed: true },
+    ],
+  },
+  {
+    type: "event",
+    name: "SourceChallenged",
+    inputs: [
+      { name: "sessionId", type: "bytes32", indexed: true },
+      { name: "sourceHash", type: "bytes32", indexed: true },
+      { name: "reasonHash", type: "bytes32", indexed: true },
+    ],
+  },
+] as const;
 const MAX_MCP_RESPONSE_BYTES = 512 * 1024;
 const REQUIRED_LEASE_TOOL_ARGUMENTS = ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"] as const;
 const DANGEROUS_TOOL_NAME_PATTERN =
@@ -111,9 +138,40 @@ export function createViemChainClient(input: { rpcUrl: string; chainId?: string 
         method: "eth_getLogs",
         params: [filter],
       });
-      return logs.map((log: unknown) => normalizeChainValue(log) as Record<string, unknown>);
+      return logs.map((log: unknown) => normalizePactFuseChainLog(normalizeChainValue(log) as Record<string, unknown>));
     },
   };
+}
+
+export function normalizePactFuseChainLog(log: Record<string, unknown>): Record<string, unknown> {
+  const rawRpcLogHash = hashChainJson(log);
+  const topics = Array.isArray(log.topics) ? log.topics.filter((topic): topic is `0x${string}` => typeof topic === "string") : [];
+  const data = typeof log.data === "string" && log.data.startsWith("0x") ? (log.data as `0x${string}`) : "0x";
+  if (topics.length === 0) {
+    return { ...log, rawRpcLogHash };
+  }
+  try {
+    const eventTopics = topics as [signature: `0x${string}`, ...args: `0x${string}`[]];
+    const decoded = decodeEventLog({
+      abi: PACTFUSE_CHAIN_EVENT_ABI,
+      data,
+      topics: eventTopics,
+    });
+    return {
+      ...log,
+      rawRpcLogHash,
+      eventName: decoded.eventName,
+      event: decoded.eventName,
+      name: decoded.eventName,
+      args: normalizeChainValue(decoded.args),
+    };
+  } catch {
+    return { ...log, rawRpcLogHash };
+  }
+}
+
+function hashChainJson(value: unknown): `0x${string}` {
+  return hashJson(normalizeChainValue(value));
 }
 
 export function createUnconfiguredCawReceiptSource(): CawReceiptSource {
