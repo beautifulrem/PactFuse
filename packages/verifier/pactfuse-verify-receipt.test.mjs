@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { verifyEvidence } from "./pactfuse-verify-receipt.mjs";
+import { createServerRuntimeVerifierOptions, verifyEvidence } from "./pactfuse-verify-receipt.mjs";
 
 const pendingReceiptPath = new URL("../../docs/evidence/receipt-pack.pending.example.json", import.meta.url);
 const verifierPath = new URL("./pactfuse-verify-receipt.mjs", import.meta.url);
@@ -80,6 +80,8 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.finalVerifierComplete).toBe(false);
     expect(result.proofCompletenessErrors).toContain("final verifier requires live chain proof provider");
     expect(result.proofCompletenessErrors).toContain("final verifier requires caw.identity.probed with mode=real, pass=true, walletAddress, proofAuthority=true, and winnerClaimAllowed=false");
+    expect(result.proofCompletenessErrors).toContain("final verifier requires canonical CAW deny_probe deny receipt");
+    expect(result.proofCompletenessErrors).toContain("final verifier requires canonical CAW approve allow receipt with txHash");
     expect(result.proofCompletenessErrors).toContain("final verifier refuses mocked_after_preflight_not_chain_settleable quotes");
     expect(result.schemaErrors).toEqual([]);
   });
@@ -95,6 +97,36 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.winnerClaimAllowed).toBe(false);
     expect(result.finalVerifierComplete).toBe(false);
     expect(result.proofCompletenessErrors).toContain("replay bundle requested winnerClaimAllowed=true before every final verifier gate passed");
+  });
+
+  it("opens final proof-chip authority only after every public winner gate is satisfied", () => {
+    const bundle = replayBundleWithLease();
+    promoteFirstQuoteToChainSettleableForTest(bundle);
+    appendCawIdentityProbeForTest(bundle);
+    const denyProbe = appendCawDenyProbeForTest(bundle);
+    appendFinalCawReceiptCoverageForTest(bundle, denyProbe);
+    appendFinalTripProofsForTest(bundle);
+    const sourceEvent = appendFinalSourceChallengeForTest(bundle);
+    appendArtifactAccessEventForTest(bundle);
+    passJudgeRowForTest(bundle, "source_challenge", "proof", sourceEvent.eventId, "finalized source challenge proof");
+    passJudgeRowForTest(bundle, "c_settlement", "proof", latestEventForTest(bundle, "token.balance_delta.verified").eventId, "token balance delta settled");
+    bundle.winnerClaimAllowed = true;
+    refreshReplayPagingForTest(bundle);
+
+    const result = verifyEvidence(
+      bundle,
+      createServerRuntimeVerifierOptions({
+        cliMode: "proof-chip",
+        proofProviders: liveProofProvidersForTest(),
+      }),
+    );
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.schemaErrors).toEqual([]);
+    expect(result.proofCompletenessErrors).toEqual([]);
+    expect(result.finalVerifierComplete).toBe(true);
+    expect(result.proofChipAllowed).toBe(true);
+    expect(result.winnerClaimAllowed).toBe(true);
   });
 
   it("rejects caller-supplied live provider flags without server runtime authority", () => {
@@ -393,7 +425,7 @@ describe("pactfuse receipt verifier contract", () => {
         delete pactEvent.payload.policyDigest;
         sealReplayBundleForTest(bundle);
       },
-      "requires policy digest, snapshot hash, chain/target/selector allowlists, request limit, and expiry",
+      "requires policy digest, snapshot hash, chain/target/selector rules, request limit, and expiry",
     ],
     [
       "CAW audit usage policy digest split from Pact",
@@ -1551,6 +1583,279 @@ function appendCawLiveAuditUsageEventsForTest(bundle, cawCalls) {
   return { auditSync, approveUsage, activateUsage };
 }
 
+function appendCawDenyProbeForTest(bundle) {
+  const createdAt = "2026-06-11T00:00:03.250Z";
+  const spend = bundle.spends[0];
+  const pactSync = bundle.cawLiveInteractions.find((interaction) => interaction.kind === "pact_sync" && interaction.status === "live_active");
+  const request = {
+    operation_kind: "deny_probe",
+    spend_id: spend.spendId,
+    pact_id: pactSync.pactId,
+    wallet_id: pactSync.walletId,
+    chain_id: "84532",
+    contract_addr: spend.market.toLowerCase(),
+    calldata: `${ERC20_APPROVE_SELECTOR}${evmAddressWord(spend.market)}${uint256Word(spend.maxPriceAtomic)}`,
+    selector: ERC20_APPROVE_SELECTOR,
+    value: "0",
+    request_id: "pf-live-deny-probe-test",
+  };
+  const response = {
+    result: {
+      id: "contract-live-deny-probe",
+      wallet_id: pactSync.walletId,
+      request_id: request.request_id,
+      status: "denied",
+      reason: "policy_denied",
+    },
+  };
+  const interaction = {
+    interactionId: hex32("caw-live-contract-deny-probe"),
+    sessionId: bundle.sessionId,
+    kind: "contract_call",
+    walletId: pactSync.walletId,
+    pactId: pactSync.pactId,
+    cawRequestId: request.request_id,
+    requestHash: hashJson(request),
+    request,
+    responseHash: hashJson(response),
+    response,
+    status: "live_denied",
+    authKeyHash: pactSync.authKeyHash,
+    proofAuthority: true,
+    winnerClaimAllowed: false,
+    createdAt,
+  };
+  bundle.cawLiveInteractions.push(interaction);
+  bundle.events.push(cawLiveContractEventForTest(bundle, interaction, createdAt));
+  sealReplayBundleForTest(bundle);
+  const contractEvent = bundle.events.find((candidate) => candidate.kind === "caw.live.contract_call.submitted" && candidate.payload.interactionId === interaction.interactionId);
+  const usageEvent = appendCawDenyProbeAuditUsageForTest(bundle, interaction, contractEvent);
+  return { interaction, contractEvent, usageEvent };
+}
+
+function appendCawDenyProbeAuditUsageForTest(bundle, interaction, contractEvent) {
+  const createdAt = "2026-06-11T00:00:03.300Z";
+  const auditItem = {
+    id: `audit-${interaction.cawRequestId}`,
+    action: "wrong_target.deny_probe",
+    result: "denied",
+    request_id: interaction.cawRequestId,
+    policy_digest: contractEvent.payload.pactPolicyDigest,
+  };
+  const auditRequest = {
+    wallet_id: interaction.walletId,
+    action: "wrong_target.deny_probe",
+    result: "denied",
+    limit: 20,
+  };
+  const auditResponse = { items: [auditItem] };
+  const auditSync = {
+    interactionId: hex32("caw-live-audit-deny-probe"),
+    sessionId: bundle.sessionId,
+    kind: "audit_sync",
+    walletId: interaction.walletId,
+    pactId: null,
+    cawRequestId: null,
+    requestHash: hashJson(auditRequest),
+    request: auditRequest,
+    responseHash: hashJson(auditResponse),
+    response: auditResponse,
+    status: "live_synced",
+    authKeyHash: null,
+    proofAuthority: true,
+    winnerClaimAllowed: false,
+    createdAt,
+  };
+  bundle.cawLiveInteractions.push(auditSync);
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "proof",
+    kind: "caw.live.audit.synced",
+    payload: {
+      interactionId: auditSync.interactionId,
+      walletId: auditSync.walletId,
+      requestHash: auditSync.requestHash,
+      responseHash: auditSync.responseHash,
+      status: "live_synced",
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+    createdAt,
+  });
+  sealReplayBundleForTest(bundle);
+  const auditEvent = bundle.events.find((candidate) => candidate.kind === "caw.live.audit.synced" && candidate.payload.interactionId === auditSync.interactionId);
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "proof",
+    kind: "caw.live.audit.usage.verified",
+    payload: {
+      auditInteractionId: auditSync.interactionId,
+      auditEventId: auditEvent.eventId,
+      cawContractCallEventId: contractEvent.eventId,
+      interactionId: interaction.interactionId,
+      walletId: interaction.walletId,
+      pactId: interaction.pactId,
+      cawRequestId: interaction.cawRequestId,
+      operationKind: "deny_probe",
+      action: auditItem.action,
+      result: "denied",
+      policyDigest: auditItem.policy_digest,
+      pactPolicyDigest: contractEvent.payload.pactPolicyDigest,
+      pactSyncInteractionId: contractEvent.payload.pactSyncInteractionId,
+      pactSyncEventId: contractEvent.payload.pactSyncEventId,
+      txHash: null,
+      auditLogHash: hashJson(auditItem),
+      auditLogIndex: 0,
+      auditLogId: auditItem.id,
+      requestHash: interaction.requestHash,
+      responseHash: interaction.responseHash,
+      auditRequestHash: auditSync.requestHash,
+      auditResponseHash: auditSync.responseHash,
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+    createdAt,
+  });
+  sealReplayBundleForTest(bundle);
+  return bundle.events.find(
+    (candidate) => candidate.kind === "caw.live.audit.usage.verified" && candidate.payload.interactionId === interaction.interactionId,
+  );
+}
+
+function appendFinalCawReceiptCoverageForTest(bundle, denyProbe) {
+  bundle.rawCawReceiptBundles[0].receiptCount = 1;
+  const approve = bundle.cawLiveInteractions.find((interaction) => interaction.kind === "contract_call" && interaction.request.operation_kind === "approve");
+  appendCanonicalCawReceiptForTest(bundle, {
+    seed: "deny-probe",
+    operationKind: "deny_probe",
+    target: denyProbe.interaction.request.contract_addr,
+    selector: denyProbe.interaction.request.selector,
+    requestId: denyProbe.interaction.cawRequestId,
+    effect: "deny",
+    status: "denied",
+    txHash: null,
+    spendId: bundle.spends[0].spendId,
+  });
+  appendCanonicalCawReceiptForTest(bundle, {
+    seed: "approve",
+    operationKind: "approve",
+    target: approve.request.contract_addr,
+    selector: approve.request.selector,
+    requestId: approve.cawRequestId,
+    effect: "allow",
+    status: "succeeded",
+    txHash: approve.response.result.transaction_hash,
+    spendId: bundle.spends[0].spendId,
+  });
+  sealReplayBundleForTest(bundle);
+}
+
+function appendCanonicalCawReceiptForTest(bundle, { seed, operationKind, target, selector, requestId, effect, status, txHash, spendId }) {
+  const createdAt = "2026-06-11T00:00:03.400Z";
+  const fetchedAt = "2026-06-11T00:00:03.350Z";
+  const operationId = hex32(`caw-receipt-operation-${seed}`);
+  const bundleId = hex32(`caw-receipt-bundle-${seed}`);
+  const rawReceipt = {
+    operationId,
+    operationKind,
+    walletAddress: bundle.spends[0].agentWallet,
+    policyDigest: hex32("pact-live-policy"),
+    paramsDigest: hex32(`caw-receipt-params-${seed}`),
+    requestId,
+    effect,
+    status,
+    target: target.toLowerCase(),
+    selector: selector.toLowerCase(),
+    txHash,
+    txCount: effect === "allow" ? "1" : "0",
+    expiry: "2026-06-12T00:00:00.000Z",
+  };
+  const rawBundleBody = {
+    source: "caw-api",
+    sourceLabel: "caw-api",
+    sessionId: bundle.sessionId,
+    operationId,
+    operationKind,
+    walletId: "wallet-live-1",
+    fetchedAt,
+    exportUrl: "https://caw.example.test/audit",
+    receipts: [rawReceipt],
+    raw: { receipts: [rawReceipt] },
+  };
+  const rawBundle = {
+    bundleId,
+    sessionId: bundle.sessionId,
+    operationId,
+    operationKind,
+    sourceLabel: "caw-api",
+    fetchedAt,
+    rawBundleHash: hashJson(rawBundleBody),
+    rawBundle: rawBundleBody,
+    receiptCount: 1,
+    createdAt,
+  };
+  const rawReceiptHash = hashJson(rawReceipt);
+  const canonicalBase = {
+    bundleId,
+    sessionId: bundle.sessionId,
+    operationId,
+    operationKind,
+    sourceLabel: "caw-api",
+    walletAddress: rawReceipt.walletAddress,
+    target: rawReceipt.target,
+    selector: rawReceipt.selector,
+    requestId,
+    effect,
+    status,
+    policyDigest: rawReceipt.policyDigest,
+    paramsDigest: rawReceipt.paramsDigest,
+    txHash,
+    txCount: rawReceipt.txCount,
+    expiry: rawReceipt.expiry,
+    fetchedAt,
+    createdAt,
+  };
+  bundle.rawCawReceiptBundles.push(rawBundle);
+  bundle.canonicalCawReceipts.push({
+    rawReceiptHash,
+    canonicalReceiptHash: hashJson(canonicalBase),
+    ...canonicalBase,
+  });
+  bundle.cawReceiptOperations.push({
+    operationId,
+    sessionId: bundle.sessionId,
+    spendId,
+    operationKind,
+    target: rawReceipt.target,
+    selector: rawReceipt.selector,
+    valueAtomic: "0",
+    request: {
+      spendId,
+      operationKind,
+      target: rawReceipt.target,
+      selector: rawReceipt.selector,
+      valueAtomic: "0",
+    },
+    receiptBundleHash: rawBundle.rawBundleHash,
+    status: "verified_policy_authority_structural",
+    createdAt,
+  });
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "proof",
+    kind: "caw.receipt.ingested.raw",
+    payload: {
+      operationId,
+      operationKind,
+      rawBundleHash: rawBundle.rawBundleHash,
+      receiptCount: 1,
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+    createdAt,
+  });
+}
+
 function cawLiveAuditItemForTest(interaction, action) {
   return {
     id: `audit-${interaction.cawRequestId}`,
@@ -2111,6 +2416,141 @@ function appendContractProofEventsForTest(bundle) {
   bundle.events = [...bundle.events, gateEvent, sourceEvent];
   sealReplayBundleForTest(bundle);
   return { gateEvent, sourceEvent };
+}
+
+function appendFinalTripProofsForTest(bundle) {
+  const baseSpend = bundle.spends[0];
+  const tripSpends = ["a", "b"].map((suffix) => ({
+    ...baseSpend,
+    spendId: hex32(`trip-spend-${suffix}`),
+    pactId: hex32(`trip-pact-${suffix}`),
+    toolId: hex32(`trip-tool-${suffix}`),
+    artifactHash: hex32(`trip-artifact-${suffix}`),
+    sourceSetHash: hex32(`trip-source-set-${suffix}`),
+    sessionCommitment: hex32(`trip-session-commitment-${suffix}`),
+    nonce: `trip-nonce-${suffix}`,
+    status: "tripped_finalized",
+    createdAt: "2026-06-11T00:00:03.600Z",
+  }));
+  bundle.spends.push(...tripSpends);
+  for (const [index, spend] of tripSpends.entries()) {
+    bundle.events.push({
+      eventSeq: bundle.events.length + 1,
+      authority: "proof",
+      kind: "gate.spend_tripped",
+      payload: {
+        gateEventId: hex32(`trip-gate-event-${index}`),
+        event: "SpendTripped",
+        spendId: spend.spendId,
+        txHash: hex32(`trip-gate-tx-${index}`),
+        logIndex: index,
+        chainId: "84532",
+        blockNumber: 110 + index,
+        currentBlockNumber: 114 + index,
+        rawLogHash: hex32(`trip-gate-log-${index}`),
+        confirmations: 4,
+        finalityDepth: 2,
+        finalityStatus: "finalized",
+        observedEventId: hex32(`trip-gate-observed-${index}`),
+        indexedLogId: hex32(`trip-gate-indexed-log-${index}`),
+        cursorId: `gate:trip:${index}`,
+        indexedRawLogHash: hex32(`trip-gate-indexed-raw-${index}`),
+        finalizedHeadBlock: 114 + index,
+        latestHeadBlock: 114 + index,
+        contractStateVerified: true,
+        contractAddress: latestEventForTest(bundle, "gate.spend_settled").payload.contractAddress,
+        contractFunction: "registeredSpend",
+        contractSessionId: bundle.sessionId,
+        contractPactId: spend.pactId,
+        contractToolId: spend.toolId,
+        contractSourceSetHash: spend.sourceSetHash,
+        contractAgentWallet: spend.agentWallet,
+        contractPaymentToken: spend.paymentToken,
+        contractPrice: spend.maxPriceAtomic,
+        contractArtifactHash: spend.artifactHash,
+        contractMarket: spend.market,
+        contractSpendState: "Tripped",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+      createdAt: "2026-06-11T00:00:03.650Z",
+    });
+  }
+  sealReplayBundleForTest(bundle);
+  passJudgeRowForTest(bundle, "ab_trip", "proof", latestEventForTest(bundle, "gate.spend_tripped").eventId, "two finalized A/B trip spends");
+}
+
+function appendFinalSourceChallengeForTest(bundle) {
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "proof",
+    kind: "source.challenge.confirmed",
+    payload: {
+      challengeId: hex32("final-source-challenge"),
+      sourceHash: bundle.spends[0].sourceHashes[0],
+      reasonHash: hex32("final-source-reason"),
+      txHash: hex32("final-source-tx"),
+      logIndex: 3,
+      chainId: "84532",
+      blockNumber: 118,
+      indexedLogId: hex32("final-source-indexed-log"),
+      cursorId: "source:challenge",
+      indexedRawLogHash: hex32("final-source-indexed-raw"),
+      finalizedHeadBlock: 122,
+      latestHeadBlock: 122,
+      finalityStatus: "finalized",
+      contractStateVerified: true,
+      sourceRegistryAddress: "0x1111111111111111111111111111111111111111",
+      contractFunction: "sourceState",
+      contractSourceState: "Challenged",
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+    createdAt: "2026-06-11T00:00:03.700Z",
+  });
+  sealReplayBundleForTest(bundle);
+  return latestEventForTest(bundle, "source.challenge.confirmed");
+}
+
+function appendArtifactAccessEventForTest(bundle) {
+  const token = bundle.artifactAccessTokens[0];
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "delivery",
+    kind: "artifact.access_token.issued",
+    payload: {
+      tokenId: token.tokenId,
+      spendId: token.spendId,
+      quoteId: token.quoteId,
+      preflightId: token.preflightId,
+      payer: token.payer,
+      artifactHash: token.artifactHash,
+      artifactCid: token.artifactCid,
+      settlementEventId: token.settlementEventId,
+      status: "active",
+      proofAuthority: false,
+      winnerClaimAllowed: false,
+    },
+    createdAt: "2026-06-11T00:00:03.750Z",
+  });
+  sealReplayBundleForTest(bundle);
+  const event = latestEventForTest(bundle, "artifact.access_token.issued");
+  passJudgeRowForTest(bundle, "artifact_access", "delivery", event.eventId, "artifact access token issued after settlement");
+  return event;
+}
+
+function passJudgeRowForTest(bundle, rowId, authority, evidenceEventId, reason) {
+  const row = bundle.judgeCheck.rows.find((candidate) => candidate.rowId === rowId);
+  row.status = "pass";
+  row.authority = authority;
+  row.reason = reason;
+  row.evidenceEventId = evidenceEventId;
+  row.evidenceUrl = null;
+  refreshReplayPagingForTest(bundle);
+}
+
+function latestEventForTest(bundle, kind) {
+  return [...bundle.events].filter((event) => event.kind === kind).sort((left, right) => left.eventSeq - right.eventSeq).at(-1);
 }
 
 function appendSignedSourceForTest(bundle) {

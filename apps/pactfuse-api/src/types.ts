@@ -99,6 +99,7 @@ export type CawLiveTransferInput = {
 
 export type CawLiveContractCallInput = {
   walletId: string;
+  operationKind?: "deny_probe" | "approve" | "activate_tool";
   chainId: string;
   contractAddress: string;
   calldata: string;

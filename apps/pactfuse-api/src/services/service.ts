@@ -1463,11 +1463,16 @@ export async function submitCawLiveContractCall(
       const pactKeyHash = sha256Hex(pactApiKey);
       const activePact = requireActiveCawLivePact(ctx, envelope.sessionId, payload.pactId, payload.walletId, pactKeyHash, requestId);
       const normalized = normalizeCawLiveContractCallPayload(payload, spend, requestId);
-      assertCawPactAllowsContractCall(activePact, normalized, requestId);
+      if (normalized.operationKind === "deny_probe") {
+        assertCawPactDeniesContractCall(activePact, normalized, requestId);
+      } else {
+        assertCawPactAllowsContractCall(activePact, normalized, requestId);
+      }
       assertCawPactRequestCapacity(ctx, envelope.sessionId, activePact, normalized, requestId);
       const request = cawLiveContractCallRequest(normalized);
       const response = await ctx.cawLive.contractCall({
         walletId: normalized.walletId,
+        operationKind: normalized.operationKind,
         chainId: normalized.chainId,
         contractAddress: normalized.contractAddress,
         calldata: normalized.calldata,
@@ -1874,6 +1879,9 @@ function normalizeCawLiveContractCallPayload(
       }),
     });
   }
+  if (normalized.operationKind === "deny_probe") {
+    return normalized;
+  }
   if (normalized.operationKind === "approve") {
     const expectedToken = String(spend.payment_token).toLowerCase();
     if (normalized.contractAddress !== expectedToken) {
@@ -2003,7 +2011,7 @@ type CawLiveAuditUsageCandidate = {
   action: string;
   result: "allowed" | "denied";
   policyDigest: `0x${string}`;
-  txHash: `0x${string}`;
+  txHash: `0x${string}` | null;
   cawRequestId: string;
 };
 
@@ -2062,7 +2070,7 @@ function appendCawLiveAuditUsageEvents(
       const pactPolicyDigest = optionalHex32(event.payload.pactPolicyDigest);
       if (
         (!requestId || requestId !== candidate.cawRequestId) &&
-        (!eventTxHash || eventTxHash.toLowerCase() !== candidate.txHash.toLowerCase())
+        (!candidate.txHash || !eventTxHash || eventTxHash.toLowerCase() !== candidate.txHash.toLowerCase())
       ) {
         continue;
       }
@@ -2070,7 +2078,7 @@ function appendCawLiveAuditUsageEvents(
         continue;
       }
       const operationKind = String(request.operation_kind ?? "");
-      if (operationKind !== "approve" && operationKind !== "activate_tool") {
+      if (operationKind !== "deny_probe" && operationKind !== "approve" && operationKind !== "activate_tool") {
         continue;
       }
       seen.add(`${interactionId}:${candidate.auditLogHash}`);
@@ -2142,7 +2150,7 @@ function cawLiveAuditUsageCandidate(item: Record<string, unknown>, index: number
   const txHash = optionalHex32(optionalStringFromRecord(item, ["tx_hash", "txHash", "transaction_hash", "transactionHash", "hash"]));
   const policyDigest = optionalHex32(optionalStringFromRecord(item, ["policy_digest", "policyDigest", "policy_hash", "policyHash"]));
   const result = cawLiveAuditResult(item);
-  if (!cawRequestId || !txHash || !policyDigest || !result) {
+  if (!cawRequestId || !policyDigest || !result || (result === "allowed" && !txHash)) {
     return null;
   }
   const action = optionalStringFromRecord(item, ["action", "operation", "operation_kind", "operationKind", "type"]) ?? "contract_call";
@@ -2574,6 +2582,19 @@ function assertCawPactAllowsContractCall(activePact: CawActivePactBinding, paylo
   if (!cawPactPolicyAllowsContractCall(activePact, payload)) {
     throw Object.assign(new Error("CAW Pact policy does not allow the requested chain/target/selector tuple"), {
       apiError: proofBlockedError(requestId, "CAW Pact policy does not allow the requested chain/target/selector tuple", {
+        chainId: payload.chainId,
+        contractAddress: payload.contractAddress,
+        selector: payload.selector,
+        policyRules: activePact.policyRules,
+      }),
+    });
+  }
+}
+
+function assertCawPactDeniesContractCall(activePact: CawActivePactBinding, payload: NormalizedCawLiveContractCallPayload, requestId: string): void {
+  if (cawPactPolicyAllowsContractCall(activePact, payload)) {
+    throw Object.assign(new Error("CAW deny_probe must target a chain/target/selector tuple outside the active Pact policy"), {
+      apiError: proofBlockedError(requestId, "CAW deny_probe must target a chain/target/selector tuple outside the active Pact policy", {
         chainId: payload.chainId,
         contractAddress: payload.contractAddress,
         selector: payload.selector,
@@ -4218,6 +4239,11 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
       isWrongTargetDenyPayload(payload)
     );
   });
+  const cawReceiptCoverage = cawRawReceiptCoverage(replayBundle);
+  const cawRawReceiptEvent = latest((event) => {
+    const payload = eventPayload(event);
+    return event.kind === "caw.receipt.ingested.raw" && payload.proofAuthority === true;
+  });
   const cawAllowance = latestKind("caw.allowance.verified");
   const cawActivation = latestKind("caw.activation.verified");
   const tokenDelta = latest((event) => event.kind === "token.balance_delta.verified" && isLiveChainProofPayload(eventPayload(event)));
@@ -4226,6 +4252,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
     providerGate(proofProviders, "chain", ["paymentMode", "tokenMode", "winnerClaimAllowed"]),
     providerGate(proofProviders, "caw_live", ["claimMode", "paymentMode", "identityMode", "winnerClaimAllowed"]),
     providerGate(proofProviders, "caw", ["claimMode", "winnerClaimAllowed"]),
+    providerGate(proofProviders, "mcp_lease", ["winnerClaimAllowed"]),
     eventGate(
       "caw_identity_probe",
       "CAW identity probe",
@@ -4244,6 +4271,15 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
       cawDeny,
       "live CAW audit contains a denied bypass attempt",
       "missing real CAW deny receipt for the wrong-target bypass attempt",
+    ),
+    eventGate(
+      "caw_raw_receipts",
+      "CAW raw receipts",
+      cawReceiptCoverage.pass,
+      ["claimMode", "winnerClaimAllowed"],
+      cawRawReceiptEvent,
+      "raw and canonical CAW receipts cover deny_probe, approve, and activate_tool",
+      cawReceiptCoverage.reason,
     ),
     eventGate(
       "caw_allowance_proof",
@@ -4317,6 +4353,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
   const cawTargetReady =
     gatePassed("caw_identity_probe") &&
     gatePassed("caw_wrong_target_deny") &&
+    gatePassed("caw_raw_receipts") &&
     gatePassed("caw_allowance_proof") &&
     gatePassed("caw_activation_proof") &&
     ["caw_boundary", "source_challenge", "ab_trip"].every((id) => rowsById.get(id)?.status === "pass");
@@ -4531,6 +4568,32 @@ function isLiveChainProofPayload(payload: Record<string, unknown>): boolean {
   return payload.chainProviderMode === "live" && typeof payload.chainId === "string" && payload.chainId.length > 0;
 }
 
+function cawRawReceiptCoverage(bundle: ReplayBundleView): { pass: boolean; reason: string } {
+  const rawBundles = bundle.rawCawReceiptBundles.filter(
+    (row) => (row.sourceLabel === "caw-api" || row.sourceLabel === "caw-export") && row.receiptCount > 0,
+  );
+  if (rawBundles.length === 0 || bundle.canonicalCawReceipts.length === 0) {
+    return { pass: false, reason: "missing raw and canonical CAW receipts for deny_probe, approve, and activate_tool" };
+  }
+  const hasReceipt = (operationKind: "deny_probe" | "approve" | "activate_tool", effect: "allow" | "deny") =>
+    bundle.canonicalCawReceipts.some(
+      (receipt) =>
+        receipt.operationKind === operationKind &&
+        receipt.effect === effect &&
+        (receipt.sourceLabel === "caw-api" || receipt.sourceLabel === "caw-export") &&
+        (effect !== "allow" || Boolean(receipt.txHash)),
+    );
+  const missing = [
+    hasReceipt("deny_probe", "deny") ? null : "deny_probe deny",
+    hasReceipt("approve", "allow") ? null : "approve allow",
+    hasReceipt("activate_tool", "allow") ? null : "activate_tool allow",
+  ].filter((value): value is string => Boolean(value));
+  if (missing.length > 0) {
+    return { pass: false, reason: `missing canonical CAW receipt coverage for ${missing.join(", ")}` };
+  }
+  return { pass: true, reason: "raw and canonical CAW receipts cover deny_probe, approve, and activate_tool" };
+}
+
 function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: ClaimReadinessGate[]): string[] {
   const inputs = new Set<string>();
   const provider = (name: ProofProviderStatus["name"]) => providers.find((candidate) => candidate.name === name);
@@ -4543,6 +4606,9 @@ function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: C
   if (provider("caw")?.ready !== true || provider("caw")?.mode !== "live") {
     inputs.add("PACTFUSE_CAW_EXPORT_URL or equivalent raw CAW receipt export source");
   }
+  if (provider("mcp_lease")?.ready !== true || provider("mcp_lease")?.mode !== "live") {
+    inputs.add("PACTFUSE_MCP_LEASE_URL for a live MCP lease runner");
+  }
   for (const gate of gates) {
     if (gate.status === "pass") {
       continue;
@@ -4552,6 +4618,9 @@ function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: C
     }
     if (gate.gateId === "caw_wrong_target_deny") {
       inputs.add("real CAW wrong-target deny request id or audit receipt");
+    }
+    if (gate.gateId === "caw_raw_receipts") {
+      inputs.add("raw CAW API/export receipts canonicalized for deny_probe, approve, and activate_tool");
     }
     if (gate.gateId === "token_balance_delta") {
       inputs.add("public ERC20 token tx/log/balance evidence for the finalized settlement");
@@ -10549,6 +10618,7 @@ function verifyCawLiveContractCallIntegrity(
   if (!activePact) {
     errors.push(`CAW live contract call ${interactionId} is not bound to an active synced CAW Pact and key hash`);
   } else {
+    const policyOperationKind = typeof request.operation_kind === "string" ? request.operation_kind : "";
     for (const [field, expected] of [
       ["pactSyncInteractionId", activePact.pactSyncInteractionId],
       ["pactSyncEventId", activePact.pactSyncEventId],
@@ -10564,24 +10634,33 @@ function verifyCawLiveContractCallIntegrity(
       contractAddress: String(request.contract_addr ?? "").toLowerCase(),
       selector: String(request.selector ?? "").toLowerCase(),
     };
-    if (activePact.policyChainIds.length > 0 && !activePact.policyChainIds.includes(normalizedForPolicy.chainId)) {
-      errors.push(`CAW live contract call ${interactionId} chainId is not allowed by active Pact policy`);
-    }
-    if (activePact.policyContractAddresses.length > 0 && !activePact.policyContractAddresses.includes(normalizedForPolicy.contractAddress as `0x${string}`)) {
-      errors.push(`CAW live contract call ${interactionId} contract_addr is not allowed by active Pact policy`);
-    }
-    if (activePact.policySelectors.length > 0 && !activePact.policySelectors.includes(normalizedForPolicy.selector as `0x${string}`)) {
-      errors.push(`CAW live contract call ${interactionId} selector is not allowed by active Pact policy`);
-    }
-    if (
+    const tupleAllowed =
       activePact.policyRules.length > 0 &&
-      !cawPactPolicyAllowsContractCall(activePact, {
+      cawPactPolicyAllowsContractCall(activePact, {
         chainId: normalizedForPolicy.chainId,
         contractAddress: normalizedForPolicy.contractAddress as `0x${string}`,
         selector: normalizedForPolicy.selector,
-      })
-    ) {
-      errors.push(`CAW live contract call ${interactionId} chain/target/selector tuple is not allowed by active Pact policy`);
+      });
+    if (policyOperationKind === "deny_probe") {
+      if (tupleAllowed) {
+        errors.push(`CAW live deny_probe ${interactionId} chain/target/selector tuple is unexpectedly allowed by active Pact policy`);
+      }
+      if (row.status !== "live_denied" || event.payload.status !== "live_denied") {
+        errors.push(`CAW live deny_probe ${interactionId} must be recorded as live_denied`);
+      }
+    } else {
+      if (activePact.policyChainIds.length > 0 && !activePact.policyChainIds.includes(normalizedForPolicy.chainId)) {
+        errors.push(`CAW live contract call ${interactionId} chainId is not allowed by active Pact policy`);
+      }
+      if (activePact.policyContractAddresses.length > 0 && !activePact.policyContractAddresses.includes(normalizedForPolicy.contractAddress as `0x${string}`)) {
+        errors.push(`CAW live contract call ${interactionId} contract_addr is not allowed by active Pact policy`);
+      }
+      if (activePact.policySelectors.length > 0 && !activePact.policySelectors.includes(normalizedForPolicy.selector as `0x${string}`)) {
+        errors.push(`CAW live contract call ${interactionId} selector is not allowed by active Pact policy`);
+      }
+      if (activePact.policyRules.length > 0 && !tupleAllowed) {
+        errors.push(`CAW live contract call ${interactionId} chain/target/selector tuple is not allowed by active Pact policy`);
+      }
     }
   }
   for (const [field, expected] of [
@@ -10602,6 +10681,9 @@ function verifyCawLiveContractCallIntegrity(
   const calldata = typeof request.calldata === "string" ? request.calldata.toLowerCase() : "";
   if (request.wallet_id !== row.wallet_id || request.pact_id !== row.pact_id) {
     errors.push(`CAW live contract call ${interactionId} request wallet_id/pact_id does not match interaction row`);
+  }
+  if (operationKind === "deny_probe") {
+    return;
   }
   if (operationKind === "approve") {
     const expectedToken = String(spend.payment_token).toLowerCase();

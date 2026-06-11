@@ -933,7 +933,7 @@ function buildOpenApi(): Record<string, unknown> {
           additionalProperties: false,
           properties: {
             spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
-            operationKind: { enum: ["approve", "activate_tool"] },
+            operationKind: { enum: ["deny_probe", "approve", "activate_tool"] },
             pactId: { type: "string", minLength: 1, maxLength: 160 },
             walletId: { type: "string", minLength: 1, maxLength: 160 },
             chainId: { type: "string", minLength: 1, maxLength: 80 },

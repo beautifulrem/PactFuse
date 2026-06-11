@@ -210,7 +210,7 @@ export const CawLiveTransferSubmitPayloadSchema = z
 export const CawLiveContractCallSubmitPayloadSchema = z
   .object({
     spendId: Hex32Schema,
-    operationKind: z.enum(["approve", "activate_tool"]),
+    operationKind: z.enum(["deny_probe", "approve", "activate_tool"]),
     pactId: z.string().min(1).max(160),
     walletId: z.string().min(1).max(160),
     chainId: z.string().min(1).max(80),

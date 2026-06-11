@@ -457,6 +457,7 @@ describe("pactfuse-api P0", () => {
         "PACTFUSE_CAW_EXPORT_URL or equivalent raw CAW receipt export source",
         "PACTFUSE_CAW_LIVE_API_URL, PACTFUSE_CAW_LIVE_API_KEY, and a CAW wallet id",
         "PACTFUSE_CHAIN_RPC_URL and PACTFUSE_CHAIN_ID for a live public testnet RPC",
+        "PACTFUSE_MCP_LEASE_URL for a live MCP lease runner",
       ]),
     );
   });
@@ -704,8 +705,11 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(json.data.blockers).toContain("final_verifier_complete: current verifier still reports finalVerifierComplete=false");
+    expect(json.data.blockers).toContain("caw_raw_receipts: missing raw and canonical CAW receipts for deny_probe, approve, and activate_tool");
     expect(json.data.blockers).toContain("artifact_quote_live: artifact quote is still mocked_after_preflight_not_chain_settleable");
     expect(json.data.requiredExternalInputs).toContain("chain-settleable artifact quote issued after preflight");
+    expect(json.data.requiredExternalInputs).toContain("PACTFUSE_MCP_LEASE_URL for a live MCP lease runner");
+    expect(json.data.requiredExternalInputs).toContain("raw CAW API/export receipts canonicalized for deny_probe, approve, and activate_tool");
     expect(json.data.requiredExternalInputs).toContain("full chain/signature/hash verifier that can set finalVerifierComplete=true");
     expect(json.data.verifierRun.winnerClaimAllowed).toBe(false);
     expect(json.data.replayBundleHash).toMatch(/^0x[0-9a-f]{64}$/);
@@ -1239,6 +1243,7 @@ describe("pactfuse-api P0", () => {
       "#/components/schemas/CawLiveAuditSyncInput",
     );
     expect(json.components.schemas.CawLiveAuditSyncPayload.properties.result.enum).toEqual(["allowed", "denied", "pending", "error"]);
+    expect(json.components.schemas.CawLiveContractCallPayload.properties.operationKind.enum).toEqual(["deny_probe", "approve", "activate_tool"]);
     expect(json.paths["/api/v1/caw/live/contracts/call"].post.parameters).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "x-pactfuse-caw-pact-api-key", in: "header", required: true }),
@@ -6929,6 +6934,75 @@ describe("pactfuse-api P0", () => {
     ).toBe(false);
   });
 
+  it("records a live CAW deny_probe for a wrong-target policy denial", async () => {
+    const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
+    const sessionId = await createSession(app, "sess-caw-live-deny-probe");
+    const spendId = await registerSpend(app, sessionId);
+    await post(app, "/api/v1/caw/live/pacts/submit", {
+      sessionId,
+      idempotencyKey: "deny-probe-pact-submit",
+      payload: { walletId: "wallet-live-1", intent: "deny probe", spec: { policies: [] } },
+    });
+    await post(app, "/api/v1/caw/live/pacts/sync", {
+      sessionId,
+      idempotencyKey: "deny-probe-pact-sync",
+      payload: { pactId: "pact-live-1" },
+    });
+    const denyProbe = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "deny-probe-call",
+        payload: {
+          spendId,
+          operationKind: "deny_probe",
+          pactId: "pact-live-1",
+          walletId: "wallet-live-1",
+          chainId: "84532",
+          contractAddress: TEST_MARKET_ADDRESS,
+          calldata: `${PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR}${"00".repeat(32)}`,
+          requestId: "deny-probe-wrong-target",
+          description: "wrong-target deny probe",
+        },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const audit = await post(app, "/api/v1/caw/live/audit/sync", {
+      sessionId,
+      idempotencyKey: "deny-probe-audit",
+      payload: { walletId: "wallet-live-1", action: "wrong_target.deny_probe", result: "denied", limit: 20 },
+    });
+    const readiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const readinessJson = await readiness.json();
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const usageEvent = replayJson.data.events.find(
+      (event: { kind: string; payload: Record<string, unknown> }) =>
+        event.kind === "caw.live.audit.usage.verified" && event.payload.operationKind === "deny_probe",
+    );
+
+    expect(denyProbe.status).toBe(202);
+    expect(denyProbe.json.data).toEqual(expect.objectContaining({ operationKind: "deny_probe", status: "live_denied", txHash: null }));
+    expect(audit.status).toBe(202);
+    expect(usageEvent).toEqual(
+      expect.objectContaining({
+        authority: "proof",
+        payload: expect.objectContaining({
+          result: "denied",
+          action: "wrong_target.deny_probe",
+          txHash: null,
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        }),
+      }),
+    );
+    expect(readiness.status).toBe(200);
+    expect(readinessJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "caw_wrong_target_deny")).toEqual(
+      expect.objectContaining({ status: "pass", evidenceEventId: usageEvent.eventId }),
+    );
+  });
+
   it("blocks CAW contract calls after Pact policy request limit is exhausted", async () => {
     const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient({ policyRequestLimit: "1" }) });
     const sessionId = await createSession(app, "sess-caw-live-policy-limit");
@@ -7571,12 +7645,12 @@ function createFakeGateChainClient(currentBlockNumber = 101, chainId = "84532"):
   };
 }
 
-function createFakeCawReceiptSource(input: { receipts: Array<Record<string, unknown>>; source?: string }): CawReceiptSource {
+function createFakeCawReceiptSource(input: { receipts: Array<Record<string, unknown>>; source?: string; mode?: "fixture" | "live" }): CawReceiptSource {
   return {
     async status() {
       return {
         name: "caw",
-        mode: "fixture",
+        mode: input.mode ?? "fixture",
         ready: true,
         reason: "test CAW receipt source",
       };
@@ -8102,7 +8176,7 @@ function createFakeCawLiveClient(
     policy: Record<string, unknown>;
   }> = {},
 ): CawLiveClient {
-  const contractCalls: Array<{ input: Parameters<CawLiveClient["contractCall"]>[0]; txHash: `0x${string}` }> = [];
+  const contractCalls: Array<{ input: Parameters<CawLiveClient["contractCall"]>[0]; txHash: `0x${string}` | null }> = [];
   const includePolicyBinding = options.includePolicyBinding ?? true;
   const pactPolicyDigest = hex32("pact-live-policy");
   const auditPolicyDigest = options.auditPolicyDigest ?? pactPolicyDigest;
@@ -8170,15 +8244,17 @@ function createFakeCawLiveClient(
       const txHash = /^0x[0-9a-fA-F]{64}$/.test(input.requestId ?? "")
         ? (input.requestId as `0x${string}`)
         : hex32(`caw-live-contract:${input.requestId ?? "default"}`);
-      contractCalls.push({ input, txHash });
+      const denied = input.operationKind === "deny_probe";
+      contractCalls.push({ input, txHash: denied ? null : txHash });
       return {
         success: true,
         result: {
           id: "contract-live-1",
           wallet_id: input.walletId,
           request_id: input.requestId,
-          status: "submitted",
-          transaction_hash: txHash,
+          status: denied ? "denied" : "submitted",
+          reason: denied ? "policy_denied" : undefined,
+          transaction_hash: denied ? null : txHash,
         },
       };
     },
@@ -8190,9 +8266,9 @@ function createFakeCawLiveClient(
           wallet_id: call.input.walletId,
           pact_id: call.input.pactId,
           action: input.action ?? `contract_call.${call.input.operationKind}`,
-          result: input.result ?? "allowed",
+          result: input.result ?? (call.input.operationKind === "deny_probe" ? "denied" : "allowed"),
           request_id: call.input.requestId,
-          transaction_hash: call.txHash,
+          ...(call.txHash ? { transaction_hash: call.txHash } : {}),
           policy_digest: auditPolicyDigest,
         }));
       return {
