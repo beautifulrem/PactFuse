@@ -9,6 +9,7 @@ import { canonicalizeJson } from "@pactfuse/evidence-schema";
 import { createApp } from "../app.js";
 import { openPactFuseDb } from "../db/index.js";
 import { completeJob, enqueueJob, leaseNextJob, requeueExpiredLeases } from "../services/jobs.js";
+import { INDEX_CHAIN_WINDOW_JOB_KIND, runIndexerWorkerOnce } from "../services/indexer-worker.js";
 import {
   createHttpsCawReceiptSource,
   createStaticTemplateRegistry,
@@ -29,6 +30,7 @@ function makeApp(
     mcpAuditSecret?: string | null;
     cawIngestToken?: string | null;
     apiSecurity?: Partial<ApiSecurityConfig>;
+    requiredIndexerCursors?: ServiceCtx["requiredIndexerCursors"];
   } = {},
 ) {
   const mcpAuditSecret = options.mcpAuditSecret === undefined ? MCP_AUDIT_TOKEN : options.mcpAuditSecret;
@@ -61,6 +63,7 @@ function makeApp(
     ]),
     mcpAuditSecret,
     cawIngestToken: options.cawIngestToken ?? null,
+    requiredIndexerCursors: options.requiredIndexerCursors ?? [],
     apiSecurity,
     clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
     logger: {
@@ -292,6 +295,59 @@ describe("pactfuse-api P0", () => {
     expect(res.json.data.proofChipAllowed).toBe(false);
     expect(res.json.data.winnerClaimAllowed).toBe(false);
     expect(res.json.data.finalVerifierComplete).toBe(false);
+  });
+
+  it("fails verifier closed when a required indexer cursor is missing", async () => {
+    const { app } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 105, logs: [] }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-required-indexer-missing");
+    const status = await app.request("/api/v1/evidence/indexer-status");
+    const statusJson = await status.json();
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-required-indexer-missing",
+      payload: { schemaOnly: true, receipt: schemaValidWinnerRequestedReceipt() },
+    });
+
+    expect(status.status).toBe(200);
+    expect(statusJson.data.cursors[0]).toEqual(expect.objectContaining({ cursorId: "gate:indexer", status: "unconfigured" }));
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.schemaOk).toBe(false);
+    expect(verify.json.data.errors.some((error: string) => error.includes("required chain indexer cursor gate:indexer is missing"))).toBe(true);
+    expect(verify.json.data.winnerClaimAllowed).toBe(false);
+  });
+
+  it("fails verifier closed when indexed cursor chain or head conflicts with the provider", async () => {
+    const mismatched = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ chainId: "1", currentBlockNumber: 201, logs: [] }),
+    });
+    const mismatchSessionId = await createSession(mismatched.app, "sess-indexer-chain-mismatch-verify");
+    insertCaughtUpIndexerCursor(mismatched.ctx, { chainId: "84532", lastIndexedBlock: 200, finalizedHeadBlock: 200 });
+    const mismatchVerify = await post(mismatched.app, "/api/v1/evidence/verify", {
+      sessionId: mismatchSessionId,
+      idempotencyKey: "verify-indexer-chain-mismatch",
+      payload: { schemaOnly: true, receipt: schemaValidWinnerRequestedReceipt() },
+    });
+
+    const rollback = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ chainId: "84532", currentBlockNumber: 150, logs: [] }),
+    });
+    const rollbackSessionId = await createSession(rollback.app, "sess-indexer-head-rollback-verify");
+    insertCaughtUpIndexerCursor(rollback.ctx, { chainId: "84532", lastIndexedBlock: 200, finalizedHeadBlock: 200 });
+    const rollbackVerify = await post(rollback.app, "/api/v1/evidence/verify", {
+      sessionId: rollbackSessionId,
+      idempotencyKey: "verify-indexer-head-rollback",
+      payload: { schemaOnly: true, receipt: schemaValidWinnerRequestedReceipt() },
+    });
+
+    expect(mismatchVerify.status).toBe(200);
+    expect(mismatchVerify.json.data.schemaOk).toBe(false);
+    expect(mismatchVerify.json.data.errors.some((error: string) => error.includes("provider is on chain 1"))).toBe(true);
+    expect(rollbackVerify.status).toBe(200);
+    expect(rollbackVerify.json.data.schemaOk).toBe(false);
+    expect(rollbackVerify.json.data.errors.some((error: string) => error.includes("ahead of provider finalized head"))).toBe(true);
   });
 
   it("does not expose MCP audit secrets or derived token hashes in health output", async () => {
@@ -2015,6 +2071,64 @@ describe("pactfuse-api P0", () => {
     expect(completeJob(ctx, job.jobId, currentLease?.leaseToken ?? "", "succeeded").status).toBe("succeeded");
   });
 
+  it("runs the indexer worker from configured cursors and advances startup windows without manual HTTP backfill", async () => {
+    const logs = [100, 101, 102, 103, 104].map((block) => indexerLog(`worker-${block}`, block));
+    const { ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 105, logs }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const options = {
+      leaseOwner: "test-indexer-worker",
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 2, address: INDEXER_ADDRESS }],
+    };
+
+    const first = await runIndexerWorkerOnce(ctx, options);
+    const second = await runIndexerWorkerOnce(ctx, options);
+    const third = await runIndexerWorkerOnce(ctx, options);
+    const cursor = ctx.db.sqlite.prepare("SELECT last_indexed_block, lag_blocks, status FROM chain_indexer_cursors WHERE cursor_id = ?").get(
+      "gate:indexer",
+    ) as Record<string, unknown>;
+    const count = ctx.db.sqlite.prepare("SELECT COUNT(*) AS count FROM chain_indexed_logs").get() as Record<string, unknown>;
+
+    expect(first.status).toBe("succeeded");
+    expect(second.status).toBe("succeeded");
+    expect(third.status).toBe("succeeded");
+    expect(cursor).toEqual(expect.objectContaining({ last_indexed_block: 104, lag_blocks: 0, status: "caught_up" }));
+    expect(Number(count.count)).toBe(5);
+  });
+
+  it("keeps indexer worker lease recovery scoped and blocks malformed indexer jobs", async () => {
+    const { ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 50, logs: [] }),
+    });
+    const nonIndexerJob = enqueueJob(ctx, {
+      kind: "lease-execute",
+      dedupeKey: "lease:test",
+      payload: { leaseRunId: "lease-test" },
+    });
+    const nonIndexerLease = leaseNextJob(ctx, ["lease-execute"], "lease-worker");
+    const lowHead = await runIndexerWorkerOnce(ctx, {
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 10 }],
+      leaseTimeoutMs: -1,
+    });
+    const nonIndexerAfterWorker = ctx.db.sqlite.prepare("SELECT status FROM jobs WHERE job_id = ?").get(nonIndexerJob.jobId) as Record<string, unknown>;
+
+    enqueueJob(ctx, {
+      kind: INDEX_CHAIN_WINDOW_JOB_KIND,
+      dedupeKey: "bad:indexer",
+      payload: { malformed: true },
+    });
+    const malformed = await runIndexerWorkerOnce(ctx, { cursors: [] });
+    const malformedJob = ctx.db.sqlite.prepare("SELECT status, locked_at FROM jobs WHERE dedupe_key = ?").get("bad:indexer") as Record<string, unknown>;
+
+    expect(nonIndexerLease?.status).toBe("leased");
+    expect(lowHead.status).toBe("idle");
+    expect(nonIndexerAfterWorker.status).toBe("leased");
+    expect(malformed.status).toBe("blocked");
+    expect(malformedJob.status).toBe("blocked");
+    expect(malformedJob.locked_at).toBeNull();
+  });
+
   it("backfills indexed chain logs in capped windows and replays duplicate windows exactly once", async () => {
     const logs = [100, 101, 102, 103, 104].map((block) => indexerLog(`window-${block}`, block));
     const firstLogTxHash = String(logs[0]?.transactionHash);
@@ -3070,6 +3184,30 @@ function indexerLog(seed: string, blockNumber: number, overrides: Record<string,
     rawLogHash: hex32(`indexer:${seed}:raw`),
     ...overrides,
   };
+}
+
+function insertCaughtUpIndexerCursor(
+  ctx: ServiceCtx,
+  input: { chainId: string; lastIndexedBlock: number; finalizedHeadBlock: number; cursorId?: string },
+): void {
+  ctx.db.sqlite
+    .prepare(
+      `INSERT INTO chain_indexer_cursors
+        (cursor_id, chain_id, address, topics_json, last_indexed_block, latest_head_block, finalized_head_block,
+         finality_depth, lag_blocks, status, reason, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 2, 0, 'caught_up', 'test caught up cursor', ?, ?)`,
+    )
+    .run(
+      input.cursorId ?? "gate:indexer",
+      input.chainId,
+      INDEXER_ADDRESS,
+      "[]",
+      input.lastIndexedBlock,
+      input.finalizedHeadBlock + 1,
+      input.finalizedHeadBlock,
+      "2026-06-11T00:00:00.000Z",
+      "2026-06-11T00:00:00.000Z",
+    );
 }
 
 function createFakeGateChainClient(currentBlockNumber = 101, chainId = "84532"): ChainClient {

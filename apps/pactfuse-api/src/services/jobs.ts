@@ -109,6 +109,22 @@ export function completeJob(
   return readJob(ctx, jobId);
 }
 
+export function retryJob(ctx: ServiceCtx, jobId: string, leaseToken: string, nextAttemptAt: string): JobLease {
+  const result = ctx.db.sqlite
+    .prepare(
+      `UPDATE jobs
+       SET status = 'queued', locked_at = NULL, next_attempt_at = ?
+       WHERE job_id = ?
+         AND status = 'leased'
+         AND locked_at LIKE ?`,
+    )
+    .run(nextAttemptAt, jobId, `%|${leaseToken}`);
+  if (Number(result.changes) !== 1) {
+    throw new Error("job lease token mismatch or job is no longer leased");
+  }
+  return readJob(ctx, jobId);
+}
+
 export function requeueExpiredLeases(ctx: ServiceCtx, olderThanIso: string): number {
   const result = ctx.db.sqlite
     .prepare(
@@ -117,6 +133,23 @@ export function requeueExpiredLeases(ctx: ServiceCtx, olderThanIso: string): num
        WHERE status = 'leased' AND locked_at < ?`,
     )
     .run(olderThanIso);
+  return Number(result.changes);
+}
+
+export function requeueExpiredLeasesForKinds(ctx: ServiceCtx, kinds: string[], olderThanIso: string): number {
+  if (kinds.length === 0) {
+    return 0;
+  }
+  const placeholders = kinds.map(() => "?").join(", ");
+  const result = ctx.db.sqlite
+    .prepare(
+      `UPDATE jobs
+       SET status = 'queued', locked_at = NULL
+       WHERE status = 'leased'
+         AND kind IN (${placeholders})
+         AND locked_at < ?`,
+    )
+    .run(...kinds, olderThanIso);
   return Number(result.changes);
 }
 

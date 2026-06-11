@@ -38,6 +38,14 @@ export type ProofProviderStatus = {
   endpoint?: string;
 };
 
+export type RequiredIndexerCursor = {
+  cursorId: string;
+  chainId: string;
+  address?: string | null;
+  topics?: Array<string | null>;
+  finalityDepth?: number;
+};
+
 export type ChainClient = {
   status: () => Promise<ProofProviderStatus>;
   getBlockNumber: () => Promise<number>;
@@ -80,6 +88,7 @@ export type ServiceCtx = {
   mcpAuditSecret: string | null;
   cawIngestToken: string | null;
   apiSecurity: ApiSecurityConfig;
+  requiredIndexerCursors: RequiredIndexerCursor[];
   clock: Clock;
   logger: Logger;
   config: LockedRuntimeConfig;

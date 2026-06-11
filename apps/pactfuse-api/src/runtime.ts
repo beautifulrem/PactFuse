@@ -9,6 +9,7 @@ import {
 } from "./services/providers.js";
 import { createVerifierAdapter } from "./services/verifier.js";
 import type { Clock, Logger, ServiceCtx } from "./types.js";
+import type { ChainIndexerWorkerCursorConfig, IndexerWorkerOptions } from "./services/indexer-worker.js";
 
 function createRuntimeCawSource() {
   if (!process.env.PACTFUSE_CAW_EXPORT_URL) {
@@ -40,11 +41,81 @@ function numberEnv(name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
+function optionalNumberEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) {
+    return undefined;
+  }
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined;
+}
+
+function booleanEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  return !["0", "false", "no", "off"].includes(raw.toLowerCase());
+}
+
+function hexEnv(name: string): `0x${string}` | undefined {
+  const raw = process.env[name];
+  return raw && /^0x[0-9a-fA-F]+$/.test(raw) ? (raw as `0x${string}`) : undefined;
+}
+
+function topicsEnv(name: string): Array<`0x${string}` | null> {
+  const raw = process.env[name];
+  if (!raw) {
+    return [];
+  }
+  return raw
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .map((part) => (part.toLowerCase() === "null" ? null : (part as `0x${string}`)))
+    .filter((part): part is `0x${string}` | null => part === null || /^0x[0-9a-fA-F]+$/.test(part));
+}
+
+export function createRuntimeIndexerWorkerOptions():
+  | (IndexerWorkerOptions & { pollIntervalMs: number })
+  | null {
+  const chainId = process.env.PACTFUSE_CHAIN_ID;
+  const rpcConfigured = Boolean(process.env.PACTFUSE_CHAIN_RPC_URL);
+  const enabled = booleanEnv("PACTFUSE_INDEXER_ENABLED", rpcConfigured && Boolean(chainId));
+  if (!enabled || !chainId) {
+    return null;
+  }
+  const startBlock = optionalNumberEnv("PACTFUSE_INDEXER_START_BLOCK");
+  const address = hexEnv("PACTFUSE_INDEXER_ADDRESS");
+  const cursor: ChainIndexerWorkerCursorConfig = {
+    cursorId: process.env.PACTFUSE_INDEXER_CURSOR_ID ?? "gate:indexer",
+    chainId,
+    finalityDepth: numberEnv("PACTFUSE_INDEXER_FINALITY_DEPTH", numberEnv("PACTFUSE_FINALITY_DEPTH", 2)),
+    maxWindowBlocks: numberEnv("PACTFUSE_INDEXER_MAX_WINDOW_BLOCKS", 2_000),
+    topics: topicsEnv("PACTFUSE_INDEXER_TOPICS"),
+  };
+  if (startBlock !== undefined) {
+    cursor.startBlock = startBlock;
+  }
+  if (address) {
+    cursor.address = address;
+  }
+  return {
+    cursors: [cursor],
+    leaseOwner: process.env.PACTFUSE_INDEXER_WORKER_ID ?? "indexer-worker",
+    retryDelayMs: numberEnv("PACTFUSE_INDEXER_RETRY_MS", 5_000),
+    leaseTimeoutMs: numberEnv("PACTFUSE_INDEXER_LEASE_TIMEOUT_MS", 60_000),
+    pollIntervalMs: numberEnv("PACTFUSE_INDEXER_POLL_MS", 5_000),
+  };
+}
+
 export function createServiceCtx(options: {
   dbPath: string;
   logger?: Logger;
   clock?: Clock;
+  requiredIndexerCursors?: ChainIndexerWorkerCursorConfig[];
 }): ServiceCtx {
+  const runtimeIndexerOptions = createRuntimeIndexerWorkerOptions();
   return {
     db: openPactFuseDb(options.dbPath),
     verifier: createVerifierAdapter(),
@@ -58,6 +129,7 @@ export function createServiceCtx(options: {
     templates: createLocalTemplateRegistry(),
     mcpAuditSecret: process.env.PACTFUSE_MCP_AUDIT_TOKEN ?? null,
     cawIngestToken: process.env.PACTFUSE_CAW_INGEST_TOKEN ?? null,
+    requiredIndexerCursors: options.requiredIndexerCursors ?? runtimeIndexerOptions?.cursors ?? [],
     apiSecurity: {
       operatorToken: process.env.PACTFUSE_OPERATOR_TOKEN ?? null,
       challengeSubmitterToken: process.env.PACTFUSE_CHALLENGE_SUBMITTER_TOKEN ?? null,

@@ -939,12 +939,18 @@ export async function readChainIndexerStatus(ctx: ServiceCtx): Promise<ServiceRe
        LIMIT 50`,
     )
     .all() as Row[];
+  const cursorViews = rows.map(indexerCursorViewFromRow);
+  for (const required of ctx.requiredIndexerCursors) {
+    if (!cursorViews.some((cursor) => cursor.cursorId === required.cursorId)) {
+      cursorViews.push(requiredIndexerCursorView(required));
+    }
+  }
   return {
     ok: true,
     requestId,
     data: {
       provider,
-      cursors: rows.map(indexerCursorViewFromRow),
+      cursors: cursorViews,
       proofAuthority: false,
       winnerClaimAllowed: false,
     },
@@ -1290,7 +1296,7 @@ async function buildVerifierRunView(
     ...verifyEventLogIntegrity(ctx, sessionId),
     ...verifyMcpAdapterCallIntegrity(ctx, sessionId),
     ...verifyGateFinalityIntegrity(ctx, sessionId),
-    ...verifyIndexerCursorIntegrity(ctx),
+    ...(await verifyIndexerCursorIntegrity(ctx, proofProviders)),
     ...verifyReplayBundleBindings(ctx, sessionId, payload),
   ];
   const rawErrors = toStringArray(raw.errors);
@@ -2215,6 +2221,23 @@ function indexerCursorViewFromRow(row: Row) {
     status: row.status,
     reason: row.reason,
     updatedAt: row.updated_at,
+  });
+}
+
+function requiredIndexerCursorView(cursor: ServiceCtx["requiredIndexerCursors"][number]) {
+  return ChainIndexerStatusViewSchema.parse({
+    cursorId: cursor.cursorId,
+    chainId: cursor.chainId,
+    address: cursor.address ?? null,
+    topics: cursor.topics ?? [],
+    lastIndexedBlock: null,
+    latestHeadBlock: 0,
+    finalizedHeadBlock: 0,
+    finalityDepth: cursor.finalityDepth ?? 2,
+    lagBlocks: 0,
+    status: "unconfigured",
+    reason: "required chain indexer cursor has not been initialized by the worker",
+    updatedAt: nowIso(),
   });
 }
 
@@ -3771,16 +3794,45 @@ function verifyGateFinalityIntegrity(ctx: ServiceCtx, sessionId: string): string
   return errors;
 }
 
-function verifyIndexerCursorIntegrity(ctx: ServiceCtx): string[] {
+async function verifyIndexerCursorIntegrity(ctx: ServiceCtx, proofProviders: ProofProviderStatus[]): Promise<string[]> {
   const rows = ctx.db.sqlite
     .prepare(
-      `SELECT cursor_id, last_indexed_block, finalized_head_block, lag_blocks, status, reason
+      `SELECT cursor_id, chain_id, last_indexed_block, finalized_head_block, finality_depth, lag_blocks, status, reason
        FROM chain_indexer_cursors
        ORDER BY cursor_id ASC`,
     )
     .all() as Row[];
   const errors: string[] = [];
+  const chainProvider = proofProviders.find((provider) => provider.name === "chain");
+  let providerHead: number | null = null;
+  if (chainProvider?.ready) {
+    try {
+      providerHead = await ctx.chain.getBlockNumber();
+    } catch (error) {
+      errors.push(`chain indexer provider head check failed; proof path is fail-closed: ${chainFailureMessage("failed to read chain head", error)}`);
+    }
+  }
+  const rowsByCursorId = new Map(rows.map((row) => [String(row.cursor_id), row]));
+  for (const required of ctx.requiredIndexerCursors) {
+    if (!rowsByCursorId.has(required.cursorId)) {
+      errors.push(`required chain indexer cursor ${required.cursorId} is missing; proof path is fail-closed`);
+    }
+  }
   for (const row of rows) {
+    if (chainProvider?.ready && chainProvider.chainId && String(row.chain_id) !== chainProvider.chainId) {
+      errors.push(
+        `chain indexer cursor ${row.cursor_id} is for chain ${row.chain_id} but provider is on chain ${chainProvider.chainId}; proof path is fail-closed`,
+      );
+    }
+    if (providerHead !== null) {
+      const finalizedHeadBlock = Math.max(0, providerHead - Number(row.finality_depth) + 1);
+      const lastIndexedBlock = row.last_indexed_block === null ? null : Number(row.last_indexed_block);
+      if (lastIndexedBlock !== null && lastIndexedBlock > finalizedHeadBlock) {
+        errors.push(
+          `chain indexer cursor ${row.cursor_id} is ahead of provider finalized head ${finalizedHeadBlock}; proof path is fail-closed`,
+        );
+      }
+    }
     const lagBlocks = Number(row.lag_blocks);
     if (row.status !== "caught_up" || lagBlocks > 0) {
       errors.push(
