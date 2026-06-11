@@ -38,8 +38,7 @@ import {
 import { badRequestError, forbiddenError, newRequestId, rateLimitedError, toApiError } from "./util.js";
 
 const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
-const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX_REQUESTS = 600;
+type ApiRole = "operator" | "challenge_submitter" | "artifact_signer";
 
 const ROUTES = [
   { method: "GET", path: "/healthz", okStatus: 200 },
@@ -105,13 +104,14 @@ export function createApp(ctx: ServiceCtx): Hono {
     const now = Date.now();
     const client = c.req.header("x-forwarded-for") ?? c.req.header("cf-connecting-ip") ?? "local";
     const key = `${client}:${c.req.method}:${c.req.path}`;
+    const limit = rateLimitMaxFor(ctx, c.req.method, c.req.path);
     const bucket = rateBuckets.get(key);
     const nextBucket =
-      !bucket || bucket.resetAt <= now ? { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS } : { ...bucket, count: bucket.count + 1 };
+      !bucket || bucket.resetAt <= now ? { count: 1, resetAt: now + ctx.apiSecurity.rateLimitWindowMs } : { ...bucket, count: bucket.count + 1 };
     rateBuckets.set(key, nextBucket);
-    c.header("x-ratelimit-limit", String(RATE_LIMIT_MAX_REQUESTS));
-    c.header("x-ratelimit-remaining", String(Math.max(0, RATE_LIMIT_MAX_REQUESTS - nextBucket.count)));
-    if (nextBucket.count > RATE_LIMIT_MAX_REQUESTS) {
+    c.header("x-ratelimit-limit", String(limit));
+    c.header("x-ratelimit-remaining", String(Math.max(0, limit - nextBucket.count)));
+    if (nextBucket.count > limit) {
       const requestId = newRequestId("rate_limit");
       return c.json({ ok: false, requestId, error: rateLimitedError(requestId) }, 429);
     }
@@ -133,6 +133,16 @@ export function createApp(ctx: ServiceCtx): Hono {
       db: "ready",
       verifier: "fail-closed-scaffold",
       proofProviders: await readProofProviderStatus(ctx),
+      apiSecurity: {
+        mode: "configured-if-env-token-present",
+        operatorTokenConfigured: Boolean(ctx.apiSecurity.operatorToken),
+        challengeSubmitterTokenConfigured: Boolean(ctx.apiSecurity.challengeSubmitterToken),
+        artifactSignerTokenConfigured: Boolean(ctx.apiSecurity.artifactSignerToken),
+        rateLimitWindowMs: ctx.apiSecurity.rateLimitWindowMs,
+        defaultRateLimitMax: ctx.apiSecurity.defaultRateLimitMax,
+        sessionCreateRateLimitMax: ctx.apiSecurity.sessionCreateRateLimitMax,
+        sourceChallengeRateLimitMax: ctx.apiSecurity.sourceChallengeRateLimitMax,
+      },
       mcpAudit: {
         mode: "hmac-shared-secret",
         configured: Boolean(ctx.mcpAuditSecret),
@@ -143,27 +153,32 @@ export function createApp(ctx: ServiceCtx): Hono {
 
   app.get("/api/v1/openapi.json", (c) => c.json(buildOpenApi()));
 
-  app.post("/api/v1/sessions", async (c) =>
-    send(c, await createSession(CreateSessionInputSchema.parse(await readJson(c)), ctx), 201),
-  );
+  app.post("/api/v1/sessions", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await createSession(CreateSessionInputSchema.parse(await readJson(c)), ctx), 201);
+  });
 
   app.get("/api/v1/sessions/:sessionId", async (c) => send(c, await getSession(c.req.param("sessionId"), ctx)));
 
-  app.post("/api/v1/sources/register", async (c) =>
-    send(c, await registerSignedSource(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201),
-  );
+  app.post("/api/v1/sources/register", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await registerSignedSource(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201);
+  });
 
-  app.post("/api/v1/sources/challenge", async (c) =>
-    send(c, await challengeSource(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202),
-  );
+  app.post("/api/v1/sources/challenge", async (c) => {
+    authorizeApiRole(c, ctx, "challenge_submitter");
+    return send(c, await challengeSource(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
+  });
 
-  app.post("/api/v1/spends/register-batch", async (c) =>
-    send(c, await registerSourceBoundSpends(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201),
-  );
+  app.post("/api/v1/spends/register-batch", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await registerSourceBoundSpends(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201);
+  });
 
-  app.post("/api/v1/caw/operations/build", async (c) =>
-    send(c, await buildCawOperation(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201),
-  );
+  app.post("/api/v1/caw/operations/build", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await buildCawOperation(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201);
+  });
 
   app.post("/api/v1/caw/receipts/ingest", async (c) => {
     authorizeCawReceiptIngest(c, ctx);
@@ -176,13 +191,15 @@ export function createApp(ctx: ServiceCtx): Hono {
     return send(c, await ingestGateEvent(body, ctx), 202);
   });
 
-  app.post("/api/v1/artifacts/preflight", async (c) =>
-    send(c, await runArtifactPreflight(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202),
-  );
+  app.post("/api/v1/artifacts/preflight", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await runArtifactPreflight(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
+  });
 
-  app.post("/api/v1/quotes", async (c) =>
-    send(c, await signArtifactQuote(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201),
-  );
+  app.post("/api/v1/quotes", async (c) => {
+    authorizeApiRole(c, ctx, "artifact_signer");
+    return send(c, await signArtifactQuote(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201);
+  });
 
   app.get("/api/v1/artifacts/:sessionId/:spendId/:payer/:artifactHash", async (c) => {
     const sessionId = Hex32Schema.parse(c.req.param("sessionId"));
@@ -192,9 +209,10 @@ export function createApp(ctx: ServiceCtx): Hono {
     return send(c, await readArtifactAccess({ sessionId, spendId, payer, artifactHash, bearerToken: bearerTokenFor(c) }, ctx));
   });
 
-  app.post("/api/v1/artifacts/refund", async (c) =>
-    send(c, await refundUndeliveredArtifact(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202),
-  );
+  app.post("/api/v1/artifacts/refund", async (c) => {
+    authorizeApiRole(c, ctx, "artifact_signer");
+    return send(c, await refundUndeliveredArtifact(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
+  });
 
   app.post("/api/v1/lease/execute", async (c) =>
     send(c, await executeLease(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx, bearerTokenFor(c)), 202),
@@ -204,9 +222,10 @@ export function createApp(ctx: ServiceCtx): Hono {
     send(c, recordMcpAdapterAudit(authorizeMcpAudit(c, ctx, McpAdapterAuditPayloadSchema.parse(await readJson(c))), ctx), 202),
   );
 
-  app.post("/api/v1/evidence/verify", async (c) =>
-    send(c, await verifyEvidenceForSession(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 200),
-  );
+  app.post("/api/v1/evidence/verify", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await verifyEvidenceForSession(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 200);
+  });
 
   app.get("/api/v1/evidence/:sessionId/verify", async (c) => send(c, await previewVerifyEvidenceForSession(c.req.param("sessionId"), ctx)));
 
@@ -283,6 +302,40 @@ function bearerTokenFor(c: Context): string | null {
 function throwBadRequest(message: string, details?: Record<string, unknown>): never {
   const requestId = newRequestId("bad_request");
   throw Object.assign(new Error(message), { apiError: badRequestError(requestId, message, details) });
+}
+
+function rateLimitMaxFor(ctx: ServiceCtx, method: string, path: string): number {
+  if (method === "POST" && path === "/api/v1/sessions") {
+    return ctx.apiSecurity.sessionCreateRateLimitMax;
+  }
+  if (method === "POST" && path === "/api/v1/sources/challenge") {
+    return ctx.apiSecurity.sourceChallengeRateLimitMax;
+  }
+  return ctx.apiSecurity.defaultRateLimitMax;
+}
+
+function authorizeApiRole(c: Context, ctx: ServiceCtx, role: ApiRole): void {
+  const token = tokenForRole(ctx, role);
+  if (!token) {
+    return;
+  }
+  const requestId = newRequestId(`${role}_auth`);
+  const bearer = bearerTokenFor(c);
+  if (!bearer || !secureEqualText(bearer, token)) {
+    throw Object.assign(new Error(`${role} token is invalid`), {
+      apiError: forbiddenError(requestId, `${role} bearer token is invalid`),
+    });
+  }
+}
+
+function tokenForRole(ctx: ServiceCtx, role: ApiRole): string | null {
+  if (role === "challenge_submitter") {
+    return ctx.apiSecurity.challengeSubmitterToken ?? ctx.apiSecurity.operatorToken;
+  }
+  if (role === "artifact_signer") {
+    return ctx.apiSecurity.artifactSignerToken ?? ctx.apiSecurity.operatorToken;
+  }
+  return ctx.apiSecurity.operatorToken;
 }
 
 function authorizeMcpAudit(c: Context, ctx: ServiceCtx, payload: unknown): unknown {
@@ -1030,6 +1083,16 @@ function parameterSchemaFor(path: string): Record<string, unknown>[] {
       description: "Required when PACTFUSE_CAW_INGEST_TOKEN is configured; protects raw/manual CAW receipt ingest writes.",
     });
   }
+  const apiRole = apiRoleForPath(path);
+  if (apiRole) {
+    parameters.push({
+      name: "authorization",
+      in: "header",
+      required: false,
+      schema: { type: "string", pattern: "^Bearer .+" },
+      description: apiRoleHeaderDescription(apiRole),
+    });
+  }
   if (path === "/api/v1/lease/execute" || path === "/api/v1/artifacts/{sessionId}/{spendId}/{payer}/{artifactHash}") {
     parameters.push({
       name: "authorization",
@@ -1040,6 +1103,35 @@ function parameterSchemaFor(path: string): Record<string, unknown>[] {
     });
   }
   return parameters;
+}
+
+function apiRoleForPath(path: string): ApiRole | null {
+  switch (path) {
+    case "/api/v1/sessions":
+    case "/api/v1/sources/register":
+    case "/api/v1/spends/register-batch":
+    case "/api/v1/caw/operations/build":
+    case "/api/v1/artifacts/preflight":
+    case "/api/v1/evidence/verify":
+      return "operator";
+    case "/api/v1/sources/challenge":
+      return "challenge_submitter";
+    case "/api/v1/quotes":
+    case "/api/v1/artifacts/refund":
+      return "artifact_signer";
+    default:
+      return null;
+  }
+}
+
+function apiRoleHeaderDescription(role: ApiRole): string {
+  if (role === "challenge_submitter") {
+    return "Required when PACTFUSE_CHALLENGE_SUBMITTER_TOKEN is configured; falls back to PACTFUSE_OPERATOR_TOKEN when only the shared operator token is configured.";
+  }
+  if (role === "artifact_signer") {
+    return "Required when PACTFUSE_ARTIFACT_SIGNER_TOKEN is configured; falls back to PACTFUSE_OPERATOR_TOKEN when only the shared operator token is configured.";
+  }
+  return "Required when PACTFUSE_OPERATOR_TOKEN is configured; protects single-operator demo mutation routes.";
 }
 
 function pathParameterSchemas(path: string): Record<string, unknown>[] {

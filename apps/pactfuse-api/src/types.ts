@@ -61,6 +61,16 @@ export type PactTemplateRegistry = {
   require: (mode: PactTemplateBinding["mode"]) => PactTemplateBinding;
 };
 
+export type ApiSecurityConfig = {
+  operatorToken: string | null;
+  challengeSubmitterToken: string | null;
+  artifactSignerToken: string | null;
+  rateLimitWindowMs: number;
+  defaultRateLimitMax: number;
+  sessionCreateRateLimitMax: number;
+  sourceChallengeRateLimitMax: number;
+};
+
 export type ServiceCtx = {
   db: PactFuseDb;
   verifier: EvidenceVerifier;
@@ -69,6 +79,7 @@ export type ServiceCtx = {
   templates: PactTemplateRegistry;
   mcpAuditSecret: string | null;
   cawIngestToken: string | null;
+  apiSecurity: ApiSecurityConfig;
   clock: Clock;
   logger: Logger;
   config: LockedRuntimeConfig;

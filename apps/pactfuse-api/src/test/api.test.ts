@@ -17,15 +17,31 @@ import {
 } from "../services/providers.js";
 import { appendEvidenceEvent, recordMcpAdapterCall } from "../services/service.js";
 import { createVerifierAdapter } from "../services/verifier.js";
-import type { CawReceiptSource, ChainClient, ServiceCtx } from "../types.js";
+import type { ApiSecurityConfig, CawReceiptSource, ChainClient, ServiceCtx } from "../types.js";
 
 const MCP_AUDIT_TOKEN = "test-mcp-audit-token";
 
 function makeApp(
   dbPath = ":memory:",
-  options: { caw?: CawReceiptSource; chain?: ChainClient; mcpAuditSecret?: string | null; cawIngestToken?: string | null } = {},
+  options: {
+    caw?: CawReceiptSource;
+    chain?: ChainClient;
+    mcpAuditSecret?: string | null;
+    cawIngestToken?: string | null;
+    apiSecurity?: Partial<ApiSecurityConfig>;
+  } = {},
 ) {
   const mcpAuditSecret = options.mcpAuditSecret === undefined ? MCP_AUDIT_TOKEN : options.mcpAuditSecret;
+  const apiSecurity: ApiSecurityConfig = {
+    operatorToken: null,
+    challengeSubmitterToken: null,
+    artifactSignerToken: null,
+    rateLimitWindowMs: 60_000,
+    defaultRateLimitMax: 600,
+    sessionCreateRateLimitMax: 60,
+    sourceChallengeRateLimitMax: 20,
+    ...options.apiSecurity,
+  };
   const ctx: ServiceCtx = {
     db: openPactFuseDb(dbPath),
     verifier: createVerifierAdapter(),
@@ -45,6 +61,7 @@ function makeApp(
     ]),
     mcpAuditSecret,
     cawIngestToken: options.cawIngestToken ?? null,
+    apiSecurity,
     clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
     logger: {
       info: () => undefined,
@@ -104,6 +121,96 @@ describe("pactfuse-api P0", () => {
     expect(conflict.status).toBe(409);
     expect(conflict.json.ok).toBe(false);
     expect(conflict.json.error.code).toBe("idempotency_conflict");
+  });
+
+  it("requires configured role tokens before protected mutations read request bodies", async () => {
+    const { app } = makeApp(":memory:", {
+      apiSecurity: {
+        operatorToken: "operator-test-token",
+        challengeSubmitterToken: "challenge-test-token",
+        artifactSignerToken: "artifact-test-token",
+      },
+    });
+
+    const missingOperator = await post(app, "/api/v1/sessions", { idempotencyKey: "auth-missing", payload: { label: "x" } });
+    const wrongOperator = await post(
+      app,
+      "/api/v1/sessions",
+      { idempotencyKey: "auth-wrong", payload: { label: "x" } },
+      { authorization: "Bearer wrong" },
+    );
+    const allowedOperator = await post(
+      app,
+      "/api/v1/sessions",
+      { idempotencyKey: "auth-allowed", payload: { label: "x" } },
+      { authorization: "Bearer operator-test-token" },
+    );
+    const missingChallenge = await post(app, "/api/v1/sources/challenge", {});
+    const allowedChallengeAuth = await post(app, "/api/v1/sources/challenge", {}, { authorization: "Bearer challenge-test-token" });
+    const missingArtifactSigner = await post(app, "/api/v1/quotes", {});
+    const allowedArtifactAuth = await post(app, "/api/v1/quotes", {}, { authorization: "Bearer artifact-test-token" });
+    const invalidJsonWithoutAuth = await rawPost(app, "/api/v1/sources/challenge", "{", {});
+    const invalidJsonWithAuth = await rawPost(app, "/api/v1/sources/challenge", "{", { authorization: "Bearer challenge-test-token" });
+
+    expect(missingOperator.status).toBe(403);
+    expect(wrongOperator.status).toBe(403);
+    expect(allowedOperator.status).toBe(201);
+    expect(missingChallenge.status).toBe(403);
+    expect(allowedChallengeAuth.status).toBe(400);
+    expect(missingArtifactSigner.status).toBe(403);
+    expect(allowedArtifactAuth.status).toBe(400);
+    expect(invalidJsonWithoutAuth.status).toBe(403);
+    expect(invalidJsonWithAuth.status).toBe(400);
+  });
+
+  it("falls back to the shared operator token for specialized roles when no role token is configured", async () => {
+    const { app } = makeApp(":memory:", {
+      apiSecurity: {
+        operatorToken: "operator-test-token",
+      },
+    });
+
+    const missingQuote = await post(app, "/api/v1/quotes", {});
+    const allowedQuoteAuth = await post(app, "/api/v1/quotes", {}, { authorization: "Bearer operator-test-token" });
+
+    expect(missingQuote.status).toBe(403);
+    expect(allowedQuoteAuth.status).toBe(400);
+  });
+
+  it("uses a narrower configurable rate limit for session creation", async () => {
+    const { app } = makeApp(":memory:", {
+      apiSecurity: {
+        sessionCreateRateLimitMax: 2,
+        defaultRateLimitMax: 100,
+      },
+    });
+
+    const first = await post(app, "/api/v1/sessions", { idempotencyKey: "rate-1", payload: { label: "a" } });
+    const second = await post(app, "/api/v1/sessions", { idempotencyKey: "rate-2", payload: { label: "b" } });
+    const third = await post(app, "/api/v1/sessions", { idempotencyKey: "rate-3", payload: { label: "c" } });
+
+    expect(first.status).toBe(201);
+    expect(first.headers.get("x-ratelimit-limit")).toBe("2");
+    expect(second.status).toBe(201);
+    expect(third.status).toBe(429);
+    expect(third.json.error.code).toBe("rate_limited");
+  });
+
+  it("uses a narrower configurable rate limit for source challenge attempts", async () => {
+    const { app } = makeApp(":memory:", {
+      apiSecurity: {
+        sourceChallengeRateLimitMax: 1,
+        defaultRateLimitMax: 100,
+      },
+    });
+
+    const first = await post(app, "/api/v1/sources/challenge", {});
+    const second = await post(app, "/api/v1/sources/challenge", {});
+
+    expect(first.status).toBe(400);
+    expect(first.headers.get("x-ratelimit-limit")).toBe("1");
+    expect(second.status).toBe(429);
+    expect(second.json.error.code).toBe("rate_limited");
   });
 
   it("rejects unknown fields at strict public boundaries", async () => {
@@ -253,6 +360,29 @@ describe("pactfuse-api P0", () => {
       "proofChipAllowed",
       "winnerClaimAllowed",
       "finalVerifierComplete",
+    ]);
+    expect(json.paths["/api/v1/sessions"].post.parameters).toEqual([
+      expect.objectContaining({
+        name: "authorization",
+        in: "header",
+        required: false,
+      }),
+    ]);
+    expect(json.paths["/api/v1/sources/challenge"].post.parameters).toEqual([
+      expect.objectContaining({
+        name: "authorization",
+        in: "header",
+        required: false,
+        description: expect.stringContaining("PACTFUSE_CHALLENGE_SUBMITTER_TOKEN"),
+      }),
+    ]);
+    expect(json.paths["/api/v1/quotes"].post.parameters).toEqual([
+      expect.objectContaining({
+        name: "authorization",
+        in: "header",
+        required: false,
+        description: expect.stringContaining("PACTFUSE_ARTIFACT_SIGNER_TOKEN"),
+      }),
     ]);
     expect(json.paths["/api/v1/caw/receipts/ingest"].post["x-pactfuse-proof-fields"]).toEqual([
       "proofAuthority",
@@ -2775,7 +2905,21 @@ async function post(
     headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
-  return { status: res.status, json: await res.json() };
+  return { status: res.status, headers: res.headers, json: await res.json() };
+}
+
+async function rawPost(
+  app: ReturnType<typeof createApp>,
+  path: string,
+  body: string,
+  headers: Record<string, string> = {},
+) {
+  const res = await app.request(path, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body,
+  });
+  return { status: res.status, headers: res.headers, json: await res.json() };
 }
 
 function hex32(seed: string): `0x${string}` {

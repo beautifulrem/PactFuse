@@ -31,6 +31,15 @@ function createRuntimeCawSource() {
   return createHttpsCawReceiptSource(input);
 }
 
+function numberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
 export function createServiceCtx(options: {
   dbPath: string;
   logger?: Logger;
@@ -49,6 +58,15 @@ export function createServiceCtx(options: {
     templates: createLocalTemplateRegistry(),
     mcpAuditSecret: process.env.PACTFUSE_MCP_AUDIT_TOKEN ?? null,
     cawIngestToken: process.env.PACTFUSE_CAW_INGEST_TOKEN ?? null,
+    apiSecurity: {
+      operatorToken: process.env.PACTFUSE_OPERATOR_TOKEN ?? null,
+      challengeSubmitterToken: process.env.PACTFUSE_CHALLENGE_SUBMITTER_TOKEN ?? null,
+      artifactSignerToken: process.env.PACTFUSE_ARTIFACT_SIGNER_TOKEN ?? null,
+      rateLimitWindowMs: numberEnv("PACTFUSE_RATE_LIMIT_WINDOW_MS", 60_000),
+      defaultRateLimitMax: numberEnv("PACTFUSE_RATE_LIMIT_MAX_REQUESTS", 600),
+      sessionCreateRateLimitMax: numberEnv("PACTFUSE_SESSION_RATE_LIMIT_MAX_REQUESTS", 60),
+      sourceChallengeRateLimitMax: numberEnv("PACTFUSE_CHALLENGE_RATE_LIMIT_MAX_REQUESTS", 20),
+    },
     clock: options.clock ?? { now: () => new Date() },
     logger: options.logger ?? pino({ name: "pactfuse-api" }),
     config: {
