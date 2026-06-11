@@ -2698,7 +2698,13 @@ function cawWalletAddress(wallet: Record<string, unknown>): string | null {
 }
 
 function optionalStringFromCaw(response: Record<string, unknown>, keys: string[]): string | null {
-  const roots = [response, objectChild(response, "result"), objectChild(objectChild(response, "result"), "pact"), objectChild(objectChild(response, "result"), "transaction")];
+  const roots = [
+    response,
+    objectChild(response, "error"),
+    objectChild(response, "result"),
+    objectChild(objectChild(response, "result"), "pact"),
+    objectChild(objectChild(response, "result"), "transaction"),
+  ];
   for (const root of roots) {
     if (!root) {
       continue;

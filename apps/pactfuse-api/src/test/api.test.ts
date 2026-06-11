@@ -1,6 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
@@ -12,6 +12,7 @@ import { openPactFuseDb } from "../db/index.js";
 import { completeJob, enqueueJob, leaseNextJob, requeueExpiredLeases } from "../services/jobs.js";
 import { INDEX_CHAIN_WINDOW_JOB_KIND, runIndexerWorkerOnce } from "../services/indexer-worker.js";
 import {
+  createCoboAgenticWalletClient,
   createHttpsCawReceiptSource,
   createHttpJsonRpcMcpLeaseClient,
   createStaticTemplateRegistry,
@@ -6657,6 +6658,101 @@ describe("pactfuse-api P0", () => {
     expect(verify.json.data.raw.proofProviders).toHaveLength(4);
   });
 
+  it("uses the official Cobo SDK surface for live wallet, pact, transaction, denial, and audit calls", async () => {
+    const requests: Array<{ method: string; path: string; apiKey: string | undefined; body: unknown }> = [];
+    const server = createServer(async (req, res) => {
+      const body = await readNodeRequestJson(req);
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      requests.push({
+        method: req.method ?? "GET",
+        path: `${url.pathname}${url.search}`,
+        apiKey: Array.isArray(req.headers["x-api-key"]) ? req.headers["x-api-key"][0] : req.headers["x-api-key"],
+        body,
+      });
+      const sendJson = (status: number, payload: Record<string, unknown>) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(payload));
+      };
+      if (req.method === "GET" && url.pathname === "/api/v1/wallets/wallet-sdk-1") {
+        sendJson(200, { result: { id: "wallet-sdk-1", status: "active", wallet_address: TEST_PAYER_ADDRESS } });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/v1/pacts/submit") {
+        sendJson(200, { result: { pact_id: "pact-sdk-1", wallet_id: "wallet-sdk-1", status: "PENDING_APPROVAL" } });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/v1/pacts/pact-sdk-1") {
+        sendJson(200, { result: { id: "pact-sdk-1", wallet_id: "wallet-sdk-1", status: "active", api_key: "pact-sdk-key" } });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/v1/wallets/wallet-sdk-1/contract-call") {
+        const record = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+        if (record.request_id === "sdk-deny") {
+          sendJson(403, { error: { code: "policy_denied", reason: "target denied by pact" }, suggestion: "Use the allowed target" });
+          return;
+        }
+        sendJson(200, { result: { id: "tx-sdk-1", request_id: record.request_id, status: "submitted", transaction_hash: hex32("sdk-contract") } });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/v1/audit-logs") {
+        sendJson(200, { result: { items: [{ id: "audit-sdk-1", result: "allowed", transaction_hash: hex32("sdk-contract") }] } });
+        return;
+      }
+      sendJson(404, { error: { code: "not_found", reason: `${req.method ?? "GET"} ${url.pathname}` } });
+    });
+    try {
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address !== "object") {
+        throw new Error("test server did not expose a TCP address");
+      }
+      const client = createCoboAgenticWalletClient({
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        apiKey: "owner-sdk-key",
+        walletId: "wallet-sdk-1",
+      });
+
+      const status = await client.status();
+      const submit = await client.submitPact({ walletId: "wallet-sdk-1", intent: "sdk pact", spec: { policies: [] } });
+      const pact = await client.getPact("pact-sdk-1");
+      const allowed = await client.contractCall({
+        walletId: "wallet-sdk-1",
+        pactApiKey: "pact-sdk-key",
+        chainId: "SETH",
+        contractAddress: TEST_MARKET_ADDRESS,
+        calldata: "0x12345678",
+        requestId: "sdk-allow",
+      });
+      const denied = await client.contractCall({
+        walletId: "wallet-sdk-1",
+        pactApiKey: "pact-sdk-key",
+        chainId: "SETH",
+        contractAddress: TEST_MARKET_ADDRESS,
+        calldata: "0x12345678",
+        requestId: "sdk-deny",
+      });
+      const audit = await client.listAuditLogs({ walletId: "wallet-sdk-1", result: "allowed", limit: 20 });
+
+      expect(status).toEqual(expect.objectContaining({ mode: "live", ready: true }));
+      expect(submit.result).toEqual(expect.objectContaining({ pact_id: "pact-sdk-1" }));
+      expect(pact.result).toEqual(expect.objectContaining({ api_key: "pact-sdk-key" }));
+      expect(allowed.result).toEqual(expect.objectContaining({ request_id: "sdk-allow", transaction_hash: hex32("sdk-contract") }));
+      expect(denied).toEqual(expect.objectContaining({ status: "denied", code: "policy_denied", request_id: "sdk-deny", transaction_hash: null }));
+      expect(audit.result).toEqual(expect.objectContaining({ items: [expect.objectContaining({ id: "audit-sdk-1" })] }));
+      expect(requests).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ method: "GET", path: "/api/v1/wallets/wallet-sdk-1?include_spend_summary=false", apiKey: "owner-sdk-key" }),
+          expect.objectContaining({ method: "POST", path: "/api/v1/pacts/submit", apiKey: "owner-sdk-key" }),
+          expect.objectContaining({ method: "GET", path: "/api/v1/pacts/pact-sdk-1", apiKey: "owner-sdk-key" }),
+          expect.objectContaining({ method: "POST", path: "/api/v1/wallets/wallet-sdk-1/contract-call", apiKey: "pact-sdk-key" }),
+          expect.objectContaining({ method: "GET", path: "/api/v1/audit-logs?wallet_id=wallet-sdk-1&result=allowed&limit=20", apiKey: "owner-sdk-key" }),
+        ]),
+      );
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+
   it("records live CAW pact, transfer, and audit interactions without storing pact API keys", async () => {
     const pactKeyHash = "0xe731d15044e2dac2b1cee3ea70e39cccc583c28ad1f42510b6a6dbc0b70b4adb";
     const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
@@ -8570,6 +8666,18 @@ async function rawPost(
     body,
   });
   return { status: res.status, headers: res.headers, json: await res.json() };
+}
+
+async function readNodeRequestJson(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  if (text.trim().length === 0) {
+    return null;
+  }
+  return JSON.parse(text) as unknown;
 }
 
 function hex32(seed: string): `0x${string}` {

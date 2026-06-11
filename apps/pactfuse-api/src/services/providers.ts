@@ -1,6 +1,11 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { AuditApi, Configuration, PactsApi, TransactionsApi, WalletsApi } from "@cobo/agentic-wallet";
 import { createPublicClient, decodeEventLog, http } from "viem";
+import type {
+  ContractCallCreate,
+  TransferCreate,
+} from "@cobo/agentic-wallet";
 import type {
   CawLiveAuditInput,
   CawLiveClient,
@@ -22,7 +27,6 @@ const DEFAULT_TEMPLATES: Array<{ mode: PactTemplateBinding["mode"]; path: string
   { mode: "gate-paid-artifact-real", path: "../../../../pact-template/gate-paid-artifact-real.json" },
   { mode: "permit-payment-real", path: "../../../../pact-template/permit-payment-real.appendix.json" },
 ];
-const MAX_CAW_LIVE_RESPONSE_BYTES = 1024 * 1024;
 export const PACTFUSE_CHAIN_EVENT_ABI = [
   {
     type: "event",
@@ -334,6 +338,13 @@ export function createCoboAgenticWalletClient(input: {
   const baseUrl = input.baseUrl.replace(/\/+$/, "");
   const timeoutMs = input.timeoutMs ?? 10_000;
   const defaultWalletId = input.walletId;
+  const ownerConfig = new Configuration({ apiKey: input.apiKey, basePath: baseUrl });
+  const walletsApi = new WalletsApi(ownerConfig);
+  const pactsApi = new PactsApi(ownerConfig);
+  const auditApi = new AuditApi(ownerConfig);
+  const requestOptions = { timeout: timeoutMs };
+  const transactionsApiFor = (apiKey: string) =>
+    new TransactionsApi(new Configuration({ apiKey, basePath: baseUrl }));
   return {
     async status() {
       try {
@@ -347,23 +358,9 @@ export function createCoboAgenticWalletClient(input: {
           };
         }
         if (defaultWalletId) {
-          await cawLiveRequest({
-            baseUrl,
-            apiKey: input.apiKey,
-            method: "GET",
-            path: `/api/v1/wallets/${encodeURIComponent(defaultWalletId)}`,
-            timeoutMs,
-            query: { include_spend_summary: "false" },
-          });
+          await walletsApi.getWallet(defaultWalletId, false, input.apiKey, requestOptions);
         } else {
-          await cawLiveRequest({
-            baseUrl,
-            apiKey: input.apiKey,
-            method: "GET",
-            path: "/api/v1/wallets",
-            timeoutMs,
-            query: { limit: "1", include_archived: "false" },
-          });
+          await walletsApi.listWallets(undefined, undefined, undefined, 1, false, undefined, input.apiKey, requestOptions);
         }
         return {
           name: "caw_live",
@@ -383,87 +380,104 @@ export function createCoboAgenticWalletClient(input: {
       }
     },
     async getWallet(walletId: string) {
-      return cawLiveRequest({
-        baseUrl,
-        apiKey: input.apiKey,
-        method: "GET",
-        path: `/api/v1/wallets/${encodeURIComponent(walletId)}`,
-        timeoutMs,
-        query: { include_spend_summary: "true" },
-      });
+      return cawSdkData((await walletsApi.getWallet(walletId, true, input.apiKey, requestOptions)).data);
     },
     async submitPact(pact) {
-      return cawLiveRequest({
-        baseUrl,
-        apiKey: input.apiKey,
-        method: "POST",
-        path: "/api/v1/pacts/submit",
-        timeoutMs,
-        body: {
-          wallet_id: pact.walletId,
-          intent: pact.intent,
-          ...(pact.originalIntent ? { original_intent: pact.originalIntent } : {}),
-          ...(pact.name ? { name: pact.name } : {}),
-          ...(pact.recipeSlugs && pact.recipeSlugs.length > 0 ? { recipe_slugs: pact.recipeSlugs } : {}),
-          spec: pact.spec,
-        },
-      });
+      return cawSdkData(
+        (
+          await pactsApi.submitPact(
+            {
+              wallet_id: pact.walletId,
+              intent: pact.intent,
+              ...(pact.originalIntent ? { original_intent: pact.originalIntent } : {}),
+              ...(pact.name ? { name: pact.name } : {}),
+              ...(pact.recipeSlugs && pact.recipeSlugs.length > 0 ? { recipe_slugs: pact.recipeSlugs } : {}),
+              spec: pact.spec,
+            },
+            input.apiKey,
+            requestOptions,
+          )
+        ).data,
+      );
     },
     async getPact(pactId: string) {
-      return cawLiveRequest({
-        baseUrl,
-        apiKey: input.apiKey,
-        method: "GET",
-        path: `/api/v1/pacts/${encodeURIComponent(pactId)}`,
-        timeoutMs,
-      });
+      return cawSdkData((await pactsApi.getPact(pactId, input.apiKey, requestOptions)).data);
     },
     async transferToken(transfer) {
-      return cawLiveRequest({
-        baseUrl,
-        apiKey: transfer.pactApiKey,
-        method: "POST",
-        path: `/api/v1/wallets/${encodeURIComponent(transfer.walletId)}/transfer`,
-        timeoutMs,
-        body: {
-          dst_addr: transfer.destinationAddress,
-          amount: transfer.amount,
-          ...(transfer.tokenId ? { token_id: transfer.tokenId } : {}),
-          ...(transfer.chainId ? { chain_id: transfer.chainId } : {}),
-          ...(transfer.requestId ? { request_id: transfer.requestId } : {}),
-          ...(transfer.sourceAddress ? { src_addr: transfer.sourceAddress } : {}),
-          ...(transfer.sponsor !== undefined ? { sponsor: transfer.sponsor } : {}),
-          ...(transfer.gasProvider ? { gas_provider: transfer.gasProvider } : {}),
-          ...(transfer.description ? { description: transfer.description } : {}),
-          ...(transfer.fee !== undefined ? { fee: transfer.fee } : {}),
-        },
-      });
+      const body = cawLiveTransferBody(transfer);
+      return cawSdkData(
+        (
+          await transactionsApiFor(transfer.pactApiKey).transferTokens(
+            transfer.walletId,
+            body,
+            transfer.pactApiKey,
+            requestOptions,
+          )
+        ).data,
+      );
     },
     async contractCall(call) {
-      return cawLiveRequest({
-        baseUrl,
-        apiKey: call.pactApiKey,
-        method: "POST",
-        path: `/api/v1/wallets/${encodeURIComponent(call.walletId)}/contract-call`,
-        timeoutMs,
-        body: cawLiveContractCallBody(call),
-      });
+      const body = cawLiveContractCallBody(call);
+      try {
+        return cawSdkData(
+          (
+            await transactionsApiFor(call.pactApiKey).contractCall(
+              call.walletId,
+              body,
+              call.pactApiKey,
+              requestOptions,
+            )
+          ).data,
+        );
+      } catch (error) {
+        const denied = cawSdkPolicyDenyResponse(error, call);
+        if (denied) {
+          return denied;
+        }
+        throw error;
+      }
     },
     async listAuditLogs(query) {
-      return cawLiveRequest({
-        baseUrl,
-        apiKey: input.apiKey,
-        method: "GET",
-        path: "/api/v1/audit-logs",
-        timeoutMs,
-        query: cawLiveAuditQuery(query),
-      });
+      return cawSdkData(
+        (
+          await auditApi.listAuditLogs(
+            query.walletId,
+            query.principalId,
+            query.action,
+            query.result,
+            query.startTime,
+            query.endTime,
+            query.after,
+            query.before,
+            undefined,
+            query.limit,
+            input.apiKey,
+            requestOptions,
+          )
+        ).data,
+      );
     },
   };
 }
 
-function cawLiveContractCallBody(call: CawLiveContractCallInput): Record<string, unknown> {
-  return {
+function cawLiveTransferBody(transfer: CawLiveTransferInput): TransferCreate {
+  const body: Record<string, unknown> = {
+    dst_addr: transfer.destinationAddress,
+    amount: transfer.amount,
+    ...(transfer.tokenId ? { token_id: transfer.tokenId } : {}),
+    ...(transfer.chainId ? { chain_id: transfer.chainId } : {}),
+    ...(transfer.requestId ? { request_id: transfer.requestId } : {}),
+    ...(transfer.sourceAddress ? { src_addr: transfer.sourceAddress } : {}),
+    ...(transfer.sponsor !== undefined ? { sponsor: transfer.sponsor } : {}),
+    ...(transfer.gasProvider ? { gas_provider: transfer.gasProvider } : {}),
+    ...(transfer.description ? { description: transfer.description } : {}),
+    ...(transfer.fee !== undefined ? { fee: transfer.fee } : {}),
+  };
+  return body as unknown as TransferCreate;
+}
+
+function cawLiveContractCallBody(call: CawLiveContractCallInput): ContractCallCreate {
+  const body: Record<string, unknown> = {
     chain_id: call.chainId,
     contract_addr: call.contractAddress,
     calldata: call.calldata,
@@ -474,6 +488,88 @@ function cawLiveContractCallBody(call: CawLiveContractCallInput): Record<string,
     ...(call.description ? { description: call.description } : {}),
     ...(call.fee !== undefined ? { fee: call.fee } : {}),
   };
+  return body as unknown as ContractCallCreate;
+}
+
+function cawSdkData(data: unknown): Record<string, unknown> {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("CAW SDK response must return a JSON object");
+  }
+  return normalizeSdkValue(data) as Record<string, unknown>;
+}
+
+function cawSdkPolicyDenyResponse(error: unknown, call: CawLiveContractCallInput): Record<string, unknown> | null {
+  const response = sdkErrorResponseData(error);
+  if (!response) {
+    return null;
+  }
+  const errorRecord =
+    response.error && typeof response.error === "object" && !Array.isArray(response.error)
+      ? response.error as Record<string, unknown>
+      : {};
+  const code = typeof errorRecord.code === "string" ? errorRecord.code : null;
+  const reason =
+    typeof errorRecord.reason === "string"
+      ? errorRecord.reason
+      : typeof errorRecord.message === "string"
+        ? errorRecord.message
+        : null;
+  const joined = [code, reason, response.suggestion]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ")
+    .toLowerCase();
+  if (!/(deny|denied|policy|forbidden|not allowed|blocked)/.test(joined)) {
+    return null;
+  }
+  return {
+    success: false,
+    status: "denied",
+    status_display: "denied",
+    code: code ?? "policy_denied",
+    reason: reason ?? "policy_denied",
+    request_id: call.requestId ?? null,
+    transaction_hash: null,
+    error: errorRecord,
+    suggestion: typeof response.suggestion === "string" ? response.suggestion : undefined,
+    result: {
+      wallet_id: call.walletId,
+      request_id: call.requestId ?? null,
+      status: "denied",
+      code: code ?? "policy_denied",
+      reason: reason ?? "policy_denied",
+      transaction_hash: null,
+    },
+  };
+}
+
+function sdkErrorResponseData(error: unknown): Record<string, unknown> | null {
+  const response =
+    error && typeof error === "object" && !Array.isArray(error)
+      ? (error as { response?: { data?: unknown } }).response
+      : null;
+  const data = response?.data;
+  return data && typeof data === "object" && !Array.isArray(data)
+    ? (normalizeSdkValue(data) as Record<string, unknown>)
+    : null;
+}
+
+function normalizeSdkValue(value: unknown): unknown {
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeSdkValue(item));
+  }
+  if (value && typeof value === "object") {
+    const output: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (child !== undefined) {
+        output[key] = normalizeSdkValue(child);
+      }
+    }
+    return output;
+  }
+  return value;
 }
 
 export function createUnconfiguredMcpLeaseClient(): McpLeaseClient {
@@ -749,88 +845,6 @@ function cawHeaders(apiKey: string | undefined): Headers {
     headers.set("authorization", `Bearer ${apiKey}`);
   }
   return headers;
-}
-
-async function cawLiveRequest(input: {
-  baseUrl: string;
-  apiKey: string;
-  method: "GET" | "POST";
-  path: string;
-  timeoutMs: number;
-  query?: Record<string, string | undefined>;
-  body?: Record<string, unknown>;
-}): Promise<Record<string, unknown>> {
-  if (!input.apiKey) {
-    throw new Error("CAW live API key is missing");
-  }
-  const url = new URL(input.path, `${input.baseUrl}/`);
-  for (const [key, value] of Object.entries(input.query ?? {})) {
-    if (value !== undefined && value !== "") {
-      url.searchParams.set(key, value);
-    }
-  }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), input.timeoutMs);
-  try {
-    const requestInit: RequestInit = {
-      method: input.method,
-      headers: {
-        accept: "application/json",
-        "content-type": "application/json",
-        "x-api-key": input.apiKey,
-      },
-      signal: controller.signal,
-    };
-    if (input.body) {
-      requestInit.body = JSON.stringify(input.body);
-    }
-    const response = await fetch(url, requestInit);
-    const text = await response.text();
-    if (Buffer.byteLength(text, "utf8") > MAX_CAW_LIVE_RESPONSE_BYTES) {
-      throw new Error("CAW live API response exceeded 1 MiB");
-    }
-    let parsed: unknown = {};
-    if (text.length > 0) {
-      try {
-        parsed = JSON.parse(text) as unknown;
-      } catch {
-        throw new Error("CAW live API returned non-JSON response");
-      }
-    }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("CAW live API must return a JSON object");
-    }
-    const body = parsed as Record<string, unknown>;
-    if (!response.ok) {
-      throw new Error(`CAW live API returned HTTP ${response.status}: ${cawLiveErrorMessage(body)}`);
-    }
-    return body;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function cawLiveAuditQuery(input: CawLiveAuditInput): Record<string, string | undefined> {
-  return {
-    wallet_id: input.walletId,
-    principal_id: input.principalId,
-    action: input.action,
-    result: input.result,
-    start_time: input.startTime,
-    end_time: input.endTime,
-    after: input.after,
-    before: input.before,
-    limit: input.limit ? String(input.limit) : undefined,
-  };
-}
-
-function cawLiveErrorMessage(body: Record<string, unknown>): string {
-  const error = body.error;
-  if (error && typeof error === "object" && !Array.isArray(error)) {
-    const record = error as Record<string, unknown>;
-    return [record.code, record.reason, record.message].filter((value): value is string => typeof value === "string" && value.length > 0).join(" ");
-  }
-  return [body.message, body.suggestion].filter((value): value is string => typeof value === "string" && value.length > 0).join(" ") || "request failed";
 }
 
 async function parseCawResponse(response: Response): Promise<Record<string, unknown>> {
