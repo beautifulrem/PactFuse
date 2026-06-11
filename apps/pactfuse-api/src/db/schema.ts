@@ -83,6 +83,9 @@ export const spends = sqliteTable(
     toolId: text("tool_id").notNull(),
     payer: text("payer").notNull(),
     agentWallet: text("agent_wallet").notNull(),
+    paymentToken: text("payment_token").notNull(),
+    artifactHash: text("artifact_hash").notNull(),
+    market: text("market").notNull(),
     sourceHashesJson: text("source_hashes_json").notNull(),
     sourceSetHash: text("source_set_hash").notNull(),
     sessionCommitment: text("session_commitment").notNull(),
@@ -185,6 +188,22 @@ export const cawCanonicalReceipts = sqliteTable(
     ),
   }),
 );
+
+export const cawLiveInteractions = sqliteTable("caw_live_interactions", {
+  interactionId: text("interaction_id").primaryKey(),
+  sessionId: text("session_id").notNull(),
+  kind: text("kind").notNull(),
+  walletId: text("wallet_id"),
+  pactId: text("pact_id"),
+  cawRequestId: text("caw_request_id"),
+  requestHash: text("request_hash").notNull(),
+  requestJson: text("request_json").notNull(),
+  responseHash: text("response_hash").notNull(),
+  responseJson: text("response_json").notNull(),
+  status: text("status").notNull(),
+  authKeyHash: text("auth_key_hash"),
+  createdAt: text("created_at").notNull(),
+});
 
 export const gateChainEvents = sqliteTable(
   "gate_chain_events",

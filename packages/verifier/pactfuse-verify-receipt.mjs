@@ -618,7 +618,14 @@ function checkPactTemplateBinding(root, errors, options) {
 const JUDGE_ROW_IDS = ["caw_boundary", "source_challenge", "ab_trip", "c_settlement", "artifact_access", "lease_execution"];
 
 const JUDGE_ROW_EVENT_KINDS = {
-  caw_boundary: new Set(["caw.receipt.ingested.raw", "caw.receipt.ingested.fixture"]),
+  caw_boundary: new Set([
+    "caw.receipt.ingested.raw",
+    "caw.receipt.ingested.fixture",
+    "caw.live.pact.submitted",
+    "caw.live.pact.synced",
+    "caw.live.transfer.submitted",
+    "caw.live.audit.synced",
+  ]),
   source_challenge: new Set(["source.challenge.confirmed"]),
   ab_trip: new Set(["gate.spend_tripped", "reorg.invalidated"]),
   c_settlement: new Set(["gate.spend_settled", "reorg.invalidated"]),
@@ -631,6 +638,7 @@ const REPLAY_COLLECTIONS = [
   "artifactAccessTokens",
   "artifactPreflights",
   "canonicalCawReceipts",
+  "cawLiveInteractions",
   "cawReceiptOperations",
   "events",
   "leaseRuns",
@@ -1233,6 +1241,30 @@ function verifyGateContractStateProofEvent(bundle, event, errors) {
   if (!isHex32(payload.contractSourceSetHash)) {
     errors.push(`${label} requires contractSourceSetHash`);
   }
+  const spend = Array.isArray(bundle.spends)
+    ? bundle.spends.find((candidate) => isObject(candidate) && lowerHex(candidate.spendId) === lowerHex(payload.spendId))
+    : null;
+  if (!spend) {
+    errors.push(`${label} requires a matching replay spend row`);
+  } else {
+    const expected = {
+      contractSessionId: lowerHex(spend.sessionId),
+      contractPactId: lowerHex(spend.pactId),
+      contractToolId: lowerHex(spend.toolId),
+      contractSourceSetHash: lowerHex(spend.sourceSetHash),
+      contractAgentWallet: lowerHex(spend.agentWallet),
+      contractPaymentToken: lowerHex(spend.paymentToken),
+      contractPrice: asText(spend.maxPriceAtomic),
+      contractArtifactHash: lowerHex(spend.artifactHash),
+      contractMarket: lowerHex(spend.market),
+    };
+    for (const [field, expectedValue] of Object.entries(expected)) {
+      const actualValue = field === "contractPrice" ? asText(payload[field]) : lowerHex(payload[field]);
+      if (actualValue !== expectedValue) {
+        errors.push(`${label} ${field} must match replay spend ${field.replace(/^contract/, "")}`);
+      }
+    }
+  }
   const expectedState = event.kind === "gate.spend_tripped" ? "Tripped" : "Settled";
   if (payload.contractSpendState !== expectedState) {
     errors.push(`${label} contractSpendState must be ${expectedState}`);
@@ -1446,6 +1478,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     "artifactAccessTokens",
     "mcpAdapterCalls",
     "cawReceiptOperations",
+    "cawLiveInteractions",
     "rawCawReceiptBundles",
     "canonicalCawReceipts",
     "leaseRuns",

@@ -195,6 +195,22 @@ describe("pactfuse receipt verifier contract", () => {
       "contractSpendState must be Settled",
     ],
     [
+      "gate contract payment token",
+      (bundle) => {
+        const { gateEvent } = appendContractProofEventsForTest(bundle);
+        gateEvent.payload.contractPaymentToken = "0x9999999999999999999999999999999999999999";
+      },
+      "contractPaymentToken must match replay spend PaymentToken",
+    ],
+    [
+      "replay spend artifact hash",
+      (bundle) => {
+        appendContractProofEventsForTest(bundle);
+        bundle.spends[0].artifactHash = hex32("tampered-spend-artifact");
+      },
+      "contractArtifactHash must match replay spend ArtifactHash",
+    ],
+    [
       "source registry address",
       (bundle) => {
         const { sourceEvent } = appendContractProofEventsForTest(bundle);
@@ -529,8 +545,9 @@ function replayBundle() {
 	        settlementEventId: hex32("settlement-event"),
 	        createdAt,
 	      },
-	    ],
+    ],
     mcpAdapterCalls: [],
+    cawLiveInteractions: [],
     cawReceiptOperations: [
       {
         operationId,
@@ -549,7 +566,7 @@ function replayBundle() {
         },
         receiptBundleHash: rawCawReceiptBundle.rawBundleHash,
         status: "verified_policy_authority_structural",
-        createdAt,
+        createdAt: "2026-06-11T00:00:03.000Z",
       },
     ],
     rawCawReceiptBundles: [rawCawReceiptBundle],
@@ -642,10 +659,13 @@ function replayBundleWithLease() {
     {
       spendId: bundle.artifactAccessTokens[0].spendId,
       sessionId: bundle.sessionId,
-      pactId: "pact-c",
-      toolId: "code-scan",
+      pactId: hex32("pact-c"),
+      toolId: hex32("code-scan"),
       payer: bundle.artifactAccessTokens[0].payer,
-      agentWallet: "0xabcd",
+      agentWallet: "0x1000000000000000000000000000000000000001",
+      paymentToken: "0x4000000000000000000000000000000000000004",
+      artifactHash: bundle.artifactAccessTokens[0].artifactHash,
+      market: "0x5000000000000000000000000000000000000005",
       sourceHashes: [sourceHash],
       sourceSetHash: hex32("source-set"),
       sessionCommitment: hex32("session-commitment"),
@@ -767,6 +787,29 @@ function replayBundleWithLease() {
 }
 
 function appendContractProofEventsForTest(bundle) {
+  if (!Array.isArray(bundle.spends) || bundle.spends.length === 0) {
+    bundle.spends = [
+      {
+        spendId: bundle.artifactAccessTokens[0].spendId,
+        sessionId: bundle.sessionId,
+        pactId: hex32("pact-c"),
+        toolId: hex32("code-scan"),
+        payer: bundle.artifactAccessTokens[0].payer,
+        agentWallet: "0x1000000000000000000000000000000000000001",
+        paymentToken: "0x4000000000000000000000000000000000000004",
+        artifactHash: bundle.artifactAccessTokens[0].artifactHash,
+        market: "0x5000000000000000000000000000000000000005",
+        sourceHashes: [hex32("source")],
+        sourceSetHash: hex32("source-set"),
+        sessionCommitment: hex32("session-commitment"),
+        spendPreimage: {},
+        maxPriceAtomic: "1000",
+        nonce: "nonce-1",
+        status: "settled_finalized",
+        createdAt: "2026-06-11T00:00:03.000Z",
+      },
+    ];
+  }
   const gateEvent = {
     eventId: hex32("contract-gate-event"),
     sessionId: bundle.sessionId,
@@ -796,7 +839,14 @@ function appendContractProofEventsForTest(bundle) {
       contractAddress: "0x1111111111111111111111111111111111111111",
       contractFunction: "registeredSpend",
       contractSessionId: bundle.sessionId,
-      contractSourceSetHash: hex32("contract-source-set"),
+      contractPactId: bundle.spends[0].pactId,
+      contractToolId: bundle.spends[0].toolId,
+      contractSourceSetHash: bundle.spends[0].sourceSetHash,
+      contractAgentWallet: bundle.spends[0].agentWallet,
+      contractPaymentToken: bundle.spends[0].paymentToken,
+      contractPrice: bundle.spends[0].maxPriceAtomic,
+      contractArtifactHash: bundle.spends[0].artifactHash,
+      contractMarket: bundle.spends[0].market,
       contractSpendState: "Settled",
       proofAuthority: true,
       winnerClaimAllowed: false,
@@ -962,6 +1012,7 @@ function replayPageIndexForTest(bundle) {
       "artifactAccessTokens",
       "artifactPreflights",
       "canonicalCawReceipts",
+      "cawLiveInteractions",
       "cawReceiptOperations",
       "events",
       "leaseRuns",
@@ -1004,6 +1055,7 @@ function replayCollectionOrderByForTest(collection) {
     artifactAccessTokens: ["createdAt ASC", "tokenId ASC"],
     artifactPreflights: ["createdAt ASC", "preflightId ASC"],
     canonicalCawReceipts: ["createdAt ASC", "rawReceiptHash ASC"],
+    cawLiveInteractions: ["createdAt ASC", "interactionId ASC"],
     cawReceiptOperations: ["createdAt ASC", "operationId ASC"],
     events: ["eventSeq ASC"],
     leaseRuns: ["createdAt DESC", "leaseRunId ASC"],

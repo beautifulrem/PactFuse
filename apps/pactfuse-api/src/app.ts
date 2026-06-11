@@ -38,6 +38,10 @@ import {
   registerSourceBoundSpends,
   runArtifactPreflight,
   signArtifactQuote,
+  submitCawLivePact,
+  submitCawLiveTransfer,
+  syncCawLiveAudit,
+  syncCawLivePact,
   verifyEvidenceForSession,
 } from "./services/service.js";
 import { badRequestError, forbiddenError, newRequestId, rateLimitedError, toApiError } from "./util.js";
@@ -55,6 +59,11 @@ const ROUTES = [
   { method: "POST", path: "/api/v1/sources/challenge", okStatus: 202 },
   { method: "POST", path: "/api/v1/spends/register-batch", okStatus: 201 },
   { method: "POST", path: "/api/v1/caw/operations/build", okStatus: 201 },
+  { method: "GET", path: "/api/v1/caw/live/status", okStatus: 200 },
+  { method: "POST", path: "/api/v1/caw/live/pacts/submit", okStatus: 202 },
+  { method: "POST", path: "/api/v1/caw/live/pacts/sync", okStatus: 202 },
+  { method: "POST", path: "/api/v1/caw/live/transfers/submit", okStatus: 202 },
+  { method: "POST", path: "/api/v1/caw/live/audit/sync", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/receipts/ingest", okStatus: 202 },
   { method: "POST", path: "/api/v1/gate/events/ingest", okStatus: 202 },
   { method: "POST", path: "/api/v1/indexer/backfill", okStatus: 202 },
@@ -78,6 +87,19 @@ const ROUTES = [
 
 const PROOF_FIELD_ROUTES: Record<string, string[]> = {
   "/api/v1/caw/receipts/ingest": ["proofAuthority", "winnerClaimAllowed"],
+  "/api/v1/caw/live/pacts/submit": ["interactionId", "pactId", "requestHash", "responseHash", "proofAuthority", "winnerClaimAllowed"],
+  "/api/v1/caw/live/pacts/sync": ["interactionId", "pactId", "requestHash", "responseHash", "proofAuthority", "winnerClaimAllowed"],
+  "/api/v1/caw/live/transfers/submit": [
+    "interactionId",
+    "pactId",
+    "cawRequestId",
+    "pactScopedApiKeyHash",
+    "requestHash",
+    "responseHash",
+    "proofAuthority",
+    "winnerClaimAllowed",
+  ],
+  "/api/v1/caw/live/audit/sync": ["interactionId", "requestHash", "responseHash", "proofAuthority", "winnerClaimAllowed"],
   "/api/v1/gate/events/ingest": ["finalityStatus", "confirmations", "finalityDepth", "proofAuthority", "winnerClaimAllowed"],
   "/api/v1/indexer/backfill": ["cursor.status", "cursor.lastIndexedBlock", "insertedLogCount", "proofAuthority", "winnerClaimAllowed"],
   "/api/v1/artifacts/preflight": ["preflightId", "artifactHashPreview", "artifactCid", "priceDisclosureHash", "winnerClaimAllowed"],
@@ -116,6 +138,7 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "eventRoot",
     "mcpAdapterCalls",
     "cawReceiptOperations",
+    "cawLiveInteractions",
     "rawCawReceiptBundles",
     "canonicalCawReceipts",
     "leaseRuns",
@@ -220,6 +243,28 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.post("/api/v1/caw/operations/build", async (c) => {
     authorizeApiRole(c, ctx, "operator");
     return send(c, await buildCawOperation(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201);
+  });
+
+  app.get("/api/v1/caw/live/status", async (c) => send(c, { ok: true, requestId: newRequestId("caw_live_status"), data: await ctx.cawLive.status() }));
+
+  app.post("/api/v1/caw/live/pacts/submit", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await submitCawLivePact(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
+  });
+
+  app.post("/api/v1/caw/live/pacts/sync", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await syncCawLivePact(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
+  });
+
+  app.post("/api/v1/caw/live/transfers/submit", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await submitCawLiveTransfer(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx, c.req.header("x-pactfuse-caw-pact-api-key") ?? null), 202);
+  });
+
+  app.post("/api/v1/caw/live/audit/sync", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await syncCawLiveAudit(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
   });
 
   app.post("/api/v1/caw/receipts/ingest", async (c) => {
@@ -639,14 +684,29 @@ function buildOpenApi(): Record<string, unknown> {
               maxItems: 32,
               items: {
                 type: "object",
-                required: ["spendId", "pactId", "toolId", "payer", "agentWallet", "sourceHashes", "maxPriceAtomic", "nonce"],
+                required: [
+                  "spendId",
+                  "pactId",
+                  "toolId",
+                  "payer",
+                  "agentWallet",
+                  "paymentToken",
+                  "artifactHash",
+                  "market",
+                  "sourceHashes",
+                  "maxPriceAtomic",
+                  "nonce",
+                ],
                 additionalProperties: false,
                 properties: {
                   spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
-                  pactId: { type: "string", minLength: 1, maxLength: 120 },
-                  toolId: { type: "string", minLength: 1, maxLength: 120 },
-                  payer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
-                  agentWallet: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+                  pactId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  toolId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  payer: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
+                  agentWallet: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
+                  paymentToken: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
+                  artifactHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  market: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
                   sourceHashes: {
                     type: "array",
                     minItems: 1,
@@ -1233,6 +1293,7 @@ function buildOpenApi(): Record<string, unknown> {
             "artifactAccessTokens",
             "mcpAdapterCalls",
             "cawReceiptOperations",
+            "cawLiveInteractions",
             "rawCawReceiptBundles",
             "canonicalCawReceipts",
             "leaseRuns",
@@ -1319,6 +1380,9 @@ function buildOpenApi(): Record<string, unknown> {
                   "toolId",
                   "payer",
                   "agentWallet",
+                  "paymentToken",
+                  "artifactHash",
+                  "market",
                   "sourceHashes",
                   "sourceSetHash",
                   "sessionCommitment",
@@ -1331,10 +1395,13 @@ function buildOpenApi(): Record<string, unknown> {
                 properties: {
                   spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
                   sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
-                  pactId: { type: "string" },
-                  toolId: { type: "string" },
-                  payer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
-                  agentWallet: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+                  pactId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  toolId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  payer: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
+                  agentWallet: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
+                  paymentToken: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
+                  artifactHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  market: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
                   sourceHashes: { type: "array", items: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" } },
                   sourceSetHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
                   sessionCommitment: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
@@ -1518,6 +1585,44 @@ function buildOpenApi(): Record<string, unknown> {
                 },
               },
             },
+            cawLiveInteractions: {
+              type: "array",
+              items: {
+                type: "object",
+                required: [
+                  "interactionId",
+                  "sessionId",
+                  "kind",
+                  "walletId",
+                  "pactId",
+                  "cawRequestId",
+                  "requestHash",
+                  "responseHash",
+                  "response",
+                  "status",
+                  "authKeyHash",
+                  "proofAuthority",
+                  "winnerClaimAllowed",
+                  "createdAt",
+                ],
+                properties: {
+                  interactionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  kind: { enum: ["pact_submit", "pact_sync", "transfer_submit", "audit_sync"] },
+                  walletId: { anyOf: [{ type: "string" }, { type: "null" }] },
+                  pactId: { anyOf: [{ type: "string" }, { type: "null" }] },
+                  cawRequestId: { anyOf: [{ type: "string" }, { type: "null" }] },
+                  requestHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  responseHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                  response: { type: "object", additionalProperties: true },
+                  status: { enum: ["live_submitted", "live_active", "live_pending", "live_denied", "live_failed", "live_synced"] },
+                  authKeyHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+                  proofAuthority: { const: true },
+                  winnerClaimAllowed: { const: false },
+                  createdAt: { type: "string", format: "date-time" },
+                },
+              },
+            },
             rawCawReceiptBundles: {
               type: "array",
               items: {
@@ -1686,6 +1791,7 @@ function buildOpenApi(): Record<string, unknown> {
                 "artifactAccessTokens",
                 "mcpAdapterCalls",
                 "cawReceiptOperations",
+                "cawLiveInteractions",
                 "rawCawReceiptBundles",
                 "canonicalCawReceipts",
                 "leaseRuns",
@@ -1856,6 +1962,15 @@ function parameterSchemaFor(path: string): Record<string, unknown>[] {
       description: "Bearer token bound to the artifact access tuple: sessionId, spendId, payer, artifactHash.",
     });
   }
+  if (path === "/api/v1/caw/live/transfers/submit") {
+    parameters.push({
+      name: "x-pactfuse-caw-pact-api-key",
+      in: "header",
+      required: true,
+      schema: { type: "string", minLength: 16 },
+      description: "Transient CAW pact-scoped API key. PactFuse stores only its SHA-256 hash.",
+    });
+  }
   return parameters;
 }
 
@@ -1865,6 +1980,10 @@ function apiRoleForPath(path: string): ApiRole | null {
     case "/api/v1/sources/register":
     case "/api/v1/spends/register-batch":
     case "/api/v1/caw/operations/build":
+    case "/api/v1/caw/live/pacts/submit":
+    case "/api/v1/caw/live/pacts/sync":
+    case "/api/v1/caw/live/transfers/submit":
+    case "/api/v1/caw/live/audit/sync":
     case "/api/v1/indexer/backfill":
     case "/api/v1/artifacts/preflight":
     case "/api/v1/evidence/verify":

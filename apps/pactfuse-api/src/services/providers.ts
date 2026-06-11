@@ -2,6 +2,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createPublicClient, decodeEventLog, http } from "viem";
 import type {
+  CawLiveAuditInput,
+  CawLiveClient,
+  CawLivePactSubmitInput,
+  CawLiveTransferInput,
   CawReceiptSource,
   ChainClient,
   McpLeaseClient,
@@ -17,6 +21,7 @@ const DEFAULT_TEMPLATES: Array<{ mode: PactTemplateBinding["mode"]; path: string
   { mode: "gate-paid-artifact-real", path: "../../../../pact-template/gate-paid-artifact-real.json" },
   { mode: "permit-payment-real", path: "../../../../pact-template/permit-payment-real.appendix.json" },
 ];
+const MAX_CAW_LIVE_RESPONSE_BYTES = 1024 * 1024;
 export const PACTFUSE_CHAIN_EVENT_ABI = [
   {
     type: "event",
@@ -289,6 +294,156 @@ export function createHttpsCawReceiptSource(input: {
         receipts,
         raw: body,
       };
+    },
+  };
+}
+
+export function createUnconfiguredCawLiveClient(): CawLiveClient {
+  return {
+    async status() {
+      return unconfiguredStatus("caw_live", "CAW live API is not configured");
+    },
+    async getWallet() {
+      throw new Error("CAW live API is unconfigured; cannot read wallet");
+    },
+    async submitPact() {
+      throw new Error("CAW live API is unconfigured; cannot submit pact");
+    },
+    async getPact() {
+      throw new Error("CAW live API is unconfigured; cannot sync pact");
+    },
+    async transferToken() {
+      throw new Error("CAW live API is unconfigured; cannot transfer token");
+    },
+    async listAuditLogs() {
+      throw new Error("CAW live API is unconfigured; cannot list audit logs");
+    },
+  };
+}
+
+export function createCoboAgenticWalletClient(input: {
+  baseUrl: string;
+  apiKey: string;
+  walletId?: string;
+  timeoutMs?: number;
+}): CawLiveClient {
+  const baseUrl = input.baseUrl.replace(/\/+$/, "");
+  const timeoutMs = input.timeoutMs ?? 10_000;
+  const defaultWalletId = input.walletId;
+  return {
+    async status() {
+      try {
+        if (!input.apiKey) {
+          return {
+            name: "caw_live",
+            mode: "live",
+            ready: false,
+            reason: "CAW live API key is missing",
+            endpoint: baseUrl,
+          };
+        }
+        if (defaultWalletId) {
+          await cawLiveRequest({
+            baseUrl,
+            apiKey: input.apiKey,
+            method: "GET",
+            path: `/api/v1/wallets/${encodeURIComponent(defaultWalletId)}`,
+            timeoutMs,
+            query: { include_spend_summary: "false" },
+          });
+        } else {
+          await cawLiveRequest({
+            baseUrl,
+            apiKey: input.apiKey,
+            method: "GET",
+            path: "/api/v1/wallets",
+            timeoutMs,
+            query: { limit: "1", include_archived: "false" },
+          });
+        }
+        return {
+          name: "caw_live",
+          mode: "live",
+          ready: true,
+          reason: defaultWalletId ? "CAW live wallet endpoint is configured" : "CAW live wallet list endpoint is configured",
+          endpoint: baseUrl,
+        };
+      } catch (error) {
+        return {
+          name: "caw_live",
+          mode: "live",
+          ready: false,
+          reason: error instanceof Error ? error.message : "CAW live API readiness check failed",
+          endpoint: baseUrl,
+        };
+      }
+    },
+    async getWallet(walletId: string) {
+      return cawLiveRequest({
+        baseUrl,
+        apiKey: input.apiKey,
+        method: "GET",
+        path: `/api/v1/wallets/${encodeURIComponent(walletId)}`,
+        timeoutMs,
+        query: { include_spend_summary: "true" },
+      });
+    },
+    async submitPact(pact) {
+      return cawLiveRequest({
+        baseUrl,
+        apiKey: input.apiKey,
+        method: "POST",
+        path: "/api/v1/pacts/submit",
+        timeoutMs,
+        body: {
+          wallet_id: pact.walletId,
+          intent: pact.intent,
+          ...(pact.originalIntent ? { original_intent: pact.originalIntent } : {}),
+          ...(pact.name ? { name: pact.name } : {}),
+          ...(pact.recipeSlugs && pact.recipeSlugs.length > 0 ? { recipe_slugs: pact.recipeSlugs } : {}),
+          spec: pact.spec,
+        },
+      });
+    },
+    async getPact(pactId: string) {
+      return cawLiveRequest({
+        baseUrl,
+        apiKey: input.apiKey,
+        method: "GET",
+        path: `/api/v1/pacts/${encodeURIComponent(pactId)}`,
+        timeoutMs,
+      });
+    },
+    async transferToken(transfer) {
+      return cawLiveRequest({
+        baseUrl,
+        apiKey: transfer.pactApiKey,
+        method: "POST",
+        path: `/api/v1/wallets/${encodeURIComponent(transfer.walletId)}/transfer`,
+        timeoutMs,
+        body: {
+          dst_addr: transfer.destinationAddress,
+          amount: transfer.amount,
+          ...(transfer.tokenId ? { token_id: transfer.tokenId } : {}),
+          ...(transfer.chainId ? { chain_id: transfer.chainId } : {}),
+          ...(transfer.requestId ? { request_id: transfer.requestId } : {}),
+          ...(transfer.sourceAddress ? { src_addr: transfer.sourceAddress } : {}),
+          ...(transfer.sponsor !== undefined ? { sponsor: transfer.sponsor } : {}),
+          ...(transfer.gasProvider ? { gas_provider: transfer.gasProvider } : {}),
+          ...(transfer.description ? { description: transfer.description } : {}),
+          ...(transfer.fee !== undefined ? { fee: transfer.fee } : {}),
+        },
+      });
+    },
+    async listAuditLogs(query) {
+      return cawLiveRequest({
+        baseUrl,
+        apiKey: input.apiKey,
+        method: "GET",
+        path: "/api/v1/audit-logs",
+        timeoutMs,
+        query: cawLiveAuditQuery(query),
+      });
     },
   };
 }
@@ -566,6 +721,88 @@ function cawHeaders(apiKey: string | undefined): Headers {
     headers.set("authorization", `Bearer ${apiKey}`);
   }
   return headers;
+}
+
+async function cawLiveRequest(input: {
+  baseUrl: string;
+  apiKey: string;
+  method: "GET" | "POST";
+  path: string;
+  timeoutMs: number;
+  query?: Record<string, string | undefined>;
+  body?: Record<string, unknown>;
+}): Promise<Record<string, unknown>> {
+  if (!input.apiKey) {
+    throw new Error("CAW live API key is missing");
+  }
+  const url = new URL(input.path, `${input.baseUrl}/`);
+  for (const [key, value] of Object.entries(input.query ?? {})) {
+    if (value !== undefined && value !== "") {
+      url.searchParams.set(key, value);
+    }
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), input.timeoutMs);
+  try {
+    const requestInit: RequestInit = {
+      method: input.method,
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "x-api-key": input.apiKey,
+      },
+      signal: controller.signal,
+    };
+    if (input.body) {
+      requestInit.body = JSON.stringify(input.body);
+    }
+    const response = await fetch(url, requestInit);
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > MAX_CAW_LIVE_RESPONSE_BYTES) {
+      throw new Error("CAW live API response exceeded 1 MiB");
+    }
+    let parsed: unknown = {};
+    if (text.length > 0) {
+      try {
+        parsed = JSON.parse(text) as unknown;
+      } catch {
+        throw new Error("CAW live API returned non-JSON response");
+      }
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("CAW live API must return a JSON object");
+    }
+    const body = parsed as Record<string, unknown>;
+    if (!response.ok) {
+      throw new Error(`CAW live API returned HTTP ${response.status}: ${cawLiveErrorMessage(body)}`);
+    }
+    return body;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function cawLiveAuditQuery(input: CawLiveAuditInput): Record<string, string | undefined> {
+  return {
+    wallet_id: input.walletId,
+    principal_id: input.principalId,
+    action: input.action,
+    result: input.result,
+    start_time: input.startTime,
+    end_time: input.endTime,
+    after: input.after,
+    before: input.before,
+    limit: input.limit ? String(input.limit) : undefined,
+  };
+}
+
+function cawLiveErrorMessage(body: Record<string, unknown>): string {
+  const error = body.error;
+  if (error && typeof error === "object" && !Array.isArray(error)) {
+    const record = error as Record<string, unknown>;
+    return [record.code, record.reason, record.message].filter((value): value is string => typeof value === "string" && value.length > 0).join(" ");
+  }
+  return [body.message, body.suggestion].filter((value): value is string => typeof value === "string" && value.length > 0).join(" ") || "request failed";
 }
 
 async function parseCawResponse(response: Response): Promise<Record<string, unknown>> {

@@ -10,9 +10,11 @@ export const LOCKED_RUNTIME_MODES = {
 
 export const HexSchema = z.string().regex(/^0x[0-9a-fA-F]+$/);
 export const Hex32Schema = z.string().regex(/^0x[0-9a-fA-F]{64}$/);
+export const AddressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/);
 export const ArtifactCidSchema = z.string().regex(/^sha256:0x[0-9a-fA-F]{64}$/);
 export const IdempotencyKeySchema = z.string().min(4).max(160).regex(/^[a-z][a-z0-9:_-]+$/);
 export const DecimalStringSchema = z.string().regex(/^(0|[1-9][0-9]*)$/);
+export const CawAmountStringSchema = z.string().regex(/^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$/);
 export const IsoDateStringSchema = z.string().datetime({ offset: true });
 
 export const JsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
@@ -114,10 +116,13 @@ export const SpendRegisterPayloadSchema = z
         z
           .object({
             spendId: Hex32Schema,
-            pactId: z.string().min(1).max(120),
-            toolId: z.string().min(1).max(120),
-            payer: HexSchema,
-            agentWallet: HexSchema,
+            pactId: Hex32Schema,
+            toolId: Hex32Schema,
+            payer: AddressSchema,
+            agentWallet: AddressSchema,
+            paymentToken: AddressSchema,
+            artifactHash: Hex32Schema,
+            market: AddressSchema,
             sourceHashes: z.array(Hex32Schema).min(1).max(16),
             maxPriceAtomic: DecimalStringSchema,
             nonce: z.string().min(1).max(128),
@@ -150,6 +155,58 @@ export const CawReceiptIngestPayloadSchema = z
   .refine((payload) => !payload.manual || payload.receipts.length > 0, {
     message: "manual CAW receipt ingest requires at least one receipt row",
     path: ["receipts"],
+  });
+
+export const CawLivePactSubmitPayloadSchema = z
+  .object({
+    walletId: z.string().min(1).max(160),
+    intent: z.string().min(1).max(500),
+    originalIntent: z.string().min(1).max(2000).optional(),
+    name: z.string().min(1).max(160).optional(),
+    recipeSlugs: z.array(z.string().min(1).max(120)).max(16).default([]),
+    spec: JsonObjectSchema,
+  })
+  .strict();
+
+export const CawLivePactSyncPayloadSchema = z
+  .object({
+    pactId: z.string().min(1).max(160),
+  })
+  .strict();
+
+export const CawLiveTransferSubmitPayloadSchema = z
+  .object({
+    pactId: z.string().min(1).max(160),
+    walletId: z.string().min(1).max(160),
+    destinationAddress: z.string().min(1).max(160),
+    amount: CawAmountStringSchema,
+    tokenId: z.string().min(1).max(80).default("SETH"),
+    chainId: z.string().min(1).max(80).optional(),
+    requestId: z.string().min(1).max(160).optional(),
+    sourceAddress: z.string().min(1).max(160).optional(),
+    sponsor: z.boolean().optional(),
+    gasProvider: z.string().min(1).max(120).optional(),
+    description: z.string().min(1).max(240).optional(),
+    fee: JsonObjectSchema.nullable().optional(),
+  })
+  .strict();
+
+export const CawLiveAuditSyncPayloadSchema = z
+  .object({
+    walletId: z.string().min(1).max(160).optional(),
+    principalId: z.string().min(1).max(160).optional(),
+    action: z.string().min(1).max(160).optional(),
+    result: z.enum(["allowed", "denied", "pending", "error"]).optional(),
+    startTime: IsoDateStringSchema.optional(),
+    endTime: IsoDateStringSchema.optional(),
+    after: z.string().min(1).max(500).optional(),
+    before: z.string().min(1).max(500).optional(),
+    limit: z.number().int().min(1).max(200).default(50),
+  })
+  .strict()
+  .refine((payload) => !payload.startTime || !payload.endTime || payload.endTime >= payload.startTime, {
+    message: "endTime must be >= startTime",
+    path: ["endTime"],
   });
 
 export const ArtifactPreflightPayloadSchema = z
@@ -320,6 +377,10 @@ export const EvidenceEventKindSchema = z.enum([
   "source.challenge.confirmed",
   "spend.registered",
   "caw.operation.built",
+  "caw.live.pact.submitted",
+  "caw.live.pact.synced",
+  "caw.live.transfer.submitted",
+  "caw.live.audit.synced",
   "caw.receipt.ingested.fixture",
   "caw.receipt.ingested.raw",
   "artifact.preflight.pending",
@@ -433,6 +494,25 @@ export const CawReceiptOperationViewSchema = z
   })
   .strict();
 
+export const CawLiveInteractionViewSchema = z
+  .object({
+    interactionId: Hex32Schema,
+    sessionId: Hex32Schema,
+    kind: z.enum(["pact_submit", "pact_sync", "transfer_submit", "audit_sync"]),
+    walletId: z.string().min(1).max(160).nullable(),
+    pactId: z.string().min(1).max(160).nullable(),
+    cawRequestId: z.string().min(1).max(160).nullable(),
+    requestHash: Hex32Schema,
+    responseHash: Hex32Schema,
+    response: JsonObjectSchema,
+    status: z.enum(["live_submitted", "live_active", "live_pending", "live_denied", "live_failed", "live_synced"]),
+    authKeyHash: Hex32Schema.nullable(),
+    proofAuthority: z.literal(true),
+    winnerClaimAllowed: z.literal(false),
+    createdAt: IsoDateStringSchema,
+  })
+  .strict();
+
 export const SourceViewSchema = z
   .object({
     sourceId: z.string().min(1).max(120),
@@ -452,10 +532,13 @@ export const SpendViewSchema = z
   .object({
     spendId: Hex32Schema,
     sessionId: Hex32Schema,
-    pactId: z.string().min(1).max(120),
-    toolId: z.string().min(1).max(120),
-    payer: HexSchema,
-    agentWallet: HexSchema,
+    pactId: Hex32Schema,
+    toolId: Hex32Schema,
+    payer: AddressSchema,
+    agentWallet: AddressSchema,
+    paymentToken: AddressSchema,
+    artifactHash: Hex32Schema,
+    market: AddressSchema,
     sourceHashes: z.array(Hex32Schema).min(1).max(16),
     sourceSetHash: Hex32Schema,
     sessionCommitment: Hex32Schema,
@@ -600,6 +683,7 @@ export const ReplayBundleViewSchema = z
     artifactAccessTokens: z.array(ArtifactAccessTokenViewSchema).max(200),
     mcpAdapterCalls: z.array(McpAdapterCallViewSchema).max(200),
     cawReceiptOperations: z.array(CawReceiptOperationViewSchema).max(200),
+    cawLiveInteractions: z.array(CawLiveInteractionViewSchema).max(200),
     rawCawReceiptBundles: z.array(RawCawReceiptBundleViewSchema).max(200),
     canonicalCawReceipts: z.array(CanonicalCawReceiptViewSchema).max(200),
     leaseRuns: z.array(LeaseRunViewSchema).max(200),
@@ -637,6 +721,7 @@ export const ReplayPageViewSchema = z
       "artifactAccessTokens",
       "mcpAdapterCalls",
       "cawReceiptOperations",
+      "cawLiveInteractions",
       "rawCawReceiptBundles",
       "canonicalCawReceipts",
       "leaseRuns",
@@ -764,3 +849,7 @@ export type JudgeCheckView = z.infer<typeof JudgeCheckViewSchema>;
 export type VerifierRunView = z.infer<typeof VerifierRunViewSchema>;
 export type ReplayBundleView = z.infer<typeof ReplayBundleViewSchema>;
 export type ChainIndexerBackfillInput = z.infer<typeof ChainIndexerBackfillInputSchema>;
+export type CawLivePactSubmitPayload = z.infer<typeof CawLivePactSubmitPayloadSchema>;
+export type CawLivePactSyncPayload = z.infer<typeof CawLivePactSyncPayloadSchema>;
+export type CawLiveTransferSubmitPayload = z.infer<typeof CawLiveTransferSubmitPayloadSchema>;
+export type CawLiveAuditSyncPayload = z.infer<typeof CawLiveAuditSyncPayloadSchema>;

@@ -11,6 +11,11 @@ import {
   ChainIndexerBackfillResultSchema,
   ChainIndexerStatusViewSchema,
   CanonicalCawReceiptViewSchema,
+  CawLiveAuditSyncPayloadSchema,
+  CawLiveInteractionViewSchema,
+  CawLivePactSubmitPayloadSchema,
+  CawLivePactSyncPayloadSchema,
+  CawLiveTransferSubmitPayloadSchema,
   CawReceiptIngestPayloadSchema,
   CawReceiptOperationViewSchema,
   CreateSessionInputSchema,
@@ -49,10 +54,13 @@ import {
   type SessionScopedEnvelope,
   type SessionView,
   type ChainIndexerBackfillInput,
+  type CawLiveAuditSyncPayload,
+  type CawLivePactSubmitPayload,
+  type CawLiveTransferSubmitPayload,
   type VerifierRunView,
 } from "@pactfuse/evidence-schema";
-import { recoverMessageAddress } from "viem";
-import type { McpLeaseExecutionResult, ProofProviderStatus, ServiceCtx, ServiceResult } from "../types.js";
+import { encodeAbiParameters, keccak256, recoverMessageAddress } from "viem";
+import type { CawLiveAuditInput, McpLeaseExecutionResult, ProofProviderStatus, ServiceCtx, ServiceResult } from "../types.js";
 import {
   ZERO_HASH,
   badRequestError,
@@ -87,14 +95,17 @@ type ReplayCollectionName =
   | "artifactAccessTokens"
   | "mcpAdapterCalls"
   | "cawReceiptOperations"
+  | "cawLiveInteractions"
   | "rawCawReceiptBundles"
   | "canonicalCawReceipts"
   | "leaseRuns";
 const REPLAY_SUMMARY_LIMIT = 200;
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const REPLAY_COLLECTION_NAMES: ReplayCollectionName[] = [
   "artifactAccessTokens",
   "artifactPreflights",
   "canonicalCawReceipts",
+  "cawLiveInteractions",
   "cawReceiptOperations",
   "events",
   "leaseRuns",
@@ -133,7 +144,14 @@ type GateContractStateProof = {
   contractAddress: string;
   contractFunction: "registeredSpend";
   contractSessionId: string;
+  contractPactId: string;
+  contractToolId: string;
   contractSourceSetHash: string;
+  contractAgentWallet: string;
+  contractPaymentToken: string;
+  contractPrice: string;
+  contractArtifactHash: string;
+  contractMarket: string;
   contractSpendState: "Tripped" | "Settled";
 };
 type SourceContractStateProof = {
@@ -509,6 +527,15 @@ export async function registerSourceBoundSpends(
       for (const spend of payload.spends) {
         const sourceHashes = normalizedSourceHashes(spend.sourceHashes);
         requireRegisteredSources(ctx, envelope.sessionId, sourceHashes, requestId);
+        if (spend.payer.toLowerCase() !== spend.agentWallet.toLowerCase()) {
+          throw Object.assign(new Error("payer must equal agentWallet for ProcurementGate settlement binding"), {
+            apiError: proofBlockedError(requestId, "payer must equal agentWallet for ProcurementGate settlement binding", {
+              payer: spend.payer,
+              agentWallet: spend.agentWallet,
+            }),
+          });
+        }
+        assertNonZeroProcurementGateSpend(spend, requestId);
         const sourceCapabilitySnapshot = sourceCapabilitySnapshotFor(ctx, envelope.sessionId, sourceHashes);
         const binding = spendBindingFor(session, envelope.sessionId, {
           pactId: spend.pactId,
@@ -517,12 +544,15 @@ export async function registerSourceBoundSpends(
           sourceCapabilitySnapshotHash: sourceCapabilitySnapshot.hash,
           payer: spend.payer,
           agentWallet: spend.agentWallet,
+          paymentToken: spend.paymentToken,
+          artifactHash: spend.artifactHash,
+          market: spend.market,
           maxPriceAtomic: spend.maxPriceAtomic,
           nonce: spend.nonce,
         });
         if (spend.spendId.toLowerCase() !== binding.spendId) {
-          throw Object.assign(new Error("spendId does not match the W8.1 source-bound spend preimage"), {
-            apiError: proofBlockedError(requestId, "spendId does not match the W8.1 source-bound spend preimage", {
+          throw Object.assign(new Error("spendId does not match the ProcurementGate ABI spend preimage"), {
+            apiError: proofBlockedError(requestId, "spendId does not match the ProcurementGate ABI spend preimage", {
               expectedSpendId: binding.spendId,
               sourceSetHash: binding.sourceSetHash,
             }),
@@ -541,6 +571,9 @@ export async function registerSourceBoundSpends(
               toolId: spend.toolId,
               payer: spend.payer,
               agentWallet: spend.agentWallet,
+              paymentToken: spend.paymentToken,
+              artifactHash: spend.artifactHash,
+              market: spend.market,
               sourceHashesJson,
               sourceSetHash: binding.sourceSetHash,
               sessionCommitment: binding.sessionCommitment,
@@ -554,9 +587,10 @@ export async function registerSourceBoundSpends(
           ctx.db.sqlite
             .prepare(
               `INSERT INTO spends
-                (spend_id, session_id, pact_id, tool_id, payer, agent_wallet, source_hashes_json, source_set_hash, session_commitment,
+                (spend_id, session_id, pact_id, tool_id, payer, agent_wallet, payment_token, artifact_hash, market,
+                 source_hashes_json, source_set_hash, session_commitment,
                  spend_preimage_json, max_price_atomic, nonce, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered_pending_chain_log', ?)`,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered_pending_chain_log', ?)`,
             )
             .run(
               binding.spendId,
@@ -565,6 +599,9 @@ export async function registerSourceBoundSpends(
               spend.toolId,
               spend.payer,
               spend.agentWallet,
+              spend.paymentToken,
+              spend.artifactHash,
+              spend.market,
               sourceHashesJson,
               binding.sourceSetHash,
               binding.sessionCommitment,
@@ -589,7 +626,7 @@ export async function registerSourceBoundSpends(
           spendIds: registeredSpends.map((spend) => spend.spendId),
           sourceSetHashes: registeredSpends.map((spend) => spend.sourceSetHash),
           sessionCommitment: registeredSpends[0]?.sessionCommitment ?? null,
-          spendIdBinding: "w8.1-keccak-jcs-v1",
+          spendIdBinding: "procurement-gate-abi-v1",
           spendPreimages: registeredSpends.map((spend) => spend.spendPreimage),
           sourceCapabilitySnapshotHashes: registeredSpends.map((spend) => String(spend.spendPreimage.sourceCapabilitySnapshotHash)),
           status: "registered_pending_chain_log",
@@ -604,7 +641,7 @@ export async function registerSourceBoundSpends(
         spendIds: registeredSpends.map((spend) => spend.spendId),
         sourceSetHashes: registeredSpends.map((spend) => spend.sourceSetHash),
         sessionCommitment: registeredSpends[0]?.sessionCommitment ?? null,
-        spendIdBinding: "w8.1-keccak-jcs-v1",
+        spendIdBinding: "procurement-gate-abi-v1",
         status: "registered_pending_chain_log",
         winnerClaimAllowed: false,
       },
@@ -891,6 +928,553 @@ export async function ingestCawReceiptBundle(
       },
     };
   });
+}
+
+export async function submitCawLivePact(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(CawLivePactSubmitPayloadSchema, envelope.payload);
+  return withIdempotency(ctx, scoped("caw:live:pact:submit", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
+    assertSession(ctx, envelope.sessionId, requestId);
+    await requireCawLiveReady(ctx, requestId);
+    const request = cawLivePactSubmitRequest(payload);
+    const pactInput: {
+      walletId: string;
+      intent: string;
+      originalIntent?: string;
+      name?: string;
+      recipeSlugs?: string[];
+      spec: Record<string, unknown>;
+    } = {
+      walletId: payload.walletId,
+      intent: payload.intent,
+      spec: payload.spec,
+    };
+    if (payload.originalIntent) {
+      pactInput.originalIntent = payload.originalIntent;
+    }
+    if (payload.name) {
+      pactInput.name = payload.name;
+    }
+    if (payload.recipeSlugs.length > 0) {
+      pactInput.recipeSlugs = payload.recipeSlugs;
+    }
+    const response = await ctx.cawLive.submitPact(pactInput);
+    const pactId = requireCawResponseId(response, ["pact_id", "id"], requestId, "CAW pact submit");
+    const status = normalizeCawLivePactStatus(response);
+    const saved = recordCawLiveInteraction(ctx, {
+      sessionId: envelope.sessionId,
+      kind: "pact_submit",
+      walletId: payload.walletId,
+      pactId,
+      cawRequestId: null,
+      request,
+      response,
+      status,
+      authKeyHash: null,
+    });
+    const event = appendEvidenceEvent(ctx, {
+      sessionId: envelope.sessionId,
+      authority: "proof",
+      kind: "caw.live.pact.submitted",
+      payload: {
+        interactionId: saved.interactionId,
+        walletId: payload.walletId,
+        pactId,
+        requestHash: saved.requestHash,
+        responseHash: saved.responseHash,
+        status,
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+    updateJudgeCheckRow(ctx, envelope.sessionId, {
+      rowId: "caw_boundary",
+      status: status === "live_active" ? "pass" : "pending",
+      authority: "proof",
+      reason: status === "live_active" ? "CAW pact is active from the live Agentic Wallet API" : "CAW pact is submitted but not active yet",
+      evidenceEventId: event.eventId,
+    });
+    return {
+      ok: true,
+      requestId,
+      evidenceEventId: event.eventId,
+      data: {
+        interactionId: saved.interactionId,
+        pactId,
+        walletId: payload.walletId,
+        status,
+        requestHash: saved.requestHash,
+        responseHash: saved.responseHash,
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    };
+  });
+}
+
+export async function syncCawLivePact(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(CawLivePactSyncPayloadSchema, envelope.payload);
+  return withIdempotency(ctx, scoped("caw:live:pact:sync", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
+    assertSession(ctx, envelope.sessionId, requestId);
+    await requireCawLiveReady(ctx, requestId);
+    const request = { pact_id: payload.pactId };
+    const response = await ctx.cawLive.getPact(payload.pactId);
+    const walletId = optionalStringFromCaw(response, ["wallet_id", "walletId"]);
+    const status = normalizeCawLivePactStatus(response);
+    const pactApiKey = optionalStringFromCaw(response, ["api_key", "apiKey"]);
+    const saved = recordCawLiveInteraction(ctx, {
+      sessionId: envelope.sessionId,
+      kind: "pact_sync",
+      walletId,
+      pactId: payload.pactId,
+      cawRequestId: null,
+      request,
+      response: redactCawLiveSecrets(response),
+      status: status === "live_submitted" ? "live_synced" : status,
+      authKeyHash: pactApiKey ? sha256Hex(pactApiKey) : null,
+    });
+    const event = appendEvidenceEvent(ctx, {
+      sessionId: envelope.sessionId,
+      authority: "proof",
+      kind: "caw.live.pact.synced",
+      payload: {
+        interactionId: saved.interactionId,
+        walletId,
+        pactId: payload.pactId,
+        pactScopedApiKeyHash: pactApiKey ? sha256Hex(pactApiKey) : null,
+        requestHash: saved.requestHash,
+        responseHash: saved.responseHash,
+        status: saved.status,
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+    updateJudgeCheckRow(ctx, envelope.sessionId, {
+      rowId: "caw_boundary",
+      status: status === "live_active" ? "pass" : "pending",
+      authority: "proof",
+      reason: status === "live_active" ? "CAW pact sync reports active live status" : "CAW pact sync does not yet report active status",
+      evidenceEventId: event.eventId,
+    });
+    return {
+      ok: true,
+      requestId,
+      evidenceEventId: event.eventId,
+      data: {
+        interactionId: saved.interactionId,
+        pactId: payload.pactId,
+        walletId,
+        status: saved.status,
+        pactScopedApiKeyHash: pactApiKey ? sha256Hex(pactApiKey) : null,
+        requestHash: saved.requestHash,
+        responseHash: saved.responseHash,
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    };
+  });
+}
+
+export async function submitCawLiveTransfer(
+  input: SessionScopedEnvelope,
+  ctx: ServiceCtx,
+  pactApiKey: string | null,
+): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(CawLiveTransferSubmitPayloadSchema, envelope.payload);
+  return withIdempotency(ctx, scoped("caw:live:transfer:submit", envelope.sessionId), envelope.idempotencyKey, { envelope, pactKeyHash: pactApiKey ? sha256Hex(pactApiKey) : null }, async (requestId) => {
+    assertSession(ctx, envelope.sessionId, requestId);
+    if (!pactApiKey) {
+      throw Object.assign(new Error("missing CAW pact-scoped API key"), {
+        apiError: unauthorizedError(requestId, "missing x-pactfuse-caw-pact-api-key header"),
+      });
+    }
+    await requireCawLiveReady(ctx, requestId);
+    const request = cawLiveTransferRequest(payload);
+    const transferInput: {
+      walletId: string;
+      destinationAddress: string;
+      amount: string;
+      tokenId?: string;
+      chainId?: string;
+      requestId?: string;
+      sourceAddress?: string;
+      sponsor?: boolean;
+      gasProvider?: string;
+      description?: string;
+      fee?: Record<string, unknown> | null;
+      pactApiKey: string;
+    } = {
+      walletId: payload.walletId,
+      destinationAddress: payload.destinationAddress,
+      amount: payload.amount,
+      tokenId: payload.tokenId,
+      pactApiKey,
+    };
+    if (payload.chainId) {
+      transferInput.chainId = payload.chainId;
+    }
+    if (payload.requestId) {
+      transferInput.requestId = payload.requestId;
+    }
+    if (payload.sourceAddress) {
+      transferInput.sourceAddress = payload.sourceAddress;
+    }
+    if (payload.sponsor !== undefined) {
+      transferInput.sponsor = payload.sponsor;
+    }
+    if (payload.gasProvider) {
+      transferInput.gasProvider = payload.gasProvider;
+    }
+    if (payload.description) {
+      transferInput.description = payload.description;
+    }
+    if (payload.fee !== undefined) {
+      transferInput.fee = payload.fee;
+    }
+    const response = await ctx.cawLive.transferToken(transferInput);
+    const cawRequestId = payload.requestId ?? optionalStringFromCaw(response, ["request_id", "requestId"]);
+    const status = normalizeCawLiveTransferStatus(response);
+    const saved = recordCawLiveInteraction(ctx, {
+      sessionId: envelope.sessionId,
+      kind: "transfer_submit",
+      walletId: payload.walletId,
+      pactId: payload.pactId,
+      cawRequestId,
+      request,
+      response,
+      status,
+      authKeyHash: sha256Hex(pactApiKey),
+    });
+    const event = appendEvidenceEvent(ctx, {
+      sessionId: envelope.sessionId,
+      authority: "proof",
+      kind: "caw.live.transfer.submitted",
+      payload: {
+        interactionId: saved.interactionId,
+        walletId: payload.walletId,
+        pactId: payload.pactId,
+        cawRequestId,
+        tokenId: payload.tokenId,
+        amount: payload.amount,
+        destinationAddress: payload.destinationAddress,
+        requestHash: saved.requestHash,
+        responseHash: saved.responseHash,
+        pactScopedApiKeyHash: saved.authKeyHash,
+        status,
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+    updateJudgeCheckRow(ctx, envelope.sessionId, {
+      rowId: "caw_boundary",
+      status: status === "live_denied" || status === "live_failed" ? "blocked" : "pass",
+      authority: "proof",
+      reason: status === "live_denied" ? "CAW live policy denied the transfer" : "CAW live transfer response is recorded",
+      evidenceEventId: event.eventId,
+    });
+    return {
+      ok: true,
+      requestId,
+      evidenceEventId: event.eventId,
+      data: {
+        interactionId: saved.interactionId,
+        walletId: payload.walletId,
+        pactId: payload.pactId,
+        cawRequestId,
+        tokenId: payload.tokenId,
+        amount: payload.amount,
+        destinationAddress: payload.destinationAddress,
+        requestHash: saved.requestHash,
+        responseHash: saved.responseHash,
+        pactScopedApiKeyHash: saved.authKeyHash,
+        status,
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    };
+  });
+}
+
+export async function syncCawLiveAudit(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(CawLiveAuditSyncPayloadSchema, envelope.payload);
+  return withIdempotency(ctx, scoped("caw:live:audit:sync", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
+    assertSession(ctx, envelope.sessionId, requestId);
+    await requireCawLiveReady(ctx, requestId);
+    const request = cawLiveAuditRequest(payload);
+    const auditInput: CawLiveAuditInput = { limit: payload.limit };
+    if (payload.walletId) {
+      auditInput.walletId = payload.walletId;
+    }
+    if (payload.principalId) {
+      auditInput.principalId = payload.principalId;
+    }
+    if (payload.action) {
+      auditInput.action = payload.action;
+    }
+    if (payload.result) {
+      auditInput.result = payload.result;
+    }
+    if (payload.startTime) {
+      auditInput.startTime = payload.startTime;
+    }
+    if (payload.endTime) {
+      auditInput.endTime = payload.endTime;
+    }
+    if (payload.after) {
+      auditInput.after = payload.after;
+    }
+    if (payload.before) {
+      auditInput.before = payload.before;
+    }
+    const response = await ctx.cawLive.listAuditLogs(auditInput);
+    const saved = recordCawLiveInteraction(ctx, {
+      sessionId: envelope.sessionId,
+      kind: "audit_sync",
+      walletId: payload.walletId ?? null,
+      pactId: null,
+      cawRequestId: null,
+      request,
+      response,
+      status: "live_synced",
+      authKeyHash: null,
+    });
+    const event = appendEvidenceEvent(ctx, {
+      sessionId: envelope.sessionId,
+      authority: "proof",
+      kind: "caw.live.audit.synced",
+      payload: {
+        interactionId: saved.interactionId,
+        walletId: payload.walletId ?? null,
+        requestHash: saved.requestHash,
+        responseHash: saved.responseHash,
+        status: "live_synced",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+    return {
+      ok: true,
+      requestId,
+      evidenceEventId: event.eventId,
+      data: {
+        interactionId: saved.interactionId,
+        walletId: payload.walletId ?? null,
+        requestHash: saved.requestHash,
+        responseHash: saved.responseHash,
+        status: "live_synced",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    };
+  });
+}
+
+async function requireCawLiveReady(ctx: ServiceCtx, requestId: string): Promise<ProofProviderStatus> {
+  let status: ProofProviderStatus;
+  try {
+    status = await ctx.cawLive.status();
+  } catch (error) {
+    throw Object.assign(new Error("CAW live API readiness check failed"), {
+      apiError: proofPendingError(requestId, cawLiveFailureMessage("CAW live API readiness check failed", error)),
+    });
+  }
+  if (!status.ready) {
+    throw Object.assign(new Error("CAW live API is not ready"), {
+      apiError: proofPendingError(requestId, `CAW live API is not ready: ${status.reason}`),
+    });
+  }
+  return status;
+}
+
+function cawLivePactSubmitRequest(payload: CawLivePactSubmitPayload): Record<string, JsonValue> {
+  return jsonRecord({
+    wallet_id: payload.walletId,
+    intent: payload.intent,
+    original_intent: payload.originalIntent,
+    name: payload.name,
+    recipe_slugs: payload.recipeSlugs,
+    spec: payload.spec,
+  });
+}
+
+function cawLiveTransferRequest(payload: CawLiveTransferSubmitPayload): Record<string, JsonValue> {
+  return jsonRecord({
+    pact_id: payload.pactId,
+    wallet_id: payload.walletId,
+    dst_addr: payload.destinationAddress,
+    amount: payload.amount,
+    token_id: payload.tokenId,
+    chain_id: payload.chainId,
+    request_id: payload.requestId,
+    src_addr: payload.sourceAddress,
+    sponsor: payload.sponsor,
+    gas_provider: payload.gasProvider,
+    description: payload.description,
+    fee: payload.fee,
+  });
+}
+
+function cawLiveAuditRequest(payload: CawLiveAuditSyncPayload): Record<string, JsonValue> {
+  return jsonRecord({
+    wallet_id: payload.walletId,
+    principal_id: payload.principalId,
+    action: payload.action,
+    result: payload.result,
+    start_time: payload.startTime,
+    end_time: payload.endTime,
+    after: payload.after,
+    before: payload.before,
+    limit: payload.limit,
+  });
+}
+
+function recordCawLiveInteraction(
+  ctx: ServiceCtx,
+  input: {
+    sessionId: string;
+    kind: "pact_submit" | "pact_sync" | "transfer_submit" | "audit_sync";
+    walletId: string | null;
+    pactId: string | null;
+    cawRequestId: string | null;
+    request: Record<string, JsonValue>;
+    response: Record<string, unknown>;
+    status: "live_submitted" | "live_active" | "live_pending" | "live_denied" | "live_failed" | "live_synced";
+    authKeyHash: `0x${string}` | null;
+  },
+): {
+  interactionId: `0x${string}`;
+  requestHash: `0x${string}`;
+  responseHash: `0x${string}`;
+  status: "live_submitted" | "live_active" | "live_pending" | "live_denied" | "live_failed" | "live_synced";
+  authKeyHash: `0x${string}` | null;
+} {
+  const responseRecord = jsonRecord(redactCawLiveSecrets(input.response));
+  const requestHash = hashJson(input.request);
+  const responseHash = hashJson(responseRecord);
+  const interactionId = hashJson({
+    sessionId: input.sessionId,
+    kind: input.kind,
+    walletId: input.walletId,
+    pactId: input.pactId,
+    cawRequestId: input.cawRequestId,
+    requestHash,
+    responseHash,
+  });
+  ctx.db.sqlite
+    .prepare(
+      `INSERT INTO caw_live_interactions
+        (interaction_id, session_id, kind, wallet_id, pact_id, caw_request_id, request_hash, request_json,
+         response_hash, response_json, status, auth_key_hash, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      interactionId,
+      input.sessionId,
+      input.kind,
+      input.walletId,
+      input.pactId,
+      input.cawRequestId,
+      requestHash,
+      canonicalizeJson(input.request),
+      responseHash,
+      canonicalizeJson(responseRecord),
+      input.status,
+      input.authKeyHash,
+      ctx.clock.now().toISOString(),
+    );
+  return { interactionId, requestHash, responseHash, status: input.status, authKeyHash: input.authKeyHash };
+}
+
+function requireCawResponseId(response: Record<string, unknown>, keys: string[], requestId: string, label: string): string {
+  const value = optionalStringFromCaw(response, keys);
+  if (!value) {
+    throw Object.assign(new Error(`${label} response is missing id`), {
+      apiError: proofBlockedError(requestId, `${label} response is missing required id`, { keys }),
+    });
+  }
+  return value;
+}
+
+function optionalStringFromCaw(response: Record<string, unknown>, keys: string[]): string | null {
+  const roots = [response, objectChild(response, "result"), objectChild(objectChild(response, "result"), "pact"), objectChild(objectChild(response, "result"), "transaction")];
+  for (const root of roots) {
+    if (!root) {
+      continue;
+    }
+    for (const key of keys) {
+      const value = root[key];
+      if (typeof value === "string" && value.length > 0) {
+        return value;
+      }
+    }
+  }
+  return null;
+}
+
+function objectChild(parent: Record<string, unknown> | null, key: string): Record<string, unknown> | null {
+  const value = parent?.[key];
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function normalizeCawLivePactStatus(response: Record<string, unknown>): "live_submitted" | "live_active" | "live_pending" | "live_failed" {
+  const status = (optionalStringFromCaw(response, ["status"]) ?? "").toLowerCase();
+  if (["active", "approved"].includes(status)) {
+    return "live_active";
+  }
+  if (["rejected", "expired", "revoked", "completed", "failed", "error"].includes(status)) {
+    return "live_failed";
+  }
+  if (status.includes("pending") || status.includes("approval")) {
+    return "live_pending";
+  }
+  return "live_submitted";
+}
+
+function normalizeCawLiveTransferStatus(response: Record<string, unknown>): "live_submitted" | "live_pending" | "live_denied" | "live_failed" {
+  const status = (optionalStringFromCaw(response, ["status", "status_display"]) ?? "").toLowerCase();
+  const errorCode = optionalStringFromCaw(response, ["code", "reason"]);
+  if (errorCode && /deny|denied|policy/.test(errorCode.toLowerCase())) {
+    return "live_denied";
+  }
+  if (/deny|denied|blocked/.test(status)) {
+    return "live_denied";
+  }
+  if (/fail|error|rejected|cancel/.test(status)) {
+    return "live_failed";
+  }
+  if (/pending|approval|submitted|broadcast/.test(status)) {
+    return "live_pending";
+  }
+  return "live_submitted";
+}
+
+function redactCawLiveSecrets(value: unknown): Record<string, unknown> {
+  return redactCawLiveSecretsValue(value) as Record<string, unknown>;
+}
+
+function redactCawLiveSecretsValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactCawLiveSecretsValue(item));
+  }
+  if (value && typeof value === "object") {
+    const output: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (/api[_-]?key|token|secret|authorization/i.test(key)) {
+        output[key] = typeof child === "string" && child.length > 0 ? { redacted: true, sha256: sha256Hex(child) } : { redacted: true };
+      } else {
+        output[key] = redactCawLiveSecretsValue(child);
+      }
+    }
+    return output;
+  }
+  return value;
+}
+
+function cawLiveFailureMessage(message: string, error: unknown): string {
+  return error instanceof Error ? `${message}: ${error.message}` : message;
 }
 
 export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
@@ -2068,8 +2652,8 @@ async function buildVerifierRunView(
 }
 
 export async function readProofProviderStatus(ctx: ServiceCtx): Promise<ProofProviderStatus[]> {
-  const [chain, caw, mcpLease] = await Promise.all([ctx.chain.status(), ctx.caw.status(), ctx.mcpLease.status()]);
-  return [chain, caw, mcpLease];
+  const [chain, caw, cawLive, mcpLease] = await Promise.all([ctx.chain.status(), ctx.caw.status(), ctx.cawLive.status(), ctx.mcpLease.status()]);
+  return [chain, caw, cawLive, mcpLease];
 }
 
 export async function readJudgeCheck(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<JudgeCheckView>> {
@@ -2110,6 +2694,7 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBun
   const quotes = listQuotes(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const artifactAccessTokens = listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const cawReceiptOperations = listCawReceiptOperations(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const cawLiveInteractions = listCawLiveInteractions(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const rawCawReceiptBundles = listRawCawReceiptBundles(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const canonicalCawReceipts = listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const leaseRuns = listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
@@ -2131,6 +2716,7 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBun
     artifactAccessTokens,
     mcpAdapterCalls,
     cawReceiptOperations,
+    cawLiveInteractions,
     rawCawReceiptBundles,
     canonicalCawReceipts,
     leaseRuns,
@@ -2372,6 +2958,8 @@ function replayCollectionRows(ctx: ServiceCtx, sessionId: string, collection: Re
       return listMcpAdapterCalls(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
     case "cawReceiptOperations":
       return listCawReceiptOperations(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+    case "cawLiveInteractions":
+      return listCawLiveInteractions(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
     case "rawCawReceiptBundles":
       return listRawCawReceiptBundles(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
     case "canonicalCawReceipts":
@@ -2405,6 +2993,8 @@ function replayCollectionTable(collection: ReplayCollectionName): string {
       return "mcp_adapter_calls";
     case "cawReceiptOperations":
       return "caw_receipt_operations";
+    case "cawLiveInteractions":
+      return "caw_live_interactions";
     case "rawCawReceiptBundles":
       return "caw_raw_receipt_bundles";
     case "canonicalCawReceipts":
@@ -2432,6 +3022,8 @@ function replayCollectionOrderBy(collection: ReplayCollectionName): string[] {
       return ["createdAt ASC", "toolName tools/list before tools/call", "callId ASC"];
     case "cawReceiptOperations":
       return ["createdAt ASC", "operationId ASC"];
+    case "cawLiveInteractions":
+      return ["createdAt ASC", "interactionId ASC"];
     case "rawCawReceiptBundles":
       return ["createdAt ASC", "bundleId ASC"];
     case "canonicalCawReceipts":
@@ -2692,6 +3284,10 @@ export function appendEvidenceEvent(
       | "source.challenge.confirmed"
       | "spend.registered"
       | "caw.operation.built"
+      | "caw.live.pact.submitted"
+      | "caw.live.pact.synced"
+      | "caw.live.transfer.submitted"
+      | "caw.live.audit.synced"
       | "caw.receipt.ingested.fixture"
       | "caw.receipt.ingested.raw"
       | "artifact.preflight.pending"
@@ -3265,12 +3861,47 @@ function assertSession(ctx: ServiceCtx, sessionId: string, requestId: string): v
 
 function assertSpend(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): Row {
   const spend = ctx.db.sqlite
-    .prepare("SELECT spend_id, payer, max_price_atomic FROM spends WHERE session_id = ? AND spend_id = ?")
+    .prepare("SELECT * FROM spends WHERE session_id = ? AND spend_id = ?")
     .get(sessionId, spendId) as Row | undefined;
   if (!spend) {
     throw Object.assign(new Error("spend not found"), { apiError: notFoundError(requestId, "spend") });
   }
   return spend;
+}
+
+function assertGateContractStateMatchesSpend(spend: Row, proof: GateContractStateProof, requestId: string): void {
+  const expected = {
+    sessionId: String(spend.session_id).toLowerCase(),
+    pactId: String(spend.pact_id).toLowerCase(),
+    toolId: String(spend.tool_id).toLowerCase(),
+    sourceSetHash: String(spend.source_set_hash).toLowerCase(),
+    agentWallet: String(spend.agent_wallet).toLowerCase(),
+    paymentToken: String(spend.payment_token).toLowerCase(),
+    price: BigInt(String(spend.max_price_atomic)).toString(),
+    artifactHash: String(spend.artifact_hash).toLowerCase(),
+    market: String(spend.market).toLowerCase(),
+  };
+  const actual = {
+    sessionId: proof.contractSessionId.toLowerCase(),
+    pactId: proof.contractPactId.toLowerCase(),
+    toolId: proof.contractToolId.toLowerCase(),
+    sourceSetHash: proof.contractSourceSetHash.toLowerCase(),
+    agentWallet: proof.contractAgentWallet.toLowerCase(),
+    paymentToken: proof.contractPaymentToken.toLowerCase(),
+    price: proof.contractPrice,
+    artifactHash: proof.contractArtifactHash.toLowerCase(),
+    market: proof.contractMarket.toLowerCase(),
+  };
+  const mismatches = Object.fromEntries(
+    (Object.keys(expected) as Array<keyof typeof expected>)
+      .filter((field) => expected[field] !== actual[field])
+      .map((field) => [field, { expected: expected[field], actual: actual[field] }]),
+  );
+  if (Object.keys(mismatches).length > 0) {
+    throw Object.assign(new Error("ProcurementGate registeredSpend state does not match backend spend binding"), {
+      apiError: proofBlockedError(requestId, "ProcurementGate registeredSpend state does not match backend spend binding", { mismatches }),
+    });
+  }
 }
 
 function requireSpendPayer(spend: Row, payer: string, requestId: string): string {
@@ -4144,11 +4775,18 @@ async function verifyGateContractState(
   }
 
   const contractSessionId = requiredContractHex32(contractTupleValue(result, 0, "sessionId"), "registeredSpend.sessionId", requestId);
+  const contractPactId = requiredContractHex32(contractTupleValue(result, 1, "pactId"), "registeredSpend.pactId", requestId);
+  const contractToolId = requiredContractHex32(contractTupleValue(result, 2, "toolId"), "registeredSpend.toolId", requestId);
   const contractSourceSetHash = requiredContractHex32(
     contractTupleValue(result, 3, "sourceSetHash"),
     "registeredSpend.sourceSetHash",
     requestId,
   );
+  const contractAgentWallet = requiredContractAddress(contractTupleValue(result, 4, "agentWallet"), "registeredSpend.agentWallet", requestId);
+  const contractPaymentToken = requiredContractAddress(contractTupleValue(result, 5, "paymentToken"), "registeredSpend.paymentToken", requestId);
+  const contractPrice = requiredContractUintString(contractTupleValue(result, 6, "price"), "registeredSpend.price", requestId);
+  const contractArtifactHash = requiredContractHex32(contractTupleValue(result, 7, "artifactHash"), "registeredSpend.artifactHash", requestId);
+  const contractMarket = requiredContractAddress(contractTupleValue(result, 8, "market"), "registeredSpend.market", requestId);
   const contractState = contractStateNumber(contractTupleValue(result, 9, "state"));
   const expectedState = semantic.event === "SpendTripped" ? GATE_SPEND_STATE.Tripped : GATE_SPEND_STATE.Settled;
   if (contractSessionId.toLowerCase() !== semantic.sessionId.toLowerCase()) {
@@ -4173,7 +4811,14 @@ async function verifyGateContractState(
     contractAddress,
     contractFunction: "registeredSpend",
     contractSessionId,
+    contractPactId,
+    contractToolId,
     contractSourceSetHash,
+    contractAgentWallet,
+    contractPaymentToken,
+    contractPrice,
+    contractArtifactHash,
+    contractMarket,
     contractSpendState: semantic.event === "SpendTripped" ? "Tripped" : "Settled",
   };
 }
@@ -4285,6 +4930,30 @@ function requiredContractHex32(value: unknown, field: string, requestId: string)
   return hex;
 }
 
+function requiredContractAddress(value: unknown, field: string, requestId: string): `0x${string}` {
+  if (typeof value !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(value)) {
+    throw Object.assign(new Error(`${field} must be a 20-byte address in contract state`), {
+      apiError: proofBlockedError(requestId, `${field} must be a 20-byte address in contract state`),
+    });
+  }
+  return value.toLowerCase() as `0x${string}`;
+}
+
+function requiredContractUintString(value: unknown, field: string, requestId: string): string {
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+    return String(value);
+  }
+  if (typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value)) {
+    return BigInt(value).toString();
+  }
+  throw Object.assign(new Error(`${field} must be a uint string in contract state`), {
+    apiError: proofBlockedError(requestId, `${field} must be a uint string in contract state`),
+  });
+}
+
 async function reconcileIndexedGateEvent(
   ctx: ServiceCtx,
   row: Row,
@@ -4292,7 +4961,7 @@ async function reconcileIndexedGateEvent(
   requestId: string,
 ): Promise<number> {
   const session = requireSessionRow(ctx, semantic.sessionId, requestId);
-  assertSpend(ctx, semantic.sessionId, semantic.spendId, requestId);
+  const spend = assertSpend(ctx, semantic.sessionId, semantic.spendId, requestId);
   const blockNumber = Number(row.block_number);
   const latestHeadBlock = Number(row.latest_head_block);
   const finalizedHeadBlock = Number(row.finalized_head_block);
@@ -4321,6 +4990,7 @@ async function reconcileIndexedGateEvent(
     rawLogHash: gatePayload.rawLogHash,
   });
   const contractStateProof = await verifyGateContractState(ctx, row, semantic, requestId);
+  assertGateContractStateMatchesSpend(spend, contractStateProof, requestId);
   return withImmediateTransaction(ctx, () => {
     const existing = ctx.db.sqlite
       .prepare(
@@ -5077,6 +5747,9 @@ function assertExistingSpendMatches(
     toolId: string;
     payer: string;
     agentWallet: string;
+    paymentToken: string;
+    artifactHash: string;
+    market: string;
     sourceHashesJson: string;
     sourceSetHash: string;
     sessionCommitment: string;
@@ -5091,6 +5764,9 @@ function assertExistingSpendMatches(
     ["tool_id", expected.toolId],
     ["payer", expected.payer],
     ["agent_wallet", expected.agentWallet],
+    ["payment_token", expected.paymentToken],
+    ["artifact_hash", expected.artifactHash],
+    ["market", expected.market],
     ["source_hashes_json", expected.sourceHashesJson],
     ["source_set_hash", expected.sourceSetHash],
     ["session_commitment", expected.sessionCommitment],
@@ -5109,6 +5785,45 @@ function assertExistingSpendMatches(
   }
 }
 
+function assertNonZeroProcurementGateSpend(
+  spend: {
+    agentWallet: string;
+    paymentToken: string;
+    artifactHash: string;
+    market: string;
+    maxPriceAtomic: string;
+  },
+  requestId: string,
+): void {
+  const zeroFields: string[] = [];
+  if (spend.agentWallet.toLowerCase() === ZERO_ADDRESS) {
+    zeroFields.push("agentWallet");
+  }
+  if (spend.paymentToken.toLowerCase() === ZERO_ADDRESS) {
+    zeroFields.push("paymentToken");
+  }
+  if (spend.market.toLowerCase() === ZERO_ADDRESS) {
+    zeroFields.push("market");
+  }
+  if (spend.artifactHash.toLowerCase() === ZERO_HASH) {
+    zeroFields.push("artifactHash");
+  }
+  let priceValid = false;
+  try {
+    priceValid = BigInt(spend.maxPriceAtomic) > 0n && BigInt(spend.maxPriceAtomic) <= (1n << 256n) - 1n;
+  } catch {
+    priceValid = false;
+  }
+  if (!priceValid) {
+    zeroFields.push("maxPriceAtomic");
+  }
+  if (zeroFields.length > 0) {
+    throw Object.assign(new Error("ProcurementGate spend fields must be non-zero and chain-registerable"), {
+      apiError: proofBlockedError(requestId, "ProcurementGate spend fields must be non-zero and chain-registerable", { fields: zeroFields }),
+    });
+  }
+}
+
 function spendBindingFor(
   session: Row,
   sessionId: string,
@@ -5119,6 +5834,9 @@ function spendBindingFor(
     sourceCapabilitySnapshotHash: string;
     payer: string;
     agentWallet: string;
+    paymentToken: string;
+    artifactHash: string;
+    market: string;
     maxPriceAtomic: string;
     nonce: string;
   },
@@ -5129,26 +5847,122 @@ function spendBindingFor(
   spendPreimage: Record<string, JsonValue>;
 } {
   const runConfigHash = String(session.run_config_hash);
-  const sourceSetHash = keccakJson(spend.sourceHashes);
+  const pactId = spend.pactId.toLowerCase();
+  const toolId = spend.toolId.toLowerCase();
+  const payer = evmAddress(spend.payer, "payer");
+  const agentWallet = evmAddress(spend.agentWallet, "agentWallet");
+  const paymentToken = evmAddress(spend.paymentToken, "paymentToken");
+  const artifactHash = spend.artifactHash.toLowerCase();
+  const market = evmAddress(spend.market, "market");
+  const priceAtomic = uint256Decimal(spend.maxPriceAtomic, "maxPriceAtomic");
+  const sourceSetHash = procurementGateSourceSetHash(spend.sourceHashes);
   const sessionCommitment = keccakJson({ sessionId: sessionId.toLowerCase(), runConfigHash });
+  const spendId = procurementGateSpendId({
+    sessionId: sessionId.toLowerCase(),
+    pactId,
+    toolId,
+    sourceSetHash,
+    agentWallet,
+    paymentToken,
+    priceAtomic,
+    artifactHash,
+    market,
+  });
   const spendPreimage: Record<string, JsonValue> = {
+    binding: "procurement-gate-abi-v1",
+    solidity: "keccak256(abi.encode(bytes32 sessionId, bytes32 pactId, bytes32 toolId, bytes32 sourceSetHash, address agentWallet, address paymentToken, uint256 price, bytes32 artifactHash, address market))",
+    sourceSetBinding: "procurement-gate-source-set-abi-v1",
+    sourceSetSolidity: "keccak256(abi.encode(bytes32[] sourceHashes))",
     runConfigHash,
     sessionCommitment,
-    pactId: spend.pactId,
-    toolId: spend.toolId,
+    sessionId: sessionId.toLowerCase(),
+    pactId,
+    toolId,
     sourceSetHash,
     sourceCapabilitySnapshotHash: spend.sourceCapabilitySnapshotHash,
-    payer: spend.payer.toLowerCase(),
-    agentWallet: spend.agentWallet.toLowerCase(),
-    maxPriceAtomic: spend.maxPriceAtomic,
+    payer,
+    agentWallet,
+    paymentToken,
+    priceAtomic,
+    artifactHash,
+    market,
+    maxPriceAtomic: priceAtomic,
     nonce: spend.nonce,
+    abiTypes: ["bytes32", "bytes32", "bytes32", "bytes32", "address", "address", "uint256", "bytes32", "address"],
+    abiValues: [sessionId.toLowerCase(), pactId, toolId, sourceSetHash, agentWallet, paymentToken, priceAtomic, artifactHash, market],
   };
   return {
-    spendId: keccakJson(spendPreimage),
+    spendId,
     sourceSetHash,
     sessionCommitment,
     spendPreimage,
   };
+}
+
+function procurementGateSourceSetHash(sourceHashes: string[]): `0x${string}` {
+  return keccak256(
+    encodeAbiParameters(
+      [{ type: "bytes32[]" }],
+      [sourceHashes.map((sourceHash) => sourceHash.toLowerCase() as `0x${string}`)],
+    ),
+  );
+}
+
+function procurementGateSpendId(input: {
+  sessionId: string;
+  pactId: string;
+  toolId: string;
+  sourceSetHash: string;
+  agentWallet: string;
+  paymentToken: string;
+  priceAtomic: string;
+  artifactHash: string;
+  market: string;
+}): `0x${string}` {
+  return keccak256(
+    encodeAbiParameters(
+      [
+        { type: "bytes32" },
+        { type: "bytes32" },
+        { type: "bytes32" },
+        { type: "bytes32" },
+        { type: "address" },
+        { type: "address" },
+        { type: "uint256" },
+        { type: "bytes32" },
+        { type: "address" },
+      ],
+      [
+        input.sessionId as `0x${string}`,
+        input.pactId as `0x${string}`,
+        input.toolId as `0x${string}`,
+        input.sourceSetHash as `0x${string}`,
+        input.agentWallet as `0x${string}`,
+        input.paymentToken as `0x${string}`,
+        BigInt(input.priceAtomic),
+        input.artifactHash as `0x${string}`,
+        input.market as `0x${string}`,
+      ],
+    ),
+  );
+}
+
+function evmAddress(value: string, field: string): `0x${string}` {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(value)) {
+    throw new Error(`${field} must be a 20-byte EVM address`);
+  }
+  return value.toLowerCase() as `0x${string}`;
+}
+
+function uint256Decimal(value: string, field: string): string {
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+    throw new Error(`${field} must be a decimal uint256 string`);
+  }
+  const parsed = BigInt(value);
+  if (parsed <= 0n || parsed > (1n << 256n) - 1n) {
+    throw new Error(`${field} must fit uint256 and be greater than zero`);
+  }
+  return parsed.toString();
 }
 
 function requireActiveArtifactAccess(
@@ -5687,6 +6501,9 @@ function listSpends(ctx: ServiceCtx, sessionId: string, limit: number, offset = 
       toolId: row.tool_id,
       payer: row.payer,
       agentWallet: row.agent_wallet,
+      paymentToken: row.payment_token,
+      artifactHash: row.artifact_hash,
+      market: row.market,
       sourceHashes: JSON.parse(String(row.source_hashes_json)),
       sourceSetHash: row.source_set_hash,
       sessionCommitment: row.session_commitment,
@@ -5863,6 +6680,36 @@ function listCawReceiptOperations(ctx: ServiceCtx, sessionId: string, limit: num
   );
 }
 
+function listCawLiveInteractions(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM caw_live_interactions
+       WHERE session_id = ?
+       ORDER BY created_at ASC, interaction_id ASC
+       LIMIT ? OFFSET ?`,
+    )
+    .all(sessionId, limit, offset) as Row[];
+  return rows.map((row) =>
+    CawLiveInteractionViewSchema.parse({
+      interactionId: row.interaction_id,
+      sessionId: row.session_id,
+      kind: row.kind,
+      walletId: row.wallet_id ?? null,
+      pactId: row.pact_id ?? null,
+      cawRequestId: row.caw_request_id ?? null,
+      requestHash: row.request_hash,
+      responseHash: row.response_hash,
+      response: JSON.parse(String(row.response_json)),
+      status: row.status,
+      authKeyHash: row.auth_key_hash ?? null,
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+      createdAt: row.created_at,
+    }),
+  );
+}
+
 function listRawCawReceiptBundles(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
@@ -5995,6 +6842,7 @@ function replaySummaryCounts(ctx: ServiceCtx, sessionId: string): Record<string,
     "replayBundle.artifactAccessTokens": countRows(ctx, "artifact_access_tokens", "session_id = ?", [sessionId]),
     "replayBundle.mcpAdapterCalls": countRows(ctx, "mcp_adapter_calls", "session_id = ?", [sessionId]),
     "replayBundle.cawReceiptOperations": countRows(ctx, "caw_receipt_operations", "session_id = ?", [sessionId]),
+    "replayBundle.cawLiveInteractions": countRows(ctx, "caw_live_interactions", "session_id = ?", [sessionId]),
     "replayBundle.rawCawReceiptBundles": countRows(ctx, "caw_raw_receipt_bundles", "session_id = ?", [sessionId]),
     "replayBundle.canonicalCawReceipts": countRows(ctx, "caw_canonical_receipts", "session_id = ?", [sessionId]),
     "replayBundle.leaseRuns": countRows(ctx, "lease_runs", "session_id = ?", [sessionId]),
@@ -6037,8 +6885,8 @@ function verifySpendBindingIntegrity(ctx: ServiceCtx, sessionId: string): string
   }
   const rows = ctx.db.sqlite
     .prepare(
-      `SELECT spend_id, pact_id, tool_id, payer, agent_wallet, source_hashes_json, source_set_hash,
-              session_commitment, spend_preimage_json, max_price_atomic, nonce
+      `SELECT spend_id, pact_id, tool_id, payer, agent_wallet, payment_token, artifact_hash, market,
+              source_hashes_json, source_set_hash, session_commitment, spend_preimage_json, max_price_atomic, nonce
        FROM spends
        WHERE session_id = ?
        ORDER BY created_at ASC, spend_id ASC`,
@@ -6054,6 +6902,9 @@ function verifySpendBindingIntegrity(ctx: ServiceCtx, sessionId: string): string
       sourceCapabilitySnapshotHash: sourceCapabilitySnapshot.hash,
       payer: String(row.payer),
       agentWallet: String(row.agent_wallet),
+      paymentToken: String(row.payment_token),
+      artifactHash: String(row.artifact_hash),
+      market: String(row.market),
       maxPriceAtomic: String(row.max_price_atomic),
       nonce: String(row.nonce),
     });
@@ -6600,6 +7451,7 @@ function verifyReplayBundleBindings(
   compareReplaySnapshot(errors, "replayBundle.artifactAccessTokens", bundle.artifactAccessTokens, listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.mcpAdapterCalls", bundle.mcpAdapterCalls, listMcpAdapterCalls(ctx, sessionId, asOfCount));
   compareReplaySnapshot(errors, "replayBundle.cawReceiptOperations", bundle.cawReceiptOperations, listCawReceiptOperations(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+  compareReplaySnapshot(errors, "replayBundle.cawLiveInteractions", bundle.cawLiveInteractions, listCawLiveInteractions(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.rawCawReceiptBundles", bundle.rawCawReceiptBundles, listRawCawReceiptBundles(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.canonicalCawReceipts", bundle.canonicalCawReceipts, listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.leaseRuns", bundle.leaseRuns, listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT));

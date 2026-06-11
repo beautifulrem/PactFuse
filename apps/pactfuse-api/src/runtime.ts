@@ -1,9 +1,11 @@
 import pino from "pino";
 import { openPactFuseDb } from "./db/index.js";
 import {
+  createCoboAgenticWalletClient,
   createLocalTemplateRegistry,
   createHttpJsonRpcMcpLeaseClient,
   createHttpsCawReceiptSource,
+  createUnconfiguredCawLiveClient,
   createUnconfiguredCawReceiptSource,
   createUnconfiguredChainClient,
   createUnconfiguredMcpLeaseClient,
@@ -43,6 +45,24 @@ function createRuntimeMcpLeaseClient() {
     toolName: process.env.PACTFUSE_LEASE_MCP_TOOL_NAME ?? "pactfuse_code_scan",
     timeoutMs: numberEnv("PACTFUSE_LEASE_MCP_TIMEOUT_MS", 10_000),
   });
+}
+
+function createRuntimeCawLiveClient() {
+  const baseUrl = process.env.AGENT_WALLET_API_URL ?? process.env.PACTFUSE_CAW_LIVE_API_URL;
+  const apiKey = process.env.AGENT_WALLET_API_KEY ?? process.env.PACTFUSE_CAW_LIVE_API_KEY;
+  if (!baseUrl || !apiKey) {
+    return createUnconfiguredCawLiveClient();
+  }
+  const clientInput: Parameters<typeof createCoboAgenticWalletClient>[0] = {
+    baseUrl,
+    apiKey,
+    timeoutMs: numberEnv("PACTFUSE_CAW_LIVE_TIMEOUT_MS", 10_000),
+  };
+  const walletId = process.env.AGENT_WALLET_WALLET_ID ?? process.env.PACTFUSE_CAW_LIVE_WALLET_ID;
+  if (walletId) {
+    clientInput.walletId = walletId;
+  }
+  return createCoboAgenticWalletClient(clientInput);
 }
 
 function numberEnv(name: string, fallback: number): number {
@@ -139,6 +159,7 @@ export function createServiceCtx(options: {
         })
       : createUnconfiguredChainClient(),
     caw: createRuntimeCawSource(),
+    cawLive: createRuntimeCawLiveClient(),
     mcpLease: createRuntimeMcpLeaseClient(),
     templates: createLocalTemplateRegistry(),
     mcpAuditSecret: process.env.PACTFUSE_MCP_AUDIT_TOKEN ?? null,

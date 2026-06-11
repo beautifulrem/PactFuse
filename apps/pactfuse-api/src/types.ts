@@ -30,7 +30,7 @@ export type EvidenceVerifier = {
 };
 
 export type ProofProviderStatus = {
-  name: "chain" | "caw" | "mcp_lease";
+  name: "chain" | "caw" | "caw_live" | "mcp_lease";
   mode: "unconfigured" | "fixture" | "live";
   ready: boolean;
   reason: string;
@@ -63,6 +63,51 @@ export type ChainClient = {
 export type CawReceiptSource = {
   status: () => Promise<ProofProviderStatus>;
   fetchReceiptBundle: (input: Record<string, unknown>) => Promise<Record<string, unknown>>;
+};
+
+export type CawLivePactSubmitInput = {
+  walletId: string;
+  intent: string;
+  originalIntent?: string;
+  name?: string;
+  recipeSlugs?: string[];
+  spec: Record<string, unknown>;
+};
+
+export type CawLiveTransferInput = {
+  walletId: string;
+  destinationAddress: string;
+  amount: string;
+  tokenId?: string;
+  chainId?: string;
+  requestId?: string;
+  sourceAddress?: string;
+  sponsor?: boolean;
+  gasProvider?: string;
+  description?: string;
+  fee?: Record<string, unknown> | null;
+  pactApiKey: string;
+};
+
+export type CawLiveAuditInput = {
+  walletId?: string;
+  principalId?: string;
+  action?: string;
+  result?: "allowed" | "denied" | "pending" | "error";
+  startTime?: string;
+  endTime?: string;
+  after?: string;
+  before?: string;
+  limit?: number;
+};
+
+export type CawLiveClient = {
+  status: () => Promise<ProofProviderStatus>;
+  getWallet: (walletId: string) => Promise<Record<string, unknown>>;
+  submitPact: (input: CawLivePactSubmitInput) => Promise<Record<string, unknown>>;
+  getPact: (pactId: string) => Promise<Record<string, unknown>>;
+  transferToken: (input: CawLiveTransferInput) => Promise<Record<string, unknown>>;
+  listAuditLogs: (input: CawLiveAuditInput) => Promise<Record<string, unknown>>;
 };
 
 export type McpLeaseExecutionInput = {
@@ -121,6 +166,7 @@ export type ServiceCtx = {
   verifier: EvidenceVerifier;
   chain: ChainClient;
   caw: CawReceiptSource;
+  cawLive: CawLiveClient;
   mcpLease: McpLeaseClient;
   templates: PactTemplateRegistry;
   mcpAuditSecret: string | null;

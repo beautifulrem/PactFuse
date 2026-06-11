@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { encodeEventTopics, keccak256, toBytes } from "viem";
+import { encodeAbiParameters, encodeEventTopics, keccak256, toBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { canonicalizeJson } from "@pactfuse/evidence-schema";
 import { createApp } from "../app.js";
@@ -15,6 +15,7 @@ import {
   createHttpsCawReceiptSource,
   createHttpJsonRpcMcpLeaseClient,
   createStaticTemplateRegistry,
+  createUnconfiguredCawLiveClient,
   createUnconfiguredCawReceiptSource,
   createUnconfiguredChainClient,
   createUnconfiguredMcpLeaseClient,
@@ -23,16 +24,18 @@ import {
 } from "../services/providers.js";
 import { appendEvidenceEvent, recordMcpAdapterCall } from "../services/service.js";
 import { createVerifierAdapter } from "../services/verifier.js";
-import type { ApiSecurityConfig, CawReceiptSource, ChainClient, McpLeaseClient, ServiceCtx } from "../types.js";
+import type { ApiSecurityConfig, CawLiveClient, CawReceiptSource, ChainClient, McpLeaseClient, ServiceCtx } from "../types.js";
 
 const MCP_AUDIT_TOKEN = "test-mcp-audit-token";
 const GATE_INGEST_TOKEN = "test-gate-ingest-token";
 const CAW_INGEST_TOKEN = "test-caw-ingest-token";
+const ZERO_HASH = `0x${"0".repeat(64)}`;
 
 function makeApp(
   dbPath = ":memory:",
   options: {
     caw?: CawReceiptSource;
+    cawLive?: CawLiveClient;
     chain?: ChainClient;
     mcpLease?: McpLeaseClient;
     mcpAuditSecret?: string | null;
@@ -60,6 +63,7 @@ function makeApp(
     verifier: createVerifierAdapter(),
     chain: options.chain ?? createUnconfiguredChainClient(),
     caw: options.caw ?? createUnconfiguredCawReceiptSource(),
+    cawLive: options.cawLive ?? createUnconfiguredCawLiveClient(),
     mcpLease: options.mcpLease ?? createUnconfiguredMcpLeaseClient(),
     templates: createStaticTemplateRegistry([
       {
@@ -605,6 +609,19 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/spends/register-batch"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/SpendRegisterBatchInput",
     );
+    expect(json.components.schemas.SpendRegisterPayload.properties.spends.items.required).toEqual([
+      "spendId",
+      "pactId",
+      "toolId",
+      "payer",
+      "agentWallet",
+      "paymentToken",
+      "artifactHash",
+      "market",
+      "sourceHashes",
+      "maxPriceAtomic",
+      "nonce",
+    ]);
     expect(json.paths["/api/v1/caw/operations/build"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/CawOperationBuildInput",
     );
@@ -896,6 +913,7 @@ describe("pactfuse-api P0", () => {
       "artifactAccessTokens",
       "mcpAdapterCalls",
       "cawReceiptOperations",
+      "cawLiveInteractions",
       "rawCawReceiptBundles",
       "canonicalCawReceipts",
       "leaseRuns",
@@ -933,6 +951,9 @@ describe("pactfuse-api P0", () => {
     ]);
     expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.spends.items.required).toContain(
       "spendPreimage",
+    );
+    expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.spends.items.required).toEqual(
+      expect.arrayContaining(["paymentToken", "artifactHash", "market"]),
     );
     expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.artifactPreflights.items.required).toContain(
       "sourceStateSnapshotHash",
@@ -1100,16 +1121,7 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "spend-register-mismatch",
       payload: {
         spends: [
-          {
-            spendId: hex32("wrong-spend-id"),
-            pactId: "pact-c",
-            toolId: "code-scan",
-            payer: "0x1234",
-            agentWallet: "0xabcd",
-            sourceHashes: [hex32("source")],
-            maxPriceAtomic: "1000",
-            nonce: "nonce-1",
-          },
+          spendRegistrationForTest(hex32("wrong-spend-id")),
         ],
       },
     });
@@ -1132,16 +1144,7 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "spend-register-missing-source",
       payload: {
         spends: [
-          {
-            spendId,
-            pactId: "pact-c",
-            toolId: "code-scan",
-            payer: "0x1234",
-            agentWallet: "0xabcd",
-            sourceHashes: [hex32("missing-source")],
-            maxPriceAtomic: "1000",
-            nonce: "nonce-1",
-          },
+          spendRegistrationForTest(spendId, { sourceHashes: [hex32("missing-source")] }),
         ],
       },
     });
@@ -1172,16 +1175,7 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "spend-register-uppercase-source",
       payload: {
         spends: [
-          {
-            spendId,
-            pactId: "pact-c",
-            toolId: "code-scan",
-            payer: "0x1234",
-            agentWallet: "0xabcd",
-            sourceHashes: [upperSourceHash],
-            maxPriceAtomic: "1000",
-            nonce: "nonce-1",
-          },
+          spendRegistrationForTest(spendId, { sourceHashes: [upperSourceHash] }),
         ],
       },
     });
@@ -1205,16 +1199,11 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "spend-register-rebind",
       payload: {
         spends: [
-          {
-            spendId,
-            pactId: "pact-c",
-            toolId: "code-scan",
-            payer: "0xbeef",
-            agentWallet: "0xabcd",
-            sourceHashes: [hex32("source")],
+          spendRegistrationForTest(spendId, {
+            payer: "0x3000000000000000000000000000000000000003",
+            agentWallet: "0x3000000000000000000000000000000000000003",
             maxPriceAtomic: "2000",
-            nonce: "nonce-1",
-          },
+          }),
         ],
       },
     });
@@ -1222,6 +1211,32 @@ describe("pactfuse-api P0", () => {
     expect(rebind.status).toBe(422);
     expect(rebind.json.error.code).toBe("proof_blocked");
     expect(rebind.json.error.message).toContain("spendId does not match");
+  });
+
+  it.each([
+    ["zero agentWallet", { payer: "0x0000000000000000000000000000000000000000", agentWallet: "0x0000000000000000000000000000000000000000" }],
+    ["zero paymentToken", { paymentToken: "0x0000000000000000000000000000000000000000" }],
+    ["zero market", { market: "0x0000000000000000000000000000000000000000" }],
+    ["zero artifactHash", { artifactHash: ZERO_HASH }],
+    ["zero price", { maxPriceAtomic: "0" }],
+  ])("rejects ProcurementGate spends with %s before chain registration", async (_label, overrides) => {
+    const { app } = makeApp();
+    const labelKey = _label.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+    const sessionId = await createSession(app, `sess-spend-${labelKey}`);
+    await registerSource(app, sessionId);
+    const spendId = await computeSpendIdForTest(app, sessionId, [hex32("source")]);
+
+    const res = await post(app, "/api/v1/spends/register-batch", {
+      sessionId,
+      idempotencyKey: `spend-register-${labelKey}`,
+      payload: {
+        spends: [spendRegistrationForTest(spendId, overrides)],
+      },
+    });
+
+    expect(res.status).toBe(422);
+    expect(res.json.error.code).toBe("proof_blocked");
+    expect(res.json.error.message).toContain("chain-registerable");
   });
 
   it("records operator key usage when scheduling a source challenge", async () => {
@@ -1372,7 +1387,7 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         operationKind: "approve",
-        target: "0x1234",
+        target: "0x1000000000000000000000000000000000000001",
         selector: "0x095ea7b3",
       },
     });
@@ -1457,7 +1472,7 @@ describe("pactfuse-api P0", () => {
                 sessionId,
                 operationId,
                 operationKind,
-                target: "0x1234",
+                target: "0x1000000000000000000000000000000000000001",
                 selector: "0xabcdef12",
               },
             ]
@@ -1488,7 +1503,7 @@ describe("pactfuse-api P0", () => {
         payload: {
           spendId,
           operationKind: "activate_tool",
-          target: "0x1234",
+          target: "0x1000000000000000000000000000000000000001",
           selector: "0xabcdef12",
         },
       });
@@ -1519,7 +1534,7 @@ describe("pactfuse-api P0", () => {
     const rawReceipt = {
       ...cawReceiptFields("linked"),
       operationKind: "activate_tool",
-      target: "0x1234",
+      target: "0x1000000000000000000000000000000000000001",
       selector: "0xabcdef12",
     };
     const { app, ctx } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: [rawReceipt] }) });
@@ -1532,7 +1547,7 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         operationKind: "activate_tool",
-        target: "0x1234",
+        target: "0x1000000000000000000000000000000000000001",
         selector: "0xabcdef12",
       },
     });
@@ -1640,7 +1655,7 @@ describe("pactfuse-api P0", () => {
     const rawReceipt = {
       ...cawReceiptFields("no-overwrite"),
       operationKind: "activate_tool",
-      target: "0x1234",
+      target: "0x1000000000000000000000000000000000000001",
       selector: "0xabcdef12",
     };
     const { app } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: [rawReceipt] }) });
@@ -1652,7 +1667,7 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         operationKind: "activate_tool",
-        target: "0x1234",
+        target: "0x1000000000000000000000000000000000000001",
         selector: "0xabcdef12",
       },
     });
@@ -1694,7 +1709,7 @@ describe("pactfuse-api P0", () => {
     const rawReceipt = {
       ...cawReceiptFields("duplicate-canonical"),
       operationKind: "activate_tool",
-      target: "0x1234",
+      target: "0x1000000000000000000000000000000000000001",
       selector: "0xabcdef12",
     };
     const { app } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: [rawReceipt, rawReceipt] }) });
@@ -1706,7 +1721,7 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         operationKind: "activate_tool",
-        target: "0x1234",
+        target: "0x1000000000000000000000000000000000000001",
         selector: "0xabcdef12",
       },
     });
@@ -1735,7 +1750,7 @@ describe("pactfuse-api P0", () => {
             ...cawReceiptFields("other-operation"),
             operationId: "other-operation",
             operationKind: "activate_tool",
-            target: "0x1234",
+            target: "0x1000000000000000000000000000000000000001",
             selector: "0xabcdef12",
           },
         ],
@@ -1749,7 +1764,7 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         operationKind: "activate_tool",
-        target: "0x1234",
+        target: "0x1000000000000000000000000000000000000001",
         selector: "0xabcdef12",
       },
     });
@@ -1776,7 +1791,7 @@ describe("pactfuse-api P0", () => {
       const rawReceipt: Record<string, unknown> = {
         ...cawReceiptFields(`missing-${missingField.toLowerCase()}`),
         operationKind: "activate_tool",
-        target: "0x1234",
+        target: "0x1000000000000000000000000000000000000001",
         selector: "0xabcdef12",
         [missingField]: undefined,
       };
@@ -1789,7 +1804,7 @@ describe("pactfuse-api P0", () => {
         payload: {
           spendId,
           operationKind: "activate_tool",
-          target: "0x1234",
+          target: "0x1000000000000000000000000000000000000001",
           selector: "0xabcdef12",
         },
       });
@@ -1817,7 +1832,7 @@ describe("pactfuse-api P0", () => {
       const rawReceipt: Record<string, unknown> = {
         ...cawReceiptFields(`missing-canonical-${missingField.toLowerCase()}`),
         operationKind: "activate_tool",
-        target: "0x1234",
+        target: "0x1000000000000000000000000000000000000001",
         selector: "0xabcdef12",
         [missingField]: undefined,
       };
@@ -1830,7 +1845,7 @@ describe("pactfuse-api P0", () => {
         payload: {
           spendId,
           operationKind: "activate_tool",
-          target: "0x1234",
+          target: "0x1000000000000000000000000000000000000001",
           selector: "0xabcdef12",
         },
       });
@@ -2200,10 +2215,10 @@ describe("pactfuse-api P0", () => {
     const spendId = await registerSpend(app, sessionId);
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact");
     const { artifactHash, artifactPayload, quoteId } = quoted;
-    const payer = "0x1234";
+    const payer = "0x1000000000000000000000000000000000000001";
     const artifactUrl = `/api/v1/artifacts/${sessionId}/${spendId}/${payer}/${artifactHash}`;
     const uppercaseArtifactHash = `0x${artifactHash.slice(2).toUpperCase()}`;
-    const wrongPayer = "0xabcd";
+    const wrongPayer = "0x2000000000000000000000000000000000000002";
 
     const pending = await app.request(artifactUrl);
     const pendingJson = await pending.json();
@@ -2339,7 +2354,7 @@ describe("pactfuse-api P0", () => {
     const sessionId = await createSession(app, "sess-artifact-token-tamper");
     const spendId = await registerSpend(app, sessionId);
     const artifactHash = hex32("artifact-token-tamper");
-    const payer = "0x1234";
+    const payer = "0x1000000000000000000000000000000000000001";
     const bearerToken = "manual-artifact-access-token";
     await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-token-tamper");
     ctx.db.sqlite
@@ -2387,7 +2402,7 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "issue-artifact-quote-mismatch",
       payload: {
         spendId,
-        payer: "0x1234",
+        payer: "0x1000000000000000000000000000000000000001",
         quoteId: quoted.quoteId,
         artifactHash: differentHash,
         artifactPayload: differentPayload,
@@ -2412,7 +2427,7 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "issue-overpriced-artifact",
       payload: {
         spendId: overpricedSpendId,
-        payer: "0x1234",
+        payer: "0x1000000000000000000000000000000000000001",
         quoteId: overpriced.quoteId,
         artifactHash: overpriced.artifactHash,
         artifactPayload: overpriced.artifactPayload,
@@ -2428,7 +2443,7 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "issue-expired-artifact",
       payload: {
         spendId: expiredSpendId,
-        payer: "0x1234",
+        payer: "0x1000000000000000000000000000000000000001",
         quoteId: expired.quoteId,
         artifactHash: expired.artifactHash,
         artifactPayload: expired.artifactPayload,
@@ -2457,7 +2472,7 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "issue-large-artifact",
       payload: {
         spendId,
-        payer: "0x1234",
+        payer: "0x1000000000000000000000000000000000000001",
         quoteId: quoted.quoteId,
         artifactHash: quoted.artifactHash,
         artifactPayload,
@@ -2491,7 +2506,7 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "issue-artifact-summary-cap",
       payload: {
         spendId,
-        payer: "0x1234",
+        payer: "0x1000000000000000000000000000000000000001",
         quoteId: quoted.quoteId,
         artifactHash: quoted.artifactHash,
         artifactPayload: quoted.artifactPayload,
@@ -2832,7 +2847,7 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "exclusive-issue-token",
       payload: {
         spendId,
-        payer: "0x1234",
+        payer: "0x1000000000000000000000000000000000000001",
         quoteId: quote.json.data.quoteId,
         artifactHash,
         artifactPayload,
@@ -2891,7 +2906,7 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "exclusive-issue-after-refund",
       payload: {
         spendId: secondSpendId,
-        payer: "0x1234",
+        payer: "0x1000000000000000000000000000000000000001",
         quoteId: secondQuote.json.data.quoteId,
         artifactHash: secondArtifactHash,
         artifactPayload: secondArtifactPayload,
@@ -3117,6 +3132,42 @@ describe("pactfuse-api P0", () => {
 
     expect(result.status).toBe("blocked");
     expect(result.reason).toContain("does not match ProcurementGate spend state");
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("gate.spend_settled");
+  });
+
+  it("blocks indexed SpendSettled logs when ProcurementGate registeredSpend tuple diverges", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({
+        currentBlockNumber: 103,
+        logs,
+        contractRegisteredSpendOverrides: { paymentToken: "0x9999999999999999999999999999999999999999" },
+      }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-indexer-contract-tuple-mismatch");
+    const spendId = await registerSpend(app, sessionId);
+    logs.push(
+      indexerLog("contract-tuple-mismatch", 100, {
+        eventName: "SpendSettled",
+        event: "SpendSettled",
+        sessionId,
+        spendId,
+        args: { sessionId, spendId },
+        transactionHash: hex32("contract-tuple-mismatch-tx"),
+        rawLogHash: hex32("contract-tuple-mismatch-log"),
+      }),
+    );
+
+    const result = await runIndexerWorkerOnce(ctx, {
+      leaseOwner: "test-indexer-contract-tuple-mismatch",
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 10, address: INDEXER_ADDRESS }],
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(result.status).toBe("blocked");
+    expect(result.reason).toContain("registeredSpend state does not match backend spend binding");
     expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("gate.spend_settled");
   });
 
@@ -4263,7 +4314,7 @@ describe("pactfuse-api P0", () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-missing-live");
     const spendId = await registerSpend(app, sessionId);
-    const payer = "0x1234";
+    const payer = "0x1000000000000000000000000000000000000001";
     const artifactHash = hex32("lease-artifact-pending");
 
     const lease = await post(app, "/api/v1/lease/execute", {
@@ -4290,8 +4341,8 @@ describe("pactfuse-api P0", () => {
     const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-lease-bearer-bound");
     const spendId = await registerSpend(app, sessionId);
-    const payer = "0x1234";
-    const wrongPayer = "0xabcd";
+    const payer = "0x1000000000000000000000000000000000000001";
+    const wrongPayer = "0x2000000000000000000000000000000000000002";
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-artifact-active");
     const { artifactHash, artifactPayload, quoteId } = quoted;
     await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-settlement");
@@ -4449,7 +4500,7 @@ describe("pactfuse-api P0", () => {
     });
     const sessionId = await createSession(app, "sess-lease-transcript-success");
     const spendId = await registerSpend(app, sessionId);
-    const payer = "0x1234";
+    const payer = "0x1000000000000000000000000000000000000001";
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-artifact-transcript");
     const { artifactHash, artifactPayload, quoteId } = quoted;
     await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-transcript-settlement");
@@ -4683,7 +4734,7 @@ describe("pactfuse-api P0", () => {
     const { app, ctx } = makeApp();
     const sessionId = await createSession(app, "sess-lease-boundary-extra-mcp-page");
     const spendId = await registerSpend(app, sessionId);
-    const payer = "0x1234";
+    const payer = "0x1000000000000000000000000000000000000001";
     const artifactHash = hex32("lease-boundary-artifact");
     const pinnedTool = leaseToolDefinitionForTest();
     const leaseInsert = ctx.db.sqlite.prepare(
@@ -4853,7 +4904,7 @@ describe("pactfuse-api P0", () => {
       });
       const sessionId = await createSession(app, "sess-lease-http-mcp-success");
       const spendId = await registerSpend(app, sessionId);
-      const payer = "0x1234";
+      const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-http-mcp-success");
       await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-http-mcp-success");
       const issued = await post(app, "/api/v1/artifacts/access-token", {
@@ -4920,7 +4971,7 @@ describe("pactfuse-api P0", () => {
       });
       const sessionId = await createSession(app, "sess-lease-pinned-manifest-mismatch");
       const spendId = await registerSpend(app, sessionId, defaultSourceCapabilityForTest("pactfuse_other_scan"));
-      const payer = "0x1234";
+      const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-pinned-manifest-mismatch");
       await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-pinned-manifest-mismatch");
       const issued = await post(app, "/api/v1/artifacts/access-token", {
@@ -4991,7 +5042,7 @@ describe("pactfuse-api P0", () => {
       });
       const sessionId = await createSession(app, "sess-lease-call-failure-blocks-token");
       const spendId = await registerSpend(app, sessionId);
-      const payer = "0x1234";
+      const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-call-failure-blocks-token");
       await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-call-failure-blocks-token");
       const issued = await post(app, "/api/v1/artifacts/access-token", {
@@ -5057,7 +5108,7 @@ describe("pactfuse-api P0", () => {
     });
     const sessionId = await createSession(app, "sess-lease-expired-consuming");
     const spendId = await registerSpend(app, sessionId);
-    const payer = "0x1234";
+    const payer = "0x1000000000000000000000000000000000000001";
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-expired-consuming");
     await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-expired-consuming");
     const issued = await post(app, "/api/v1/artifacts/access-token", {
@@ -5159,7 +5210,7 @@ describe("pactfuse-api P0", () => {
       });
       const sessionId = await createSession(app, "sess-lease-dangerous-tools");
       const spendId = await registerSpend(app, sessionId);
-      const payer = "0x1234";
+      const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-dangerous-tools");
       await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-dangerous-tools");
       const issued = await post(app, "/api/v1/artifacts/access-token", {
@@ -5229,7 +5280,7 @@ describe("pactfuse-api P0", () => {
       });
       const sessionId = await createSession(app, "sess-lease-missing-tool-metadata");
       const spendId = await registerSpend(app, sessionId);
-      const payer = "0x1234";
+      const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-missing-tool-metadata");
       await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-missing-tool-metadata");
       const issued = await post(app, "/api/v1/artifacts/access-token", {
@@ -5304,7 +5355,7 @@ describe("pactfuse-api P0", () => {
     });
     const sessionId = await createSession(app, "sess-lease-token-race");
     const spendId = await registerSpend(app, sessionId);
-    const payer = "0x1234";
+    const payer = "0x1000000000000000000000000000000000000001";
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-token-race");
     await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-token-race");
     const issued = await post(app, "/api/v1/artifacts/access-token", {
@@ -5381,7 +5432,7 @@ describe("pactfuse-api P0", () => {
       });
       const sessionId = await createSession(first.app, "sess-cross-instance-lease-claim");
       const spendId = await registerSpend(first.app, sessionId);
-      const payer = "0x1234";
+      const payer = "0x1000000000000000000000000000000000000001";
       const quoted = await quoteArtifactForTest(first.app, sessionId, spendId, "cross-instance-lease-claim");
       await finalizeSpendSettlement(first.app, first.ctx, logs, sessionId, spendId, "cross-instance-lease-claim");
       const issued = await post(first.app, "/api/v1/artifacts/access-token", {
@@ -5454,7 +5505,7 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         operationKind: "activate_tool",
-        target: "0x1234",
+        target: "0x1000000000000000000000000000000000000001",
         selector: "0xabcdef12",
       },
     });
@@ -5467,6 +5518,7 @@ describe("pactfuse-api P0", () => {
     expect(readyJson.proofProviders).toEqual([
       expect.objectContaining({ name: "chain", mode: "unconfigured", ready: false }),
       expect.objectContaining({ name: "caw", mode: "unconfigured", ready: false }),
+      expect.objectContaining({ name: "caw_live", mode: "unconfigured", ready: false }),
       expect.objectContaining({ name: "mcp_lease", mode: "unconfigured", ready: false }),
     ]);
     expect(session.json.data.pactTemplates).toEqual([
@@ -5477,8 +5529,85 @@ describe("pactfuse-api P0", () => {
     expect(operation.json.data.pactTemplateHash).toBe(hex32("gate-paid-template"));
     expect(verify.json.data.warnings).toContain("chain proof provider is unconfigured: chain RPC endpoint is not configured");
     expect(verify.json.data.warnings).toContain("caw proof provider is unconfigured: CAW receipt source is not configured");
+    expect(verify.json.data.warnings).toContain("caw_live proof provider is unconfigured: CAW live API is not configured");
     expect(verify.json.data.warnings).toContain("mcp_lease proof provider is unconfigured: lease MCP endpoint is not configured");
-    expect(verify.json.data.raw.proofProviders).toHaveLength(3);
+    expect(verify.json.data.raw.proofProviders).toHaveLength(4);
+  });
+
+  it("records live CAW pact, transfer, and audit interactions without storing pact API keys", async () => {
+    const pactKeyHash = "0xe731d15044e2dac2b1cee3ea70e39cccc583c28ad1f42510b6a6dbc0b70b4adb";
+    const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
+    const sessionId = await createSession(app, "sess-caw-live");
+
+    const status = await app.request("/api/v1/caw/live/status");
+    const statusJson = await status.json();
+    expect(status.status).toBe(200);
+    expect(statusJson.data).toEqual(expect.objectContaining({ name: "caw_live", mode: "live", ready: true }));
+
+    const submit = await post(app, "/api/v1/caw/live/pacts/submit", {
+      sessionId,
+      idempotencyKey: "caw-live-pact-submit",
+      payload: {
+        walletId: "wallet-live-1",
+        intent: "Pay for a PactFuse source-fresh code-scan lease",
+        spec: {
+          policies: [
+            {
+              name: "pactfuse-transfer-cap",
+              type: "transfer",
+              rules: { effect: "allow", when: { token_in: [{ chain_id: "SETH", token_id: "SETH" }] }, deny_if: { amount_gt: "0.002" } },
+            },
+          ],
+          completion_conditions: [{ type: "time_elapsed", threshold: "86400" }],
+        },
+      },
+    });
+    expect(submit.status).toBe(202);
+    expect(submit.json.data).toEqual(expect.objectContaining({ pactId: "pact-live-1", status: "live_pending", proofAuthority: true }));
+
+    const sync = await post(app, "/api/v1/caw/live/pacts/sync", {
+      sessionId,
+      idempotencyKey: "caw-live-pact-sync",
+      payload: { pactId: "pact-live-1" },
+    });
+    expect(sync.status).toBe(202);
+    expect(sync.json.data).toEqual(expect.objectContaining({ pactId: "pact-live-1", status: "live_active", pactScopedApiKeyHash: pactKeyHash }));
+
+    const transfer = await post(
+      app,
+      "/api/v1/caw/live/transfers/submit",
+      {
+        sessionId,
+        idempotencyKey: "caw-live-transfer-submit",
+        payload: {
+          pactId: "pact-live-1",
+          walletId: "wallet-live-1",
+          destinationAddress: "0x1111111111111111111111111111111111111111",
+          amount: "0.001",
+          tokenId: "SETH",
+          requestId: "pf-live-transfer-1",
+          description: "PactFuse live transfer proof",
+        },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    expect(transfer.status).toBe(202);
+    expect(transfer.json.data).toEqual(expect.objectContaining({ cawRequestId: "pf-live-transfer-1", status: "live_pending" }));
+    expect(transfer.json.data.pactScopedApiKeyHash).toBe(pactKeyHash);
+
+    const audit = await post(app, "/api/v1/caw/live/audit/sync", {
+      sessionId,
+      idempotencyKey: "caw-live-audit-sync",
+      payload: { walletId: "wallet-live-1", action: "transfer.initiate", result: "allowed", limit: 20 },
+    });
+    expect(audit.status).toBe(202);
+    expect(audit.json.data).toEqual(expect.objectContaining({ status: "live_synced", proofAuthority: true }));
+
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    expect(replayJson.data.cawLiveInteractions).toHaveLength(4);
+    expect(JSON.stringify(replayJson.data.cawLiveInteractions)).not.toContain("pact-scoped-secret");
+    expect(replayJson.data.replayPageIndex.collections.cawLiveInteractions.totalRows).toBe(4);
   });
 
   it("passes pinned Pact template hashes into the verifier", async () => {
@@ -5593,16 +5722,7 @@ async function registerSpend(
     idempotencyKey: "spend-register",
     payload: {
       spends: [
-        {
-          spendId,
-          pactId: "pact-c",
-          toolId: "code-scan",
-          payer: "0x1234",
-          agentWallet: "0xabcd",
-          sourceHashes,
-          maxPriceAtomic: "1000",
-          nonce: "nonce-1",
-        },
+        spendRegistrationForTest(spendId, { sourceHashes }),
       ],
     },
   });
@@ -5670,6 +5790,43 @@ async function quoteArtifactForTest(
 }
 
 const INDEXER_ADDRESS = "0x1111111111111111111111111111111111111111";
+const TEST_PAYER_ADDRESS = "0x1000000000000000000000000000000000000001";
+const TEST_PAYMENT_TOKEN_ADDRESS = "0x4000000000000000000000000000000000000004";
+const TEST_MARKET_ADDRESS = "0x5000000000000000000000000000000000000005";
+const TEST_PACT_ID = hex32("pact-c");
+const TEST_TOOL_ID = hex32("code-scan");
+const TEST_ARTIFACT_HASH = hex32("artifact");
+
+function spendRegistrationForTest(
+  spendId: string,
+  overrides: Partial<{
+    pactId: string;
+    toolId: string;
+    payer: string;
+    agentWallet: string;
+    paymentToken: string;
+    artifactHash: string;
+    market: string;
+    sourceHashes: string[];
+    maxPriceAtomic: string;
+    nonce: string;
+  }> = {},
+): Record<string, unknown> {
+  return {
+    spendId,
+    pactId: TEST_PACT_ID,
+    toolId: TEST_TOOL_ID,
+    payer: TEST_PAYER_ADDRESS,
+    agentWallet: TEST_PAYER_ADDRESS,
+    paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+    artifactHash: TEST_ARTIFACT_HASH,
+    market: TEST_MARKET_ADDRESS,
+    sourceHashes: [hex32("source")],
+    maxPriceAtomic: "1000",
+    nonce: "nonce-1",
+    ...overrides,
+  };
+}
 
 function createFakeIndexerChainClient(config: {
   chainId?: string;
@@ -5680,6 +5837,16 @@ function createFakeIndexerChainClient(config: {
   getLogsError?: Error;
   readContractError?: Error;
   contractSpendStates?: Record<string, number>;
+  contractRegisteredSpendOverrides?: Partial<{
+    pactId: string;
+    toolId: string;
+    sourceSetHash: string;
+    agentWallet: string;
+    paymentToken: string;
+    price: string;
+    artifactHash: string;
+    market: string;
+  }>;
   sourceStates?: Record<string, number>;
   ignoreAddressFilter?: boolean;
 }): ChainClient {
@@ -5776,14 +5943,14 @@ function createFakeIndexerChainClient(config: {
         const state = config.contractSpendStates?.[spendId] ?? (event === "SpendTripped" ? 2 : event === "SpendSettled" ? 3 : 1);
         return [
           sessionId,
-          hex32("contract-pact"),
-          hex32("contract-tool"),
-          hex32(`contract-source-set:${spendId}`),
-          INDEXER_ADDRESS,
-          INDEXER_ADDRESS,
-          "1000",
-          hex32("contract-artifact"),
-          INDEXER_ADDRESS,
+          config.contractRegisteredSpendOverrides?.pactId ?? TEST_PACT_ID,
+          config.contractRegisteredSpendOverrides?.toolId ?? TEST_TOOL_ID,
+          config.contractRegisteredSpendOverrides?.sourceSetHash ?? procurementGateSourceSetHashForTest([hex32("source")]),
+          config.contractRegisteredSpendOverrides?.agentWallet ?? TEST_PAYER_ADDRESS,
+          config.contractRegisteredSpendOverrides?.paymentToken ?? TEST_PAYMENT_TOKEN_ADDRESS,
+          config.contractRegisteredSpendOverrides?.price ?? "1000",
+          config.contractRegisteredSpendOverrides?.artifactHash ?? TEST_ARTIFACT_HASH,
+          config.contractRegisteredSpendOverrides?.market ?? TEST_MARKET_ADDRESS,
           state,
         ];
       }
@@ -6005,7 +6172,7 @@ async function computeSpendIdForTest(
   expect(session.status).toBe(200);
   const normalizedSourceHashes = [...sourceHashes].map((sourceHash) => sourceHash.toLowerCase()).sort();
   const runConfigHash = sessionJson.data.runConfigHash as string;
-  const sourceSetHash = keccakJsonForTest(normalizedSourceHashes);
+  const sourceSetHash = procurementGateSourceSetHashForTest(normalizedSourceHashes);
   const sourceCapabilitySnapshotHash = hashForTestJson([
     {
       sourceHash: hex32("source"),
@@ -6014,18 +6181,68 @@ async function computeSpendIdForTest(
     },
   ]);
   const sessionCommitment = keccakJsonForTest({ sessionId: sessionId.toLowerCase(), runConfigHash });
-  return keccakJsonForTest({
-    runConfigHash,
-    sessionCommitment,
-    pactId: "pact-c",
-    toolId: "code-scan",
+  void runConfigHash;
+  void sessionCommitment;
+  void sourceCapabilitySnapshotHash;
+  return procurementGateSpendIdForTest({
+    sessionId: sessionId.toLowerCase(),
+    pactId: TEST_PACT_ID,
+    toolId: TEST_TOOL_ID,
     sourceSetHash,
-    sourceCapabilitySnapshotHash,
-    payer: "0x1234",
-    agentWallet: "0xabcd",
-    maxPriceAtomic: "1000",
-    nonce: "nonce-1",
+    agentWallet: TEST_PAYER_ADDRESS,
+    paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+    priceAtomic: "1000",
+    artifactHash: TEST_ARTIFACT_HASH,
+    market: TEST_MARKET_ADDRESS,
   });
+}
+
+function procurementGateSourceSetHashForTest(sourceHashes: string[]): `0x${string}` {
+  return keccak256(
+    encodeAbiParameters(
+      [{ type: "bytes32[]" }],
+      [sourceHashes.map((sourceHash) => sourceHash.toLowerCase() as `0x${string}`)],
+    ),
+  );
+}
+
+function procurementGateSpendIdForTest(input: {
+  sessionId: string;
+  pactId: string;
+  toolId: string;
+  sourceSetHash: string;
+  agentWallet: string;
+  paymentToken: string;
+  priceAtomic: string;
+  artifactHash: string;
+  market: string;
+}): `0x${string}` {
+  return keccak256(
+    encodeAbiParameters(
+      [
+        { type: "bytes32" },
+        { type: "bytes32" },
+        { type: "bytes32" },
+        { type: "bytes32" },
+        { type: "address" },
+        { type: "address" },
+        { type: "uint256" },
+        { type: "bytes32" },
+        { type: "address" },
+      ],
+      [
+        input.sessionId as `0x${string}`,
+        input.pactId as `0x${string}`,
+        input.toolId as `0x${string}`,
+        input.sourceSetHash as `0x${string}`,
+        input.agentWallet as `0x${string}`,
+        input.paymentToken as `0x${string}`,
+        BigInt(input.priceAtomic),
+        input.artifactHash as `0x${string}`,
+        input.market as `0x${string}`,
+      ],
+    ),
+  );
 }
 
 function schemaValidWinnerRequestedReceipt(): Record<string, unknown> {
@@ -6134,6 +6351,70 @@ function cawReceiptFields(seed: string, overrides: Record<string, unknown> = {})
     txCount: "1",
     expiry: "2026-06-12T00:00:00.000Z",
     ...overrides,
+  };
+}
+
+function createFakeCawLiveClient(): CawLiveClient {
+  return {
+    async status() {
+      return {
+        name: "caw_live",
+        mode: "live",
+        ready: true,
+        reason: "fake CAW live API",
+        endpoint: "https://api.agenticwallet.cobo.test",
+      };
+    },
+    async getWallet(walletId) {
+      return { success: true, result: { id: walletId, status: "active" } };
+    },
+    async submitPact(input) {
+      return {
+        success: true,
+        result: {
+          pact_id: "pact-live-1",
+          wallet_id: input.walletId,
+          status: "PENDING_APPROVAL",
+        },
+      };
+    },
+    async getPact(pactId) {
+      return {
+        success: true,
+        result: {
+          pact_id: pactId,
+          wallet_id: "wallet-live-1",
+          status: "ACTIVE",
+          api_key: "pact-scoped-secret",
+        },
+      };
+    },
+    async transferToken(input) {
+      return {
+        success: true,
+        result: {
+          id: "tx-live-1",
+          wallet_id: input.walletId,
+          request_id: input.requestId,
+          status: "submitted",
+          transaction_hash: null,
+        },
+      };
+    },
+    async listAuditLogs(input) {
+      return {
+        success: true,
+        result: {
+          items: [
+            {
+              wallet_id: input.walletId,
+              action: input.action ?? "transfer.initiate",
+              result: "allowed",
+            },
+          ],
+        },
+      };
+    },
   };
 }
 

@@ -87,6 +87,9 @@ CREATE TABLE IF NOT EXISTS spends (
   tool_id TEXT NOT NULL,
   payer TEXT NOT NULL,
   agent_wallet TEXT NOT NULL,
+  payment_token TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
+  artifact_hash TEXT NOT NULL DEFAULT '${ZERO_HASH}',
+  market TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
   source_hashes_json TEXT NOT NULL,
   source_set_hash TEXT NOT NULL DEFAULT '${ZERO_HASH}',
   session_commitment TEXT NOT NULL DEFAULT '${ZERO_HASH}',
@@ -147,6 +150,22 @@ CREATE TABLE IF NOT EXISTS caw_canonical_receipts (
   fetched_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
   UNIQUE(session_id, operation_id, canonical_receipt_hash)
+);
+
+CREATE TABLE IF NOT EXISTS caw_live_interactions (
+  interaction_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  wallet_id TEXT,
+  pact_id TEXT,
+  caw_request_id TEXT,
+  request_hash TEXT NOT NULL,
+  request_json TEXT NOT NULL,
+  response_hash TEXT NOT NULL,
+  response_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  auth_key_hash TEXT,
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS artifact_preflights (
@@ -345,6 +364,9 @@ CREATE TABLE IF NOT EXISTS judge_check_rows (
   ensureColumn(sqlite, "mcp_adapter_calls", "request_json", "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(sqlite, "mcp_adapter_calls", "response_json", "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(sqlite, "spends", "source_set_hash", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
+  ensureColumn(sqlite, "spends", "payment_token", "TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000'");
+  ensureColumn(sqlite, "spends", "artifact_hash", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
+  ensureColumn(sqlite, "spends", "market", "TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000'");
   ensureColumn(sqlite, "spends", "session_commitment", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
   ensureColumn(sqlite, "spends", "spend_preimage_json", "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(sqlite, "artifact_preflights", "artifact_cid", `TEXT NOT NULL DEFAULT '${ZERO_ARTIFACT_CID}'`);
