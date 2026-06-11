@@ -12,6 +12,7 @@ import {
   ChainIndexerStatusViewSchema,
   CanonicalCawReceiptViewSchema,
   CawLiveAuditSyncPayloadSchema,
+  CawLiveContractCallSubmitPayloadSchema,
   CawLiveInteractionViewSchema,
   CawLivePactSubmitPayloadSchema,
   CawLivePactSyncPayloadSchema,
@@ -56,11 +57,12 @@ import {
   type SessionView,
   type ChainIndexerBackfillInput,
   type CawLiveAuditSyncPayload,
+  type CawLiveContractCallSubmitPayload,
   type CawLivePactSubmitPayload,
   type CawLiveTransferSubmitPayload,
   type VerifierRunView,
 } from "@pactfuse/evidence-schema";
-import { encodeAbiParameters, keccak256, recoverMessageAddress } from "viem";
+import { encodeAbiParameters, encodeFunctionData, keccak256, recoverMessageAddress } from "viem";
 import type { CawLiveAuditInput, McpLeaseExecutionResult, ProofProviderStatus, ServiceCtx, ServiceResult } from "../types.js";
 import {
   ZERO_HASH,
@@ -212,6 +214,30 @@ const PROCUREMENT_GATE_STATE_ABI = [
       { name: "market", type: "address" },
       { name: "state", type: "uint8" },
     ],
+  },
+] as const;
+const ERC20_APPROVE_ABI = [
+  {
+    type: "function",
+    name: "approve",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
+const PROCUREMENT_GATE_ACTIVATE_TOOL_ABI = [
+  {
+    type: "function",
+    name: "activateTool",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spendId", type: "bytes32" },
+      { name: "paymentAuth", type: "bytes" },
+    ],
+    outputs: [{ name: "artifactHash", type: "bytes32" }],
   },
 ] as const;
 const SOURCE_REGISTRY_STATE_ABI = [
@@ -1289,6 +1315,116 @@ export async function submitCawLiveTransfer(
   });
 }
 
+export async function submitCawLiveContractCall(
+  input: SessionScopedEnvelope,
+  ctx: ServiceCtx,
+  pactApiKey: string | null,
+): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(CawLiveContractCallSubmitPayloadSchema, envelope.payload);
+  return withIdempotency(
+    ctx,
+    scoped("caw:live:contract-call:submit", envelope.sessionId),
+    envelope.idempotencyKey,
+    { envelope, pactKeyHash: pactApiKey ? sha256Hex(pactApiKey) : null },
+    async (requestId) => {
+      assertSession(ctx, envelope.sessionId, requestId);
+      if (!pactApiKey) {
+        throw Object.assign(new Error("missing CAW pact-scoped API key"), {
+          apiError: unauthorizedError(requestId, "missing x-pactfuse-caw-pact-api-key header"),
+        });
+      }
+      await requireCawLiveReady(ctx, requestId);
+      const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+      const pactKeyHash = sha256Hex(pactApiKey);
+      requireActiveCawLivePact(ctx, envelope.sessionId, payload.pactId, payload.walletId, pactKeyHash, requestId);
+      const normalized = normalizeCawLiveContractCallPayload(payload, spend, requestId);
+      const request = cawLiveContractCallRequest(normalized);
+      const response = await ctx.cawLive.contractCall({
+        walletId: normalized.walletId,
+        chainId: normalized.chainId,
+        contractAddress: normalized.contractAddress,
+        calldata: normalized.calldata,
+        valueAtomic: normalized.valueAtomic,
+        pactApiKey,
+        ...(normalized.requestId ? { requestId: normalized.requestId } : {}),
+        ...(normalized.sponsor !== undefined ? { sponsor: normalized.sponsor } : {}),
+        ...(normalized.gasProvider ? { gasProvider: normalized.gasProvider } : {}),
+        ...(normalized.description ? { description: normalized.description } : {}),
+        ...(normalized.fee !== undefined ? { fee: normalized.fee } : {}),
+      });
+      const cawRequestId = normalized.requestId ?? optionalStringFromCaw(response, ["request_id", "requestId"]);
+      const status = normalizeCawLiveTransferStatus(response);
+      const saved = recordCawLiveInteraction(ctx, {
+        sessionId: envelope.sessionId,
+        kind: "contract_call",
+        walletId: normalized.walletId,
+        pactId: normalized.pactId,
+        cawRequestId,
+        request,
+        response,
+        status,
+        authKeyHash: pactKeyHash,
+      });
+      const event = appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "proof",
+        kind: "caw.live.contract_call.submitted",
+        payload: {
+          interactionId: saved.interactionId,
+          walletId: normalized.walletId,
+          pactId: normalized.pactId,
+          spendId: normalized.spendId,
+          operationKind: normalized.operationKind,
+          contractAddress: normalized.contractAddress,
+          selector: normalized.selector,
+          cawRequestId,
+          chainId: normalized.chainId,
+          valueAtomic: normalized.valueAtomic,
+          requestHash: saved.requestHash,
+          responseHash: saved.responseHash,
+          pactScopedApiKeyHash: saved.authKeyHash,
+          status,
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        },
+      });
+      if (status === "live_denied" || status === "live_failed") {
+        updateJudgeCheckRow(ctx, envelope.sessionId, {
+          rowId: "caw_boundary",
+          status: "blocked",
+          authority: "proof",
+          reason: status === "live_denied" ? "CAW live policy denied the contract call" : "CAW live contract call failed",
+          evidenceEventId: event.eventId,
+        });
+      }
+      return {
+        ok: true,
+        requestId,
+        evidenceEventId: event.eventId,
+        data: {
+          interactionId: saved.interactionId,
+          walletId: normalized.walletId,
+          pactId: normalized.pactId,
+          spendId: normalized.spendId,
+          operationKind: normalized.operationKind,
+          cawRequestId,
+          contractAddress: normalized.contractAddress,
+          selector: normalized.selector,
+          chainId: normalized.chainId,
+          valueAtomic: normalized.valueAtomic,
+          requestHash: saved.requestHash,
+          responseHash: saved.responseHash,
+          pactScopedApiKeyHash: saved.authKeyHash,
+          status,
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        },
+      };
+    },
+  );
+}
+
 export async function syncCawLiveAudit(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
   const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
   const payload = parseStrict(CawLiveAuditSyncPayloadSchema, envelope.payload);
@@ -1411,6 +1547,163 @@ function cawLiveTransferRequest(payload: CawLiveTransferSubmitPayload): Record<s
   });
 }
 
+type NormalizedCawLiveContractCallPayload = Omit<
+  CawLiveContractCallSubmitPayload,
+  "contractAddress" | "calldata" | "valueAtomic" | "procurementGateAddress"
+> & {
+  contractAddress: `0x${string}`;
+  calldata: `0x${string}`;
+  valueAtomic: string;
+  selector: string;
+  procurementGateAddress?: `0x${string}` | undefined;
+  decodedSpenderAddress?: `0x${string}`;
+  decodedAmountAtomic?: string;
+  decodedPaymentAuth?: "0x";
+};
+
+function normalizeCawLiveContractCallPayload(
+  payload: CawLiveContractCallSubmitPayload,
+  spend: Row,
+  requestId: string,
+): NormalizedCawLiveContractCallPayload {
+  const {
+    contractAddress: _contractAddress,
+    calldata: _calldata,
+    valueAtomic: _valueAtomic,
+    procurementGateAddress: _procurementGateAddress,
+    ...payloadBase
+  } = payload;
+  const normalized: NormalizedCawLiveContractCallPayload = {
+    ...payloadBase,
+    contractAddress: payload.contractAddress.toLowerCase() as `0x${string}`,
+    calldata: payload.calldata.toLowerCase() as `0x${string}`,
+    valueAtomic: BigInt(payload.valueAtomic).toString(),
+    selector: payload.calldata.slice(0, 10).toLowerCase(),
+  };
+  if (payload.procurementGateAddress) {
+    normalized.procurementGateAddress = payload.procurementGateAddress.toLowerCase() as `0x${string}`;
+  }
+  if (!/^0x[0-9a-f]{8}$/.test(normalized.selector)) {
+    throw Object.assign(new Error("CAW live contract call calldata must include a 4-byte selector"), {
+      apiError: proofBlockedError(requestId, "CAW live contract call calldata must include a 4-byte selector"),
+    });
+  }
+  if (normalized.valueAtomic !== "0") {
+    throw Object.assign(new Error("CAW live ProcurementGate contract calls must not send native value"), {
+      apiError: proofBlockedError(requestId, "CAW live ProcurementGate contract calls must not send native value", {
+        spendId: normalized.spendId,
+        valueAtomic: normalized.valueAtomic,
+      }),
+    });
+  }
+  if (normalized.operationKind === "approve") {
+    const expectedToken = String(spend.payment_token).toLowerCase();
+    if (normalized.contractAddress !== expectedToken) {
+      throw Object.assign(new Error("CAW live approve contract target must match registered ProcurementGate paymentToken"), {
+        apiError: proofBlockedError(requestId, "CAW live approve contract target must match registered ProcurementGate paymentToken", {
+          spendId: normalized.spendId,
+          expectedContractAddress: expectedToken,
+          actualContractAddress: normalized.contractAddress,
+        }),
+      });
+    }
+    if (!normalized.procurementGateAddress) {
+      throw Object.assign(new Error("CAW live approve contract call requires procurementGateAddress"), {
+        apiError: proofBlockedError(requestId, "CAW live approve contract call requires procurementGateAddress", {
+          spendId: normalized.spendId,
+        }),
+      });
+    }
+    const expectedCalldata = expectedApproveCalldata(normalized.procurementGateAddress, String(spend.max_price_atomic)).toLowerCase();
+    if (normalized.calldata !== expectedCalldata) {
+      throw Object.assign(new Error("CAW live approve calldata must approve ProcurementGate for the registered spend price"), {
+        apiError: proofBlockedError(requestId, "CAW live approve calldata must approve ProcurementGate for the registered spend price", {
+          spendId: normalized.spendId,
+          expectedSelector: ERC20_APPROVE_SELECTOR,
+          expectedSpender: normalized.procurementGateAddress,
+          expectedAmount: BigInt(String(spend.max_price_atomic)).toString(),
+        }),
+      });
+    }
+    return {
+      ...normalized,
+      selector: ERC20_APPROVE_SELECTOR,
+      decodedSpenderAddress: normalized.procurementGateAddress,
+      decodedAmountAtomic: BigInt(String(spend.max_price_atomic)).toString(),
+    };
+  }
+  if (normalized.contractAddress === String(spend.market).toLowerCase()) {
+    throw Object.assign(new Error("CAW live activate_tool target cannot be the PaidArtifactMarket"), {
+      apiError: proofBlockedError(requestId, "CAW live activate_tool target cannot be the PaidArtifactMarket", {
+        spendId: normalized.spendId,
+        market: String(spend.market).toLowerCase(),
+      }),
+    });
+  }
+  if (normalized.procurementGateAddress && normalized.procurementGateAddress !== normalized.contractAddress) {
+    throw Object.assign(new Error("CAW live activate_tool procurementGateAddress must match contractAddress"), {
+      apiError: proofBlockedError(requestId, "CAW live activate_tool procurementGateAddress must match contractAddress", {
+        expectedProcurementGateAddress: normalized.contractAddress,
+        actualProcurementGateAddress: normalized.procurementGateAddress,
+      }),
+    });
+  }
+  const expectedCalldata = expectedActivateToolCalldata(normalized.spendId).toLowerCase();
+  if (normalized.calldata !== expectedCalldata) {
+    throw Object.assign(new Error("CAW live activate_tool calldata must call ProcurementGate.activateTool(spendId, 0x)"), {
+      apiError: proofBlockedError(requestId, "CAW live activate_tool calldata must call ProcurementGate.activateTool(spendId, 0x)", {
+        spendId: normalized.spendId,
+        expectedSelector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+      }),
+    });
+  }
+  return {
+    ...normalized,
+    selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+    procurementGateAddress: normalized.contractAddress,
+    decodedPaymentAuth: "0x",
+  };
+}
+
+function expectedApproveCalldata(spender: `0x${string}`, amountAtomic: string): `0x${string}` {
+  return encodeFunctionData({
+    abi: ERC20_APPROVE_ABI,
+    functionName: "approve",
+    args: [spender, BigInt(amountAtomic)],
+  });
+}
+
+function expectedActivateToolCalldata(spendId: string): `0x${string}` {
+  return encodeFunctionData({
+    abi: PROCUREMENT_GATE_ACTIVATE_TOOL_ABI,
+    functionName: "activateTool",
+    args: [spendId as `0x${string}`, "0x"],
+  });
+}
+
+function cawLiveContractCallRequest(payload: NormalizedCawLiveContractCallPayload): Record<string, JsonValue> {
+  return jsonRecord({
+    operation_kind: payload.operationKind,
+    spend_id: payload.spendId,
+    pact_id: payload.pactId,
+    wallet_id: payload.walletId,
+    chain_id: payload.chainId,
+    contract_addr: payload.contractAddress,
+    calldata: payload.calldata,
+    selector: payload.selector,
+    value: payload.valueAtomic,
+    procurement_gate_addr: payload.procurementGateAddress,
+    spender_addr: payload.decodedSpenderAddress,
+    amount: payload.decodedAmountAtomic,
+    payment_auth: payload.decodedPaymentAuth,
+    request_id: payload.requestId,
+    sponsor: payload.sponsor,
+    gas_provider: payload.gasProvider,
+    description: payload.description,
+    fee: payload.fee,
+  });
+}
+
 function cawLiveAuditRequest(payload: CawLiveAuditSyncPayload): Record<string, JsonValue> {
   return jsonRecord({
     wallet_id: payload.walletId,
@@ -1429,7 +1722,7 @@ function recordCawLiveInteraction(
   ctx: ServiceCtx,
   input: {
     sessionId: string;
-    kind: "pact_submit" | "pact_sync" | "transfer_submit" | "audit_sync";
+    kind: "pact_submit" | "pact_sync" | "transfer_submit" | "contract_call" | "audit_sync";
     walletId: string | null;
     pactId: string | null;
     cawRequestId: string | null;
@@ -3428,6 +3721,7 @@ export function appendEvidenceEvent(
       | "caw.live.pact.submitted"
       | "caw.live.pact.synced"
       | "caw.live.transfer.submitted"
+      | "caw.live.contract_call.submitted"
       | "caw.live.audit.synced"
       | "caw.receipt.ingested.fixture"
       | "caw.receipt.ingested.raw"
@@ -7182,7 +7476,8 @@ function verifyCawLiveInteractionIntegrity(ctx: ServiceCtx, sessionId: string): 
        ORDER BY created_at ASC, interaction_id ASC`,
     )
     .all(sessionId) as Row[];
-  const events = listEvents(ctx, sessionId, 0, 200).filter((event) => event.kind.startsWith("caw.live."));
+  const allEvents = listEvents(ctx, sessionId, 0, 200);
+  const events = allEvents.filter((event) => event.kind.startsWith("caw.live."));
   const eventsByInteractionId = new Map(
     events
       .map((event) => {
@@ -7229,7 +7524,9 @@ function verifyCawLiveInteractionIntegrity(ctx: ServiceCtx, sessionId: string): 
           ? "caw.live.pact.synced"
           : row.kind === "transfer_submit"
             ? "caw.live.transfer.submitted"
-            : "caw.live.audit.synced";
+            : row.kind === "contract_call"
+              ? "caw.live.contract_call.submitted"
+              : "caw.live.audit.synced";
     if (event.kind !== expectedKind) {
       errors.push(`CAW live interaction ${interactionId} event kind does not match row kind`);
     }
@@ -7247,7 +7544,14 @@ function verifyCawLiveInteractionIntegrity(ctx: ServiceCtx, sessionId: string): 
     if (event.authority !== "proof" || event.payload.proofAuthority !== true || event.payload.winnerClaimAllowed !== false) {
       errors.push(`CAW live event ${event.eventId} does not carry fail-closed proof payload`);
     }
-    if (row.kind !== "transfer_submit" || !request) {
+    if (!request) {
+      continue;
+    }
+    if (row.kind === "contract_call") {
+      verifyCawLiveContractCallIntegrity(ctx, sessionId, row, request, event, activePacts, allEvents, errors);
+      continue;
+    }
+    if (row.kind !== "transfer_submit") {
       continue;
     }
     const spendId = typeof request.spend_id === "string" ? request.spend_id : null;
@@ -7298,6 +7602,125 @@ function verifyCawLiveInteractionIntegrity(ctx: ServiceCtx, sessionId: string): 
     }
   }
   return errors;
+}
+
+function verifyCawLiveContractCallIntegrity(
+  ctx: ServiceCtx,
+  sessionId: string,
+  row: Row,
+  request: Record<string, JsonValue>,
+  event: EvidenceEvent,
+  activePacts: Set<string>,
+  allEvents: EvidenceEvent[],
+  errors: string[],
+): void {
+  const interactionId = String(row.interaction_id);
+  const spendId = typeof request.spend_id === "string" ? request.spend_id : null;
+  if (!spendId) {
+    errors.push(`CAW live contract call ${interactionId} is missing spend_id`);
+    return;
+  }
+  const spend = ctx.db.sqlite
+    .prepare(
+      `SELECT spend_id, payer, payment_token, market, max_price_atomic
+       FROM spends
+       WHERE session_id = ? AND spend_id = ?`,
+    )
+    .get(sessionId, spendId) as Row | undefined;
+  if (!spend) {
+    errors.push(`CAW live contract call ${interactionId} references missing registered spend`);
+    return;
+  }
+  if (!activePacts.has(`${String(row.wallet_id)}:${String(row.pact_id)}:${String(row.auth_key_hash).toLowerCase()}`)) {
+    errors.push(`CAW live contract call ${interactionId} is not bound to an active synced CAW Pact and key hash`);
+  }
+  for (const [field, expected] of [
+    ["spendId", spendId],
+    ["operationKind", request.operation_kind],
+    ["contractAddress", request.contract_addr],
+    ["selector", request.selector],
+    ["chainId", request.chain_id],
+    ["valueAtomic", request.value],
+  ] as const) {
+    if (String(event.payload[field] ?? "").toLowerCase() !== String(expected ?? "").toLowerCase()) {
+      errors.push(`CAW live event ${event.eventId} payload.${field} does not match contract call request`);
+    }
+  }
+  const operationKind = typeof request.operation_kind === "string" ? request.operation_kind : "";
+  const contractAddress = typeof request.contract_addr === "string" ? request.contract_addr.toLowerCase() : "";
+  const selector = typeof request.selector === "string" ? request.selector.toLowerCase() : "";
+  const calldata = typeof request.calldata === "string" ? request.calldata.toLowerCase() : "";
+  if (request.wallet_id !== row.wallet_id || request.pact_id !== row.pact_id) {
+    errors.push(`CAW live contract call ${interactionId} request wallet_id/pact_id does not match interaction row`);
+  }
+  if (operationKind === "approve") {
+    const expectedToken = String(spend.payment_token).toLowerCase();
+    const expectedAmount = BigInt(String(spend.max_price_atomic)).toString();
+    const procurementGateAddress = typeof request.procurement_gate_addr === "string" ? request.procurement_gate_addr.toLowerCase() : "";
+    if (contractAddress !== expectedToken) {
+      errors.push(`CAW live approve ${interactionId} request.contract_addr does not match registered spend payment token`);
+    }
+    if (!isEvmAddressText(procurementGateAddress)) {
+      errors.push(`CAW live approve ${interactionId} requires procurement_gate_addr`);
+      return;
+    }
+    if (selector !== ERC20_APPROVE_SELECTOR) {
+      errors.push(`CAW live approve ${interactionId} selector must be ERC20.approve(address,uint256)`);
+    }
+    if (String(request.spender_addr ?? "").toLowerCase() !== procurementGateAddress) {
+      errors.push(`CAW live approve ${interactionId} request.spender_addr must match procurement_gate_addr`);
+    }
+    if (safeDecimalString(request.amount) !== expectedAmount) {
+      errors.push(`CAW live approve ${interactionId} request.amount does not match registered spend price`);
+    }
+    if (calldata !== expectedApproveCalldata(procurementGateAddress as `0x${string}`, expectedAmount).toLowerCase()) {
+      errors.push(`CAW live approve ${interactionId} calldata must approve ProcurementGate for the registered spend price`);
+    }
+    return;
+  }
+  if (operationKind !== "activate_tool") {
+    errors.push(`CAW live contract call ${interactionId} has unsupported operation_kind`);
+    return;
+  }
+  if (!isEvmAddressText(contractAddress)) {
+    errors.push(`CAW live activate_tool ${interactionId} requires contract_addr`);
+    return;
+  }
+  if (contractAddress === String(spend.market).toLowerCase()) {
+    errors.push(`CAW live activate_tool ${interactionId} contract_addr cannot be the PaidArtifactMarket`);
+  }
+  if (typeof request.procurement_gate_addr === "string" && request.procurement_gate_addr.toLowerCase() !== contractAddress) {
+    errors.push(`CAW live activate_tool ${interactionId} procurement_gate_addr must match contract_addr`);
+  }
+  if (selector !== PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR) {
+    errors.push(`CAW live activate_tool ${interactionId} selector must be ProcurementGate.activateTool(bytes32,bytes)`);
+  }
+  if (safeDecimalString(request.value) !== "0") {
+    errors.push(`CAW live activate_tool ${interactionId} value must be zero`);
+  }
+  if (request.payment_auth !== "0x") {
+    errors.push(`CAW live activate_tool ${interactionId} payment_auth must be 0x`);
+  }
+  if (calldata !== expectedActivateToolCalldata(spendId).toLowerCase()) {
+    errors.push(`CAW live activate_tool ${interactionId} calldata must call activateTool(spendId, 0x)`);
+  }
+  const settled = allEvents.find((candidate) => {
+    const payload = candidate.payload;
+    return (
+      candidate.kind === "gate.spend_settled" &&
+      payload.spendId === spendId &&
+      String(payload.contractAddress ?? "").toLowerCase() === contractAddress &&
+      payload.finalityStatus === "finalized" &&
+      payload.proofAuthority === true
+    );
+  });
+  if (!settled) {
+    errors.push(`CAW live activate_tool ${interactionId} does not match a finalized SpendSettled proof event by spendId and contractAddress`);
+  }
+}
+
+function isEvmAddressText(value: unknown): value is `0x${string}` {
+  return typeof value === "string" && /^0x[0-9a-fA-F]{40}$/.test(value);
 }
 
 function safeDecimalString(value: unknown): string {

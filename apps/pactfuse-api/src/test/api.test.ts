@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { encodeAbiParameters, encodeEventTopics, keccak256, toBytes } from "viem";
+import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, keccak256, toBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { canonicalizeJson } from "@pactfuse/evidence-schema";
 import { createApp } from "../app.js";
@@ -32,6 +32,30 @@ const CAW_INGEST_TOKEN = "test-caw-ingest-token";
 const ZERO_HASH = `0x${"0".repeat(64)}`;
 const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
+const ERC20_APPROVE_ABI = [
+  {
+    type: "function",
+    name: "approve",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
+const PROCUREMENT_GATE_ACTIVATE_TOOL_ABI = [
+  {
+    type: "function",
+    name: "activateTool",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spendId", type: "bytes32" },
+      { name: "paymentAuth", type: "bytes" },
+    ],
+    outputs: [],
+  },
+] as const;
 
 function makeApp(
   dbPath = ":memory:",
@@ -916,6 +940,40 @@ describe("pactfuse-api P0", () => {
       "proofAuthority",
       "winnerClaimAllowed",
       "createdAt",
+    ]);
+    expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.cawLiveInteractions.items.properties.kind.enum).toContain(
+      "contract_call",
+    );
+    expect(json.paths["/api/v1/caw/live/contracts/call"].post["x-pactfuse-proof-fields"]).toEqual([
+      "interactionId",
+      "pactId",
+      "spendId",
+      "operationKind",
+      "contractAddress",
+      "selector",
+      "cawRequestId",
+      "pactScopedApiKeyHash",
+      "requestHash",
+      "responseHash",
+      "proofAuthority",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/caw/live/contracts/call"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/CawLiveContractCallInput",
+    );
+    expect(json.paths["/api/v1/caw/live/contracts/call"].post.parameters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "x-pactfuse-caw-pact-api-key", in: "header", required: true }),
+      ]),
+    );
+    expect(json.components.schemas.CawLiveContractCallPayload.required).toEqual([
+      "spendId",
+      "operationKind",
+      "pactId",
+      "walletId",
+      "chainId",
+      "contractAddress",
+      "calldata",
     ]);
     expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.required).toEqual([
       "bundleType",
@@ -5686,6 +5744,72 @@ describe("pactfuse-api P0", () => {
     );
     expect(transfer.json.data.pactScopedApiKeyHash).toBe(pactKeyHash);
 
+    const approve = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "caw-live-approve-call",
+        payload: {
+          spendId,
+          operationKind: "approve",
+          pactId: "pact-live-1",
+          walletId: "wallet-live-1",
+          chainId: "84532",
+          contractAddress: TEST_PAYMENT_TOKEN_ADDRESS,
+          procurementGateAddress: INDEXER_ADDRESS,
+          calldata: cawApproveCalldataForTest(INDEXER_ADDRESS, "1000"),
+          requestId: "pf-live-approve-1",
+          description: "PactFuse live approve proof",
+        },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    expect(approve.status).toBe(202);
+    expect(approve.json.data).toEqual(
+      expect.objectContaining({
+        spendId,
+        operationKind: "approve",
+        cawRequestId: "pf-live-approve-1",
+        contractAddress: TEST_PAYMENT_TOKEN_ADDRESS,
+        selector: ERC20_APPROVE_SELECTOR,
+        status: "live_pending",
+      }),
+    );
+
+    const activate = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "caw-live-activate-call",
+        payload: {
+          spendId,
+          operationKind: "activate_tool",
+          pactId: "pact-live-1",
+          walletId: "wallet-live-1",
+          chainId: "84532",
+          contractAddress: INDEXER_ADDRESS,
+          procurementGateAddress: INDEXER_ADDRESS,
+          calldata: cawActivateToolCalldataForTest(spendId),
+          requestId: "pf-live-activate-1",
+          description: "PactFuse live activate proof",
+        },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    expect(activate.status).toBe(202);
+    expect(activate.json.data).toEqual(
+      expect.objectContaining({
+        spendId,
+        operationKind: "activate_tool",
+        cawRequestId: "pf-live-activate-1",
+        contractAddress: INDEXER_ADDRESS,
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+        status: "live_pending",
+      }),
+    );
+
     const audit = await post(app, "/api/v1/caw/live/audit/sync", {
       sessionId,
       idempotencyKey: "caw-live-audit-sync",
@@ -5696,7 +5820,7 @@ describe("pactfuse-api P0", () => {
 
     const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
     const replayJson = await replay.json();
-    expect(replayJson.data.cawLiveInteractions).toHaveLength(4);
+    expect(replayJson.data.cawLiveInteractions).toHaveLength(6);
     expect(JSON.stringify(replayJson.data.cawLiveInteractions)).not.toContain("pact-scoped-secret");
     expect(replayJson.data.cawLiveInteractions.find((row: { kind: string }) => row.kind === "transfer_submit")).toEqual(
       expect.objectContaining({
@@ -5708,7 +5832,31 @@ describe("pactfuse-api P0", () => {
         }),
       }),
     );
-    expect(replayJson.data.replayPageIndex.collections.cawLiveInteractions.totalRows).toBe(4);
+    expect(replayJson.data.cawLiveInteractions.filter((row: { kind: string }) => row.kind === "contract_call")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          request: expect.objectContaining({
+            operation_kind: "approve",
+            spend_id: spendId,
+            contract_addr: TEST_PAYMENT_TOKEN_ADDRESS,
+            procurement_gate_addr: INDEXER_ADDRESS,
+            selector: ERC20_APPROVE_SELECTOR,
+            amount: "1000",
+          }),
+        }),
+        expect.objectContaining({
+          request: expect.objectContaining({
+            operation_kind: "activate_tool",
+            spend_id: spendId,
+            contract_addr: INDEXER_ADDRESS,
+            procurement_gate_addr: INDEXER_ADDRESS,
+            selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+            payment_auth: "0x",
+          }),
+        }),
+      ]),
+    );
+    expect(replayJson.data.replayPageIndex.collections.cawLiveInteractions.totalRows).toBe(6);
   });
 
   it("blocks CAW live transfers that are not bound to an active Pact and registered spend", async () => {
@@ -5810,6 +5958,149 @@ describe("pactfuse-api P0", () => {
     expect(badAmount.json.error.message).toContain("priceAtomic does not match");
     expect(badMarket.status).toBe(422);
     expect(badMarket.json.error.message).toContain("destinationAddress does not match");
+  });
+
+  it("blocks CAW live contract calls that are not bound to the registered ProcurementGate spend", async () => {
+    const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
+    const sessionId = await createSession(app, "sess-caw-live-contract-binding");
+    const spendId = await registerSpend(app, sessionId);
+    const approvePayload = {
+      spendId,
+      operationKind: "approve",
+      pactId: "pact-live-1",
+      walletId: "wallet-live-1",
+      chainId: "84532",
+      contractAddress: TEST_PAYMENT_TOKEN_ADDRESS,
+      procurementGateAddress: INDEXER_ADDRESS,
+      calldata: cawApproveCalldataForTest(INDEXER_ADDRESS, "1000"),
+      requestId: "pf-live-approve-binding",
+    };
+    const activatePayload = {
+      spendId,
+      operationKind: "activate_tool",
+      pactId: "pact-live-1",
+      walletId: "wallet-live-1",
+      chainId: "84532",
+      contractAddress: INDEXER_ADDRESS,
+      procurementGateAddress: INDEXER_ADDRESS,
+      calldata: cawActivateToolCalldataForTest(spendId),
+      requestId: "pf-live-activate-binding",
+    };
+
+    const beforePact = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "caw-contract-before-active-pact",
+        payload: approvePayload,
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    await post(app, "/api/v1/caw/live/pacts/submit", {
+      sessionId,
+      idempotencyKey: "contract-binding-pact-submit",
+      payload: { walletId: "wallet-live-1", intent: "bind contract calls", spec: { policies: [] } },
+    });
+    await post(app, "/api/v1/caw/live/pacts/sync", {
+      sessionId,
+      idempotencyKey: "contract-binding-pact-sync",
+      payload: { pactId: "pact-live-1" },
+    });
+    const missingPactKey = await post(app, "/api/v1/caw/live/contracts/call", {
+      sessionId,
+      idempotencyKey: "caw-contract-missing-pact-key",
+      payload: approvePayload,
+    });
+    const badPactKey = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "caw-contract-bad-pact-key",
+        payload: approvePayload,
+      },
+      { "x-pactfuse-caw-pact-api-key": "wrong-pact-scoped-secret" },
+    );
+    const badApproveTarget = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "caw-contract-bad-approve-target",
+        payload: { ...approvePayload, contractAddress: "0x9999999999999999999999999999999999999999" },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const badApproveSpender = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "caw-contract-bad-approve-spender",
+        payload: { ...approvePayload, calldata: cawApproveCalldataForTest(TEST_MARKET_ADDRESS, "1000") },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const badApproveAmount = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "caw-contract-bad-approve-amount",
+        payload: { ...approvePayload, calldata: cawApproveCalldataForTest(INDEXER_ADDRESS, "999") },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const badActivateMarket = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "caw-contract-bad-activate-market",
+        payload: { ...activatePayload, contractAddress: TEST_MARKET_ADDRESS, procurementGateAddress: TEST_MARKET_ADDRESS },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const badActivateSpend = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "caw-contract-bad-activate-spend",
+        payload: { ...activatePayload, calldata: cawActivateToolCalldataForTest(hex32("wrong-contract-spend")) },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const badActivateValue = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "caw-contract-bad-activate-value",
+        payload: { ...activatePayload, valueAtomic: "1" },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+
+    expect(beforePact.status).toBe(422);
+    expect(beforePact.json.error.message).toContain("active synced Pact");
+    expect(missingPactKey.status).toBe(401);
+    expect(missingPactKey.json.error.message).toContain("missing x-pactfuse-caw-pact-api-key");
+    expect(badPactKey.status).toBe(422);
+    expect(badPactKey.json.error.message).toContain("pact API key does not match");
+    expect(badApproveTarget.status).toBe(422);
+    expect(badApproveTarget.json.error.message).toContain("approve contract target must match");
+    expect(badApproveSpender.status).toBe(422);
+    expect(badApproveSpender.json.error.message).toContain("approve calldata must approve");
+    expect(badApproveAmount.status).toBe(422);
+    expect(badApproveAmount.json.error.message).toContain("approve calldata must approve");
+    expect(badActivateMarket.status).toBe(422);
+    expect(badActivateMarket.json.error.message).toContain("target cannot be the PaidArtifactMarket");
+    expect(badActivateSpend.status).toBe(422);
+    expect(badActivateSpend.json.error.message).toContain("activate_tool calldata must call");
+    expect(badActivateValue.status).toBe(422);
+    expect(badActivateValue.json.error.message).toContain("must not send native value");
   });
 
   it("passes pinned Pact template hashes into the verifier", async () => {
@@ -6006,6 +6297,22 @@ const TEST_PACT_ID = hex32("pact-c");
 const TEST_TOOL_ID = hex32("code-scan");
 const TEST_ARTIFACT_PAYLOAD = Object.freeze({ artifactType: "source-bound-code-scan-mcp-lease", seed: "artifact", content: "scan:artifact" });
 const TEST_ARTIFACT_HASH = hashForTestJson(TEST_ARTIFACT_PAYLOAD);
+
+function cawApproveCalldataForTest(spender: string, amountAtomic: string): `0x${string}` {
+  return encodeFunctionData({
+    abi: ERC20_APPROVE_ABI,
+    functionName: "approve",
+    args: [spender as `0x${string}`, BigInt(amountAtomic)],
+  });
+}
+
+function cawActivateToolCalldataForTest(spendId: string): `0x${string}` {
+  return encodeFunctionData({
+    abi: PROCUREMENT_GATE_ACTIVATE_TOOL_ABI,
+    functionName: "activateTool",
+    args: [spendId as `0x${string}`, "0x"],
+  });
+}
 
 function spendRegistrationForTest(
   spendId: string,
@@ -6629,6 +6936,18 @@ function createFakeCawLiveClient(): CawLiveClient {
         success: true,
         result: {
           id: "tx-live-1",
+          wallet_id: input.walletId,
+          request_id: input.requestId,
+          status: "submitted",
+          transaction_hash: null,
+        },
+      };
+    },
+    async contractCall(input) {
+      return {
+        success: true,
+        result: {
+          id: "contract-live-1",
           wallet_id: input.walletId,
           request_id: input.requestId,
           status: "submitted",

@@ -193,6 +193,25 @@ export const CawLiveTransferSubmitPayloadSchema = z
   })
   .strict();
 
+export const CawLiveContractCallSubmitPayloadSchema = z
+  .object({
+    spendId: Hex32Schema,
+    operationKind: z.enum(["approve", "activate_tool"]),
+    pactId: z.string().min(1).max(160),
+    walletId: z.string().min(1).max(160),
+    chainId: z.string().min(1).max(80),
+    contractAddress: AddressSchema,
+    calldata: HexSchema,
+    valueAtomic: DecimalStringSchema.default("0"),
+    procurementGateAddress: AddressSchema.optional(),
+    requestId: z.string().min(1).max(160).optional(),
+    sponsor: z.boolean().optional(),
+    gasProvider: z.string().min(1).max(120).optional(),
+    description: z.string().min(1).max(240).optional(),
+    fee: JsonObjectSchema.nullable().optional(),
+  })
+  .strict();
+
 export const CawLiveAuditSyncPayloadSchema = z
   .object({
     walletId: z.string().min(1).max(160).optional(),
@@ -382,6 +401,7 @@ export const EvidenceEventKindSchema = z.enum([
   "caw.live.pact.submitted",
   "caw.live.pact.synced",
   "caw.live.transfer.submitted",
+  "caw.live.contract_call.submitted",
   "caw.live.audit.synced",
   "caw.receipt.ingested.fixture",
   "caw.receipt.ingested.raw",
@@ -500,7 +520,7 @@ export const CawLiveInteractionViewSchema = z
   .object({
     interactionId: Hex32Schema,
     sessionId: Hex32Schema,
-    kind: z.enum(["pact_submit", "pact_sync", "transfer_submit", "audit_sync"]),
+    kind: z.enum(["pact_submit", "pact_sync", "transfer_submit", "contract_call", "audit_sync"]),
     walletId: z.string().min(1).max(160).nullable(),
     pactId: z.string().min(1).max(160).nullable(),
     cawRequestId: z.string().min(1).max(160).nullable(),
@@ -856,4 +876,5 @@ export type CawOperationBuildPayload = z.infer<typeof CawOperationBuildPayloadSc
 export type CawLivePactSubmitPayload = z.infer<typeof CawLivePactSubmitPayloadSchema>;
 export type CawLivePactSyncPayload = z.infer<typeof CawLivePactSyncPayloadSchema>;
 export type CawLiveTransferSubmitPayload = z.infer<typeof CawLiveTransferSubmitPayloadSchema>;
+export type CawLiveContractCallSubmitPayload = z.infer<typeof CawLiveContractCallSubmitPayloadSchema>;
 export type CawLiveAuditSyncPayload = z.infer<typeof CawLiveAuditSyncPayloadSchema>;

@@ -39,6 +39,7 @@ import {
   runArtifactPreflight,
   signArtifactQuote,
   submitCawLivePact,
+  submitCawLiveContractCall,
   submitCawLiveTransfer,
   syncCawLiveAudit,
   syncCawLivePact,
@@ -63,6 +64,7 @@ const ROUTES = [
   { method: "POST", path: "/api/v1/caw/live/pacts/submit", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/live/pacts/sync", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/live/transfers/submit", okStatus: 202 },
+  { method: "POST", path: "/api/v1/caw/live/contracts/call", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/live/audit/sync", okStatus: 202 },
   { method: "POST", path: "/api/v1/caw/receipts/ingest", okStatus: 202 },
   { method: "POST", path: "/api/v1/gate/events/ingest", okStatus: 202 },
@@ -96,6 +98,20 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "cawRequestId",
     "pactScopedApiKeyHash",
     "paymentToken",
+    "requestHash",
+    "responseHash",
+    "proofAuthority",
+    "winnerClaimAllowed",
+  ],
+  "/api/v1/caw/live/contracts/call": [
+    "interactionId",
+    "pactId",
+    "spendId",
+    "operationKind",
+    "contractAddress",
+    "selector",
+    "cawRequestId",
+    "pactScopedApiKeyHash",
     "requestHash",
     "responseHash",
     "proofAuthority",
@@ -262,6 +278,11 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.post("/api/v1/caw/live/transfers/submit", async (c) => {
     authorizeApiRole(c, ctx, "operator");
     return send(c, await submitCawLiveTransfer(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx, c.req.header("x-pactfuse-caw-pact-api-key") ?? null), 202);
+  });
+
+  app.post("/api/v1/caw/live/contracts/call", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await submitCawLiveContractCall(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx, c.req.header("x-pactfuse-caw-pact-api-key") ?? null), 202);
   });
 
   app.post("/api/v1/caw/live/audit/sync", async (c) => {
@@ -745,6 +766,28 @@ function buildOpenApi(): Record<string, unknown> {
             operationId: { type: "string", minLength: 1, maxLength: 160 },
             receipts: { type: "array", maxItems: 64, items: { type: "object", additionalProperties: true }, default: [] },
             manual: { type: "boolean", default: false },
+          },
+        },
+        CawLiveContractCallInput: sessionEnvelopeSchema("#/components/schemas/CawLiveContractCallPayload"),
+        CawLiveContractCallPayload: {
+          type: "object",
+          required: ["spendId", "operationKind", "pactId", "walletId", "chainId", "contractAddress", "calldata"],
+          additionalProperties: false,
+          properties: {
+            spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            operationKind: { enum: ["approve", "activate_tool"] },
+            pactId: { type: "string", minLength: 1, maxLength: 160 },
+            walletId: { type: "string", minLength: 1, maxLength: 160 },
+            chainId: { type: "string", minLength: 1, maxLength: 80 },
+            contractAddress: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
+            calldata: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
+            valueAtomic: { type: "string", pattern: "^(0|[1-9][0-9]*)$", default: "0" },
+            procurementGateAddress: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
+            requestId: { type: "string", minLength: 1, maxLength: 160 },
+            sponsor: { type: "boolean" },
+            gasProvider: { type: "string", minLength: 1, maxLength: 120 },
+            description: { type: "string", minLength: 1, maxLength: 240 },
+            fee: { anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }] },
           },
         },
         ArtifactPreflightInput: sessionEnvelopeSchema("#/components/schemas/ArtifactPreflightPayload"),
@@ -1611,7 +1654,7 @@ function buildOpenApi(): Record<string, unknown> {
                 properties: {
                   interactionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
                   sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
-                  kind: { enum: ["pact_submit", "pact_sync", "transfer_submit", "audit_sync"] },
+                  kind: { enum: ["pact_submit", "pact_sync", "transfer_submit", "contract_call", "audit_sync"] },
                   walletId: { anyOf: [{ type: "string" }, { type: "null" }] },
                   pactId: { anyOf: [{ type: "string" }, { type: "null" }] },
                   cawRequestId: { anyOf: [{ type: "string" }, { type: "null" }] },
@@ -1885,6 +1928,9 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   if (path === "/api/v1/caw/operations/build") {
     return jsonRequestBody({ $ref: "#/components/schemas/CawOperationBuildInput" });
   }
+  if (path === "/api/v1/caw/live/contracts/call") {
+    return jsonRequestBody({ $ref: "#/components/schemas/CawLiveContractCallInput" });
+  }
   if (path === "/api/v1/caw/receipts/ingest") {
     return jsonRequestBody({ $ref: "#/components/schemas/CawReceiptIngestInput" });
   }
@@ -1966,7 +2012,7 @@ function parameterSchemaFor(path: string): Record<string, unknown>[] {
       description: "Bearer token bound to the artifact access tuple: sessionId, spendId, payer, artifactHash.",
     });
   }
-  if (path === "/api/v1/caw/live/transfers/submit") {
+  if (path === "/api/v1/caw/live/transfers/submit" || path === "/api/v1/caw/live/contracts/call") {
     parameters.push({
       name: "x-pactfuse-caw-pact-api-key",
       in: "header",
@@ -1987,6 +2033,7 @@ function apiRoleForPath(path: string): ApiRole | null {
     case "/api/v1/caw/live/pacts/submit":
     case "/api/v1/caw/live/pacts/sync":
     case "/api/v1/caw/live/transfers/submit":
+    case "/api/v1/caw/live/contracts/call":
     case "/api/v1/caw/live/audit/sync":
     case "/api/v1/indexer/backfill":
     case "/api/v1/artifacts/preflight":

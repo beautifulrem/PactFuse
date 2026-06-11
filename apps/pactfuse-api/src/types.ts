@@ -89,6 +89,20 @@ export type CawLiveTransferInput = {
   pactApiKey: string;
 };
 
+export type CawLiveContractCallInput = {
+  walletId: string;
+  chainId: string;
+  contractAddress: string;
+  calldata: string;
+  valueAtomic?: string;
+  requestId?: string;
+  sponsor?: boolean;
+  gasProvider?: string;
+  description?: string;
+  fee?: Record<string, unknown> | null;
+  pactApiKey: string;
+};
+
 export type CawLiveAuditInput = {
   walletId?: string;
   principalId?: string;
@@ -107,6 +121,7 @@ export type CawLiveClient = {
   submitPact: (input: CawLivePactSubmitInput) => Promise<Record<string, unknown>>;
   getPact: (pactId: string) => Promise<Record<string, unknown>>;
   transferToken: (input: CawLiveTransferInput) => Promise<Record<string, unknown>>;
+  contractCall: (input: CawLiveContractCallInput) => Promise<Record<string, unknown>>;
   listAuditLogs: (input: CawLiveAuditInput) => Promise<Record<string, unknown>>;
 };
 

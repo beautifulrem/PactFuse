@@ -10,6 +10,7 @@ const verifierPath = new URL("./pactfuse-verify-receipt.mjs", import.meta.url);
 const pendingReceiptFile = fileURLToPath(pendingReceiptPath);
 const verifierFile = fileURLToPath(verifierPath);
 const ZERO_HASH = `0x${"0".repeat(64)}`;
+const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 
 describe("pactfuse receipt verifier contract", () => {
@@ -75,6 +76,17 @@ describe("pactfuse receipt verifier contract", () => {
   it("accepts replay contract state proof markers while keeping final authority closed", () => {
     const bundle = replayBundle();
     appendContractProofEventsForTest(bundle);
+    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.schemaErrors).toEqual([]);
+  });
+
+  it("accepts structurally bound CAW live contract calls while keeping final authority closed", () => {
+    const bundle = replayBundle();
+    appendCawLiveContractCallsForTest(bundle);
     const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
 
     expect(result.schemaOk).toBe(true);
@@ -252,6 +264,45 @@ describe("pactfuse receipt verifier contract", () => {
         sealReplayBundleForTest(bundle);
       },
       "request.token_id does not match registered spend payment token",
+    ],
+    [
+      "self-consistent CAW live approve amount drift from registered spend",
+      (bundle) => {
+        const { approve } = appendCawLiveContractCallsForTest(bundle);
+        approve.request.amount = "999";
+        approve.request.calldata = expectedApproveCalldata(approve.request.procurement_gate_addr, "999");
+        resealCawLiveContractCallForTest(bundle, approve);
+      },
+      "request.amount does not match registered spend price",
+    ],
+    [
+      "self-consistent CAW live approve spender drift from ProcurementGate",
+      (bundle) => {
+        const { approve } = appendCawLiveContractCallsForTest(bundle);
+        approve.request.spender_addr = bundle.spends[0].market.toLowerCase();
+        approve.request.calldata = expectedApproveCalldata(bundle.spends[0].market, bundle.spends[0].maxPriceAtomic);
+        resealCawLiveContractCallForTest(bundle, approve);
+      },
+      "request.spender_addr must match procurement_gate_addr",
+    ],
+    [
+      "self-consistent CAW live activate calldata spend drift",
+      (bundle) => {
+        const { activate } = appendCawLiveContractCallsForTest(bundle);
+        activate.request.calldata = expectedActivateToolCalldata(hex32("wrong-live-activate-spend"));
+        resealCawLiveContractCallForTest(bundle, activate);
+      },
+      "calldata must call activateTool(spendId, 0x)",
+    ],
+    [
+      "self-consistent CAW live activate gate split from finalized settlement",
+      (bundle) => {
+        const { activate } = appendCawLiveContractCallsForTest(bundle);
+        activate.request.contract_addr = "0x9999999999999999999999999999999999999999";
+        activate.request.procurement_gate_addr = "0x9999999999999999999999999999999999999999";
+        resealCawLiveContractCallForTest(bundle, activate);
+      },
+      "does not match a finalized SpendSettled proof event by spendId and contractAddress",
     ],
 	    [
 	      "agent transcript hash",
@@ -921,6 +972,197 @@ function appendCawLiveTransferForTest(bundle) {
   ];
   sealReplayBundleForTest(bundle);
   return { pactSync, transfer };
+}
+
+function appendCawLiveContractCallsForTest(bundle) {
+  const createdAt = "2026-06-11T00:00:02.000Z";
+  const walletId = "wallet-live-1";
+  const pactId = "pact-live-1";
+  const authKeyHash = hashJson("pact-scoped-secret");
+  const spend = bundle.spends[0];
+  const gateEvent = bundle.events.find((candidate) => candidate.kind === "gate.spend_settled");
+  const gateAddress = gateEvent.payload.contractAddress.toLowerCase();
+  const pactRequest = { pact_id: pactId };
+  const pactResponse = {
+    result: {
+      pact_id: pactId,
+      wallet_id: walletId,
+      status: "ACTIVE",
+    },
+  };
+  const pactSync = {
+    interactionId: hex32("caw-live-contract-pact-sync"),
+    sessionId: bundle.sessionId,
+    kind: "pact_sync",
+    walletId,
+    pactId,
+    cawRequestId: null,
+    requestHash: hashJson(pactRequest),
+    request: pactRequest,
+    responseHash: hashJson(pactResponse),
+    response: pactResponse,
+    status: "live_active",
+    authKeyHash,
+    proofAuthority: true,
+    winnerClaimAllowed: false,
+    createdAt,
+  };
+  const approveRequest = {
+    operation_kind: "approve",
+    spend_id: spend.spendId,
+    pact_id: pactId,
+    wallet_id: walletId,
+    chain_id: "84532",
+    contract_addr: spend.paymentToken.toLowerCase(),
+    calldata: expectedApproveCalldata(gateAddress, spend.maxPriceAtomic),
+    selector: ERC20_APPROVE_SELECTOR,
+    value: "0",
+    procurement_gate_addr: gateAddress,
+    spender_addr: gateAddress,
+    amount: spend.maxPriceAtomic,
+    request_id: "pf-live-approve-test",
+  };
+  const activateRequest = {
+    operation_kind: "activate_tool",
+    spend_id: spend.spendId,
+    pact_id: pactId,
+    wallet_id: walletId,
+    chain_id: "84532",
+    contract_addr: gateAddress,
+    calldata: expectedActivateToolCalldata(spend.spendId),
+    selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+    value: "0",
+    procurement_gate_addr: gateAddress,
+    payment_auth: "0x",
+    request_id: "pf-live-activate-test",
+  };
+  const approve = cawLiveContractInteractionForTest({
+    seed: "approve",
+    bundle,
+    walletId,
+    pactId,
+    authKeyHash,
+    request: approveRequest,
+    createdAt,
+  });
+  const activate = cawLiveContractInteractionForTest({
+    seed: "activate",
+    bundle,
+    walletId,
+    pactId,
+    authKeyHash,
+    request: activateRequest,
+    createdAt,
+  });
+  bundle.cawLiveInteractions = [pactSync, approve, activate];
+  bundle.events = [
+    ...bundle.events,
+    {
+      eventSeq: bundle.events.length + 1,
+      authority: "proof",
+      kind: "caw.live.pact.synced",
+      payload: {
+        interactionId: pactSync.interactionId,
+        walletId,
+        pactId,
+        pactScopedApiKeyHash: authKeyHash,
+        requestHash: pactSync.requestHash,
+        responseHash: pactSync.responseHash,
+        status: "live_active",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+      createdAt,
+    },
+    cawLiveContractEventForTest(bundle, approve, createdAt),
+    cawLiveContractEventForTest(bundle, activate, createdAt),
+  ];
+  sealReplayBundleForTest(bundle);
+  return { pactSync, approve, activate };
+}
+
+function cawLiveContractInteractionForTest({ seed, bundle, walletId, pactId, authKeyHash, request, createdAt }) {
+  const response = {
+    result: {
+      id: `contract-live-${seed}`,
+      wallet_id: walletId,
+      request_id: request.request_id,
+      status: "submitted",
+    },
+  };
+  return {
+    interactionId: hex32(`caw-live-contract-${seed}`),
+    sessionId: bundle.sessionId,
+    kind: "contract_call",
+    walletId,
+    pactId,
+    cawRequestId: request.request_id,
+    requestHash: hashJson(request),
+    request,
+    responseHash: hashJson(response),
+    response,
+    status: "live_pending",
+    authKeyHash,
+    proofAuthority: true,
+    winnerClaimAllowed: false,
+    createdAt,
+  };
+}
+
+function cawLiveContractEventForTest(bundle, interaction, createdAt) {
+  void bundle;
+  return {
+    authority: "proof",
+    kind: "caw.live.contract_call.submitted",
+    payload: {
+      interactionId: interaction.interactionId,
+      walletId: interaction.walletId,
+      pactId: interaction.pactId,
+      spendId: interaction.request.spend_id,
+      operationKind: interaction.request.operation_kind,
+      contractAddress: interaction.request.contract_addr,
+      selector: interaction.request.selector,
+      cawRequestId: interaction.cawRequestId,
+      chainId: interaction.request.chain_id,
+      valueAtomic: interaction.request.value,
+      requestHash: interaction.requestHash,
+      responseHash: interaction.responseHash,
+      pactScopedApiKeyHash: interaction.authKeyHash,
+      status: interaction.status,
+      proofAuthority: true,
+      winnerClaimAllowed: false,
+    },
+    createdAt,
+  };
+}
+
+function resealCawLiveContractCallForTest(bundle, interaction) {
+  interaction.requestHash = hashJson(interaction.request);
+  const event = bundle.events.find((candidate) => candidate.payload?.interactionId === interaction.interactionId);
+  event.payload.spendId = interaction.request.spend_id;
+  event.payload.operationKind = interaction.request.operation_kind;
+  event.payload.contractAddress = interaction.request.contract_addr;
+  event.payload.selector = interaction.request.selector;
+  event.payload.chainId = interaction.request.chain_id;
+  event.payload.valueAtomic = interaction.request.value;
+  event.payload.requestHash = interaction.requestHash;
+  sealReplayBundleForTest(bundle);
+}
+
+function expectedApproveCalldata(spender, amount) {
+  return `${ERC20_APPROVE_SELECTOR}${evmAddressWord(spender)}${uint256Word(amount)}`;
+}
+
+function expectedActivateToolCalldata(spendId) {
+  return `${PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR}${spendId.slice(2).toLowerCase()}${uint256Word("64")}${uint256Word("0")}`;
+}
+
+function evmAddressWord(address) {
+  return address.slice(2).toLowerCase().padStart(64, "0");
+}
+
+function uint256Word(value) {
+  return BigInt(value).toString(16).padStart(64, "0");
 }
 
 function replayBundleWithLease() {

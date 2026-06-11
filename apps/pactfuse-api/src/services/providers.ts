@@ -4,6 +4,7 @@ import { createPublicClient, decodeEventLog, http } from "viem";
 import type {
   CawLiveAuditInput,
   CawLiveClient,
+  CawLiveContractCallInput,
   CawLivePactSubmitInput,
   CawLiveTransferInput,
   CawReceiptSource,
@@ -315,6 +316,9 @@ export function createUnconfiguredCawLiveClient(): CawLiveClient {
     async transferToken() {
       throw new Error("CAW live API is unconfigured; cannot transfer token");
     },
+    async contractCall() {
+      throw new Error("CAW live API is unconfigured; cannot submit contract call");
+    },
     async listAuditLogs() {
       throw new Error("CAW live API is unconfigured; cannot list audit logs");
     },
@@ -435,6 +439,16 @@ export function createCoboAgenticWalletClient(input: {
         },
       });
     },
+    async contractCall(call) {
+      return cawLiveRequest({
+        baseUrl,
+        apiKey: call.pactApiKey,
+        method: "POST",
+        path: `/api/v1/wallets/${encodeURIComponent(call.walletId)}/contract-call`,
+        timeoutMs,
+        body: cawLiveContractCallBody(call),
+      });
+    },
     async listAuditLogs(query) {
       return cawLiveRequest({
         baseUrl,
@@ -445,6 +459,20 @@ export function createCoboAgenticWalletClient(input: {
         query: cawLiveAuditQuery(query),
       });
     },
+  };
+}
+
+function cawLiveContractCallBody(call: CawLiveContractCallInput): Record<string, unknown> {
+  return {
+    chain_id: call.chainId,
+    contract_addr: call.contractAddress,
+    calldata: call.calldata,
+    value: call.valueAtomic ?? "0",
+    ...(call.requestId ? { request_id: call.requestId } : {}),
+    ...(call.sponsor !== undefined ? { sponsor: call.sponsor } : {}),
+    ...(call.gasProvider ? { gas_provider: call.gasProvider } : {}),
+    ...(call.description ? { description: call.description } : {}),
+    ...(call.fee !== undefined ? { fee: call.fee } : {}),
   };
 }
 
