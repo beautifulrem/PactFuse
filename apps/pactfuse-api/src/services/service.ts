@@ -57,6 +57,7 @@ import {
   type EvidenceEvent,
   type JsonValue,
   type JudgeCheckView,
+  type QuoteStatus,
   type ReplayBundleView,
   type SessionScopedEnvelope,
   type SessionView,
@@ -286,6 +287,9 @@ const GATE_SPEND_STATE = {
 } as const;
 const SOURCE_STATE_CHALLENGED = 2;
 const CAW_STRUCTURAL_AUTHORITY_STATUS = "verified_policy_authority_structural";
+const MOCK_QUOTE_STATUS = "mocked_after_preflight_not_chain_settleable";
+const CHAIN_SETTLEABLE_QUOTE_STATUS = "chain_settleable_after_preflight";
+const BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
 const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 
@@ -1580,7 +1584,7 @@ export async function verifyCawAllowance(input: SessionScopedEnvelope, ctx: Serv
         operationKind: "approve",
         requestId,
       });
-      await requireChainReadyForBalanceDelta(ctx, approve.chainId, requestId);
+      const chainProvider = await requireChainReadyForBalanceDelta(ctx, approve.chainId, requestId);
       const blockNumber = await requireTransactionReceiptBlock(ctx, approve.txHash, requestId, "CAW approve");
       if (blockNumber <= 0) {
         throw Object.assign(new Error("CAW allowance proof requires a non-genesis approve block"), {
@@ -1618,6 +1622,8 @@ export async function verifyCawAllowance(input: SessionScopedEnvelope, ctx: Serv
           auditPolicyDigest: auditUsage.policyDigest,
           auditLogHash: auditUsage.auditLogHash,
           chainId: approve.chainId,
+          chainProviderMode: chainProvider.mode,
+          chainProviderEndpoint: chainProvider.endpoint ?? null,
           blockNumber,
           preBlockNumber: blockNumber - 1,
           approvalLogIndex: approvalLog.logIndex,
@@ -2875,7 +2881,7 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
           }),
         });
       }
-      await requireChainReadyForBalanceDelta(ctx, settlement.chainId, requestId);
+      const chainProvider = await requireChainReadyForBalanceDelta(ctx, settlement.chainId, requestId);
       if (settlement.blockNumber <= 0) {
         throw Object.assign(new Error("token balance delta proof requires a non-genesis settlement block"), {
           apiError: proofBlockedError(requestId, "token balance delta proof requires a non-genesis settlement block", {
@@ -2921,6 +2927,8 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
           gateEventId: settlement.gateEventId,
           procurementGateAddress: activation.procurementGateAddress,
           chainId: activation.chainId,
+          chainProviderMode: chainProvider.mode,
+          chainProviderEndpoint: chainProvider.endpoint ?? null,
           requestHash: activation.requestHash,
           responseHash: activation.responseHash,
           proofAuthority: true,
@@ -2943,6 +2951,8 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
           gateEventId: settlement.gateEventId,
           txHash: settlement.txHash,
           chainId: settlement.chainId,
+          chainProviderMode: chainProvider.mode,
+          chainProviderEndpoint: chainProvider.endpoint ?? null,
           blockNumber: settlement.blockNumber,
           preBlockNumber: settlement.blockNumber - 1,
           transferLogIndex: transferLog.logIndex,
@@ -2987,6 +2997,8 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
           settlementEventId: settlement.finalizedEventId,
           txHash: settlement.txHash,
           chainId: settlement.chainId,
+          chainProviderMode: chainProvider.mode,
+          chainProviderEndpoint: chainProvider.endpoint ?? null,
           blockNumber: settlement.blockNumber,
           preBlockNumber: settlement.blockNumber - 1,
           transferLogIndex: transferLog.logIndex,
@@ -3265,12 +3277,27 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
     assertSpendPrice(spend, payload.priceAtomic, "artifact quote", requestId);
     const priceDisclosureHash = String(preflight.price_disclosure_hash);
     const sourceStateSnapshotHash = String(preflight.source_state_snapshot_hash);
+    const status = payload.settlementMode;
+    const chainStatus =
+      status === CHAIN_SETTLEABLE_QUOTE_STATUS ? await requireLiveChainSettleableQuoteProvider(ctx, payload.validUntilBlock, requestId) : null;
+    const modes = quoteRuntimeModes(status, String(spend.payment_token));
+    const chainId = chainStatus?.chainId ?? null;
+    const payer = String(spend.payer).toLowerCase();
+    const agentWallet = String(spend.agent_wallet).toLowerCase();
+    const paymentToken = String(spend.payment_token).toLowerCase();
+    const market = String(spend.market).toLowerCase();
     const createdAt = ctx.clock.now().toISOString();
     const quoteHash = hashJson({
       sessionId: envelope.sessionId,
       spendId: payload.spendId,
       preflightId: payload.preflightId,
       artifactCommitment,
+      status,
+      chainId,
+      payer,
+      agentWallet,
+      paymentToken,
+      market,
       priceAtomic: payload.priceAtomic,
       quoteNonce: payload.quoteNonce,
       validUntilBlock: payload.validUntilBlock,
@@ -3278,16 +3305,18 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
       priceDisclosureHash,
       sourceStateSnapshotHash,
       quoteSignedAfterPreflight: true,
-      modes: LOCKED_RUNTIME_MODES,
+      modes,
     });
     const quoteId = hashJson({ quoteHash, requestId });
+    const eventKind = status === CHAIN_SETTLEABLE_QUOTE_STATUS ? "quote.signed.chain_settleable" : "quote.signed.mocked";
+    const eventAuthority = status === CHAIN_SETTLEABLE_QUOTE_STATUS ? "delivery" : "advisory";
     const event = withImmediateTransaction(ctx, () => {
       ctx.db.sqlite
         .prepare(
           `INSERT INTO quotes
             (quote_id, session_id, spend_id, preflight_id, artifact_commitment, artifact_cid, price_disclosure_hash, source_state_snapshot_hash,
-             price_atomic, quote_nonce, valid_until_block, quote_hash, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mocked_after_preflight_not_chain_settleable', ?)`,
+             price_atomic, quote_nonce, valid_until_block, quote_hash, status, chain_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           quoteId,
@@ -3302,20 +3331,26 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
           payload.quoteNonce,
           payload.validUntilBlock,
           quoteHash,
+          status,
+          chainId,
           createdAt,
         );
       recordOperatorKeyUse(ctx, {
         sessionId: envelope.sessionId,
         role: "quote_signer",
-        method: "ArtifactQuote.sign",
+        method: status === CHAIN_SETTLEABLE_QUOTE_STATUS ? "ArtifactQuote.signChainSettleable" : "ArtifactQuote.sign",
         requestId,
         operationId: quoteId,
-        authorizedMethods: ["ArtifactQuote.sign(sessionId,spendId,artifactCommitment,priceAtomic,quoteNonce,validUntilBlock)"],
+        authorizedMethods: [
+          status === CHAIN_SETTLEABLE_QUOTE_STATUS
+            ? "ArtifactQuote.signChainSettleable(sessionId,spendId,artifactCommitment,priceAtomic,quoteNonce,validUntilBlock,chainId)"
+            : "ArtifactQuote.sign(sessionId,spendId,artifactCommitment,priceAtomic,quoteNonce,validUntilBlock)",
+        ],
       });
       return appendEvidenceEvent(ctx, {
         sessionId: envelope.sessionId,
-        authority: "advisory",
-        kind: "quote.signed.mocked",
+        authority: eventAuthority,
+        kind: eventKind,
         payload: {
           quoteId,
           quoteHash,
@@ -3323,10 +3358,20 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
           preflightId: payload.preflightId,
           artifactCommitment,
           artifactCid,
+          payer,
+          agentWallet,
+          paymentToken,
+          market,
+          priceAtomic: payload.priceAtomic,
+          validUntilBlock: payload.validUntilBlock,
           priceDisclosureHash,
           sourceStateSnapshotHash,
           quoteSignedAfterPreflight: true,
-          status: "mocked_after_preflight_not_chain_settleable",
+          status,
+          modes,
+          chainId,
+          proofAuthority: false,
+          winnerClaimAllowed: false,
         },
       });
     });
@@ -3342,7 +3387,8 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
         priceDisclosureHash,
         sourceStateSnapshotHash,
         quoteSignedAfterPreflight: true,
-        status: "mocked_after_preflight_not_chain_settleable",
+        status,
+        chainId,
         winnerClaimAllowed: false,
       },
     };
@@ -3432,8 +3478,13 @@ export async function issueArtifactAccessToken(input: SessionScopedEnvelope, ctx
           quoteId: payload.quoteId,
           artifactHash,
           settlementBlockNumber: settlement.blockNumber,
+          settlementChainId: settlement.chainId,
           spendMaxPriceAtomic: String(spend.max_price_atomic),
           spendArtifactHash: String(spend.artifact_hash),
+          spendPayer: String(spend.payer),
+          spendAgentWallet: String(spend.agent_wallet),
+          spendPaymentToken: String(spend.payment_token),
+          spendMarket: String(spend.market),
         },
         requestId,
       );
@@ -3460,9 +3511,19 @@ export async function issueArtifactAccessToken(input: SessionScopedEnvelope, ctx
           .prepare(
             `INSERT INTO verifier_runs
               (verifier_run_id, session_id, input_hash, result_json, schema_ok, proof_chip_allowed, winner_claim_allowed, final_verifier_complete, created_at)
-             VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
-          .run(verifierRunId, envelope.sessionId, inputHash, canonicalizeJson(view), view.schemaOk ? 1 : 0, ctx.clock.now().toISOString());
+          .run(
+            verifierRunId,
+            envelope.sessionId,
+            inputHash,
+            canonicalizeJson(view),
+            view.schemaOk ? 1 : 0,
+            view.proofChipAllowed ? 1 : 0,
+            view.winnerClaimAllowed ? 1 : 0,
+            view.finalVerifierComplete ? 1 : 0,
+            ctx.clock.now().toISOString(),
+          );
         ctx.db.sqlite
           .prepare(
             `INSERT INTO artifact_access_tokens
@@ -3580,6 +3641,18 @@ export async function executeLease(
           payer,
           artifactHash,
           bearerToken,
+        },
+        requestId,
+      );
+      assertActiveArtifactAccessStillBound(
+        ctx,
+        {
+          sessionId: envelope.sessionId,
+          spendId: payload.spendId,
+          artifactHash,
+          spend,
+          settlement,
+          access: activeToken,
         },
         requestId,
       );
@@ -3906,19 +3979,29 @@ export async function verifyEvidenceForSession(
       .prepare(
         `INSERT INTO verifier_runs
           (verifier_run_id, session_id, input_hash, result_json, schema_ok, proof_chip_allowed, winner_claim_allowed, final_verifier_complete, created_at)
-         VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(verifierRunId, envelope.sessionId, inputHash, canonicalizeJson(view), view.schemaOk ? 1 : 0, ctx.clock.now().toISOString());
+      .run(
+        verifierRunId,
+        envelope.sessionId,
+        inputHash,
+        canonicalizeJson(view),
+        view.schemaOk ? 1 : 0,
+        view.proofChipAllowed ? 1 : 0,
+        view.winnerClaimAllowed ? 1 : 0,
+        view.finalVerifierComplete ? 1 : 0,
+        ctx.clock.now().toISOString(),
+      );
     const event = appendEvidenceEvent(ctx, {
       sessionId: envelope.sessionId,
       authority: "operator",
-      kind: "verifier.fail_closed",
+      kind: view.finalVerifierComplete ? "verifier.final_replay_claim" : "verifier.fail_closed",
       payload: {
         verifierRunId,
         schemaOk: view.schemaOk,
-        proofChipAllowed: false,
-        winnerClaimAllowed: false,
-        finalVerifierComplete: false,
+        proofChipAllowed: view.proofChipAllowed,
+        winnerClaimAllowed: view.winnerClaimAllowed,
+        finalVerifierComplete: view.finalVerifierComplete,
       },
     });
     return {
@@ -3958,6 +4041,7 @@ async function buildVerifierRunView(
       ? await ctx.verifier.verify(verifierInput, {
           cliMode: payload.schemaOnly ? "schema-only" : "proof-chip",
           proofProviders,
+          proofProviderAuthority: "server-runtime",
           pactTemplates: ctx.templates.list(),
         })
       : {
@@ -4046,7 +4130,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
   });
   const cawAllowance = latestKind("caw.allowance.verified");
   const cawActivation = latestKind("caw.activation.verified");
-  const tokenDelta = latestKind("token.balance_delta.verified");
+  const tokenDelta = latest((event) => event.kind === "token.balance_delta.verified" && isLiveChainProofPayload(eventPayload(event)));
   const liveArtifactQuote = hasLiveArtifactQuote(replayBundle);
   const gates = [
     providerGate(proofProviders, "chain", ["paymentMode", "tokenMode", "winnerClaimAllowed"]),
@@ -4243,8 +4327,7 @@ function hasLiveArtifactQuote(replayBundle: unknown): boolean {
     if (!quote || typeof quote !== "object" || Array.isArray(quote)) {
       return false;
     }
-    const status = String((quote as { status?: unknown }).status ?? "").toLowerCase();
-    return status.length > 0 && !status.includes("mocked") && !status.includes("not_chain_settleable");
+    return (quote as { status?: unknown }).status === CHAIN_SETTLEABLE_QUOTE_STATUS;
   });
 }
 
@@ -4252,11 +4335,15 @@ function tokenTargetMode(event: EvidenceEvent | null): "official-testnet-usdc" |
   if (!event) {
     return null;
   }
-  const paymentToken = String(eventPayload(event).paymentToken ?? "").toLowerCase();
-  if (paymentToken === "0x036cbd53842c5426634e7929541ec2318f3dcf7e") {
+  return tokenModeForPaymentToken(String(eventPayload(event).paymentToken ?? ""));
+}
+
+function tokenModeForPaymentToken(paymentToken: string): "official-testnet-usdc" | "mock-test-token" | null {
+  const normalized = paymentToken.toLowerCase();
+  if (normalized === BASE_SEPOLIA_USDC) {
     return "official-testnet-usdc";
   }
-  return paymentToken ? "mock-test-token" : null;
+  return normalized ? "mock-test-token" : null;
 }
 
 function identityTargetMode(event: EvidenceEvent): "p0-win-separate-identities" | "p0-floor-one-wallet" {
@@ -4268,16 +4355,20 @@ function eventPayload(event: EvidenceEvent): Record<string, unknown> {
   return event.payload && typeof event.payload === "object" && !Array.isArray(event.payload) ? (event.payload as Record<string, unknown>) : {};
 }
 
+function isLiveChainProofPayload(payload: Record<string, unknown>): boolean {
+  return payload.chainProviderMode === "live" && typeof payload.chainId === "string" && payload.chainId.length > 0;
+}
+
 function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: ClaimReadinessGate[]): string[] {
   const inputs = new Set<string>();
   const provider = (name: ProofProviderStatus["name"]) => providers.find((candidate) => candidate.name === name);
-  if (provider("chain")?.ready !== true) {
+  if (provider("chain")?.ready !== true || provider("chain")?.mode !== "live") {
     inputs.add("PACTFUSE_CHAIN_RPC_URL and PACTFUSE_CHAIN_ID for a live public testnet RPC");
   }
-  if (provider("caw_live")?.ready !== true) {
+  if (provider("caw_live")?.ready !== true || provider("caw_live")?.mode !== "live") {
     inputs.add("PACTFUSE_CAW_LIVE_API_URL, PACTFUSE_CAW_LIVE_API_KEY, and a CAW wallet id");
   }
-  if (provider("caw")?.ready !== true) {
+  if (provider("caw")?.ready !== true || provider("caw")?.mode !== "live") {
     inputs.add("PACTFUSE_CAW_EXPORT_URL or equivalent raw CAW receipt export source");
   }
   for (const gate of gates) {
@@ -4721,6 +4812,8 @@ export async function readArtifactAccess(
   const payer = requireSpendPayer(spend, input.payer, requestId);
   requireFinalizedSettlement(ctx, sessionId, spendId, requestId);
   const access = requireActiveArtifactAccess(ctx, { ...input, sessionId, spendId, payer, artifactHash }, requestId);
+  const settlement = requireVerifiedTokenSettlement(ctx, sessionId, spendId, requestId);
+  assertActiveArtifactAccessStillBound(ctx, { sessionId, spendId, artifactHash, spend, settlement, access }, requestId);
   return {
     ok: true,
     requestId,
@@ -4967,6 +5060,7 @@ export function appendEvidenceEvent(
       | "artifact.preflight.pending"
       | "artifact.access_token.issued"
       | "quote.signed.mocked"
+      | "quote.signed.chain_settleable"
       | "artifact.refund.pending"
       | "operator.key_used"
       | "gate.spend_tripped.observed"
@@ -4978,6 +5072,7 @@ export function appendEvidenceEvent(
       | "lease.execution.blocked"
       | "lease.execution.succeeded"
       | "verifier.fail_closed"
+      | "verifier.final_replay_claim"
       | "judge_check.pending"
       | "runner.heartbeat"
       | "mcp.adapter.call";
@@ -6186,7 +6281,7 @@ function requireFinalizedSettlement(
   sessionId: string,
   spendId: string,
   requestId: string,
-): { finalizedEventId: string; observedEventId: string; blockNumber: number } {
+): { finalizedEventId: string; observedEventId: string; blockNumber: number; chainId: string } {
   const invalidated = ctx.db.sqlite
     .prepare(
       `SELECT tx_hash, log_index
@@ -6204,7 +6299,7 @@ function requireFinalizedSettlement(
 
   const settlement = ctx.db.sqlite
     .prepare(
-      `SELECT status, observed_event_id, finalized_event_id, finality_depth, confirmations, block_number
+      `SELECT status, observed_event_id, finalized_event_id, finality_depth, confirmations, block_number, chain_id
        FROM gate_chain_events
        WHERE session_id = ? AND spend_id = ? AND event_kind = 'SpendSettled'
        ORDER BY block_number DESC, log_index DESC
@@ -6225,6 +6320,7 @@ function requireFinalizedSettlement(
     finalizedEventId: String(settlement.finalized_event_id),
     observedEventId: String(settlement.observed_event_id),
     blockNumber: Number(settlement.block_number),
+    chainId: String(settlement.chain_id),
   };
 }
 
@@ -6233,7 +6329,7 @@ function requireVerifiedTokenSettlement(
   sessionId: string,
   spendId: string,
   requestId: string,
-): { tokenBalanceEventId: string; finalizedEventId: string; observedEventId: string; blockNumber: number } {
+): { tokenBalanceEventId: string; finalizedEventId: string; observedEventId: string; blockNumber: number; chainId: string } {
   const settlement = requireFinalizedSettlement(ctx, sessionId, spendId, requestId);
   const integrityErrors = verifyTokenBalanceDeltaIntegrity(ctx, sessionId);
   if (integrityErrors.length > 0) {
@@ -6747,7 +6843,7 @@ async function requireTransactionReceiptBlock(ctx: ServiceCtx, txHash: `0x${stri
   return blockNumber;
 }
 
-async function requireChainReadyForBalanceDelta(ctx: ServiceCtx, chainId: string, requestId: string): Promise<void> {
+async function requireChainReadyForBalanceDelta(ctx: ServiceCtx, chainId: string, requestId: string): Promise<ProofProviderStatus> {
   let status;
   try {
     status = await ctx.chain.status();
@@ -6761,7 +6857,13 @@ async function requireChainReadyForBalanceDelta(ctx: ServiceCtx, chainId: string
       apiError: proofPendingError(requestId, `chain proof provider is not ready: ${status.reason}`),
     });
   }
+  if (status.mode !== "live") {
+    throw Object.assign(new Error("token balance delta requires a live chain proof provider"), {
+      apiError: proofPendingError(requestId, `token balance delta requires a live chain proof provider: ${status.reason}`),
+    });
+  }
   assertProviderChainMatchesPayload(status, chainId, requestId, "token balance delta proof");
+  return status;
 }
 
 async function requireErc20TransferLogForBalanceDelta(
@@ -8605,6 +8707,63 @@ function requireActiveArtifactAccess(
   return active;
 }
 
+function assertActiveArtifactAccessStillBound(
+  ctx: ServiceCtx,
+  input: {
+    sessionId: string;
+    spendId: string;
+    artifactHash: string;
+    spend: Row;
+    settlement: { tokenBalanceEventId: string; finalizedEventId: string; observedEventId: string; blockNumber: number; chainId: string };
+    access: Row;
+  },
+  requestId: string,
+): void {
+  const tokenId = String(input.access.token_id);
+  const quoteId = typeof input.access.quote_id === "string" ? input.access.quote_id : null;
+  const preflightId = typeof input.access.preflight_id === "string" ? input.access.preflight_id : null;
+  if (!quoteId || !preflightId || typeof input.access.artifact_cid !== "string") {
+    throw Object.assign(new Error("artifact bearer token is missing quote or preflight binding"), {
+      apiError: proofBlockedError(requestId, "artifact bearer token is missing quote or preflight binding", { tokenId }),
+    });
+  }
+  if (String(input.access.settlement_event_id) !== input.settlement.tokenBalanceEventId) {
+    throw Object.assign(new Error("artifact bearer token settlement proof no longer matches the verified token settlement"), {
+      apiError: proofBlockedError(requestId, "artifact bearer token settlement proof no longer matches the verified token settlement", {
+        tokenId,
+        tokenSettlementEventId: String(input.access.settlement_event_id),
+        verifiedSettlementEventId: input.settlement.tokenBalanceEventId,
+      }),
+    });
+  }
+  const quoteBinding = requireArtifactQuoteBinding(
+    ctx,
+    input.sessionId,
+    {
+      spendId: input.spendId,
+      quoteId,
+      artifactHash: input.artifactHash,
+      settlementBlockNumber: input.settlement.blockNumber,
+      settlementChainId: input.settlement.chainId,
+      spendMaxPriceAtomic: String(input.spend.max_price_atomic),
+      spendArtifactHash: String(input.spend.artifact_hash),
+      spendPayer: String(input.spend.payer),
+      spendAgentWallet: String(input.spend.agent_wallet),
+      spendPaymentToken: String(input.spend.payment_token),
+      spendMarket: String(input.spend.market),
+    },
+    requestId,
+  );
+  if (preflightId !== quoteBinding.preflightId || String(input.access.artifact_cid).toLowerCase() !== quoteBinding.artifactCid.toLowerCase()) {
+    throw Object.assign(new Error("artifact bearer token quote binding no longer matches the active token row"), {
+      apiError: proofBlockedError(requestId, "artifact bearer token quote binding no longer matches the active token row", {
+        tokenId,
+        quoteId,
+      }),
+    });
+  }
+}
+
 function assertNoArtifactRefundPending(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): void {
   const rows = ctx.db.sqlite
     .prepare(
@@ -8823,6 +8982,71 @@ function requireQuotePreflight(
   return preflight;
 }
 
+async function requireLiveChainSettleableQuoteProvider(
+  ctx: ServiceCtx,
+  validUntilBlock: string,
+  requestId: string,
+): Promise<{ chainId: string; currentBlockNumber: number }> {
+  let status: ProofProviderStatus;
+  try {
+    status = await ctx.chain.status();
+  } catch (error) {
+    throw Object.assign(new Error("chain quote provider readiness check failed"), {
+      apiError: proofPendingError(requestId, chainFailureMessage("chain quote provider readiness check failed", error)),
+    });
+  }
+  if (status.mode !== "live" || status.ready !== true) {
+    throw Object.assign(new Error("chain-settleable quote requires a live chain proof provider"), {
+      apiError: proofPendingError(
+        requestId,
+        `chain-settleable quote requires a live chain proof provider: ${status.reason}`,
+      ),
+    });
+  }
+  if (!status.chainId) {
+    throw Object.assign(new Error("chain-settleable quote provider did not report chainId"), {
+      apiError: proofPendingError(requestId, "chain-settleable quote provider did not report chainId"),
+    });
+  }
+  let currentBlockNumber: number;
+  try {
+    currentBlockNumber = await ctx.chain.getBlockNumber();
+  } catch (error) {
+    throw Object.assign(new Error("failed to read chain head for chain-settleable quote"), {
+      apiError: proofPendingError(requestId, chainFailureMessage("failed to read chain head for chain-settleable quote", error)),
+    });
+  }
+  if (!Number.isSafeInteger(currentBlockNumber) || currentBlockNumber < 0) {
+    throw Object.assign(new Error("chain provider returned an invalid current block for chain-settleable quote"), {
+      apiError: proofBlockedError(requestId, "chain provider returned an invalid current block for chain-settleable quote", {
+        currentBlockNumber,
+      }),
+    });
+  }
+  if (BigInt(validUntilBlock) <= BigInt(currentBlockNumber)) {
+    throw Object.assign(new Error("chain-settleable quote is already expired at current chain head"), {
+      apiError: proofBlockedError(requestId, "chain-settleable quote is already expired at current chain head", {
+        validUntilBlock,
+        currentBlockNumber,
+      }),
+    });
+  }
+  return { chainId: status.chainId, currentBlockNumber };
+}
+
+function quoteRuntimeModes(status: QuoteStatus, paymentToken: string): Record<string, string | boolean> {
+  if (status === MOCK_QUOTE_STATUS) {
+    return LOCKED_RUNTIME_MODES;
+  }
+  return {
+    CLAIM_MODE: "caw-target-real",
+    PAYMENT_MODE: "gate-paid-artifact-real",
+    TOKEN_MODE: tokenModeForPaymentToken(paymentToken) ?? "mock-test-token",
+    IDENTITY_MODE: "p0-floor-one-wallet",
+    WINNER_CLAIM_ALLOWED: false,
+  };
+}
+
 function requireArtifactQuoteBinding(
   ctx: ServiceCtx,
   sessionId: string,
@@ -8831,14 +9055,20 @@ function requireArtifactQuoteBinding(
     quoteId: string;
     artifactHash: string;
     settlementBlockNumber: number;
+    settlementChainId: string;
     spendMaxPriceAtomic: string;
     spendArtifactHash: string;
+    spendPayer: string;
+    spendAgentWallet: string;
+    spendPaymentToken: string;
+    spendMarket: string;
   },
   requestId: string,
 ): { preflightId: string; artifactCid: string } {
   const quote = ctx.db.sqlite
     .prepare(
-      `SELECT quote_id, preflight_id, artifact_commitment, artifact_cid, price_atomic, valid_until_block, status
+      `SELECT quote_id, preflight_id, artifact_commitment, artifact_cid, price_disclosure_hash, source_state_snapshot_hash,
+              price_atomic, quote_nonce, valid_until_block, quote_hash, status, chain_id
        FROM quotes
        WHERE session_id = ? AND spend_id = ? AND quote_id = ?`,
     )
@@ -8848,9 +9078,18 @@ function requireArtifactQuoteBinding(
       apiError: proofPendingError(requestId, "artifact access requires a signed quote for the spend"),
     });
   }
-  if (quote.status !== "mocked_after_preflight_not_chain_settleable") {
+  if (quote.status !== MOCK_QUOTE_STATUS && quote.status !== CHAIN_SETTLEABLE_QUOTE_STATUS) {
     throw Object.assign(new Error("artifact quote is not in an issuable state"), {
       apiError: proofBlockedError(requestId, "artifact quote is not in an issuable state"),
+    });
+  }
+  if (quote.status === CHAIN_SETTLEABLE_QUOTE_STATUS && String(quote.chain_id) !== input.settlementChainId) {
+    throw Object.assign(new Error("chain-settleable quote chainId does not match finalized settlement chain"), {
+      apiError: proofBlockedError(requestId, "chain-settleable quote chainId does not match finalized settlement chain", {
+        quoteId: input.quoteId,
+        quoteChainId: String(quote.chain_id),
+        settlementChainId: input.settlementChainId,
+      }),
     });
   }
   if (String(quote.artifact_commitment).toLowerCase() !== input.artifactHash.toLowerCase()) {
@@ -8884,6 +9123,33 @@ function requireArtifactQuoteBinding(
       apiError: proofBlockedError(requestId, "artifact quote expired before finalized settlement", {
         validUntilBlock: String(quote.valid_until_block),
         settlementBlockNumber: input.settlementBlockNumber,
+      }),
+    });
+  }
+  const expectedQuoteHash = hashJson({
+    sessionId,
+    spendId: input.spendId,
+    preflightId: String(quote.preflight_id),
+    artifactCommitment: String(quote.artifact_commitment).toLowerCase(),
+    status: String(quote.status),
+    chainId: quote.chain_id === null || quote.chain_id === undefined ? null : String(quote.chain_id),
+    payer: input.spendPayer.toLowerCase(),
+    agentWallet: input.spendAgentWallet.toLowerCase(),
+    paymentToken: input.spendPaymentToken.toLowerCase(),
+    market: input.spendMarket.toLowerCase(),
+    priceAtomic: String(quote.price_atomic),
+    quoteNonce: String(quote.quote_nonce),
+    validUntilBlock: String(quote.valid_until_block),
+    artifactCid: String(quote.artifact_cid).toLowerCase(),
+    priceDisclosureHash: String(quote.price_disclosure_hash),
+    sourceStateSnapshotHash: String(quote.source_state_snapshot_hash),
+    quoteSignedAfterPreflight: true,
+    modes: quoteRuntimeModes(quote.status as QuoteStatus, input.spendPaymentToken),
+  });
+  if (String(quote.quote_hash).toLowerCase() !== expectedQuoteHash) {
+    throw Object.assign(new Error("artifact quote hash does not recompute from spend/payment binding"), {
+      apiError: proofBlockedError(requestId, "artifact quote hash does not recompute from spend/payment binding", {
+        quoteId: input.quoteId,
       }),
     });
   }
@@ -9155,6 +9421,7 @@ function listQuotes(ctx: ServiceCtx, sessionId: string, limit: number, offset = 
       validUntilBlock: row.valid_until_block,
       quoteHash: row.quote_hash,
       status: row.status,
+      chainId: row.chain_id ?? null,
       createdAt: row.created_at,
     }),
   );
@@ -9660,6 +9927,9 @@ function verifyCawAllowanceIntegrity(ctx: ServiceCtx, sessionId: string): string
     const label = `CAW allowance event ${event.eventId}`;
     if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
       errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
+    }
+    if (!isLiveChainProofPayload(payload)) {
+      errors.push(`${label} requires chainProviderMode=live`);
     }
     const spendId = typeof payload.spendId === "string" ? payload.spendId : "";
     const spend = ctx.db.sqlite
@@ -10435,6 +10705,9 @@ function verifyTokenBalanceDeltaIntegrity(ctx: ServiceCtx, sessionId: string): s
       if (String(payload.txHash ?? "").toLowerCase() !== String(activationEvent.payload.activateTxHash ?? "").toLowerCase()) {
         errors.push(`${label} activateTxHash must match settlement txHash`);
       }
+      if (!isLiveChainProofPayload(activationEvent.payload)) {
+        errors.push(`${label} activation proof requires chainProviderMode=live`);
+      }
     }
     const settlementEventId = typeof payload.settlementEventId === "string" ? payload.settlementEventId : "";
     const settlementEvent = ctx.db.sqlite
@@ -10613,7 +10886,7 @@ function verifyArtifactAccessTokenIntegrity(ctx: ServiceCtx, sessionId: string):
     }
     const quote = ctx.db.sqlite
       .prepare(
-        `SELECT quote_id, preflight_id, artifact_commitment, artifact_cid
+        `SELECT quote_id, preflight_id, artifact_commitment, artifact_cid, status, chain_id, valid_until_block
          FROM quotes
          WHERE session_id = ? AND spend_id = ? AND quote_id = ?`,
       )
@@ -10645,6 +10918,14 @@ function verifyArtifactAccessTokenIntegrity(ctx: ServiceCtx, sessionId: string):
         tokenSettlementPayload.winnerClaimAllowed !== false
       ) {
         errors.push(`artifact token ${tokenId} token balance delta proof is not bound to the token spend`);
+      }
+      if (quote && String(quote.status) === CHAIN_SETTLEABLE_QUOTE_STATUS) {
+        if (String(quote.chain_id) !== String(tokenSettlementPayload?.chainId ?? "")) {
+          errors.push(`artifact token ${tokenId} chain-settleable quote chainId does not match token settlement`);
+        }
+        if (BigInt(String(quote.valid_until_block)) < BigInt(String(tokenSettlementPayload?.blockNumber ?? "0"))) {
+          errors.push(`artifact token ${tokenId} chain-settleable quote expired before token settlement`);
+        }
       }
     }
     const event = issuedByTokenId.get(tokenId);

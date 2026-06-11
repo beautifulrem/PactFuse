@@ -27,12 +27,13 @@ This section is for the final/current public claim, not the hour-4 `TARGET_*` ca
 
 Allowed only when all are true:
 
-- `docs/evidence/caw-identity-probe.json` has `mode: real`, `pass: true`, and `winnerClaimAllowed: true`
+- `docs/evidence/caw-identity-probe.json` has `mode: real`, `pass: true`, and `winnerClaimAllowed: true`, and the probed `walletAddress` matches the settled C spend `payer` and `agentWallet`
 - CAW policy receipt plus matching tx/audit evidence proves chain, target, selector, expiry, tx-count/request-count limits, and usage
 - CAW receipt ingest proves every CAW operation came from raw API/export JSON, not hand-entered fields
 - wrong-target bypass has a real CAW deny request id or audit receipt
 - clean activation has a real CAW allow receipt
 - `SpendTripped` A/B and `SpendSettled` C are real chain events in the same session
+- artifact quote status is exactly `chain_settleable_after_preflight`, its `quoteHash` binds status, chain id, payer, agent wallet, token, market, price, and preflight fields, and the artifact access token references that quote; the quote chain id and expiry must also match the verified token settlement block, and artifact read/lease paths must still re-check the token's settlement and quote binding at use time
 - Judge Check rows for CAW boundary, source challenge, A/B trip, and C settlement are `pass`
 - `PACTFUSE_EVIDENCE_V1` replay bundle binds the CAW receipts, tx/log refs, source proof, artifact records, Agent Transcript, Judge Check rows, and verifier output under one `sessionId`
 

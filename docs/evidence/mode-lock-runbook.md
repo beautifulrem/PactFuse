@@ -75,14 +75,14 @@ The final winner banner is allowed only after the full evidence chain passes. Th
 
 Required winner inputs:
 
-- CAW identity probe proves same-wallet semantics with live evidence.
+- CAW identity probe proves same-wallet semantics with live evidence, and the probed wallet address matches the settled C spend payer/agentWallet.
 - Token evidence is public and inspectable.
 - CAW policy receipts plus matching on-chain tx evidence prove deny, approve, clean allow, policy digest, tx-count/request-count, and expiry.
 - Raw CAW receipt ingest bundle links every CAW operation to API/export JSON; no CAW winner chip may depend on hand-entered receipt fields.
 - `SourceChallenged` is a real chain tx from an issuer key separate from owner/runner.
 - A and B have real `SpendTripped` events, canonical tx ordering, and no token movement.
-- C has a real `SpendSettled` event plus ERC20 `Transfer` and balance delta from `agentWallet` to market; `payer` must equal `agentWallet` until wallet ownership proof exists.
-- Artifact quote was signed only after preflight passed, and the receipt pack includes matching `priceDisclosure` and `deliveryPreflight` hashes.
+- C has a real `SpendSettled` event plus ERC20 `Transfer` and balance delta from `agentWallet` to market, verified through a live chain provider; `payer` must equal `agentWallet` until wallet ownership proof exists.
+- Artifact quote was signed only after preflight passed, has `chain_settleable_after_preflight` status for winner mode, its `quoteHash` binds status, chain id, payer, agent wallet, token, market, price, and preflight fields, and its chain id plus expiry match the token settlement.
 - Agent Transcript includes raw MCP JSON-RPC `tools/list` and `tools/call` hashes, bounded to the pinned manifest, before any "agent used what it bought" chip is shown.
 - Lease target is an independent pinned public repo/commit for the external-workflow chip; team-owned target requires a visible downgrade.
 - `PACTFUSE_EVIDENCE_V1` replay bundle binds run config, raw CAW receipts, tx/log refs, source proof, artifact preflight, agent transcript, lease run, Judge Check, and verifier output under one `sessionId`.

@@ -29,6 +29,7 @@ export const ClaimModeSchema = z.enum(["simulated", "caw-target-real", "caw-stab
 export const PaymentModeSchema = z.enum(["mocked", "gate-paid-artifact-real", "permit-payment-real"]);
 export const TokenModeSchema = z.enum(["local-mocked", "mock-test-token", "official-testnet-usdc"]);
 export const IdentityModeSchema = z.enum(["pending", "p0-floor-one-wallet", "p0-win-separate-identities"]);
+export const QuoteStatusSchema = z.enum(["mocked_after_preflight_not_chain_settleable", "chain_settleable_after_preflight"]);
 
 export const RuntimeModesSchema = z
   .object({
@@ -269,6 +270,7 @@ export const QuotePayloadSchema = z
     priceAtomic: DecimalStringSchema,
     quoteNonce: z.string().min(1).max(128),
     validUntilBlock: z.string().regex(/^[0-9]+$/),
+    settlementMode: QuoteStatusSchema.default("mocked_after_preflight_not_chain_settleable"),
   })
   .strict();
 
@@ -439,6 +441,7 @@ export const EvidenceEventKindSchema = z.enum([
   "artifact.preflight.pending",
   "artifact.access_token.issued",
   "quote.signed.mocked",
+  "quote.signed.chain_settleable",
   "artifact.refund.pending",
   "operator.key_used",
   "gate.spend_tripped.observed",
@@ -450,6 +453,7 @@ export const EvidenceEventKindSchema = z.enum([
   "lease.execution.blocked",
   "lease.execution.succeeded",
   "verifier.fail_closed",
+  "verifier.final_replay_claim",
   "judge_check.pending",
   "runner.heartbeat",
   "mcp.adapter.call",
@@ -634,7 +638,8 @@ export const QuoteViewSchema = z
     quoteNonce: z.string().min(1).max(128),
     validUntilBlock: z.string().regex(/^[0-9]+$/),
     quoteHash: Hex32Schema,
-    status: z.enum(["mocked_after_preflight_not_chain_settleable"]),
+    status: QuoteStatusSchema,
+    chainId: z.string().min(1).nullable().default(null),
     createdAt: IsoDateStringSchema,
   })
   .strict();
@@ -939,6 +944,7 @@ export type JudgeCheckView = z.infer<typeof JudgeCheckViewSchema>;
 export type VerifierRunView = z.infer<typeof VerifierRunViewSchema>;
 export type ClaimReadinessView = z.infer<typeof ClaimReadinessViewSchema>;
 export type ReplayBundleView = z.infer<typeof ReplayBundleViewSchema>;
+export type QuoteStatus = z.infer<typeof QuoteStatusSchema>;
 export type ChainIndexerBackfillInput = z.infer<typeof ChainIndexerBackfillInputSchema>;
 export type CawOperationBuildPayload = z.infer<typeof CawOperationBuildPayloadSchema>;
 export type CawLivePactSubmitPayload = z.infer<typeof CawLivePactSubmitPayloadSchema>;

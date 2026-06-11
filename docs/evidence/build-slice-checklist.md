@@ -43,7 +43,7 @@ Purpose: keep implementation aligned with the proof gates. This checklist is not
    - Every CAW receipt must be linked to an ingested raw receipt hash; manual rows are fixtures and cannot pass Judge Check.
 
 6. Artifact API and verifier
-   - `/api/artifacts/preflight` must pass before a quote signer can sign.
+   - `/api/artifacts/preflight` must pass before a quote signer can sign; winner mode requires `chain_settleable_after_preflight`, a quote hash bound to chain/payment/preflight fields, and quote chain/expiry matching the verified token settlement.
    - Generate Source-Bound Code-Scan MCP Lease receipt pack.
    - Hash artifact payload and receipt pack separately.
    - Include `priceDisclosure` and `deliveryPreflight` in the receipt pack and verify their hashes against displayed UI values.
@@ -51,7 +51,7 @@ Purpose: keep implementation aligned with the proof gates. This checklist is not
    - Include `cawReceiptIngest` and the `PACTFUSE_EVIDENCE_V1` replay bundle hash before any CAW or winner proof chip can pass.
    - `/api/evidence/verify` validates source proof, CAW receipts/operations, payment proof, trip/settle events, balance delta, artifact hash, and block window.
    - `/api/evidence/judge-check` returns pass/fail rows backed by raw evidence links; no row can pass from prose-only evidence.
-   - Reuse `verifyEvidence(input, chainClient)` from `packages/verifier/pactfuse-verify-receipt.mjs` in both CLI and `/api/evidence/verify`.
+   - Reuse `verifyEvidence(input, chainClient)` from `packages/verifier/pactfuse-verify-receipt.mjs` in both CLI and `/api/evidence/verify`; only the API/runtime may pass `proofProviderAuthority: "server-runtime"` for final replay authority.
    - Use `--schema-only` only for structural preflight; default CLI mode must fail closed unless `proofChipAllowed: true`.
    - Keep winner claims blocked unless the replay verifier reports no `proofCompletenessErrors` and the app verifier accepts the same evidence snapshot.
    - Implement one paid-but-undelivered negative path: either `QuoteVoided` before settlement or `ArtifactRefunded` after settlement.

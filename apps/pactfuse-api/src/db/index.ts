@@ -195,6 +195,7 @@ CREATE TABLE IF NOT EXISTS quotes (
   valid_until_block TEXT NOT NULL,
   quote_hash TEXT NOT NULL,
   status TEXT NOT NULL,
+  chain_id TEXT,
   created_at TEXT NOT NULL,
   UNIQUE(session_id, quote_nonce)
 );
@@ -383,6 +384,7 @@ CREATE TABLE IF NOT EXISTS judge_check_rows (
   ensureColumn(sqlite, "artifact_access_tokens", "lease_claimed_at", "TEXT");
   ensureColumn(sqlite, "artifact_access_tokens", "issued_by_verifier_run_id", "TEXT");
   ensureColumn(sqlite, "artifact_access_tokens", "settlement_event_id", "TEXT");
+  ensureColumn(sqlite, "quotes", "chain_id", "TEXT");
   ensureColumn(sqlite, "lease_runs", "payer", "TEXT");
   ensureColumn(sqlite, "lease_runs", "artifact_hash", "TEXT");
   ensureColumn(sqlite, "lease_runs", "tools_list_hash", "TEXT");

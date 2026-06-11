@@ -12,6 +12,9 @@ const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
 const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const ERC20_APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
+const MOCK_QUOTE_STATUS = "mocked_after_preflight_not_chain_settleable";
+const CHAIN_SETTLEABLE_QUOTE_STATUS = "chain_settleable_after_preflight";
+const BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
 const REQUIRED_LEASE_TOOL_ARGUMENTS = ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"];
 const DANGEROUS_TOOL_NAME_PATTERN =
   /(write|edit|delete|remove|shell|exec|terminal|command|commit|push|deploy|transfer|send|apply|patch|modify|create|move|copy|rename|upload|download|file|fs|process|subprocess)/;
@@ -1303,6 +1306,9 @@ function verifyCawAllowanceEvents(eventsById, spendsById, interactionsById, erro
     if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
       errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
     }
+    if (payload.chainProviderMode !== "live") {
+      errors.push(`${label} requires chainProviderMode=live`);
+    }
     const spend = spendsById.get(lowerHex(payload.spendId));
     if (!spend) {
       errors.push(`${label} references missing registered spend`);
@@ -1447,6 +1453,9 @@ function verifyCawActivationEvents(eventsById, errors) {
     if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
       errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
     }
+    if (payload.chainProviderMode !== "live") {
+      errors.push(`${label} requires chainProviderMode=live`);
+    }
     if (!isHex32(payload.activateTxHash)) {
       errors.push(`${label} requires activateTxHash`);
     }
@@ -1519,6 +1528,9 @@ function verifyTokenBalanceDeltaEvents(eventsById, spendsById, errors) {
     }
     if (event.authority !== "proof" || payload.proofAuthority !== true || payload.winnerClaimAllowed !== false) {
       errors.push(`${label} must carry proofAuthority=true and winnerClaimAllowed=false`);
+    }
+    if (payload.chainProviderMode !== "live") {
+      errors.push(`${label} requires chainProviderMode=live`);
     }
     const spend = spendsById.get(lowerHex(payload.spendId));
     if (!spend) {
@@ -2478,6 +2490,10 @@ function replayProviderReady(options, name) {
   return providers.some((provider) => provider?.name === name && provider.ready === true && provider.mode === "live");
 }
 
+function replayProviderAuthorityLocked(options) {
+  return options.proofProviderAuthority === "server-runtime";
+}
+
 function latestReplayEvent(eventsById, kind, predicate = () => true) {
   return [...eventsById.values()]
     .filter((event) => isObject(event) && event.kind === kind && predicate(event))
@@ -2506,6 +2522,11 @@ function replayEventHasProofAuthority(event, winnerClaimAllowed = false) {
   return event?.authority === "proof" && payload.proofAuthority === true && payload.winnerClaimAllowed === winnerClaimAllowed;
 }
 
+function replayEventHasLiveChainProofAuthority(event, winnerClaimAllowed = false) {
+  const payload = isObject(event?.payload) ? event.payload : {};
+  return replayEventHasProofAuthority(event, winnerClaimAllowed) && payload.chainProviderMode === "live";
+}
+
 function replayGateFinalized(event) {
   const payload = isObject(event?.payload) ? event.payload : {};
   return replayEventHasProofAuthority(event, false) && payload.finalityStatus === "finalized" && payload.contractStateVerified === true;
@@ -2515,6 +2536,36 @@ function replayWrongTargetDenyPayload(payload) {
   const operationKind = asText(payload.operationKind).toLowerCase();
   const action = asText(payload.action).toLowerCase();
   return operationKind === "deny_probe" || action.includes("wrong") || action.includes("bypass") || action.includes("deny_probe");
+}
+
+function tokenModeForPaymentToken(paymentToken) {
+  const normalized = asText(paymentToken).toLowerCase();
+  if (normalized === BASE_SEPOLIA_USDC) {
+    return "official-testnet-usdc";
+  }
+  return normalized ? "mock-test-token" : "local-mocked";
+}
+
+function quoteRuntimeModesForStatus(status, spend) {
+  if (status === MOCK_QUOTE_STATUS) {
+    return {
+      CLAIM_MODE: "simulated",
+      PAYMENT_MODE: "mocked",
+      TOKEN_MODE: "local-mocked",
+      IDENTITY_MODE: "pending",
+      WINNER_CLAIM_ALLOWED: false,
+    };
+  }
+  if (status === CHAIN_SETTLEABLE_QUOTE_STATUS) {
+    return {
+      CLAIM_MODE: "caw-target-real",
+      PAYMENT_MODE: "gate-paid-artifact-real",
+      TOKEN_MODE: tokenModeForPaymentToken(spend?.paymentToken),
+      IDENTITY_MODE: "p0-floor-one-wallet",
+      WINNER_CLAIM_ALLOWED: false,
+    };
+  }
+  return null;
 }
 
 function replayJudgeRowsById(bundle) {
@@ -2528,6 +2579,9 @@ function replayJudgeRowPasses(rowsById, rowId, allowedAuthorities) {
 
 function verifyFinalReplayClaimGate(bundle, eventsById, options) {
   const blockers = [];
+  if (!replayProviderAuthorityLocked(options)) {
+    blockers.push("final verifier requires proofProviders from server-runtime authority, not caller-supplied live flags");
+  }
   for (const name of ["chain", "caw", "caw_live", "mcp_lease"]) {
     if (!replayProviderReady(options, name)) {
       blockers.push(`final verifier requires live ${name} proof provider`);
@@ -2585,8 +2639,8 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
   if (!latestReplayEvent(eventsById, "caw.allowance.verified", (event) => replayEventHasProofAuthority(event, false))) {
     blockers.push("final verifier requires caw.allowance.verified proof event");
   }
-  if (!latestReplayEvent(eventsById, "caw.activation.verified", (event) => replayEventHasProofAuthority(event, false))) {
-    blockers.push("final verifier requires caw.activation.verified proof event");
+  if (!latestReplayEvent(eventsById, "caw.activation.verified", (event) => replayEventHasLiveChainProofAuthority(event, false))) {
+    blockers.push("final verifier requires caw.activation.verified proof event from a live chain provider");
   }
   if (!latestReplayEvent(eventsById, "gate.spend_tripped", replayGateFinalized)) {
     blockers.push("final verifier requires finalized gate.spend_tripped proof event");
@@ -2597,8 +2651,8 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
   if (!latestReplayEvent(eventsById, "source.challenge.confirmed", replayGateFinalized)) {
     blockers.push("final verifier requires finalized source.challenge.confirmed proof event");
   }
-  if (!latestReplayEvent(eventsById, "token.balance_delta.verified", (event) => replayEventHasProofAuthority(event, false))) {
-    blockers.push("final verifier requires token.balance_delta.verified proof event");
+  if (!latestReplayEvent(eventsById, "token.balance_delta.verified", (event) => replayEventHasLiveChainProofAuthority(event, false))) {
+    blockers.push("final verifier requires token.balance_delta.verified proof event from a live chain provider");
   }
   if (!latestReplayEvent(eventsById, "artifact.access_token.issued", (event) => event.authority === "delivery")) {
     blockers.push("final verifier requires artifact.access_token.issued delivery event");
@@ -2618,10 +2672,78 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
   }
 
   const quotes = Array.isArray(bundle.quotes) ? bundle.quotes : [];
+  const quotesById = new Map(quotes.filter(isObject).map((quote) => [quote.quoteId, quote]));
+  const spends = Array.isArray(bundle.spends) ? bundle.spends : [];
+  const spendsById = new Map(spends.filter(isObject).map((spend) => [spend.spendId, spend]));
+  const accessTokens = Array.isArray(bundle.artifactAccessTokens) ? bundle.artifactAccessTokens : [];
   if (quotes.length === 0) {
     blockers.push("final verifier requires at least one artifact quote bound to the payment");
-  } else if (quotes.some((quote) => quote?.status === "mocked_after_preflight_not_chain_settleable")) {
+  } else if (quotes.some((quote) => quote?.status === MOCK_QUOTE_STATUS)) {
     blockers.push("final verifier refuses mocked_after_preflight_not_chain_settleable quotes");
+  } else if (!quotes.some((quote) => quote?.status === CHAIN_SETTLEABLE_QUOTE_STATUS)) {
+    blockers.push("final verifier requires chain_settleable_after_preflight quote status");
+  }
+  if (accessTokens.length === 0) {
+    blockers.push("final verifier requires at least one artifact access token");
+  }
+  for (const token of accessTokens) {
+    const quote = quotesById.get(token?.quoteId);
+    if (!quote || quote.status !== CHAIN_SETTLEABLE_QUOTE_STATUS) {
+      blockers.push(`final verifier requires artifact access token ${token?.tokenId ?? "-"} to reference a chain-settleable quote`);
+      break;
+    }
+  }
+  const finalizedTrips = finalEvents.filter((event) => event.kind === "gate.spend_tripped" && replayGateFinalized(event));
+  const finalizedTripSpendIds = [...new Set(finalizedTrips.map((event) => event.payload?.spendId).filter((spendId) => typeof spendId === "string"))];
+  if (finalizedTripSpendIds.length < 2) {
+    blockers.push("final verifier requires two distinct finalized gate.spend_tripped proof spends for A/B");
+  }
+  const settledSpendIds = new Set(
+    finalEvents
+      .filter((event) => event.kind === "gate.spend_settled" && replayGateFinalized(event))
+      .map((event) => event.payload?.spendId)
+      .filter((spendId) => typeof spendId === "string"),
+  );
+  const tokenDeltaSpendIds = new Set(
+    finalEvents
+      .filter((event) => event.kind === "token.balance_delta.verified" && replayEventHasProofAuthority(event, false))
+      .map((event) => event.payload?.spendId)
+      .filter((spendId) => typeof spendId === "string"),
+  );
+  const liveQuoteSpendIds = new Set(quotes.filter((quote) => quote?.status === CHAIN_SETTLEABLE_QUOTE_STATUS).map((quote) => quote.spendId));
+  const liveArtifactSpendIds = new Set(
+    accessTokens
+      .filter((token) => quotesById.get(token?.quoteId)?.status === CHAIN_SETTLEABLE_QUOTE_STATUS)
+      .map((token) => token.spendId),
+  );
+  const leaseSpendIds = new Set(
+    finalEvents
+      .filter((event) => event.kind === "lease.execution.succeeded" && event.authority === "delivery")
+      .map((event) => event.payload?.spendId)
+      .filter((spendId) => typeof spendId === "string"),
+  );
+  const closedLoopSpendIds = [...settledSpendIds].filter(
+    (spendId) =>
+      tokenDeltaSpendIds.has(spendId) &&
+      liveQuoteSpendIds.has(spendId) &&
+      liveArtifactSpendIds.has(spendId) &&
+      leaseSpendIds.has(spendId),
+  );
+  if (closedLoopSpendIds.length !== 1) {
+    blockers.push("final verifier requires exactly one settled spend bound to token delta, live quote, artifact access, and lease execution");
+  } else if (finalizedTripSpendIds.includes(closedLoopSpendIds[0])) {
+    blockers.push("final verifier requires A/B tripped spends to be distinct from the settled C spend");
+  } else if (cawIdentityProbe) {
+    const closedLoopSpend = spendsById.get(closedLoopSpendIds[0]);
+    const walletAddress = lowerHex(cawIdentityProbe.payload?.walletAddress);
+    if (
+      !closedLoopSpend ||
+      !walletAddress ||
+      walletAddress !== lowerHex(closedLoopSpend.payer) ||
+      walletAddress !== lowerHex(closedLoopSpend.agentWallet)
+    ) {
+      blockers.push("final verifier requires CAW identity walletAddress to match the settled spend payer and agentWallet");
+    }
   }
 
   if (bundle.winnerClaimAllowed === true && blockers.length > 0) {
@@ -2776,12 +2898,22 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
         errors.push(`quote ${quote.quoteId ?? "-"} priceAtomic does not match registered spend price`);
       }
     }
+    const quoteModes = quoteRuntimeModesForStatus(quote.status, spend);
+    if (!quoteModes) {
+      errors.push(`quote ${quote.quoteId ?? "-"} has unsupported status ${quote.status ?? "-"}`);
+    }
     const expectedQuoteHash = safeHashJson(
       {
         sessionId: bundle.sessionId,
         spendId: quote.spendId,
         preflightId: quote.preflightId,
         artifactCommitment: lowerHex(quote.artifactCommitment),
+        status: quote.status,
+        chainId: quote.chainId ?? null,
+        payer: lowerHex(spend?.payer),
+        agentWallet: lowerHex(spend?.agentWallet),
+        paymentToken: lowerHex(spend?.paymentToken),
+        market: lowerHex(spend?.market),
         priceAtomic: quote.priceAtomic,
         quoteNonce: quote.quoteNonce,
         validUntilBlock: quote.validUntilBlock,
@@ -2789,19 +2921,44 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
         priceDisclosureHash: quote.priceDisclosureHash,
         sourceStateSnapshotHash: quote.sourceStateSnapshotHash,
         quoteSignedAfterPreflight: true,
-        modes: {
-          CLAIM_MODE: "simulated",
-          PAYMENT_MODE: "mocked",
-          TOKEN_MODE: "local-mocked",
-          IDENTITY_MODE: "pending",
-          WINNER_CLAIM_ALLOWED: false,
-        },
+        modes: quoteModes ?? {},
       },
       `quote ${quote.quoteId ?? "-"} quoteHash body`,
       errors,
     );
     if (expectedQuoteHash && lowerHex(quote.quoteHash) !== expectedQuoteHash) {
       errors.push(`quote ${quote.quoteId ?? "-"} quoteHash does not recompute`);
+    }
+    if (quote.status === CHAIN_SETTLEABLE_QUOTE_STATUS) {
+      const quoteEvent = [...eventsById.values()].find(
+        (event) => event.kind === "quote.signed.chain_settleable" && event.payload?.quoteId === quote.quoteId,
+      );
+      if (!quoteEvent || quoteEvent.authority !== "delivery") {
+        errors.push(`quote ${quote.quoteId ?? "-"} requires delivery-authority quote.signed.chain_settleable event`);
+      } else {
+        for (const [field, expected] of [
+          ["quoteHash", quote.quoteHash],
+          ["spendId", quote.spendId],
+          ["preflightId", quote.preflightId],
+          ["artifactCommitment", lowerHex(quote.artifactCommitment)],
+          ["artifactCid", lowerHex(quote.artifactCid)],
+          ["payer", lowerHex(spend?.payer)],
+          ["agentWallet", lowerHex(spend?.agentWallet)],
+          ["paymentToken", lowerHex(spend?.paymentToken)],
+          ["market", lowerHex(spend?.market)],
+          ["priceAtomic", quote.priceAtomic],
+          ["validUntilBlock", quote.validUntilBlock],
+          ["status", CHAIN_SETTLEABLE_QUOTE_STATUS],
+          ["chainId", quote.chainId],
+        ]) {
+          if (lowerHex(quoteEvent.payload?.[field]) !== lowerHex(expected)) {
+            errors.push(`quote ${quote.quoteId ?? "-"} event payload.${field} does not match quote/payment binding`);
+          }
+        }
+        if (quoteEvent.payload?.proofAuthority !== false || quoteEvent.payload?.winnerClaimAllowed !== false) {
+          errors.push(`quote ${quote.quoteId ?? "-"} live quote event must be delivery-only and winnerClaimAllowed=false`);
+        }
+      }
     }
   }
   for (const token of accessTokens) {
@@ -2849,10 +3006,21 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
       !settlementPayload ||
       settlementPayload.spendId !== token.spendId ||
       settlementPayload.proofAuthority !== true
-    ) {
-      errors.push(`artifact access token ${token.tokenId ?? "-"} must reference token.balance_delta.verified settlementEventId`);
-    }
-  }
+	    ) {
+	      errors.push(`artifact access token ${token.tokenId ?? "-"} must reference token.balance_delta.verified settlementEventId`);
+	    } else if (quote.status === CHAIN_SETTLEABLE_QUOTE_STATUS) {
+	      if (!quote.chainId) {
+	        errors.push(`artifact access token ${token.tokenId ?? "-"} chain-settleable quote requires chainId`);
+	      } else if (asText(quote.chainId) !== asText(settlementPayload.chainId)) {
+	        errors.push(`artifact access token ${token.tokenId ?? "-"} chain-settleable quote chainId does not match token settlement`);
+	      }
+	      const validUntilBlock = decimal(quote.validUntilBlock);
+	      const settlementBlock = decimal(settlementPayload.blockNumber);
+	      if (validUntilBlock === null || settlementBlock === null || validUntilBlock < settlementBlock) {
+	        errors.push(`artifact access token ${token.tokenId ?? "-"} chain-settleable quote expired before token settlement`);
+	      }
+	    }
+	  }
   const rawReceiptsByHash = new Map();
   for (const rawBundle of rawBundles) {
     if (!isObject(rawBundle)) {

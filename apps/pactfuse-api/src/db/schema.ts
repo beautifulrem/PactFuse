@@ -266,6 +266,7 @@ export const quotes = sqliteTable(
     validUntilBlock: text("valid_until_block").notNull(),
     quoteHash: text("quote_hash").notNull(),
     status: text("status").notNull(),
+    chainId: text("chain_id"),
     createdAt: text("created_at").notNull(),
   },
   (table) => ({

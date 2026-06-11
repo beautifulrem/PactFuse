@@ -97,6 +97,18 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.proofCompletenessErrors).toContain("replay bundle requested winnerClaimAllowed=true before every final verifier gate passed");
   });
 
+  it("rejects caller-supplied live provider flags without server runtime authority", () => {
+    const bundle = replayBundle();
+    const result = verifyEvidence(bundle, { cliMode: "proof-chip", proofProviders: liveProofProvidersForTest() });
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofCompletenessErrors).toContain(
+      "final verifier requires proofProviders from server-runtime authority, not caller-supplied live flags",
+    );
+  });
+
   it("rejects replay bundles missing a page beyond the summary rows", () => {
     const bundle = replayBundle();
     addSecondReplayEventPageForTest(bundle);
@@ -268,6 +280,15 @@ describe("pactfuse receipt verifier contract", () => {
       },
       "priceAtomic does not match registered spend price",
     ],
+    [
+      "quote live status drift without live hash",
+      (bundle) => {
+        bundle.quotes[0].status = "chain_settleable_after_preflight";
+        bundle.quotes[0].chainId = "84532";
+        refreshReplayPagingForTest(bundle);
+      },
+      "quoteHash does not recompute",
+    ],
 	    [
 	      "quote expiry",
 	      (bundle) => {
@@ -389,6 +410,24 @@ describe("pactfuse receipt verifier contract", () => {
       "payload.pactPolicyDigest does not match contract call request",
     ],
     [
+      "CAW activation fixture chain provider",
+      (bundle) => {
+        const activationEvent = bundle.events.find((event) => event.kind === "caw.activation.verified");
+        activationEvent.payload.chainProviderMode = "fixture";
+        sealReplayBundleForTest(bundle);
+      },
+      "requires chainProviderMode=live",
+    ],
+    [
+      "CAW allowance fixture chain provider",
+      (bundle) => {
+        const allowanceEvent = bundle.events.find((event) => event.kind === "caw.allowance.verified");
+        allowanceEvent.payload.chainProviderMode = "fixture";
+        sealReplayBundleForTest(bundle);
+      },
+      "requires chainProviderMode=live",
+    ],
+    [
       "token balance agent delta",
       (bundle) => {
         const tokenEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
@@ -414,6 +453,15 @@ describe("pactfuse receipt verifier contract", () => {
         resealTokenBalanceEventForTest(bundle);
       },
       "references missing finalized proof-authority gate.spend_settled event",
+    ],
+    [
+      "token balance fixture chain provider",
+      (bundle) => {
+        const tokenEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
+        tokenEvent.payload.chainProviderMode = "fixture";
+        resealTokenBalanceEventForTest(bundle);
+      },
+      "requires chainProviderMode=live",
     ],
     [
       "c settlement pass row without token balance proof",
@@ -500,7 +548,7 @@ describe("pactfuse receipt verifier contract", () => {
 	    expect(result.errors.some((error) => error.includes(expected))).toBe(true);
 	  });
 
-	  it("accepts uppercase artifact hex variants after canonical comparison", () => {
+  it("accepts uppercase artifact hex variants after canonical comparison", () => {
 	    const bundle = replayBundle();
 	    bundle.artifactPreflights[0].artifactHashPreview = uppercaseHexBody(bundle.artifactPreflights[0].artifactHashPreview);
 	    bundle.artifactPreflights[0].artifactCid = `sha256:${uppercaseHexBody(bundle.artifactPreflights[0].artifactHashPreview)}`;
@@ -517,7 +565,70 @@ describe("pactfuse receipt verifier contract", () => {
 	    expect(result.schemaErrors.some((error) => error.includes("artifact"))).toBe(false);
 	  });
 
-	  it("accepts replay bundles with MCP lease transcript hashes while keeping proof-chip authority closed", () => {
+	  it("accepts structurally bound chain-settleable quote evidence while keeping final authority closed", () => {
+	    const bundle = replayBundle();
+	    promoteFirstQuoteToChainSettleableForTest(bundle);
+	    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.schemaErrors).toEqual([]);
+    expect(result.proofCompletenessErrors).not.toContain("final verifier refuses mocked_after_preflight_not_chain_settleable quotes");
+    expect(result.proofCompletenessErrors).not.toContain("final verifier requires chain_settleable_after_preflight quote status");
+	    expect(result.finalVerifierComplete).toBe(false);
+	  });
+
+  it("rejects chain-settleable quotes whose chainId does not match token settlement", () => {
+    const bundle = replayBundle();
+    promoteFirstQuoteToChainSettleableForTest(bundle);
+    const tokenEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
+    tokenEvent.payload.chainId = "1";
+    resealTokenBalanceEventForTest(bundle);
+
+    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(false);
+    expect(
+      result.errors.some((error) => error.includes("chain-settleable quote chainId does not match token settlement")),
+      JSON.stringify(result.errors),
+    ).toBe(true);
+  });
+
+  it("rejects chain-settleable quotes that expire before token settlement", () => {
+    const bundle = replayBundle();
+    promoteFirstQuoteToChainSettleableForTest(bundle);
+    bundle.quotes[0].validUntilBlock = "99";
+    const quoteEvent = bundle.events.find((event) => event.kind === "quote.signed.chain_settleable");
+    quoteEvent.payload.validUntilBlock = "99";
+    sealReplayBundleForTest(bundle);
+
+    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(false);
+    expect(
+      result.errors.some((error) => error.includes("chain-settleable quote expired before token settlement")),
+      JSON.stringify(result.errors),
+    ).toBe(true);
+  });
+
+  it("rejects final replay authority when the CAW identity wallet is not the closed-loop spend wallet", () => {
+    const bundle = replayBundleWithLease();
+    promoteFirstQuoteToChainSettleableForTest(bundle);
+    appendCawIdentityProbeForTest(bundle, "0x9999999999999999999999999999999999999999");
+
+    const result = verifyEvidence(bundle, {
+      cliMode: "proof-chip",
+      proofProviders: liveProofProvidersForTest(),
+      proofProviderAuthority: "server-runtime",
+    });
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofCompletenessErrors).toContain(
+      "final verifier requires CAW identity walletAddress to match the settled spend payer and agentWallet",
+    );
+  });
+
+		  it("accepts replay bundles with MCP lease transcript hashes while keeping proof-chip authority closed", () => {
 	    const bundle = replayBundleWithLease();
 	    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
 
@@ -779,6 +890,12 @@ function replayBundle() {
 	    spendId,
 	    preflightId,
 	    artifactCommitment: artifactHash,
+      status: "mocked_after_preflight_not_chain_settleable",
+      chainId: null,
+      payer: agentWallet.toLowerCase(),
+      agentWallet: agentWallet.toLowerCase(),
+      paymentToken: paymentToken.toLowerCase(),
+      market: market.toLowerCase(),
 	    priceAtomic: "1000",
 	    quoteNonce: "quote-nonce",
 	    validUntilBlock: "1000000",
@@ -851,6 +968,7 @@ function replayBundle() {
 	        validUntilBlock: "1000000",
 	        quoteHash,
 	        status: "mocked_after_preflight_not_chain_settleable",
+        chainId: null,
 	        createdAt,
 	      },
 	    ],
@@ -986,6 +1104,8 @@ function replayBundle() {
       gateEventId: gateEvent.payload.gateEventId,
       txHash: gateEvent.payload.txHash,
       chainId: gateEvent.payload.chainId,
+      chainProviderMode: "live",
+      chainProviderEndpoint: "https://rpc.example.test",
       blockNumber: gateEvent.payload.blockNumber,
       preBlockNumber: gateEvent.payload.blockNumber - 1,
       transferLogIndex: 2,
@@ -1023,6 +1143,12 @@ function rehashFirstQuoteForTest(bundle) {
     spendId: quote.spendId,
     preflightId: quote.preflightId,
     artifactCommitment: quote.artifactCommitment.toLowerCase(),
+    status: quote.status,
+    chainId: quote.chainId ?? null,
+    payer: bundle.spends[0].payer.toLowerCase(),
+    agentWallet: bundle.spends[0].agentWallet.toLowerCase(),
+    paymentToken: bundle.spends[0].paymentToken.toLowerCase(),
+    market: bundle.spends[0].market.toLowerCase(),
     priceAtomic: quote.priceAtomic,
     quoteNonce: quote.quoteNonce,
     validUntilBlock: quote.validUntilBlock,
@@ -1033,6 +1159,64 @@ function rehashFirstQuoteForTest(bundle) {
     modes: lockedRuntimeModes(),
   });
   refreshReplayPagingForTest(bundle);
+}
+
+function promoteFirstQuoteToChainSettleableForTest(bundle) {
+  const quote = bundle.quotes[0];
+  quote.status = "chain_settleable_after_preflight";
+  quote.chainId = "84532";
+  const spend = bundle.spends[0];
+  quote.quoteHash = hashJson({
+    sessionId: bundle.sessionId,
+    spendId: quote.spendId,
+    preflightId: quote.preflightId,
+    artifactCommitment: quote.artifactCommitment.toLowerCase(),
+    status: quote.status,
+    chainId: quote.chainId,
+    payer: spend.payer.toLowerCase(),
+    agentWallet: spend.agentWallet.toLowerCase(),
+    paymentToken: spend.paymentToken.toLowerCase(),
+    market: spend.market.toLowerCase(),
+    priceAtomic: quote.priceAtomic,
+    quoteNonce: quote.quoteNonce,
+    validUntilBlock: quote.validUntilBlock,
+    artifactCid: quote.artifactCid.toLowerCase(),
+    priceDisclosureHash: quote.priceDisclosureHash,
+    sourceStateSnapshotHash: quote.sourceStateSnapshotHash,
+    quoteSignedAfterPreflight: true,
+    modes: {
+      CLAIM_MODE: "caw-target-real",
+      PAYMENT_MODE: "gate-paid-artifact-real",
+      TOKEN_MODE: "mock-test-token",
+      IDENTITY_MODE: "p0-floor-one-wallet",
+      WINNER_CLAIM_ALLOWED: false,
+    },
+  });
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "delivery",
+    kind: "quote.signed.chain_settleable",
+    payload: {
+      quoteId: quote.quoteId,
+      quoteHash: quote.quoteHash,
+      spendId: quote.spendId,
+      preflightId: quote.preflightId,
+      artifactCommitment: quote.artifactCommitment.toLowerCase(),
+      artifactCid: quote.artifactCid.toLowerCase(),
+      payer: spend.payer.toLowerCase(),
+      agentWallet: spend.agentWallet.toLowerCase(),
+      paymentToken: spend.paymentToken.toLowerCase(),
+      market: spend.market.toLowerCase(),
+      priceAtomic: quote.priceAtomic,
+      validUntilBlock: quote.validUntilBlock,
+      status: quote.status,
+      chainId: quote.chainId,
+      proofAuthority: false,
+      winnerClaimAllowed: false,
+    },
+    createdAt: "2026-06-11T00:00:02.125Z",
+  });
+  sealReplayBundleForTest(bundle);
 }
 
 function rehashFirstCawReceiptForTest(bundle) {
@@ -1435,6 +1619,8 @@ function appendCawAllowanceEventForTest(bundle, approve, auditUsage) {
       auditPolicyDigest: auditUsage.payload.policyDigest,
       auditLogHash: auditUsage.payload.auditLogHash,
       chainId: approve.request.chain_id,
+      chainProviderMode: "live",
+      chainProviderEndpoint: "https://rpc.example.test",
       blockNumber: 99,
       preBlockNumber: 98,
       approvalLogIndex: 1,
@@ -1491,6 +1677,8 @@ function appendCawActivationEventForTest(bundle, activate, auditUsage, gateEvent
       gateEventId: gateEvent.payload.gateEventId,
       procurementGateAddress: activate.request.contract_addr,
       chainId: activate.request.chain_id,
+      chainProviderMode: "live",
+      chainProviderEndpoint: "https://rpc.example.test",
       requestHash: activate.requestHash,
       responseHash: activate.responseHash,
       proofAuthority: true,
@@ -1796,6 +1984,30 @@ function replayBundleWithLease() {
   leaseRow.reason = "MCP transcript recorded";
   leaseRow.evidenceEventId = leaseEvent.eventId;
   return bundle;
+}
+
+function appendCawIdentityProbeForTest(bundle, walletAddress = bundle.spends[0].payer) {
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "proof",
+    kind: "caw.identity.probed",
+    payload: {
+      mode: "real",
+      pass: true,
+      walletId: "wallet-live-1",
+      walletAddress: walletAddress.toLowerCase(),
+      expectedWalletAddress: walletAddress.toLowerCase(),
+      walletStatus: "active",
+      identityMode: "p0-floor-one-wallet",
+      requestHash: hex32("identity-request"),
+      responseHash: hex32("identity-response"),
+      proofAuthority: true,
+      winnerClaimAllowed: true,
+    },
+    createdAt: "2026-06-11T00:00:03.500Z",
+  });
+  sealReplayBundleForTest(bundle);
+  return bundle.events.find((event) => event.kind === "caw.identity.probed");
 }
 
 function appendContractProofEventsForTest(bundle) {

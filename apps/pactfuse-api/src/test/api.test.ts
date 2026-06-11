@@ -71,6 +71,7 @@ function makeApp(
     cawIngestToken?: string | null;
     apiSecurity?: Partial<ApiSecurityConfig>;
     requiredIndexerCursors?: ServiceCtx["requiredIndexerCursors"];
+    verifier?: ServiceCtx["verifier"];
   } = {},
 ) {
   const mcpAuditSecret = options.mcpAuditSecret === undefined ? MCP_AUDIT_TOKEN : options.mcpAuditSecret;
@@ -88,7 +89,7 @@ function makeApp(
   };
   const ctx: ServiceCtx = {
     db: openPactFuseDb(dbPath),
-    verifier: createVerifierAdapter(),
+    verifier: options.verifier ?? createVerifierAdapter(),
     chain: options.chain ?? createUnconfiguredChainClient(),
     caw: options.caw ?? createUnconfiguredCawReceiptSource(),
     cawLive: options.cawLive ?? createUnconfiguredCawLiveClient(),
@@ -368,6 +369,63 @@ describe("pactfuse-api P0", () => {
     expect(res.json.data.proofChipAllowed).toBe(false);
     expect(res.json.data.winnerClaimAllowed).toBe(false);
     expect(res.json.data.finalVerifierComplete).toBe(false);
+  });
+
+  it("persists final verifier results instead of hardcoding fail-closed flags", async () => {
+    const { app, ctx } = makeApp(":memory:", {
+      verifier: {
+        verify: async () => ({
+          schemaOk: true,
+          proofChipAllowed: true,
+          winnerClaimAllowed: true,
+          requestedWinnerClaimAllowed: true,
+          finalVerifierComplete: true,
+          warnings: [],
+          errors: [],
+        }),
+      },
+    });
+    const sessionId = await createSession(app, "sess-verify-final-result");
+
+    const res = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-final-result",
+      payload: { receipt: { receiptId: "final-result" } },
+    });
+    const run = ctx.db.sqlite
+      .prepare(
+        "SELECT schema_ok, proof_chip_allowed, winner_claim_allowed, final_verifier_complete FROM verifier_runs WHERE session_id = ?",
+      )
+      .get(sessionId) as
+      | { schema_ok: number; proof_chip_allowed: number; winner_claim_allowed: number; final_verifier_complete: number }
+      | undefined;
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const verifierEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "verifier.final_replay_claim");
+
+    expect(res.status).toBe(200);
+    expect(res.json.data.proofLevel).toBe("final_replay_claim");
+    expect(res.json.data.schemaOk).toBe(true);
+    expect(res.json.data.proofChipAllowed).toBe(true);
+    expect(res.json.data.finalVerifierComplete).toBe(true);
+    expect(res.json.data.winnerClaimAllowed).toBe(true);
+    expect(run).toEqual({
+      schema_ok: 1,
+      proof_chip_allowed: 1,
+      winner_claim_allowed: 1,
+      final_verifier_complete: 1,
+    });
+    expect(verifierEvent).toEqual(
+      expect.objectContaining({
+        authority: "operator",
+        payload: expect.objectContaining({
+          schemaOk: true,
+          proofChipAllowed: true,
+          winnerClaimAllowed: true,
+          finalVerifierComplete: true,
+        }),
+      }),
+    );
   });
 
   it("fails verifier closed when a required indexer cursor is missing", async () => {
@@ -812,9 +870,11 @@ describe("pactfuse-api P0", () => {
       "activationEventId",
       "activateInteractionId",
       "activateTxHash",
-      "settlementEventId",
-      "txHash",
-      "paymentToken",
+	      "settlementEventId",
+	      "txHash",
+	      "chainProviderMode",
+	      "chainProviderEndpoint",
+	      "paymentToken",
       "agentWallet",
       "market",
       "amountAtomic",
@@ -892,6 +952,8 @@ describe("pactfuse-api P0", () => {
 	      "artifactCid",
 	      "quoteSignedAfterPreflight",
 	      "priceDisclosureHash",
+      "status",
+      "chainId",
 	      "winnerClaimAllowed",
 	    ]);
     expect(json.paths["/api/v1/quotes"].post.requestBody.content["application/json"].schema.$ref).toBe("#/components/schemas/QuoteInput");
@@ -1007,6 +1069,14 @@ describe("pactfuse-api P0", () => {
     expect(json.components.schemas.QuoteResponse.oneOf[0].properties.data.properties.quoteSignedAfterPreflight.const).toBe(
       true,
     );
+    expect(json.components.schemas.QuotePayload.properties.settlementMode.enum).toEqual([
+      "mocked_after_preflight_not_chain_settleable",
+      "chain_settleable_after_preflight",
+    ]);
+    expect(json.components.schemas.QuoteResponse.oneOf[0].properties.data.properties.status.enum).toContain(
+      "chain_settleable_after_preflight",
+    );
+    expect(json.components.schemas.QuoteResponse.oneOf[0].properties.data.properties.chainId.type).toEqual(["string", "null"]);
     expect(json.paths["/api/v1/mcp/audit"].post["x-pactfuse-proof-fields"]).toEqual([
       "proofAuthority",
       "winnerClaimAllowed",
@@ -2645,6 +2715,87 @@ describe("pactfuse-api P0", () => {
     expect(payerMismatchJson.error.code).toBe("proof_blocked");
   });
 
+  it("rechecks artifact token quote and settlement bindings when the bearer token is used", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
+    });
+    const payer = "0x1000000000000000000000000000000000000001";
+    const settlementSessionId = await createSession(app, "sess-artifact-token-settlement-drift");
+    const settlementSpendId = await registerSpend(app, settlementSessionId);
+    const settlementQuote = await quoteArtifactForTest(app, settlementSessionId, settlementSpendId, "artifact-settlement-drift");
+    const settlementFinalized = await finalizeSpendSettlement(
+      app,
+      ctx,
+      logs,
+      settlementSessionId,
+      settlementSpendId,
+      "artifact-settlement-drift",
+    );
+    await verifyTokenBalanceDeltaForTest(
+      app,
+      logs,
+      tokenBalances,
+      settlementSessionId,
+      settlementSpendId,
+      "artifact-settlement-drift",
+      settlementFinalized,
+    );
+    const settlementIssued = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId: settlementSessionId,
+      idempotencyKey: "issue-settlement-drift-token",
+      payload: {
+        spendId: settlementSpendId,
+        payer,
+        quoteId: settlementQuote.quoteId,
+        artifactHash: settlementQuote.artifactHash,
+        artifactPayload: settlementQuote.artifactPayload,
+      },
+    });
+    ctx.db.sqlite
+      .prepare("UPDATE artifact_access_tokens SET settlement_event_id = ? WHERE session_id = ? AND token_id = ?")
+      .run(hex32("wrong-artifact-settlement-event"), settlementSessionId, settlementIssued.json.data.tokenId);
+    const settlementRead = await app.request(
+      `/api/v1/artifacts/${settlementSessionId}/${settlementSpendId}/${payer}/${settlementQuote.artifactHash}`,
+      { headers: { authorization: `Bearer ${settlementIssued.json.data.accessToken}` } },
+    );
+    const settlementReadJson = await settlementRead.json();
+
+    const quoteSessionId = await createSession(app, "sess-artifact-token-quote-drift");
+    const quoteSpendId = await registerSpend(app, quoteSessionId);
+    const quote = await quoteArtifactForTest(app, quoteSessionId, quoteSpendId, "artifact-quote-drift");
+    const quoteFinalized = await finalizeSpendSettlement(app, ctx, logs, quoteSessionId, quoteSpendId, "artifact-quote-drift");
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, quoteSessionId, quoteSpendId, "artifact-quote-drift", quoteFinalized);
+    const quoteIssued = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId: quoteSessionId,
+      idempotencyKey: "issue-quote-drift-token",
+      payload: {
+        spendId: quoteSpendId,
+        payer,
+        quoteId: quote.quoteId,
+        artifactHash: quote.artifactHash,
+        artifactPayload: quote.artifactPayload,
+      },
+    });
+    ctx.db.sqlite
+      .prepare("UPDATE quotes SET chain_id = ? WHERE session_id = ? AND quote_id = ?")
+      .run("1", quoteSessionId, quote.quoteId);
+    const quoteRead = await app.request(`/api/v1/artifacts/${quoteSessionId}/${quoteSpendId}/${payer}/${quote.artifactHash}`, {
+      headers: { authorization: `Bearer ${quoteIssued.json.data.accessToken}` },
+    });
+    const quoteReadJson = await quoteRead.json();
+
+    expect(settlementIssued.status).toBe(202);
+    expect(settlementRead.status).toBe(422);
+    expect(settlementReadJson.error.code).toBe("proof_blocked");
+    expect(settlementReadJson.error.message).toContain("settlement proof no longer matches");
+    expect(quoteIssued.status).toBe(202);
+    expect(quoteRead.status).toBe(422);
+    expect(quoteReadJson.error.code).toBe("proof_blocked");
+  });
+
   it("rejects hand-written artifact token rows without verifier issuance evidence", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
@@ -2946,6 +3097,7 @@ describe("pactfuse-api P0", () => {
     expect(quote.json.data.sourceStateSnapshotHash).toBe(sourceStateSnapshotHash);
     expect(quote.json.data.quoteSignedAfterPreflight).toBe(true);
     expect(quote.json.data.status).toBe("mocked_after_preflight_not_chain_settleable");
+    expect(quote.json.data.chainId).toBeNull();
     expect(keyEvent).toEqual(
       expect.objectContaining({
         authority: "operator",
@@ -2974,9 +3126,117 @@ describe("pactfuse-api P0", () => {
       expect.objectContaining({
         preflightId: preflight.json.data.preflightId,
         artifactCommitment: artifactHashPreview,
+        status: "mocked_after_preflight_not_chain_settleable",
+        chainId: null,
         priceDisclosureHash,
         sourceStateSnapshotHash,
         quoteSignedAfterPreflight: true,
+      }),
+    );
+  });
+
+  it("requires a live chain provider before signing chain-settleable quotes", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-live-quote-provider-required");
+    const spendId = await registerSpend(app, sessionId);
+    const artifactHashPreview = TEST_ARTIFACT_HASH;
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "live-quote-provider-preflight",
+      payload: {
+        spendId,
+        artifactHashPreview,
+        artifactCid: artifactCidForTest(artifactHashPreview),
+        endpointUrl: "https://example.com/artifact",
+        priceDisclosureHash: hex32("live-quote-provider-price"),
+        sourceStateSnapshotHash: hex32("live-quote-provider-source"),
+      },
+    });
+
+    const quote = await post(app, "/api/v1/quotes", {
+      sessionId,
+      idempotencyKey: "live-quote-provider-missing",
+      payload: {
+        spendId,
+        preflightId: preflight.json.data.preflightId,
+        artifactCommitment: artifactHashPreview,
+        priceAtomic: "1000",
+        quoteNonce: "live-quote-provider-missing",
+        validUntilBlock: "123",
+        settlementMode: "chain_settleable_after_preflight",
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(quote.status).toBe(423);
+    expect(quote.json.error.message).toContain("chain-settleable quote requires a live chain proof provider");
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("quote.signed.chain_settleable");
+  });
+
+  it("signs chain-settleable quotes with live chain and payment bindings", async () => {
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ mode: "live", chainId: "84532", currentBlockNumber: 100, logs: [] }),
+    });
+    const sessionId = await createSession(app, "sess-live-quote-bound");
+    const spendId = await registerSpend(app, sessionId);
+    const artifactHashPreview = TEST_ARTIFACT_HASH;
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "live-quote-bound-preflight",
+      payload: {
+        spendId,
+        artifactHashPreview,
+        artifactCid: artifactCidForTest(artifactHashPreview),
+        endpointUrl: "https://example.com/artifact",
+        priceDisclosureHash: hex32("live-quote-bound-price"),
+        sourceStateSnapshotHash: hex32("live-quote-bound-source"),
+      },
+    });
+    const quote = await post(app, "/api/v1/quotes", {
+      sessionId,
+      idempotencyKey: "live-quote-bound",
+      payload: {
+        spendId,
+        preflightId: preflight.json.data.preflightId,
+        artifactCommitment: artifactHashPreview,
+        priceAtomic: "1000",
+        quoteNonce: "live-quote-bound",
+        validUntilBlock: "123",
+        settlementMode: "chain_settleable_after_preflight",
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const quoteEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "quote.signed.chain_settleable");
+    const quoteRow = ctx.db.sqlite.prepare("SELECT status, chain_id FROM quotes WHERE quote_id = ?").get(quote.json.data.quoteId) as Record<
+      string,
+      unknown
+    >;
+
+    expect(quote.status).toBe(201);
+    expect(quote.json.data.status).toBe("chain_settleable_after_preflight");
+    expect(quote.json.data.chainId).toBe("84532");
+    expect(quoteRow).toEqual(expect.objectContaining({ status: "chain_settleable_after_preflight", chain_id: "84532" }));
+    expect(quoteEvent).toEqual(
+      expect.objectContaining({
+        authority: "delivery",
+        payload: expect.objectContaining({
+          quoteId: quote.json.data.quoteId,
+          quoteHash: quote.json.data.quoteHash,
+          spendId,
+          preflightId: preflight.json.data.preflightId,
+          artifactCommitment: artifactHashPreview,
+          priceAtomic: "1000",
+          validUntilBlock: "123",
+          paymentToken: TEST_PAYMENT_TOKEN_ADDRESS.toLowerCase(),
+          agentWallet: TEST_PAYER_ADDRESS.toLowerCase(),
+          market: TEST_MARKET_ADDRESS.toLowerCase(),
+          chainId: "84532",
+          status: "chain_settleable_after_preflight",
+          proofAuthority: false,
+          winnerClaimAllowed: false,
+        }),
       }),
     );
   });
@@ -3459,11 +3719,40 @@ describe("pactfuse-api P0", () => {
         evidenceEventId: tokenEvent?.eventId,
       }),
     );
-    expect(verify.status).toBe(200);
-    expect(verifyJson.data.schemaOk).toBe(true);
-  });
+	  expect(verify.status).toBe(200);
+	  expect(verifyJson.data.schemaOk).toBe(true);
+	});
 
-  it("blocks ERC20 balance delta verification when the settlement tx has no matching Transfer log", async () => {
+  it("refuses CAW allowance and token settlement proof when the chain provider is fixture-mode", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const tokenBalances: Record<string, string> = {};
+    const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ mode: "fixture", currentBlockNumber: 101, logs, tokenBalances }),
+    });
+    const sessionId = await createSession(app, "sess-token-delta-fixture-chain");
+    const spendId = await registerSpend(app, sessionId);
+	    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "token-delta-fixture-chain");
+    const allowance = await verifyCawAllowanceForTest(
+      app,
+      logs,
+      tokenBalances,
+      sessionId,
+      spendId,
+      "token-delta-fixture-chain",
+      {},
+      423,
+    );
+	    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+	    const replayJson = await replay.json();
+
+    expect((allowance.error as { code?: string }).code).toBe("proof_pending");
+    expect((allowance.error as { message?: string }).message).toContain("live chain proof provider");
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("caw.allowance.verified");
+	    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("token.balance_delta.verified");
+	  });
+
+	it("blocks ERC20 balance delta verification when the settlement tx has no matching Transfer log", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
     const { app, ctx } = makeApp(":memory:", {
@@ -6824,6 +7113,7 @@ function createFakeIndexerChainClient(config: {
   chainId?: string;
   currentBlockNumber?: number;
   logs?: Array<Record<string, unknown>>;
+  mode?: "fixture" | "live";
   ready?: boolean;
   reason?: string;
   getLogsError?: Error;
@@ -6847,7 +7137,7 @@ function createFakeIndexerChainClient(config: {
     async status() {
       return {
         name: "chain",
-        mode: "fixture",
+        mode: config.mode ?? "live",
         ready: config.ready ?? true,
         reason: config.reason ?? "test chain indexer provider",
         chainId: config.chainId ?? "84532",
@@ -7354,14 +7644,15 @@ async function verifyCawAllowanceForTest(
   sessionId: string,
   spendId: string,
   key: string,
-  overrides: Partial<{
-    paymentToken: string;
-    agentWallet: string;
-    procurementGateAddress: string;
-    amountAtomic: string;
-    blockNumber: number;
-  }> = {},
-): Promise<Record<string, unknown>> {
+	  overrides: Partial<{
+	    paymentToken: string;
+	    agentWallet: string;
+	    procurementGateAddress: string;
+	    amountAtomic: string;
+	    blockNumber: number;
+	  }> = {},
+	  expectedStatus = 202,
+	): Promise<Record<string, unknown>> {
   const paymentToken = overrides.paymentToken ?? TEST_PAYMENT_TOKEN_ADDRESS;
   const agentWallet = overrides.agentWallet ?? TEST_PAYER_ADDRESS;
   const procurementGateAddress = overrides.procurementGateAddress ?? INDEXER_ADDRESS;
@@ -7434,8 +7725,8 @@ async function verifyCawAllowanceForTest(
     idempotencyKey: `${key}-caw-allowance`,
     payload: { spendId, approveInteractionId: approve.json.data.interactionId },
   });
-  expect(allowance.status).toBe(202);
-  return allowance.json.data as Record<string, unknown>;
+  expect(allowance.status, JSON.stringify(allowance.json)).toBe(expectedStatus);
+  return (expectedStatus === 202 ? allowance.json.data : allowance.json) as Record<string, unknown>;
 }
 
 async function verifyCawActivationForTest(
