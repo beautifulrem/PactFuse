@@ -2411,7 +2411,7 @@ describe("pactfuse-api P0", () => {
 
     expect(issue.status).toBe(422);
     expect(issue.json.error.code).toBe("proof_blocked");
-    expect(issue.json.error.message).toContain("quote commitment");
+    expect(issue.json.error.message).toContain("registered ProcurementGate artifactHash");
   });
 
   it("blocks artifact access issuance for overpriced or expired quotes", async () => {
@@ -2419,18 +2419,28 @@ describe("pactfuse-api P0", () => {
     const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const overpricedSessionId = await createSession(app, "sess-artifact-overpriced-quote");
     const overpricedSpendId = await registerSpend(app, overpricedSessionId);
-    const overpriced = await quoteArtifactForTest(app, overpricedSessionId, overpricedSpendId, "artifact-overpriced", { priceAtomic: "1001" });
-    await finalizeSpendSettlement(app, ctx, logs, overpricedSessionId, overpricedSpendId, "artifact-overpriced");
-
-    const overpricedIssue = await post(app, "/api/v1/artifacts/access-token", {
+    const overpricedPreflight = await post(app, "/api/v1/artifacts/preflight", {
       sessionId: overpricedSessionId,
-      idempotencyKey: "issue-overpriced-artifact",
+      idempotencyKey: "overpriced-preflight",
       payload: {
         spendId: overpricedSpendId,
-        payer: "0x1000000000000000000000000000000000000001",
-        quoteId: overpriced.quoteId,
-        artifactHash: overpriced.artifactHash,
-        artifactPayload: overpriced.artifactPayload,
+        artifactHashPreview: TEST_ARTIFACT_HASH,
+        artifactCid: artifactCidForTest(TEST_ARTIFACT_HASH),
+        endpointUrl: "https://example.com/overpriced.json",
+        priceDisclosureHash: hex32("overpriced-price-disclosure"),
+        sourceStateSnapshotHash: hex32("overpriced-source-state"),
+      },
+    });
+    const overpricedQuote = await post(app, "/api/v1/quotes", {
+      sessionId: overpricedSessionId,
+      idempotencyKey: "overpriced-quote",
+      payload: {
+        spendId: overpricedSpendId,
+        preflightId: overpricedPreflight.json.data.preflightId,
+        artifactCommitment: TEST_ARTIFACT_HASH,
+        priceAtomic: "1001",
+        quoteNonce: "overpriced-quote-nonce",
+        validUntilBlock: "1000000",
       },
     });
 
@@ -2450,9 +2460,10 @@ describe("pactfuse-api P0", () => {
       },
     });
 
-    expect(overpricedIssue.status).toBe(422);
-    expect(overpricedIssue.json.error.code).toBe("proof_blocked");
-    expect(overpricedIssue.json.error.message).toContain("price exceeds");
+    expect(overpricedPreflight.status).toBe(202);
+    expect(overpricedQuote.status).toBe(422);
+    expect(overpricedQuote.json.error.code).toBe("proof_blocked");
+    expect(overpricedQuote.json.error.message).toContain("priceAtomic does not match registered ProcurementGate price");
     expect(expiredIssue.status).toBe(422);
     expect(expiredIssue.json.error.code).toBe("proof_blocked");
     expect(expiredIssue.json.error.message).toContain("expired");
@@ -2462,10 +2473,11 @@ describe("pactfuse-api P0", () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-artifact-large-payload");
-    const spendId = await registerSpend(app, sessionId);
     const artifactPayload = { artifactType: "source-bound-code-scan-mcp-lease", content: "x".repeat(300 * 1024) };
+    const artifactHash = hashForTestJson(artifactPayload);
+    const spendId = await registerSpend(app, sessionId, defaultSourceCapabilityForTest(), { artifactHash });
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact-large-payload", { artifactPayload });
-    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-large-payload");
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-large-payload", { artifactHash });
 
     const issue = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
@@ -2580,7 +2592,7 @@ describe("pactfuse-api P0", () => {
     const { app, ctx } = makeApp();
     const sessionId = await createSession(app, "sess-quote-preflight-bound");
     const spendId = await registerSpend(app, sessionId);
-    const artifactHashPreview = hex32("artifact-preview-bound");
+    const artifactHashPreview = TEST_ARTIFACT_HASH;
     const priceDisclosureHash = hex32("price-disclosure-bound");
     const sourceStateSnapshotHash = hex32("source-state-bound");
 
@@ -2668,13 +2680,14 @@ describe("pactfuse-api P0", () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-quote-preflight-mismatch");
     const spendId = await registerSpend(app, sessionId);
+    const artifactHashPreview = TEST_ARTIFACT_HASH;
     const preflight = await post(app, "/api/v1/artifacts/preflight", {
       sessionId,
       idempotencyKey: "preflight-mismatch",
       payload: {
         spendId,
-        artifactHashPreview: hex32("artifact-preview-original"),
-        artifactCid: artifactCidForTest(hex32("artifact-preview-original")),
+        artifactHashPreview,
+        artifactCid: artifactCidForTest(artifactHashPreview),
         endpointUrl: "https://example.com/artifact",
         priceDisclosureHash: hex32("price-disclosure-mismatch"),
         sourceStateSnapshotHash: hex32("source-state-mismatch"),
@@ -2724,7 +2737,7 @@ describe("pactfuse-api P0", () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-refund-quoted");
     const spendId = await registerSpend(app, sessionId);
-    const artifactHashPreview = hex32("refund-artifact-preview");
+    const artifactHashPreview = TEST_ARTIFACT_HASH;
     const preflight = await post(app, "/api/v1/artifacts/preflight", {
       sessionId,
       idempotencyKey: "refund-preflight",
@@ -2761,19 +2774,6 @@ describe("pactfuse-api P0", () => {
         sourceStateSnapshotHash: hex32("refund-second-source-state"),
       },
     });
-    const secondQuote = await post(app, "/api/v1/quotes", {
-      sessionId,
-      idempotencyKey: "refund-second-quote",
-      payload: {
-        spendId,
-        preflightId: secondPreflight.json.data.preflightId,
-        artifactCommitment: secondPreflight.json.data.artifactHashPreview,
-        priceAtomic: "2000",
-        quoteNonce: "refund-second-quote-nonce",
-        validUntilBlock: "124",
-      },
-    });
-
     const refund = await post(app, "/api/v1/artifacts/refund", {
       sessionId,
       idempotencyKey: "refund-after-quote",
@@ -2787,7 +2787,9 @@ describe("pactfuse-api P0", () => {
     const replayJson = await replay.json();
     const refundEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "artifact.refund.pending");
 
-    expect(secondQuote.status).toBe(201);
+    expect(secondPreflight.status).toBe(422);
+    expect(secondPreflight.json.error.code).toBe("proof_blocked");
+    expect(secondPreflight.json.error.message).toContain("registered ProcurementGate artifactHash");
     expect(refund.status).toBe(202);
     expect(refund.json.data).toEqual(
       expect.objectContaining({
@@ -2814,9 +2816,9 @@ describe("pactfuse-api P0", () => {
     const logs: Array<Record<string, unknown>> = [];
     const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-refund-token-exclusive");
-    const spendId = await registerSpend(app, sessionId);
     const artifactPayload = artifactPayloadForTest("refund-token-artifact");
     const artifactHash = hashForTestJson(artifactPayload);
+    const spendId = await registerSpend(app, sessionId, defaultSourceCapabilityForTest(), { artifactHash });
     const preflight = await post(app, "/api/v1/artifacts/preflight", {
       sessionId,
       idempotencyKey: "exclusive-preflight",
@@ -2841,7 +2843,7 @@ describe("pactfuse-api P0", () => {
         validUntilBlock: "123",
       },
     });
-    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "exclusive-token-first");
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "exclusive-token-first", { artifactHash });
     const issue = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
       idempotencyKey: "exclusive-issue-token",
@@ -2864,9 +2866,9 @@ describe("pactfuse-api P0", () => {
     });
 
     const secondSessionId = await createSession(app, "sess-token-refund-exclusive");
-    const secondSpendId = await registerSpend(app, secondSessionId);
     const secondArtifactPayload = artifactPayloadForTest("token-refund-artifact");
     const secondArtifactHash = hashForTestJson(secondArtifactPayload);
+    const secondSpendId = await registerSpend(app, secondSessionId, defaultSourceCapabilityForTest(), { artifactHash: secondArtifactHash });
     const secondPreflight = await post(app, "/api/v1/artifacts/preflight", {
       sessionId: secondSessionId,
       idempotencyKey: "exclusive-second-preflight",
@@ -2900,7 +2902,7 @@ describe("pactfuse-api P0", () => {
         reason: "delivery timeout",
       },
     });
-    await finalizeSpendSettlement(app, ctx, logs, secondSessionId, secondSpendId, "exclusive-refund-first");
+    await finalizeSpendSettlement(app, ctx, logs, secondSessionId, secondSpendId, "exclusive-refund-first", { artifactHash: secondArtifactHash });
     const issueAfterRefund = await post(app, "/api/v1/artifacts/access-token", {
       sessionId: secondSessionId,
       idempotencyKey: "exclusive-issue-after-refund",
@@ -4315,7 +4317,7 @@ describe("pactfuse-api P0", () => {
     const sessionId = await createSession(app, "sess-missing-live");
     const spendId = await registerSpend(app, sessionId);
     const payer = "0x1000000000000000000000000000000000000001";
-    const artifactHash = hex32("lease-artifact-pending");
+    const artifactHash = TEST_ARTIFACT_HASH;
 
     const lease = await post(app, "/api/v1/lease/execute", {
       sessionId,
@@ -5713,16 +5715,23 @@ async function registerSpend(
   app: ReturnType<typeof createApp>,
   sessionId: string,
   capabilityVector: Record<string, unknown> = defaultSourceCapabilityForTest(),
+  spendOverrides: Partial<{
+    paymentToken: string;
+    artifactHash: string;
+    market: string;
+    maxPriceAtomic: string;
+    nonce: string;
+  }> = {},
 ): Promise<string> {
   await registerSource(app, sessionId, capabilityVector);
   const sourceHashes = [hex32("source")];
-  const spendId = await computeSpendIdForTest(app, sessionId, sourceHashes, capabilityVector);
+  const spendId = await computeSpendIdForTest(app, sessionId, sourceHashes, capabilityVector, spendOverrides);
   const res = await post(app, "/api/v1/spends/register-batch", {
     sessionId,
     idempotencyKey: "spend-register",
     payload: {
       spends: [
-        spendRegistrationForTest(spendId, { sourceHashes }),
+        spendRegistrationForTest(spendId, { sourceHashes, ...spendOverrides }),
       ],
     },
   });
@@ -5735,7 +5744,7 @@ function artifactCidForTest(artifactHash: string): string {
 }
 
 function artifactPayloadForTest(seed: string): Record<string, unknown> {
-  return { artifactType: "source-bound-code-scan-mcp-lease", seed, content: `scan:${seed}` };
+  return seed === "artifact" ? { ...TEST_ARTIFACT_PAYLOAD } : { artifactType: "source-bound-code-scan-mcp-lease", seed, content: `scan:${seed}` };
 }
 
 async function quoteArtifactForTest(
@@ -5751,7 +5760,7 @@ async function quoteArtifactForTest(
   preflightId: string;
   quoteId: string;
 }> {
-  const artifactPayload = options.artifactPayload ?? artifactPayloadForTest(seed);
+  const artifactPayload = options.artifactPayload ?? artifactPayloadForTest("artifact");
   const artifactHash = hashForTestJson(artifactPayload);
   const artifactCid = artifactCidForTest(artifactHash);
   const preflight = await post(app, "/api/v1/artifacts/preflight", {
@@ -5795,7 +5804,8 @@ const TEST_PAYMENT_TOKEN_ADDRESS = "0x4000000000000000000000000000000000000004";
 const TEST_MARKET_ADDRESS = "0x5000000000000000000000000000000000000005";
 const TEST_PACT_ID = hex32("pact-c");
 const TEST_TOOL_ID = hex32("code-scan");
-const TEST_ARTIFACT_HASH = hex32("artifact");
+const TEST_ARTIFACT_PAYLOAD = Object.freeze({ artifactType: "source-bound-code-scan-mcp-lease", seed: "artifact", content: "scan:artifact" });
+const TEST_ARTIFACT_HASH = hashForTestJson(TEST_ARTIFACT_PAYLOAD);
 
 function spendRegistrationForTest(
   spendId: string,
@@ -5941,16 +5951,24 @@ function createFakeIndexerChainClient(config: {
         const sessionId =
           typeof logArgs.sessionId === "string" ? logArgs.sessionId : typeof matchingLog?.sessionId === "string" ? matchingLog.sessionId : hex32("contract-session");
         const state = config.contractSpendStates?.[spendId] ?? (event === "SpendTripped" ? 2 : event === "SpendSettled" ? 3 : 1);
+        const logContractPactId = typeof logArgs.pactId === "string" ? logArgs.pactId : undefined;
+        const logContractToolId = typeof logArgs.toolId === "string" ? logArgs.toolId : undefined;
+        const logContractSourceSetHash = typeof logArgs.sourceSetHash === "string" ? logArgs.sourceSetHash : undefined;
+        const logContractAgentWallet = typeof logArgs.agentWallet === "string" ? logArgs.agentWallet : undefined;
+        const logContractPaymentToken = typeof logArgs.paymentToken === "string" ? logArgs.paymentToken : undefined;
+        const logContractPrice = typeof logArgs.price === "string" ? logArgs.price : undefined;
+        const logContractArtifactHash = typeof logArgs.artifactHash === "string" ? logArgs.artifactHash : undefined;
+        const logContractMarket = typeof logArgs.market === "string" ? logArgs.market : undefined;
         return [
           sessionId,
-          config.contractRegisteredSpendOverrides?.pactId ?? TEST_PACT_ID,
-          config.contractRegisteredSpendOverrides?.toolId ?? TEST_TOOL_ID,
-          config.contractRegisteredSpendOverrides?.sourceSetHash ?? procurementGateSourceSetHashForTest([hex32("source")]),
-          config.contractRegisteredSpendOverrides?.agentWallet ?? TEST_PAYER_ADDRESS,
-          config.contractRegisteredSpendOverrides?.paymentToken ?? TEST_PAYMENT_TOKEN_ADDRESS,
-          config.contractRegisteredSpendOverrides?.price ?? "1000",
-          config.contractRegisteredSpendOverrides?.artifactHash ?? TEST_ARTIFACT_HASH,
-          config.contractRegisteredSpendOverrides?.market ?? TEST_MARKET_ADDRESS,
+          config.contractRegisteredSpendOverrides?.pactId ?? logContractPactId ?? TEST_PACT_ID,
+          config.contractRegisteredSpendOverrides?.toolId ?? logContractToolId ?? TEST_TOOL_ID,
+          config.contractRegisteredSpendOverrides?.sourceSetHash ?? logContractSourceSetHash ?? procurementGateSourceSetHashForTest([hex32("source")]),
+          config.contractRegisteredSpendOverrides?.agentWallet ?? logContractAgentWallet ?? TEST_PAYER_ADDRESS,
+          config.contractRegisteredSpendOverrides?.paymentToken ?? logContractPaymentToken ?? TEST_PAYMENT_TOKEN_ADDRESS,
+          config.contractRegisteredSpendOverrides?.price ?? logContractPrice ?? "1000",
+          config.contractRegisteredSpendOverrides?.artifactHash ?? logContractArtifactHash ?? TEST_ARTIFACT_HASH,
+          config.contractRegisteredSpendOverrides?.market ?? logContractMarket ?? TEST_MARKET_ADDRESS,
           state,
         ];
       }
@@ -6123,6 +6141,16 @@ async function finalizeSpendSettlement(
   sessionId: string,
   spendId: string,
   key: string,
+  contractOverrides: Partial<{
+    pactId: string;
+    toolId: string;
+    sourceSetHash: string;
+    agentWallet: string;
+    paymentToken: string;
+    price: string;
+    artifactHash: string;
+    market: string;
+  }> = {},
 ): Promise<Record<string, unknown>> {
   const observedBody = gateEventEnvelope(sessionId, spendId, `${key}-observed`, {
     txHash: hex32(`${key}-tx`),
@@ -6137,7 +6165,7 @@ async function finalizeSpendSettlement(
       event: "SpendSettled",
       sessionId,
       spendId,
-      args: { sessionId, spendId },
+      args: { sessionId, spendId, ...contractOverrides },
       transactionHash: hex32(`${key}-tx`),
       rawLogHash: hex32(`${key}-log`),
     }),
@@ -6166,6 +6194,13 @@ async function computeSpendIdForTest(
   sessionId: string,
   sourceHashes: string[],
   capabilityVector: Record<string, unknown> = defaultSourceCapabilityForTest(),
+  spendOverrides: Partial<{
+    agentWallet: string;
+    paymentToken: string;
+    artifactHash: string;
+    market: string;
+    maxPriceAtomic: string;
+  }> = {},
 ): Promise<`0x${string}`> {
   const session = await app.request(`/api/v1/sessions/${sessionId}`);
   const sessionJson = await session.json();
@@ -6189,11 +6224,11 @@ async function computeSpendIdForTest(
     pactId: TEST_PACT_ID,
     toolId: TEST_TOOL_ID,
     sourceSetHash,
-    agentWallet: TEST_PAYER_ADDRESS,
-    paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
-    priceAtomic: "1000",
-    artifactHash: TEST_ARTIFACT_HASH,
-    market: TEST_MARKET_ADDRESS,
+    agentWallet: spendOverrides.agentWallet ?? TEST_PAYER_ADDRESS,
+    paymentToken: spendOverrides.paymentToken ?? TEST_PAYMENT_TOKEN_ADDRESS,
+    priceAtomic: spendOverrides.maxPriceAtomic ?? "1000",
+    artifactHash: spendOverrides.artifactHash ?? TEST_ARTIFACT_HASH,
+    market: spendOverrides.market ?? TEST_MARKET_ADDRESS,
   });
 }
 

@@ -157,6 +157,14 @@ describe("pactfuse receipt verifier contract", () => {
 	      },
 	      "quoteHash does not recompute",
 	    ],
+    [
+      "self-consistent quote price drift from registered spend",
+      (bundle) => {
+        bundle.quotes[0].priceAtomic = "999";
+        rehashFirstQuoteForTest(bundle);
+      },
+      "priceAtomic does not match registered spend price",
+    ],
 	    [
 	      "quote expiry",
 	      (bundle) => {
@@ -164,6 +172,13 @@ describe("pactfuse receipt verifier contract", () => {
 	      },
 	      "quoteHash does not recompute",
 	    ],
+    [
+      "self-consistent artifact drift from registered spend",
+      (bundle) => {
+        retargetArtifactForTest(bundle, { artifactType: "source-bound-code-scan-mcp-lease", content: "drifted-scan-result" });
+      },
+      "artifactHashPreview does not match registered spend artifactHash",
+    ],
 	    [
 	      "artifact token payload",
 	      (bundle) => {
@@ -171,6 +186,14 @@ describe("pactfuse receipt verifier contract", () => {
 	      },
 	      "payload hash does not match artifactHash",
 	    ],
+    [
+      "missing registered spend",
+      (bundle) => {
+        bundle.spends = [];
+        bundle.replayPageIndex = replayPageIndexForTest(bundle);
+      },
+      "references missing registered spend",
+    ],
 	    [
 	      "agent transcript hash",
 	      (bundle) => {
@@ -325,6 +348,14 @@ describe("pactfuse receipt verifier contract", () => {
 	      },
 	      "tools/list is not bounded to pinned source manifest",
 	    ],
+    [
+      "lease registered spend artifact",
+      (bundle) => {
+        bundle.spends[0].artifactHash = hex32("lease-spend-artifact-drift");
+        bundle.replayPageIndex = replayPageIndexForTest(bundle);
+      },
+      "artifactHash does not match registered spend artifactHash",
+    ],
     [
       "self-consistent non-read-only pinned tool metadata",
       (bundle) => {
@@ -494,7 +525,27 @@ function replayBundle() {
     agentTranscriptHash: hashJson(agentTranscriptForTest(sessionId, [])),
     events,
     sources: [],
-    spends: [],
+    spends: [
+      {
+        spendId,
+        sessionId,
+        pactId: hex32("pact-c"),
+        toolId: hex32("code-scan"),
+        payer: "0x1234",
+        agentWallet: "0x1000000000000000000000000000000000000001",
+        paymentToken: "0x4000000000000000000000000000000000000004",
+        artifactHash,
+        market: "0x5000000000000000000000000000000000000005",
+        sourceHashes: [hex32("source")],
+        sourceSetHash: hex32("source-set"),
+        sessionCommitment: hex32("session-commitment"),
+        spendPreimage: {},
+        maxPriceAtomic: "1000",
+        nonce: "nonce-1",
+        status: "settled_finalized",
+        createdAt,
+      },
+    ],
 	    artifactPreflights: [
 	      {
 	        preflightId,
@@ -596,6 +647,39 @@ function replayBundle() {
   sealReplayBundleForTest(bundle);
   return bundle;
 		}
+
+function rehashFirstQuoteForTest(bundle) {
+  const quote = bundle.quotes[0];
+  quote.quoteHash = hashJson({
+    sessionId: bundle.sessionId,
+    spendId: quote.spendId,
+    preflightId: quote.preflightId,
+    artifactCommitment: quote.artifactCommitment.toLowerCase(),
+    priceAtomic: quote.priceAtomic,
+    quoteNonce: quote.quoteNonce,
+    validUntilBlock: quote.validUntilBlock,
+    artifactCid: quote.artifactCid.toLowerCase(),
+    priceDisclosureHash: quote.priceDisclosureHash,
+    sourceStateSnapshotHash: quote.sourceStateSnapshotHash,
+    quoteSignedAfterPreflight: true,
+    modes: lockedRuntimeModes(),
+  });
+  bundle.replayPageIndex = replayPageIndexForTest(bundle);
+}
+
+function retargetArtifactForTest(bundle, artifactPayload) {
+  const artifactHash = hashJson(artifactPayload);
+  const artifactCid = `sha256:${artifactHash}`;
+  bundle.artifactPreflights[0].artifactHashPreview = artifactHash;
+  bundle.artifactPreflights[0].artifactCid = artifactCid;
+  bundle.quotes[0].artifactCommitment = artifactHash;
+  bundle.quotes[0].artifactCid = artifactCid;
+  bundle.artifactAccessTokens[0].artifactHash = artifactHash;
+  bundle.artifactAccessTokens[0].artifactCid = artifactCid;
+  bundle.artifactAccessTokens[0].artifactPayloadHash = artifactHash;
+  bundle.artifactAccessTokens[0].artifactPayload = artifactPayload;
+  rehashFirstQuoteForTest(bundle);
+}
 
 function replayBundleWithLease() {
   const bundle = replayBundle();

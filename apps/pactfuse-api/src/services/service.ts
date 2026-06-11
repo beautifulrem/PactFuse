@@ -1854,11 +1854,12 @@ export async function runArtifactPreflight(input: SessionScopedEnvelope, ctx: Se
   const payload = parseStrict(ArtifactPreflightPayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("artifacts:preflight", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
-    assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
     const artifactHashPreview = payload.artifactHashPreview.toLowerCase();
     const artifactCid = payload.artifactCid.toLowerCase();
     const createdAt = ctx.clock.now().toISOString();
     const preflightId = hashJson({ sessionId: envelope.sessionId, payload, requestId });
+    assertSpendArtifactHash(spend, artifactHashPreview, "artifact preflight", requestId);
     assertArtifactCidMatchesHash(artifactCid, artifactHashPreview, requestId);
     ctx.db.sqlite
       .prepare(
@@ -1913,10 +1914,12 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
   const payload = parseStrict(QuotePayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("quotes:sign", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
-    assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
     const preflight = requireQuotePreflight(ctx, envelope.sessionId, payload, requestId);
     const artifactCid = String(preflight.artifact_cid);
     const artifactCommitment = payload.artifactCommitment.toLowerCase();
+    assertSpendArtifactHash(spend, artifactCommitment, "artifact quote", requestId);
+    assertSpendPrice(spend, payload.priceAtomic, "artifact quote", requestId);
     const priceDisclosureHash = String(preflight.price_disclosure_hash);
     const sourceStateSnapshotHash = String(preflight.source_state_snapshot_hash);
     const createdAt = ctx.clock.now().toISOString();
@@ -2062,6 +2065,7 @@ export async function issueArtifactAccessToken(input: SessionScopedEnvelope, ctx
     const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
     const payer = requireSpendPayer(spend, payload.payer, requestId);
     const artifactHash = payload.artifactHash.toLowerCase();
+    assertSpendArtifactHash(spend, artifactHash, "artifact access", requestId);
     const settlement = requireFinalizedSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
     assertNoArtifactRefundPending(ctx, envelope.sessionId, payload.spendId, requestId);
     return withProcessLock(`artifact-token:${envelope.sessionId}:${payload.spendId}`, async () => {
@@ -2086,6 +2090,7 @@ export async function issueArtifactAccessToken(input: SessionScopedEnvelope, ctx
           artifactHash,
           settlementBlockNumber: settlement.blockNumber,
           spendMaxPriceAtomic: String(spend.max_price_atomic),
+          spendArtifactHash: String(spend.artifact_hash),
         },
         requestId,
       );
@@ -2219,6 +2224,7 @@ export async function executeLease(
       const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
       const payer = requireSpendPayer(spend, payload.payer, requestId);
       const artifactHash = payload.artifactHash.toLowerCase();
+      assertSpendArtifactHash(spend, artifactHash, "lease execution", requestId);
       const settlement = requireFinalizedSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
       assertNoArtifactRefundPending(ctx, envelope.sessionId, payload.spendId, requestId);
       const activeToken = requireActiveArtifactAccess(
@@ -3912,6 +3918,34 @@ function requireSpendPayer(spend: Row, payer: string, requestId: string): string
     });
   }
   return registeredPayer;
+}
+
+function assertSpendArtifactHash(spend: Row, artifactHash: string, scope: string, requestId: string): void {
+  const expected = String(spend.artifact_hash).toLowerCase();
+  const actual = artifactHash.toLowerCase();
+  if (actual !== expected) {
+    throw Object.assign(new Error(`${scope} artifactHash does not match registered ProcurementGate artifactHash`), {
+      apiError: proofBlockedError(requestId, `${scope} artifactHash does not match registered ProcurementGate artifactHash`, {
+        spendId: String(spend.spend_id),
+        expectedArtifactHash: expected,
+        actualArtifactHash: actual,
+      }),
+    });
+  }
+}
+
+function assertSpendPrice(spend: Row, priceAtomic: string, scope: string, requestId: string): void {
+  const expected = BigInt(String(spend.max_price_atomic)).toString();
+  const actual = BigInt(priceAtomic).toString();
+  if (actual !== expected) {
+    throw Object.assign(new Error(`${scope} priceAtomic does not match registered ProcurementGate price`), {
+      apiError: proofBlockedError(requestId, `${scope} priceAtomic does not match registered ProcurementGate price`, {
+        spendId: String(spend.spend_id),
+        expectedPriceAtomic: expected,
+        actualPriceAtomic: actual,
+      }),
+    });
+  }
 }
 
 function assertCawOperationCanAcceptReceipt(operation: Row | undefined, requestId: string): void {
@@ -6277,6 +6311,7 @@ function requireArtifactQuoteBinding(
     artifactHash: string;
     settlementBlockNumber: number;
     spendMaxPriceAtomic: string;
+    spendArtifactHash: string;
   },
   requestId: string,
 ): { preflightId: string; artifactCid: string } {
@@ -6304,11 +6339,23 @@ function requireArtifactQuoteBinding(
       }),
     });
   }
+  if (String(quote.artifact_commitment).toLowerCase() !== input.spendArtifactHash.toLowerCase()) {
+    throw Object.assign(new Error("artifact quote commitment does not match registered ProcurementGate artifactHash"), {
+      apiError: proofBlockedError(requestId, "artifact quote commitment does not match registered ProcurementGate artifactHash", {
+        quoteId: input.quoteId,
+        expectedArtifactHash: input.spendArtifactHash.toLowerCase(),
+        actualArtifactHash: String(quote.artifact_commitment).toLowerCase(),
+      }),
+    });
+  }
   const artifactCid = String(quote.artifact_cid);
   assertArtifactCidMatchesHash(artifactCid, input.artifactHash, requestId);
-  if (BigInt(String(quote.price_atomic)) > BigInt(input.spendMaxPriceAtomic)) {
-    throw Object.assign(new Error("artifact quote price exceeds spend maxPriceAtomic"), {
-      apiError: proofBlockedError(requestId, "artifact quote price exceeds spend maxPriceAtomic"),
+  if (BigInt(String(quote.price_atomic)) !== BigInt(input.spendMaxPriceAtomic)) {
+    throw Object.assign(new Error("artifact quote price must match registered ProcurementGate price"), {
+      apiError: proofBlockedError(requestId, "artifact quote price must match registered ProcurementGate price", {
+        expectedPriceAtomic: BigInt(input.spendMaxPriceAtomic).toString(),
+        actualPriceAtomic: BigInt(String(quote.price_atomic)).toString(),
+      }),
     });
   }
   if (BigInt(String(quote.valid_until_block)) < BigInt(input.settlementBlockNumber)) {

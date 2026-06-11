@@ -960,6 +960,9 @@ function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
   const artifactTokensById = new Map(
     (Array.isArray(bundle.artifactAccessTokens) ? bundle.artifactAccessTokens : []).filter(isObject).map((token) => [token.tokenId, token]),
   );
+  const spendsById = new Map(
+    (Array.isArray(bundle.spends) ? bundle.spends : []).filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]),
+  );
   for (const lease of Array.isArray(bundle.leaseRuns) ? bundle.leaseRuns : []) {
     if (!isObject(lease)) {
       errors.push("leaseRuns entries must be objects");
@@ -973,6 +976,17 @@ function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
     }
     for (const field of ["leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit", "settlementEventId", "artifactTokenId"]) {
       requirePath(lease, [field], errors);
+    }
+    const spend = spendsById.get(lowerHex(lease.spendId));
+    if (!spend) {
+      errors.push(`succeeded lease run ${lease.leaseRunId} references missing registered spend`);
+    } else {
+      if (lowerHex(lease.artifactHash) !== lowerHex(spend.artifactHash)) {
+        errors.push(`succeeded lease run ${lease.leaseRunId} artifactHash does not match registered spend artifactHash`);
+      }
+      if (typeof spend.payer === "string" && lease.payer !== spend.payer) {
+        errors.push(`succeeded lease run ${lease.leaseRunId} payer does not match registered spend payer`);
+      }
     }
     const transcriptHash = requireLeaseHashField(lease, "transcriptHash", errors);
     const toolsListHash = requireLeaseHashField(lease, "toolsListHash", errors);
@@ -1531,6 +1545,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   const preflights = Array.isArray(bundle.artifactPreflights) ? bundle.artifactPreflights : [];
   const quotes = Array.isArray(bundle.quotes) ? bundle.quotes : [];
   const accessTokens = Array.isArray(bundle.artifactAccessTokens) ? bundle.artifactAccessTokens : [];
+  const spends = Array.isArray(bundle.spends) ? bundle.spends : [];
   const cawOperationsById = new Map(cawReceiptOperations.filter(isObject).map((operation) => [operation.operationId, operation]));
   const mcpCalls = Array.isArray(bundle.mcpAdapterCalls) ? bundle.mcpAdapterCalls : [];
   if (!Array.isArray(bundle.mcpAdapterCalls)) {
@@ -1544,6 +1559,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   verifyJudgeCheck(bundle, eventsById, errors);
   verifyContractStateProofEvents(bundle, Array.isArray(bundle.events) ? bundle.events : [], errors);
   verifySourceIdentityBindings(bundle, errors);
+  const spendsById = new Map(spends.filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]));
   const preflightsById = new Map(preflights.filter(isObject).map((preflight) => [preflight.preflightId, preflight]));
   const quotesById = new Map(quotes.filter(isObject).map((quote) => [quote.quoteId, quote]));
   for (const preflight of preflights) {
@@ -1553,6 +1569,12 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     }
     if (lowerHex(preflight.artifactCid) !== `sha256:${asText(preflight.artifactHashPreview).toLowerCase()}`) {
       errors.push(`artifact preflight ${preflight.preflightId ?? "-"} artifactCid does not match artifactHashPreview`);
+    }
+    const spend = spendsById.get(lowerHex(preflight.spendId));
+    if (!spend) {
+      errors.push(`artifact preflight ${preflight.preflightId ?? "-"} references missing registered spend`);
+    } else if (lowerHex(preflight.artifactHashPreview) !== lowerHex(spend.artifactHash)) {
+      errors.push(`artifact preflight ${preflight.preflightId ?? "-"} artifactHashPreview does not match registered spend artifactHash`);
     }
   }
   for (const quote of quotes) {
@@ -1573,6 +1595,19 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
       lowerHex(quote.artifactCid) !== lowerHex(preflight.artifactCid)
     ) {
       errors.push(`quote ${quote.quoteId ?? "-"} artifact commitment does not match preflight`);
+    }
+    const spend = spendsById.get(lowerHex(quote.spendId));
+    if (!spend) {
+      errors.push(`quote ${quote.quoteId ?? "-"} references missing registered spend`);
+    } else {
+      if (lowerHex(quote.artifactCommitment) !== lowerHex(spend.artifactHash)) {
+        errors.push(`quote ${quote.quoteId ?? "-"} artifactCommitment does not match registered spend artifactHash`);
+      }
+      const quotePrice = decimal(quote.priceAtomic);
+      const spendPrice = decimal(spend.maxPriceAtomic);
+      if (quotePrice === null || spendPrice === null || quotePrice !== spendPrice) {
+        errors.push(`quote ${quote.quoteId ?? "-"} priceAtomic does not match registered spend price`);
+      }
     }
     const expectedQuoteHash = safeHashJson(
       {
@@ -1626,6 +1661,17 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
       lowerHex(token.artifactCid) !== lowerHex(quote.artifactCid)
     ) {
       errors.push(`artifact access token ${token.tokenId ?? "-"} is not bound to quote/preflight artifact`);
+    }
+    const spend = spendsById.get(lowerHex(token.spendId));
+    if (!spend) {
+      errors.push(`artifact access token ${token.tokenId ?? "-"} references missing registered spend`);
+    } else {
+      if (lowerHex(token.artifactHash) !== lowerHex(spend.artifactHash)) {
+        errors.push(`artifact access token ${token.tokenId ?? "-"} artifactHash does not match registered spend artifactHash`);
+      }
+      if (typeof spend.payer === "string" && token.payer !== spend.payer) {
+        errors.push(`artifact access token ${token.tokenId ?? "-"} payer does not match registered spend payer`);
+      }
     }
   }
   const rawReceiptsByHash = new Map();
