@@ -88,8 +88,8 @@ WINNER_CLAIM_ALLOWED: false
 | --- | --- | --- |
 | Cobo wallet identity | Pending probe | No |
 | Payment settlement | Mocked/local | No real-token claim |
-| CAW allowance proof | Implemented with CAW live approve call evidence, CAW audit allow usage, approve tx receipt, ERC20 `Approval` log, and block-level `allowance` checks in local mocked mode | No public Cobo-payment claim |
-| Token balance delta proof | Implemented with finalized `SpendSettled`, prior `caw.allowance.verified`, CAW `activate_tool` audit usage bound to the settlement tx, ERC20 `Transfer`, and block-level `balanceOf` checks in local mocked mode | No public token-settlement claim |
+| CAW allowance proof | Implemented with active Pact policy digest/snapshot binding, CAW live approve call evidence, CAW audit allow usage, approve tx receipt, ERC20 `Approval` log, and block-level `allowance` checks in local mocked mode | No public Cobo-payment claim |
+| Token balance delta proof | Implemented with finalized `SpendSettled`, prior `caw.allowance.verified`, active Pact policy digest/snapshot binding, CAW `activate_tool` audit usage bound to the settlement tx, ERC20 `Transfer`, and block-level `balanceOf` checks in local mocked mode | No public token-settlement claim |
 | Token delivery | Local mocked | No public token-delivery claim |
 | Fusebox app | Fixture preview | No proof authority |
 | Receipt verifier | Fail-closed structural verifier | No public proof claim |

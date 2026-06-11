@@ -88,7 +88,6 @@ describe("pactfuse receipt verifier contract", () => {
 
   it("accepts structurally bound CAW live contract calls while keeping final authority closed", () => {
     const bundle = replayBundle();
-    appendCawLiveContractCallsForTest(bundle);
     const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
 
     expect(result.schemaOk).toBe(true);
@@ -305,6 +304,33 @@ describe("pactfuse receipt verifier contract", () => {
         resealCawLiveContractCallForTest(bundle, activate);
       },
       "does not match a finalized SpendSettled proof event by spendId and contractAddress",
+    ],
+    [
+      "CAW active Pact missing policy authority binding",
+      (bundle) => {
+        const pactEvent = bundle.events.find((event) => event.kind === "caw.live.pact.synced");
+        delete pactEvent.payload.policyDigest;
+        sealReplayBundleForTest(bundle);
+      },
+      "requires policy digest, snapshot hash, chain/target/selector allowlists, request limit, and expiry",
+    ],
+    [
+      "CAW audit usage policy digest split from Pact",
+      (bundle) => {
+        const auditUsage = bundle.events.find((event) => event.kind === "caw.live.audit.usage.verified");
+        auditUsage.payload.pactPolicyDigest = hex32("wrong-pact-policy");
+        sealReplayBundleForTest(bundle);
+      },
+      "pactPolicyDigest must match policyDigest",
+    ],
+    [
+      "CAW contract event policy digest split from active Pact",
+      (bundle) => {
+        const contractEvent = bundle.events.find((event) => event.kind === "caw.live.contract_call.submitted");
+        contractEvent.payload.pactPolicyDigest = hex32("wrong-contract-policy");
+        sealReplayBundleForTest(bundle);
+      },
+      "payload.pactPolicyDigest does not match contract call request",
     ],
     [
       "token balance agent delta",
@@ -1074,12 +1100,23 @@ function appendCawLiveContractCallsForTest(bundle) {
   const spend = bundle.spends[0];
   const gateEvent = bundle.events.find((candidate) => candidate.kind === "gate.spend_settled");
   const gateAddress = gateEvent.payload.contractAddress.toLowerCase();
+  const policyDigest = hex32("pact-live-policy");
+  const policy = {
+    chain_ids: ["84532"],
+    target_addresses: [spend.paymentToken.toLowerCase(), gateAddress],
+    selectors: [ERC20_APPROVE_SELECTOR, PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR],
+    request_limit: "2",
+    expiry: "2026-06-12T00:00:00.000Z",
+  };
+  const policySnapshotHash = hashJson({ policy });
   const pactRequest = { pact_id: pactId };
   const pactResponse = {
     result: {
       pact_id: pactId,
       wallet_id: walletId,
       status: "ACTIVE",
+      policy_digest: policyDigest,
+      policy,
     },
   };
   const pactSync = {
@@ -1147,28 +1184,32 @@ function appendCawLiveContractCallsForTest(bundle) {
     createdAt,
   });
   bundle.cawLiveInteractions = [...bundle.cawLiveInteractions, pactSync, approve, activate];
-  bundle.events = [
-    ...bundle.events,
-    {
-      eventSeq: bundle.events.length + 1,
-      authority: "proof",
-      kind: "caw.live.pact.synced",
-      payload: {
-        interactionId: pactSync.interactionId,
-        walletId,
-        pactId,
-        pactScopedApiKeyHash: authKeyHash,
-        requestHash: pactSync.requestHash,
-        responseHash: pactSync.responseHash,
-        status: "live_active",
-        proofAuthority: true,
-        winnerClaimAllowed: false,
-      },
-      createdAt,
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "proof",
+    kind: "caw.live.pact.synced",
+    payload: {
+      interactionId: pactSync.interactionId,
+      walletId,
+      pactId,
+      pactScopedApiKeyHash: authKeyHash,
+      policyDigest,
+      policySnapshotHash,
+      policyChainIds: policy.chain_ids,
+      policyContractAddresses: policy.target_addresses,
+      policySelectors: policy.selectors,
+      policyRequestLimit: policy.request_limit,
+      policyExpiry: policy.expiry,
+      requestHash: pactSync.requestHash,
+      responseHash: pactSync.responseHash,
+      status: "live_active",
+      proofAuthority: true,
+      winnerClaimAllowed: false,
     },
-    cawLiveContractEventForTest(bundle, approve, createdAt),
-    cawLiveContractEventForTest(bundle, activate, createdAt),
-  ];
+    createdAt,
+  });
+  sealReplayBundleForTest(bundle);
+  bundle.events.push(cawLiveContractEventForTest(bundle, approve, createdAt), cawLiveContractEventForTest(bundle, activate, createdAt));
   sealReplayBundleForTest(bundle);
   return { pactSync, approve, activate };
 }
@@ -1233,7 +1274,7 @@ function cawLiveAuditItemForTest(interaction, action) {
     result: "allowed",
     request_id: interaction.cawRequestId,
     transaction_hash: interaction.response.result.transaction_hash,
-    policy_digest: hex32(`policy-${interaction.cawRequestId}`),
+    policy_digest: hex32("pact-live-policy"),
   };
 }
 
@@ -1255,6 +1296,9 @@ function appendCawAuditUsageEventForTest(bundle, auditSync, auditEvent, interact
       action: auditItem.action,
       result: "allowed",
       policyDigest: auditItem.policy_digest,
+      pactPolicyDigest: contractEvent.payload.pactPolicyDigest,
+      pactSyncInteractionId: contractEvent.payload.pactSyncInteractionId,
+      pactSyncEventId: contractEvent.payload.pactSyncEventId,
       txHash: auditItem.transaction_hash,
       auditLogHash: hashJson(auditItem),
       auditLogIndex,
@@ -1394,7 +1438,9 @@ function cawLiveContractInteractionForTest({ seed, bundle, walletId, pactId, aut
 }
 
 function cawLiveContractEventForTest(bundle, interaction, createdAt) {
-  void bundle;
+  const pactSyncEvent = bundle.events.find(
+    (candidate) => candidate.kind === "caw.live.pact.synced" && candidate.payload?.pactId === interaction.pactId && candidate.payload?.walletId === interaction.walletId,
+  );
   return {
     authority: "proof",
     kind: "caw.live.contract_call.submitted",
@@ -1407,6 +1453,10 @@ function cawLiveContractEventForTest(bundle, interaction, createdAt) {
       contractAddress: interaction.request.contract_addr,
       selector: interaction.request.selector,
       cawRequestId: interaction.cawRequestId,
+      pactSyncInteractionId: pactSyncEvent?.payload.interactionId,
+      pactSyncEventId: pactSyncEvent?.eventId,
+      pactPolicyDigest: pactSyncEvent?.payload.policyDigest,
+      pactPolicySnapshotHash: pactSyncEvent?.payload.policySnapshotHash,
       chainId: interaction.request.chain_id,
       valueAtomic: interaction.request.value,
       txHash: interaction.response.result.transaction_hash,

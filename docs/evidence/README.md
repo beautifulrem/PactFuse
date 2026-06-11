@@ -9,8 +9,9 @@ This folder separates current checked-in status from future winner-claim evidenc
 - `caw-policy-receipt.example.json`: template for normalized CAW receipt capture.
 - `receipt-pack.pending.example.json`: schema-only example only; not real evidence yet.
 - Artifact preflight / Judge Check / runner heartbeat / CAW receipt ingest / Agent Transcript / replay bundle records are API-backed, but checked-in public evidence remains pending until live Cobo identity, deployed token, and external-chain receipts are captured.
-- The backend now requires `caw.allowance.verified` before `token.balance_delta.verified`: CAW live approve call evidence, CAW audit allow usage, approve tx receipt, ERC20 `Approval(owner=agentWallet, spender=ProcurementGate)`, and block-level `allowance` state must all match the registered spend.
-- Token settlement proof also requires `caw.activation.verified`: the CAW `activate_tool` contract call must have audit allow usage and a tx hash matching the finalized `SpendSettled` event before ERC20 `Transfer` and `balanceOf` deltas can pass.
+- The backend now requires an active CAW Pact policy authority binding before proof-bearing contract calls: policy digest, policy snapshot hash, chain allowlist, target allowlist, selector allowlist, request limit, and expiry must be present and consistent.
+- The backend requires `caw.allowance.verified` before `token.balance_delta.verified`: CAW live approve call evidence, matching Pact policy digest, CAW audit allow usage, approve tx receipt, ERC20 `Approval(owner=agentWallet, spender=ProcurementGate)`, and block-level `allowance` state must all match the registered spend.
+- Token settlement proof also requires `caw.activation.verified`: the CAW `activate_tool` contract call must have the same Pact policy digest, audit allow usage, and a tx hash matching the finalized `SpendSettled` event before ERC20 `Transfer` and `balanceOf` deltas can pass.
 
 Current checked-in public modes stay:
 

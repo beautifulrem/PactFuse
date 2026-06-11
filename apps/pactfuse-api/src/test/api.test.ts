@@ -993,6 +993,10 @@ describe("pactfuse-api P0", () => {
       "cawRequestId",
       "txHash",
       "pactScopedApiKeyHash",
+      "pactSyncInteractionId",
+      "pactSyncEventId",
+      "pactPolicyDigest",
+      "pactPolicySnapshotHash",
       "requestHash",
       "responseHash",
       "proofAuthority",
@@ -6354,6 +6358,111 @@ describe("pactfuse-api P0", () => {
     expect(badActivateValue.json.error.message).toContain("must not send native value");
   });
 
+  it("blocks proof-bearing CAW contract calls when active Pact policy authority is missing", async () => {
+    const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient({ includePolicyBinding: false }) });
+    const sessionId = await createSession(app, "sess-caw-live-missing-policy-binding");
+    const spendId = await registerSpend(app, sessionId);
+    await post(app, "/api/v1/caw/live/pacts/submit", {
+      sessionId,
+      idempotencyKey: "missing-policy-pact-submit",
+      payload: { walletId: "wallet-live-1", intent: "missing policy", spec: { policies: [] } },
+    });
+    const sync = await post(app, "/api/v1/caw/live/pacts/sync", {
+      sessionId,
+      idempotencyKey: "missing-policy-pact-sync",
+      payload: { pactId: "pact-live-1" },
+    });
+    const approve = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "missing-policy-approve",
+        payload: {
+          spendId,
+          operationKind: "approve",
+          pactId: "pact-live-1",
+          walletId: "wallet-live-1",
+          chainId: "84532",
+          contractAddress: TEST_PAYMENT_TOKEN_ADDRESS,
+          procurementGateAddress: INDEXER_ADDRESS,
+          calldata: cawApproveCalldataForTest(INDEXER_ADDRESS, "1000"),
+          requestId: "missing-policy-approve",
+        },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const judge = await app.request(`/api/v1/evidence/judge-check?sessionId=${sessionId}`);
+    const judgeJson = await judge.json();
+    const cawRow = judgeJson.data.rows.find((row: { rowId: string }) => row.rowId === "caw_boundary");
+
+    expect(sync.status).toBe(202);
+    expect(sync.json.data.policyDigest).toBeNull();
+    expect(cawRow.status).toBe("blocked");
+    expect(approve.status).toBe(422);
+    expect(approve.json.error.message).toContain("policy authority binding");
+  });
+
+  it("blocks CAW contract calls after Pact policy request limit is exhausted", async () => {
+    const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient({ policyRequestLimit: "1" }) });
+    const sessionId = await createSession(app, "sess-caw-live-policy-limit");
+    const spendId = await registerSpend(app, sessionId);
+    await post(app, "/api/v1/caw/live/pacts/submit", {
+      sessionId,
+      idempotencyKey: "policy-limit-pact-submit",
+      payload: { walletId: "wallet-live-1", intent: "policy limit", spec: { policies: [] } },
+    });
+    await post(app, "/api/v1/caw/live/pacts/sync", {
+      sessionId,
+      idempotencyKey: "policy-limit-pact-sync",
+      payload: { pactId: "pact-live-1" },
+    });
+    const approve = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "policy-limit-approve",
+        payload: {
+          spendId,
+          operationKind: "approve",
+          pactId: "pact-live-1",
+          walletId: "wallet-live-1",
+          chainId: "84532",
+          contractAddress: TEST_PAYMENT_TOKEN_ADDRESS,
+          procurementGateAddress: INDEXER_ADDRESS,
+          calldata: cawApproveCalldataForTest(INDEXER_ADDRESS, "1000"),
+          requestId: "policy-limit-approve",
+        },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const activate = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "policy-limit-activate",
+        payload: {
+          spendId,
+          operationKind: "activate_tool",
+          pactId: "pact-live-1",
+          walletId: "wallet-live-1",
+          chainId: "84532",
+          contractAddress: INDEXER_ADDRESS,
+          procurementGateAddress: INDEXER_ADDRESS,
+          calldata: cawActivateToolCalldataForTest(spendId),
+          requestId: "policy-limit-activate",
+        },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+
+    expect(approve.status).toBe(202);
+    expect(activate.status).toBe(422);
+    expect(activate.json.error.message).toContain("request limit is exhausted");
+  });
+
   it("passes pinned Pact template hashes into the verifier", async () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-template-verify");
@@ -7457,8 +7566,18 @@ function cawReceiptFields(seed: string, overrides: Record<string, unknown> = {})
   };
 }
 
-function createFakeCawLiveClient(): CawLiveClient {
+function createFakeCawLiveClient(
+  options: Partial<{
+    includePolicyBinding: boolean;
+    auditPolicyDigest: `0x${string}`;
+    policyRequestLimit: string;
+  }> = {},
+): CawLiveClient {
   const contractCalls: Array<{ input: Parameters<CawLiveClient["contractCall"]>[0]; txHash: `0x${string}` }> = [];
+  const includePolicyBinding = options.includePolicyBinding ?? true;
+  const pactPolicyDigest = hex32("pact-live-policy");
+  const auditPolicyDigest = options.auditPolicyDigest ?? pactPolicyDigest;
+  const policyRequestLimit = options.policyRequestLimit ?? "2";
   return {
     async status() {
       return {
@@ -7483,12 +7602,25 @@ function createFakeCawLiveClient(): CawLiveClient {
       };
     },
     async getPact(pactId) {
+      const policyFields = includePolicyBinding
+        ? {
+            policy_digest: pactPolicyDigest,
+            policy: {
+              chain_ids: ["84532"],
+              target_addresses: [TEST_PAYMENT_TOKEN_ADDRESS, INDEXER_ADDRESS],
+              selectors: [ERC20_APPROVE_SELECTOR, PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR],
+              request_limit: policyRequestLimit,
+              expiry: "2026-06-12T00:00:00.000Z",
+            },
+          }
+        : {};
       return {
         success: true,
         result: {
           pact_id: pactId,
           wallet_id: "wallet-live-1",
           status: "ACTIVE",
+          ...policyFields,
           api_key: "pact-scoped-secret",
         },
       };
@@ -7532,7 +7664,7 @@ function createFakeCawLiveClient(): CawLiveClient {
           result: input.result ?? "allowed",
           request_id: call.input.requestId,
           transaction_hash: call.txHash,
-          policy_digest: hex32(`policy:${call.input.requestId ?? call.txHash}`),
+          policy_digest: auditPolicyDigest,
         }));
       return {
         success: true,

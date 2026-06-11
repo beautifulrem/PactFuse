@@ -1222,6 +1222,9 @@ function verifyCawAuditUsageEvents(eventsById, interactionsById, errors) {
     if (!isHex32(payload.policyDigest)) {
       errors.push(`${label} requires policyDigest`);
     }
+    if (payload.pactPolicyDigest !== payload.policyDigest) {
+      errors.push(`${label} pactPolicyDigest must match policyDigest`);
+    }
     if (!isHex32(payload.txHash)) {
       errors.push(`${label} requires txHash`);
     }
@@ -1253,6 +1256,7 @@ function verifyCawAuditUsageEvents(eventsById, interactionsById, errors) {
         ["interactionId", payload.interactionId],
         ["operationKind", payload.operationKind],
         ["txHash", payload.txHash],
+        ["pactPolicyDigest", payload.policyDigest],
         ["requestHash", payload.requestHash],
         ["responseHash", payload.responseHash],
       ]) {
@@ -1260,6 +1264,16 @@ function verifyCawAuditUsageEvents(eventsById, interactionsById, errors) {
           errors.push(`${label} contract call event payload.${field} does not match usage proof`);
         }
       }
+    }
+    const pactSyncEvent = eventsById.get(payload.pactSyncEventId);
+    if (!isObject(pactSyncEvent) || pactSyncEvent.kind !== "caw.live.pact.synced" || pactSyncEvent.authority !== "proof") {
+      errors.push(`${label} references missing CAW Pact sync event`);
+    } else if (
+      pactSyncEvent.payload?.interactionId !== payload.pactSyncInteractionId ||
+      pactSyncEvent.payload?.policyDigest !== payload.policyDigest ||
+      pactSyncEvent.payload?.proofAuthority !== true
+    ) {
+      errors.push(`${label} Pact sync event does not match audit policy proof`);
     }
     const interaction = interactionsById.get(payload.interactionId);
     if (!isObject(interaction) || interaction.kind !== "contract_call") {
@@ -1360,6 +1374,7 @@ function verifyCawAllowanceEvents(eventsById, spendsById, interactionsById, erro
         ["contractAddress", spend.paymentToken],
         ["selector", ERC20_APPROVE_SELECTOR],
         ["txHash", payload.approveTxHash],
+        ["pactPolicyDigest", payload.auditPolicyDigest],
         ["requestHash", payload.requestHash],
         ["responseHash", payload.responseHash],
       ]) {
@@ -1407,6 +1422,7 @@ function verifyCawAllowanceEvents(eventsById, spendsById, interactionsById, erro
         ["operationKind", "approve"],
         ["result", "allowed"],
         ["policyDigest", payload.auditPolicyDigest],
+        ["pactPolicyDigest", payload.auditPolicyDigest],
         ["auditLogHash", payload.auditLogHash],
       ]) {
         if (asText(auditUsageEvent.payload?.[field]).toLowerCase() !== asText(expected).toLowerCase()) {
@@ -1448,6 +1464,7 @@ function verifyCawActivationEvents(eventsById, errors) {
         ["interactionId", payload.activateInteractionId],
         ["operationKind", "activate_tool"],
         ["txHash", payload.activateTxHash],
+        ["pactPolicyDigest", payload.auditPolicyDigest],
         ["spendId", payload.spendId],
         ["requestHash", payload.requestHash],
         ["responseHash", payload.responseHash],
@@ -1467,6 +1484,7 @@ function verifyCawActivationEvents(eventsById, errors) {
         ["result", "allowed"],
         ["txHash", payload.activateTxHash],
         ["policyDigest", payload.auditPolicyDigest],
+        ["pactPolicyDigest", payload.auditPolicyDigest],
         ["auditLogHash", payload.auditLogHash],
       ]) {
         if (asText(auditUsageEvent.payload?.[field]).toLowerCase() !== asText(expected).toLowerCase()) {
@@ -1661,7 +1679,8 @@ function verifySourceIdentityBindings(bundle, errors) {
 }
 
 function verifyCawLiveInteractions(interactions, spendsById, eventsById, errors) {
-  const activePacts = new Set();
+  const activePacts = new Map();
+  const contractCallCounts = new Map();
   for (const interaction of interactions) {
     if (
       isObject(interaction) &&
@@ -1671,7 +1690,13 @@ function verifyCawLiveInteractions(interactions, spendsById, eventsById, errors)
       interaction.pactId &&
       interaction.authKeyHash
     ) {
-      activePacts.add(`${interaction.walletId}:${interaction.pactId}:${lowerHex(interaction.authKeyHash)}`);
+      const event = [...eventsById.values()].find(
+        (candidate) => isObject(candidate) && candidate.kind === "caw.live.pact.synced" && candidate.payload?.interactionId === interaction.interactionId,
+      );
+      const binding = cawPactPolicyBindingFromInteraction(interaction, event, errors);
+      if (binding) {
+        activePacts.set(`${interaction.walletId}:${interaction.pactId}:${lowerHex(interaction.authKeyHash)}`, binding);
+      }
     }
   }
   for (const interaction of interactions) {
@@ -1725,6 +1750,10 @@ function verifyCawLiveInteractions(interactions, spendsById, eventsById, errors)
     }
     if (interaction.kind === "contract_call") {
       verifyCawLiveContractCallInteraction(interaction, spendsById, eventsById, activePacts, event, errors);
+      const key = `${interaction.walletId}:${interaction.pactId}:${lowerHex(interaction.authKeyHash)}`;
+      if (interaction.status !== "live_denied" && interaction.status !== "live_failed") {
+        contractCallCounts.set(key, (contractCallCounts.get(key) ?? 0) + 1);
+      }
       continue;
     }
     if (interaction.kind !== "transfer_submit") {
@@ -1759,7 +1788,8 @@ function verifyCawLiveInteractions(interactions, spendsById, eventsById, errors)
     if (typeof interaction.request.src_addr === "string" && lowerHex(interaction.request.src_addr) !== lowerHex(spend.payer)) {
       errors.push(`CAW live transfer ${interaction.interactionId ?? "-"} request.src_addr does not match registered spend payer`);
     }
-    if (!activePacts.has(`${interaction.walletId}:${interaction.pactId}:${lowerHex(interaction.authKeyHash)}`)) {
+    const activePact = activePacts.get(`${interaction.walletId}:${interaction.pactId}:${lowerHex(interaction.authKeyHash)}`);
+    if (!activePact) {
       errors.push(`CAW live transfer ${interaction.interactionId ?? "-"} is not bound to an active synced CAW Pact and key hash`);
     }
     if (event) {
@@ -1768,13 +1798,94 @@ function verifyCawLiveInteractions(interactions, spendsById, eventsById, errors)
         ["paymentToken", lowerHex(spend.paymentToken)],
         ["amount", asText(spend.maxPriceAtomic)],
         ["destinationAddress", lowerHex(spend.market)],
+        ["pactSyncInteractionId", activePact?.pactSyncInteractionId],
+        ["pactSyncEventId", activePact?.pactSyncEventId],
+        ["pactPolicyDigest", activePact?.policyDigest],
+        ["pactPolicySnapshotHash", activePact?.policySnapshotHash],
       ]) {
-        if (asText(event.payload?.[field]).toLowerCase() !== asText(expected).toLowerCase()) {
+        if (expected !== undefined && asText(event.payload?.[field]).toLowerCase() !== asText(expected).toLowerCase()) {
           errors.push(`CAW live event ${event.eventId ?? "-"} payload.${field} does not match registered spend transfer`);
         }
       }
     }
   }
+  for (const [key, count] of contractCallCounts.entries()) {
+    const activePact = activePacts.get(key);
+    if (activePact && count > Number(activePact.policyRequestLimit)) {
+      errors.push(`CAW live Pact ${key} contract call count exceeds policyRequestLimit`);
+    }
+  }
+}
+
+function cawPactPolicyBindingFromInteraction(interaction, event, errors) {
+  const label = `CAW live active Pact ${interaction.interactionId ?? "-"}`;
+  if (!isObject(event) || event.kind !== "caw.live.pact.synced" || event.authority !== "proof") {
+    errors.push(`${label} has no proof-authority pact sync event`);
+    return null;
+  }
+  const policyRoot = cawPactPolicyRoot(interaction.response);
+  const policySnapshotHash = hashJson(policyRoot);
+  const policyDigest = cawOptionalString(interaction.response, ["policy_digest", "policyDigest", "policy_hash", "policyHash", "pact_digest", "pactDigest"]);
+  const policyChainIds = arrayText(event.payload?.policyChainIds);
+  const policyContractAddresses = arrayText(event.payload?.policyContractAddresses).map((value) => value.toLowerCase()).filter(isEvmAddress);
+  const policySelectors = arrayText(event.payload?.policySelectors).map((value) => value.toLowerCase()).filter((value) => /^0x[0-9a-f]{8}$/.test(value));
+  const policyRequestLimit = asText(event.payload?.policyRequestLimit);
+  const policyExpiry = asText(event.payload?.policyExpiry);
+  if (
+    !isHex32(policyDigest) ||
+    event.payload?.policyDigest !== policyDigest ||
+    !isHex32(event.payload?.policySnapshotHash) ||
+    event.payload?.policySnapshotHash !== policySnapshotHash ||
+    policyChainIds.length === 0 ||
+    policyContractAddresses.length === 0 ||
+    policySelectors.length === 0 ||
+    decimal(policyRequestLimit) === null ||
+    !policyExpiry
+  ) {
+    errors.push(`${label} requires policy digest, snapshot hash, chain/target/selector allowlists, request limit, and expiry`);
+    return null;
+  }
+  return {
+    pactSyncInteractionId: interaction.interactionId,
+    pactSyncEventId: event.eventId,
+    policyDigest,
+    policySnapshotHash,
+    policyChainIds,
+    policyContractAddresses,
+    policySelectors,
+    policyRequestLimit,
+    policyExpiry,
+  };
+}
+
+function cawPactPolicyRoot(response) {
+  const result = isObject(response?.result) ? response.result : null;
+  const pact = isObject(result?.pact) ? result.pact : null;
+  for (const root of [pact, result, response].filter(isObject)) {
+    for (const key of ["policy", "policies", "policy_spec", "policySpec", "spec", "limits", "authorization", "rules"]) {
+      if (root[key] !== undefined && root[key] !== null) {
+        return { [key]: root[key] };
+      }
+    }
+  }
+  return result ?? response;
+}
+
+function cawOptionalString(response, keys) {
+  const result = isObject(response?.result) ? response.result : null;
+  const pact = isObject(result?.pact) ? result.pact : null;
+  for (const root of [response, result, pact].filter(isObject)) {
+    for (const key of keys) {
+      if (typeof root[key] === "string" && root[key].length > 0) {
+        return root[key];
+      }
+    }
+  }
+  return null;
+}
+
+function arrayText(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
 }
 
 function cawLiveEventKindForInteraction(kind) {
@@ -1799,7 +1910,8 @@ function verifyCawLiveContractCallInteraction(interaction, spendsById, eventsByI
     errors.push(`${label} references missing registered spend`);
     return;
   }
-  if (!activePacts.has(`${interaction.walletId}:${interaction.pactId}:${lowerHex(interaction.authKeyHash)}`)) {
+  const activePact = activePacts.get(`${interaction.walletId}:${interaction.pactId}:${lowerHex(interaction.authKeyHash)}`);
+  if (!activePact) {
     errors.push(`${label} is not bound to an active synced CAW Pact and key hash`);
   }
   if (interaction.request.wallet_id !== interaction.walletId || interaction.request.pact_id !== interaction.pactId) {
@@ -1813,8 +1925,12 @@ function verifyCawLiveContractCallInteraction(interaction, spendsById, eventsByI
       ["selector", interaction.request.selector],
       ["chainId", interaction.request.chain_id],
       ["valueAtomic", interaction.request.value],
+      ["pactSyncInteractionId", activePact?.pactSyncInteractionId],
+      ["pactSyncEventId", activePact?.pactSyncEventId],
+      ["pactPolicyDigest", activePact?.policyDigest],
+      ["pactPolicySnapshotHash", activePact?.policySnapshotHash],
     ]) {
-      if (asText(event.payload?.[field]).toLowerCase() !== asText(expected).toLowerCase()) {
+      if (expected !== undefined && asText(event.payload?.[field]).toLowerCase() !== asText(expected).toLowerCase()) {
         errors.push(`CAW live event ${event.eventId ?? "-"} payload.${field} does not match contract call request`);
       }
     }
@@ -1823,6 +1939,17 @@ function verifyCawLiveContractCallInteraction(interaction, spendsById, eventsByI
   const contractAddress = asText(interaction.request.contract_addr).toLowerCase();
   const selector = asText(interaction.request.selector).toLowerCase();
   const calldata = asText(interaction.request.calldata).toLowerCase();
+  if (activePact) {
+    if (!activePact.policyChainIds.includes(asText(interaction.request.chain_id))) {
+      errors.push(`${label} chain_id is not allowed by active Pact policy`);
+    }
+    if (!activePact.policyContractAddresses.includes(contractAddress)) {
+      errors.push(`${label} contract_addr is not allowed by active Pact policy`);
+    }
+    if (!activePact.policySelectors.includes(selector)) {
+      errors.push(`${label} selector is not allowed by active Pact policy`);
+    }
+  }
   if (operationKind === "approve") {
     verifyCawLiveApproveCall(interaction, spend, contractAddress, selector, calldata, errors);
     return;
