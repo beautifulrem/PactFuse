@@ -51,7 +51,7 @@ import {
   verifyTokenBalanceDelta,
   verifyEvidenceForSession,
 } from "./services/service.js";
-import { badRequestError, forbiddenError, newRequestId, rateLimitedError, toApiError } from "./util.js";
+import { badRequestError, forbiddenError, newRequestId, rateLimitedError, toApiError, unauthorizedError } from "./util.js";
 
 const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
 type ApiRole = "operator" | "challenge_submitter" | "artifact_signer";
@@ -328,11 +328,19 @@ export function createApp(ctx: ServiceCtx): Hono {
 
   app.get("/readyz", async (c) => {
     ctx.db.sqlite.prepare("SELECT 1").get();
+    const proofProvidersChecked = canRunDeepProviderStatus(c, ctx);
     return c.json({
       ok: true,
       db: "ready",
       verifier: "fail-closed-scaffold",
-      proofProviders: await readProofProviderStatus(ctx),
+      proofProviders: proofProvidersChecked ? await readProofProviderStatus(ctx) : [],
+      proofProviderCheck: {
+        mode: "operator-deep-check",
+        checked: proofProvidersChecked,
+        reason: proofProvidersChecked
+          ? "deep proof provider checks are enabled for this request"
+          : "deep proof provider checks require an operator bearer token in fail-closed mode",
+      },
       apiSecurity: {
         mode: "fail-closed-unless-explicit-dev-bypass",
         operatorTokenConfigured: Boolean(ctx.apiSecurity.operatorToken),
@@ -385,7 +393,10 @@ export function createApp(ctx: ServiceCtx): Hono {
     return send(c, await buildCawOperation(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 201);
   });
 
-  app.get("/api/v1/caw/live/status", async (c) => send(c, { ok: true, requestId: newRequestId("caw_live_status"), data: await ctx.cawLive.status() }));
+  app.get("/api/v1/caw/live/status", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, { ok: true, requestId: newRequestId("caw_live_status"), data: await ctx.cawLive.status() });
+  });
 
   app.post("/api/v1/caw/live/identity/probe", async (c) => {
     authorizeApiRole(c, ctx, "operator");
@@ -492,16 +503,19 @@ export function createApp(ctx: ServiceCtx): Hono {
   });
 
   app.get("/api/v1/evidence/claim-readiness", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
     const sessionId = requiredQuery(c, "sessionId");
     return send(c, await readClaimReadiness(sessionId, ctx));
   });
 
   app.get("/api/v1/evidence/live-preflight", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
     const sessionId = requiredQuery(c, "sessionId");
     return send(c, await readLiveProofPreflight(sessionId, ctx));
   });
 
   app.get("/api/v1/evidence/public-claim", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
     const sessionId = requiredQuery(c, "sessionId");
     return send(c, await authorizePublicClaim(sessionId, ctx));
   });
@@ -580,6 +594,15 @@ function bearerTokenFor(c: Context): string | null {
   return authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : null;
 }
 
+function canRunDeepProviderStatus(c: Context, ctx: ServiceCtx): boolean {
+  if (ctx.apiSecurity.allowInsecureMissingRoleTokens) {
+    return true;
+  }
+  const token = tokenForRole(ctx, "operator");
+  const bearer = bearerTokenFor(c);
+  return Boolean(token && bearer && secureEqualText(bearer, token));
+}
+
 function throwBadRequest(message: string, details?: Record<string, unknown>): never {
   const requestId = newRequestId("bad_request");
   throw Object.assign(new Error(message), { apiError: badRequestError(requestId, message, details) });
@@ -608,7 +631,12 @@ function authorizeApiRole(c: Context, ctx: ServiceCtx, role: ApiRole): void {
   }
   const requestId = newRequestId(`${role}_auth`);
   const bearer = bearerTokenFor(c);
-  if (!bearer || !secureEqualText(bearer, token)) {
+  if (!bearer) {
+    throw Object.assign(new Error(`${role} token is missing`), {
+      apiError: unauthorizedError(requestId, `${role} bearer token is required`),
+    });
+  }
+  if (!secureEqualText(bearer, token)) {
     throw Object.assign(new Error(`${role} token is invalid`), {
       apiError: forbiddenError(requestId, `${role} bearer token is invalid`),
     });
@@ -2488,6 +2516,7 @@ function apiRoleForPath(path: string): ApiRole | null {
     case "/api/v1/sources/register":
     case "/api/v1/spends/register-batch":
     case "/api/v1/caw/operations/build":
+    case "/api/v1/caw/live/status":
     case "/api/v1/caw/live/pacts/submit":
     case "/api/v1/caw/live/pacts/sync":
     case "/api/v1/caw/live/transfers/submit":
@@ -2498,6 +2527,9 @@ function apiRoleForPath(path: string): ApiRole | null {
     case "/api/v1/token/balance-deltas/verify":
     case "/api/v1/artifacts/preflight":
     case "/api/v1/evidence/verify":
+    case "/api/v1/evidence/claim-readiness":
+    case "/api/v1/evidence/live-preflight":
+    case "/api/v1/evidence/public-claim":
       return "operator";
     case "/api/v1/sources/challenge":
       return "challenge_submitter";
@@ -2517,7 +2549,7 @@ function apiRoleHeaderDescription(role: ApiRole): string {
   if (role === "artifact_signer") {
     return "Required for protected artifact signer writes; PACTFUSE_ARTIFACT_SIGNER_TOKEN falls back to PACTFUSE_OPERATOR_TOKEN, and missing tokens fail closed unless PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=true is set for local development.";
   }
-  return "Required for protected operator writes; missing PACTFUSE_OPERATOR_TOKEN fails closed unless PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=true is set for local development.";
+  return "Required for protected operator actions and deep live proof checks; missing PACTFUSE_OPERATOR_TOKEN fails closed unless PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=true is set for local development.";
 }
 
 function pathParameterSchemas(path: string): Record<string, unknown>[] {

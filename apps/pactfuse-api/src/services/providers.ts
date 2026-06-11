@@ -594,11 +594,13 @@ export function createHttpJsonRpcMcpLeaseClient(input: {
     async status() {
       try {
         new URL(input.endpointUrl);
+        const response = await postJsonRpc(input.endpointUrl, jsonRpcRequest("tools/list", {}), Math.min(timeoutMs, 2_000));
+        assertToolListed(response, toolName);
         return {
           name: "mcp_lease",
           mode: "live",
           ready: true,
-          reason: "lease MCP JSON-RPC endpoint is configured",
+          reason: "lease MCP JSON-RPC endpoint lists the required read-only tool",
           endpoint: input.endpointUrl,
         };
       } catch (error) {
@@ -606,7 +608,7 @@ export function createHttpJsonRpcMcpLeaseClient(input: {
           name: "mcp_lease",
           mode: "live",
           ready: false,
-          reason: error instanceof Error ? error.message : "lease MCP endpoint URL is invalid",
+          reason: error instanceof Error ? error.message : "lease MCP readiness check failed",
           endpoint: input.endpointUrl,
         };
       }

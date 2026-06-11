@@ -204,16 +204,16 @@ describe("pactfuse-api P0", () => {
     const invalidJsonWithoutAuth = await rawPost(app, "/api/v1/sources/challenge", "{", {});
     const invalidJsonWithAuth = await rawPost(app, "/api/v1/sources/challenge", "{", { authorization: "Bearer challenge-test-token" });
 
-    expect(missingOperator.status).toBe(403);
+    expect(missingOperator.status).toBe(401);
     expect(wrongOperator.status).toBe(403);
     expect(allowedOperator.status).toBe(201);
-    expect(missingChallenge.status).toBe(403);
+    expect(missingChallenge.status).toBe(401);
     expect(allowedChallengeAuth.status).toBe(400);
-    expect(missingArtifactSigner.status).toBe(403);
+    expect(missingArtifactSigner.status).toBe(401);
     expect(allowedArtifactAuth.status).toBe(400);
-    expect(missingIndexer.status).toBe(403);
+    expect(missingIndexer.status).toBe(401);
     expect(allowedIndexerAuth.status).toBe(400);
-    expect(invalidJsonWithoutAuth.status).toBe(403);
+    expect(invalidJsonWithoutAuth.status).toBe(401);
     expect(invalidJsonWithAuth.status).toBe(400);
   });
 
@@ -245,6 +245,84 @@ describe("pactfuse-api P0", () => {
     expect((await ready.json()).apiSecurity.allowInsecureMissingRoleTokens).toBe(false);
   });
 
+  it("does not run deep live provider checks from unauthenticated readiness probes in fail-closed mode", async () => {
+    const baseCawLive = createFakeCawLiveClient();
+    let cawLiveStatusCalls = 0;
+    const { app } = makeApp(":memory:", {
+      cawLive: {
+        ...baseCawLive,
+        async status() {
+          cawLiveStatusCalls += 1;
+          return baseCawLive.status();
+        },
+      },
+      apiSecurity: {
+        operatorToken: "operator-test-token",
+        allowInsecureMissingRoleTokens: false,
+      },
+    });
+
+    const unauthReady = await app.request("/readyz");
+    const unauthReadyJson = await unauthReady.json();
+    const unauthLiveStatus = await app.request("/api/v1/caw/live/status");
+
+    expect(unauthReady.status).toBe(200);
+    expect(unauthReadyJson.proofProviders).toEqual([]);
+    expect(unauthReadyJson.proofProviderCheck).toEqual(
+      expect.objectContaining({
+        mode: "operator-deep-check",
+        checked: false,
+      }),
+    );
+    expect(unauthLiveStatus.status).toBe(401);
+    expect(cawLiveStatusCalls).toBe(0);
+
+    const authReady = await app.request("/readyz", { headers: { authorization: "Bearer operator-test-token" } });
+    const authReadyJson = await authReady.json();
+    const authLiveStatus = await app.request("/api/v1/caw/live/status", { headers: { authorization: "Bearer operator-test-token" } });
+
+    expect(authReady.status).toBe(200);
+    expect(authReadyJson.proofProviderCheck).toEqual(expect.objectContaining({ checked: true }));
+    expect(authReadyJson.proofProviders).toEqual(expect.arrayContaining([expect.objectContaining({ name: "caw_live", ready: true })]));
+    expect(authLiveStatus.status).toBe(200);
+    expect(cawLiveStatusCalls).toBe(2);
+  });
+
+  it("keeps proof provider status fail-closed when a provider status check throws", async () => {
+    const brokenCaw: CawReceiptSource = {
+      async status() {
+        throw new Error("CAW export status exploded");
+      },
+      async fetchReceiptBundle() {
+        throw new Error("unused broken CAW export");
+      },
+    };
+    const { app } = makeApp(":memory:", { caw: brokenCaw });
+
+    const ready = await app.request("/readyz");
+    const readyJson = await ready.json();
+    const sessionId = await createSession(app, "sess-provider-status-throws");
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-provider-status-throws",
+      payload: { receipt: { receiptId: "provider-status-throws" } },
+    });
+
+    expect(ready.status).toBe(200);
+    expect(readyJson.proofProviders).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "caw",
+          mode: "live",
+          ready: false,
+          reason: "CAW export status exploded",
+        }),
+      ]),
+    );
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.warnings).toContain("caw proof provider is live: CAW export status exploded");
+  });
+
   it("falls back to the shared operator token for specialized roles when no role token is configured", async () => {
     const { app } = makeApp(":memory:", {
       apiSecurity: {
@@ -255,7 +333,7 @@ describe("pactfuse-api P0", () => {
     const missingQuote = await post(app, "/api/v1/quotes", {});
     const allowedQuoteAuth = await post(app, "/api/v1/quotes", {}, { authorization: "Bearer operator-test-token" });
 
-    expect(missingQuote.status).toBe(403);
+    expect(missingQuote.status).toBe(401);
     expect(allowedQuoteAuth.status).toBe(400);
   });
 
@@ -601,10 +679,27 @@ describe("pactfuse-api P0", () => {
     );
     ctx.apiSecurity.operatorToken = "operator-test-token";
     ctx.apiSecurity.allowInsecureMissingRoleTokens = false;
-    const readiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const readiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
     const readinessJson = await readiness.json();
-    const claim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`);
+    const claim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
     const claimJson = await claim.json();
+    const repeatedClaim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const repeatedClaimJson = await repeatedClaim.json();
+    const claimEvents = ctx.db.sqlite
+      .prepare(
+        `SELECT event_seq, authority, kind, payload_json
+         FROM evidence_events
+         WHERE session_id = ? AND kind = 'public.claim.authorized'
+         ORDER BY event_seq ASC`,
+      )
+      .all(sessionId) as Array<{ event_seq: number; authority: string; kind: string; payload_json: string }>;
+    const claimEventPayload = JSON.parse(claimEvents[0]?.payload_json ?? "{}") as Record<string, unknown>;
 
     expect(identity.status).toBe(202);
     expect(denyProbe.status, JSON.stringify(denyProbe.json)).toBe(202);
@@ -631,6 +726,20 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(claimJson.data.publicClaimHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(repeatedClaim.status).toBe(200);
+    expect(repeatedClaimJson.data.publicClaimHash).toBe(claimJson.data.publicClaimHash);
+    expect(claimEvents).toHaveLength(1);
+    expect(claimEvents[0]).toEqual(expect.objectContaining({ authority: "advisory", kind: "public.claim.authorized" }));
+    expect(claimEventPayload).toEqual(
+      expect.objectContaining({
+        publicClaimHash: claimJson.data.publicClaimHash,
+        replayBundleHash: claimJson.data.replayBundleHash,
+        proofAuthority: true,
+        winnerClaimAllowed: true,
+        asOfEventSeq: claimEvents[0].event_seq - 1,
+      }),
+    );
+    expect(claimEventPayload.claim).toEqual(expect.objectContaining({ publicClaimHash: claimJson.data.publicClaimHash }));
   });
 
   it("fails verifier closed when a required indexer cursor is missing", async () => {
@@ -941,9 +1050,13 @@ describe("pactfuse-api P0", () => {
     expect(session.status).toBe(201);
     const sessionId = session.json.data.sessionId;
 
-    const res = await app.request(`/api/v1/evidence/live-preflight?sessionId=${sessionId}`);
+    const unauth = await app.request(`/api/v1/evidence/live-preflight?sessionId=${sessionId}`);
+    const res = await app.request(`/api/v1/evidence/live-preflight?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
     const json = await res.json();
 
+    expect(unauth.status).toBe(401);
     expect(res.status).toBe(200);
     expect(json.data.status).toBe("blocked");
     expect(json.data.security).toEqual(
@@ -2676,6 +2789,40 @@ describe("pactfuse-api P0", () => {
     expect(finalized.status).toBe(423);
     expect(finalized.json.error.code).toBe("proof_pending");
     expect(finalized.json.error.message).toContain("claimed gate event log was not found on chain");
+  });
+
+  it("blocks signed finalized gate proofs whose chain log address differs from the required gate cursor", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-gate-signed-wrong-address", { finalityDepth: 2 });
+    const spendId = await registerSpend(app, sessionId);
+    const body = gateEventEnvelope(sessionId, spendId, "gate-signed-wrong-address", {
+      blockNumber: 100,
+      currentBlockNumber: 101,
+      txHash: hex32("gate-signed-wrong-address-tx"),
+      rawLogHash: hex32("gate-signed-wrong-address-log"),
+    });
+    logs.push(
+      indexerLog("gate-signed-wrong-address", 100, {
+        address: "0x2222222222222222222222222222222222222222",
+        eventName: "SpendSettled",
+        event: "SpendSettled",
+        sessionId,
+        spendId,
+        args: { sessionId, spendId },
+        transactionHash: hex32("gate-signed-wrong-address-tx"),
+        rawLogHash: hex32("gate-signed-wrong-address-log"),
+      }),
+    );
+
+    const finalized = await postSignedGateEvent(app, body);
+
+    expect(finalized.status).toBe(422);
+    expect(finalized.json.error.code).toBe("proof_blocked");
+    expect(finalized.json.error.message).toContain("claimed gate event log address does not match a required gate cursor address");
   });
 
   it("finalizes gate settlement only from indexed public-chain logs and records a matching proof row", async () => {
@@ -6044,9 +6191,47 @@ describe("pactfuse-api P0", () => {
       expect(lease.status).toBe(202);
       expect(lease.json.data.status).toBe("succeeded_live_mcp_transcript");
       expect(tokenRow.status).toBe("consumed");
-      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/call"]);
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/list", "tools/call"]);
     } finally {
       await mcp.close();
+    }
+  });
+
+  it("requires live MCP provider readiness to list the unique read-only PactFuse tool", async () => {
+    const goodMcp = await startMcpJsonRpcServer((request) => ({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { tools: [leaseToolDefinitionForTest()] },
+    }));
+    const badMcp = await startMcpJsonRpcServer((request) => ({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { tools: [leaseToolDefinitionForTest("pactfuse_other_scan")] },
+    }));
+    try {
+      const goodStatus = await createHttpJsonRpcMcpLeaseClient({ endpointUrl: goodMcp.url, timeoutMs: 1_000 }).status();
+      const badStatus = await createHttpJsonRpcMcpLeaseClient({ endpointUrl: badMcp.url, timeoutMs: 1_000 }).status();
+
+      expect(goodStatus).toEqual(
+        expect.objectContaining({
+          name: "mcp_lease",
+          mode: "live",
+          ready: true,
+        }),
+      );
+      expect(badStatus).toEqual(
+        expect.objectContaining({
+          name: "mcp_lease",
+          mode: "live",
+          ready: false,
+        }),
+      );
+      expect(badStatus.reason).toContain("required unique tool pactfuse_code_scan");
+      expect(goodMcp.calls.map((call) => call.method)).toEqual(["tools/list"]);
+      expect(badMcp.calls.map((call) => call.method)).toEqual(["tools/list"]);
+    } finally {
+      await goodMcp.close();
+      await badMcp.close();
     }
   });
 
@@ -6118,7 +6303,7 @@ describe("pactfuse-api P0", () => {
       expect(lease.json.data.status).toBe("blocked_mcp_execution_failed");
       expect(tokenRow.status).toBe("active");
       expect(succeededLeaseCount.count).toBe(0);
-      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list"]);
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/list"]);
     } finally {
       await mcp.close();
     }
@@ -6192,7 +6377,7 @@ describe("pactfuse-api P0", () => {
       expect(second.status).toBe(422);
       expect(second.json.error.code).toBe("proof_blocked");
       expect(tokenRow.status).toBe("blocked");
-      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/call"]);
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/list", "tools/call"]);
     } finally {
       await mcp.close();
     }
@@ -6362,7 +6547,7 @@ describe("pactfuse-api P0", () => {
       expect(lease.status).toBe(202);
       expect(lease.json.data.status).toBe("blocked_mcp_execution_failed");
       expect(lease.json.data.winnerClaimAllowed).toBe(false);
-      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list"]);
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/list"]);
       expect(succeededLeaseCount.count).toBe(0);
     } finally {
       await mcp.close();
@@ -6432,7 +6617,7 @@ describe("pactfuse-api P0", () => {
       expect(lease.status).toBe(202);
       expect(lease.json.data.status).toBe("blocked_mcp_execution_failed");
       expect(lease.json.data.winnerClaimAllowed).toBe(false);
-      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list"]);
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/list"]);
     } finally {
       await mcp.close();
     }

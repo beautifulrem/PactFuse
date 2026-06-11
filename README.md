@@ -63,7 +63,7 @@ PactFuse turns that freshness boundary into an enforceable procurement primitive
 
 ## Highlights
 
-- **Fail-closed API**: mutation routes require operator or role tokens unless explicitly bypassed for local development.
+- **Fail-closed API**: mutation routes and deep live proof checks require operator or role tokens unless explicitly bypassed for local development.
 - **Source freshness gate**: `ProcurementGate` and reusable `SourceFreshGuard` anchor the core on-chain rule.
 - **Replayable evidence**: session, events, CAW receipts, artifact preflight, access tokens, MCP calls, lease runs, Judge Check, and verifier output share one `sessionId`.
 - **Paged replay index**: large evidence sets expose page roots and `/api/v1/evidence/replay-page`.
@@ -207,9 +207,9 @@ Important `/api/v1` routes:
 | `POST /api/v1/lease/execute` | Execute clean leases through audited MCP JSON-RPC |
 | `POST /api/v1/mcp/audit` | Record audited MCP adapter calls |
 | `GET /api/v1/evidence/judge-check` | Read the six-row Judge Check |
-| `GET /api/v1/evidence/claim-readiness` | Derive current and target claim modes from evidence gates |
-| `GET /api/v1/evidence/live-preflight` | Machine-check live provider, production auth, indexer, and claim-readiness blockers before any public claim |
-| `GET /api/v1/evidence/public-claim` | Fail-closed public-claim authorization gate |
+| `GET /api/v1/evidence/claim-readiness` | Operator-only derivation of current and target claim modes from evidence gates |
+| `GET /api/v1/evidence/live-preflight` | Operator-only live provider, production auth, indexer, and claim-readiness blockers before any public claim |
+| `GET /api/v1/evidence/public-claim` | Operator-only fail-closed public-claim authorization gate |
 | `GET /api/v1/evidence/replay-bundle` | Read `PACTFUSE_EVIDENCE_V1` summary plus embedded replay page proofs |
 | `GET /api/v1/evidence/replay-page` | Read paged replay collections |
 | `GET /api/v1/evidence/agent-transcript` | Read MCP transcript summary |
@@ -235,7 +235,7 @@ Expected behavior:
 - `--schema-only` accepts the pending structure.
 - full verifier mode rejects it because the example is pending, not final proof.
 - `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` remain `false` until every final replay gate passes.
-- `GET /api/v1/evidence/public-claim` returns `proof_pending` until claim readiness, verifier output, replay hash, and every live evidence gate are simultaneously green.
+- `GET /api/v1/evidence/public-claim` requires the operator bearer token and returns `proof_pending` until claim readiness, verifier output, replay hash, and every live evidence gate are simultaneously green.
 
 The replay verifier checks:
 

@@ -454,6 +454,7 @@ export const EvidenceEventKindSchema = z.enum([
   "lease.execution.succeeded",
   "verifier.fail_closed",
   "verifier.final_replay_claim",
+  "public.claim.authorized",
   "judge_check.pending",
   "runner.heartbeat",
   "mcp.adapter.call",

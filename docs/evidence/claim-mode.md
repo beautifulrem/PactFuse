@@ -19,9 +19,9 @@ Hour 4 may lock target values such as `TARGET_CLAIM_MODE: caw-target-real` and `
 
 This is not a winner claim. `WINNER_CLAIM_ALLOWED` remains `false` until the full upgrade rules below pass.
 
-The backend exposes `/api/v1/evidence/claim-readiness?sessionId=<id>` as the machine-readable readiness report for these modes. It derives target modes from provider status, CAW events, token settlement evidence, Judge Check rows, replay bundle verification, and the final verifier flags. It may report target modes as viable, but current public modes stay locked until every gate passes.
+The backend exposes `/api/v1/evidence/claim-readiness?sessionId=<id>` as the operator-only machine-readable readiness report for these modes. It derives target modes from provider status, CAW events, token settlement evidence, Judge Check rows, replay bundle verification, and the final verifier flags. It may report target modes as viable, but current public modes stay locked until every gate passes.
 
-The public claim gate is `/api/v1/evidence/public-claim?sessionId=<id>`. It returns `proof_pending` with blockers until claim readiness, replay bundle hash, verifier `final_replay_claim`, `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` are all true in the same session. Public copy must not treat readiness target modes as an authorized claim.
+The public claim gate is `/api/v1/evidence/public-claim?sessionId=<id>`, also operator-only because it runs deep live proof checks. It returns `proof_pending` with blockers until claim readiness, replay bundle hash, verifier `final_replay_claim`, `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` are all true in the same session. Public copy must not treat readiness target modes as an authorized claim.
 
 ## Upgrade Current Claim To `caw-target-real`
 

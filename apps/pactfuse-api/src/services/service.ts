@@ -2792,12 +2792,12 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
   const payload = parseStrict(GateEventIngestPayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("gate:events:ingest", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     const session = requireSessionRow(ctx, envelope.sessionId, requestId);
-    assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
     const finalityDepth = finalityDepthForSession(session);
     let certifiedPayload = payload;
     let confirmations = payload.reorged ? 0 : payload.currentBlockNumber - payload.blockNumber + 1;
     if (payload.reorged || confirmations >= finalityDepth) {
-      const chainProof = await verifyGateEventWithChain(ctx, payload, requestId);
+      const chainProof = await verifyGateEventWithChain(ctx, envelope.sessionId, spend, payload, requestId);
       certifiedPayload = { ...payload, currentBlockNumber: chainProof.currentBlockNumber };
       confirmations = payload.reorged ? 0 : chainProof.confirmations;
     }
@@ -4400,6 +4400,10 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
   const requestId = newRequestId("public_claim");
   const parsedSessionId = parseStrict(Hex32Schema, sessionId);
   assertSession(ctx, parsedSessionId, requestId);
+  const latestClaim = latestAuthorizedPublicClaim(ctx, parsedSessionId);
+  if (latestClaim) {
+    return { ok: true, requestId, data: latestClaim };
+  }
   const readiness = await readClaimReadiness(parsedSessionId, ctx);
   if (!readiness.ok) {
     return readiness;
@@ -4466,7 +4470,54 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
     winnerClaimAllowed: true,
     publicClaimHash,
   });
+  appendPublicClaimAuthorizedEvent(ctx, parsedSessionId, claim);
   return { ok: true, requestId, data: claim };
+}
+
+function latestAuthorizedPublicClaim(ctx: ServiceCtx, sessionId: string): PublicClaimView | null {
+  const session = getSessionRow(ctx, sessionId);
+  if (!session) {
+    return null;
+  }
+  const row = ctx.db.sqlite
+    .prepare(
+      `SELECT event_seq, payload_json
+       FROM evidence_events
+       WHERE session_id = ? AND kind = 'public.claim.authorized'
+       ORDER BY event_seq DESC
+       LIMIT 1`,
+    )
+    .get(sessionId) as Row | undefined;
+  if (!row || Number(row.event_seq) !== Number(session.latest_event_seq)) {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(String(row.payload_json)) as unknown;
+    const claim = payload && typeof payload === "object" && !Array.isArray(payload) ? (payload as Record<string, unknown>).claim : null;
+    const parsed = PublicClaimViewSchema.safeParse(claim);
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+function appendPublicClaimAuthorizedEvent(ctx: ServiceCtx, sessionId: string, claim: PublicClaimView): EvidenceEvent {
+  const session = requireSessionRow(ctx, sessionId, "public_claim_event");
+  const asOfEventSeq = Number(session.latest_event_seq);
+  return appendEvidenceEvent(ctx, {
+    sessionId,
+    authority: "advisory",
+    kind: "public.claim.authorized",
+    payload: jsonRecord({
+      claim,
+      publicClaimHash: claim.publicClaimHash,
+      replayBundleHash: claim.replayBundleHash,
+      verifierRunHash: hashJson(claim.verifierRun),
+      asOfEventSeq,
+      proofAuthority: true,
+      winnerClaimAllowed: true,
+    }),
+  });
 }
 
 export async function readLiveProofPreflight(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<LiveProofPreflightView>> {
@@ -4904,8 +4955,29 @@ function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: C
 }
 
 export async function readProofProviderStatus(ctx: ServiceCtx): Promise<ProofProviderStatus[]> {
-  const [chain, caw, cawLive, mcpLease] = await Promise.all([ctx.chain.status(), ctx.caw.status(), ctx.cawLive.status(), ctx.mcpLease.status()]);
+  const [chain, caw, cawLive, mcpLease] = await Promise.all([
+    proofProviderStatusOrBlocked("chain", () => ctx.chain.status()),
+    proofProviderStatusOrBlocked("caw", () => ctx.caw.status()),
+    proofProviderStatusOrBlocked("caw_live", () => ctx.cawLive.status()),
+    proofProviderStatusOrBlocked("mcp_lease", () => ctx.mcpLease.status()),
+  ]);
   return [chain, caw, cawLive, mcpLease];
+}
+
+async function proofProviderStatusOrBlocked(
+  name: ProofProviderStatus["name"],
+  status: () => Promise<ProofProviderStatus>,
+): Promise<ProofProviderStatus> {
+  try {
+    return await status();
+  } catch (error) {
+    return {
+      name,
+      mode: "live",
+      ready: false,
+      reason: error instanceof Error ? error.message : `${name} proof provider status check failed`,
+    };
+  }
 }
 
 export async function readJudgeCheck(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<JudgeCheckView>> {
@@ -5590,6 +5662,7 @@ export function appendEvidenceEvent(
       | "lease.execution.succeeded"
       | "verifier.fail_closed"
       | "verifier.final_replay_claim"
+      | "public.claim.authorized"
       | "judge_check.pending"
       | "runner.heartbeat"
       | "mcp.adapter.call";
@@ -7663,6 +7736,8 @@ function contractUintBigInt(value: unknown, field: string, requestId: string): b
 
 async function verifyGateEventWithChain(
   ctx: ServiceCtx,
+  sessionId: string,
+  spend: Row,
   payload: {
     event: "SpendTripped" | "SpendSettled";
     spendId: string;
@@ -7760,10 +7835,52 @@ async function verifyGateEventWithChain(
       }),
     });
   }
+  const contractAddress = signedGateLogContractAddress(ctx, payload.chainId, matchingLog, requestId);
+  const contractStateProof = await verifyGateContractState(
+    ctx,
+    {
+      address: contractAddress,
+      cursor_address: contractAddress,
+      block_number: payload.blockNumber,
+    },
+    {
+      event: payload.event,
+      sessionId: sessionId as `0x${string}`,
+      spendId: payload.spendId as `0x${string}`,
+    },
+    requestId,
+  );
+  assertGateContractStateMatchesSpend(spend, contractStateProof, requestId);
   return {
     currentBlockNumber,
     confirmations: currentBlockNumber - payload.blockNumber + 1,
   };
+}
+
+function signedGateLogContractAddress(
+  ctx: ServiceCtx,
+  chainId: string,
+  log: Record<string, unknown>,
+  requestId: string,
+): `0x${string}` {
+  const contractAddress = optionalHex(log.address);
+  if (!contractAddress) {
+    throw Object.assign(new Error("claimed gate event log is missing contract address"), {
+      apiError: proofBlockedError(requestId, "claimed gate event log is missing contract address"),
+    });
+  }
+  const gateCursors = ctx.requiredIndexerCursors.filter((cursor) => {
+    return cursor.chainId === chainId && cursor.cursorId.startsWith("gate") && typeof cursor.address === "string" && cursor.address.length > 0;
+  });
+  if (gateCursors.length > 0 && !gateCursors.some((cursor) => cursor.address?.toLowerCase() === contractAddress.toLowerCase())) {
+    throw Object.assign(new Error("claimed gate event log address does not match a required gate cursor address"), {
+      apiError: proofBlockedError(requestId, "claimed gate event log address does not match a required gate cursor address", {
+        expected: gateCursors.map((cursor) => cursor.address),
+        actual: contractAddress,
+      }),
+    });
+  }
+  return contractAddress as `0x${string}`;
 }
 
 function normalizeIndexedChainLog(
