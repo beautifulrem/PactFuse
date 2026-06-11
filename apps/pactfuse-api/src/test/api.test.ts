@@ -509,6 +509,52 @@ describe("pactfuse-api P0", () => {
     expect(res.json.error.code).toBe("proof_pending");
   });
 
+  it("records operator key usage when scheduling a source challenge", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-challenge-key-used");
+    await registerSource(app, sessionId);
+
+    const challenge = await post(app, "/api/v1/sources/challenge", {
+      sessionId,
+      idempotencyKey: "challenge-key-used",
+      payload: {
+        sourceHash: hex32("source"),
+        reasonHash: hex32("challenge-reason"),
+        evidenceRef: "https://example.com/challenge-evidence.json",
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const keyEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "operator.key_used");
+    const keyRow = ctx.db.sqlite
+      .prepare("SELECT role, authority, status, use_count, authorized_methods_json FROM operator_keys")
+      .get() as Record<string, unknown>;
+
+    expect(challenge.status).toBe(202);
+    expect(keyEvent).toEqual(
+      expect.objectContaining({
+        authority: "operator",
+        payload: expect.objectContaining({
+          role: "challenge_submitter",
+          method: "SourceStateRegistry.challengeSource",
+          operationId: challenge.json.data.challengeId,
+          secretMaterialStored: false,
+          winnerClaimAllowed: false,
+        }),
+      }),
+    );
+    expect(JSON.stringify(keyEvent.payload)).not.toContain(MCP_AUDIT_TOKEN);
+    expect(keyRow).toEqual(
+      expect.objectContaining({
+        role: "challenge_submitter",
+        authority: "operator",
+        status: "active_demo_key",
+        use_count: 1,
+      }),
+    );
+    expect(JSON.parse(String(keyRow.authorized_methods_json))).toEqual(["SourceStateRegistry.challengeSource(bytes32,bytes32)"]);
+  });
+
   it("resumes the SSE stream after an event id", async () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-sse");
@@ -972,7 +1018,7 @@ describe("pactfuse-api P0", () => {
   });
 
   it("binds mocked quote signing to the matching artifact preflight", async () => {
-    const { app } = makeApp();
+    const { app, ctx } = makeApp();
     const sessionId = await createSession(app, "sess-quote-preflight-bound");
     const spendId = await registerSpend(app, sessionId);
     const artifactHashPreview = hex32("artifact-preview-bound");
@@ -1005,6 +1051,13 @@ describe("pactfuse-api P0", () => {
     const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
     const replayJson = await replay.json();
     const quoteEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "quote.signed.mocked");
+    const keyEvent = replayJson.data.events.find(
+      (event: { kind: string; payload: Record<string, unknown> }) =>
+        event.kind === "operator.key_used" && event.payload.role === "quote_signer",
+    );
+    const keyRow = ctx.db.sqlite
+      .prepare("SELECT role, authority, status, use_count, authorized_methods_hash, authorized_methods_json FROM operator_keys WHERE role = ?")
+      .get("quote_signer") as Record<string, unknown>;
 
     expect(preflight.status).toBe(202);
     expect(preflight.json.data.artifactHashPreview).toBe(artifactHashPreview);
@@ -1016,6 +1069,30 @@ describe("pactfuse-api P0", () => {
     expect(quote.json.data.sourceStateSnapshotHash).toBe(sourceStateSnapshotHash);
     expect(quote.json.data.quoteSignedAfterPreflight).toBe(true);
     expect(quote.json.data.status).toBe("mocked_after_preflight_not_chain_settleable");
+    expect(keyEvent).toEqual(
+      expect.objectContaining({
+        authority: "operator",
+        payload: expect.objectContaining({
+          role: "quote_signer",
+          method: "ArtifactQuote.sign",
+          operationId: quote.json.data.quoteId,
+          secretMaterialStored: false,
+          winnerClaimAllowed: false,
+        }),
+      }),
+    );
+    expect(keyRow).toEqual(
+      expect.objectContaining({
+        role: "quote_signer",
+        authority: "operator",
+        status: "active_demo_key",
+        use_count: 1,
+      }),
+    );
+    expect(keyEvent.payload.authorizedMethodsHash).toBe(keyRow.authorized_methods_hash);
+    expect(JSON.parse(String(keyRow.authorized_methods_json))).toEqual([
+      "ArtifactQuote.sign(sessionId,spendId,artifactCommitment,priceAtomic,quoteNonce,validUntilBlock)",
+    ]);
     expect(quoteEvent.payload).toEqual(
       expect.objectContaining({
         preflightId: preflight.json.data.preflightId,

@@ -238,6 +238,7 @@ export const EvidenceEventKindSchema = z.enum([
   "artifact.preflight.pending",
   "quote.signed.mocked",
   "artifact.refund.pending",
+  "operator.key_used",
   "gate.spend_tripped.observed",
   "gate.spend_settled.observed",
   "gate.spend_tripped",

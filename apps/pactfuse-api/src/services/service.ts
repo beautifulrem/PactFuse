@@ -188,23 +188,33 @@ export async function challengeSource(input: SessionScopedEnvelope, ctx: Service
     assertSession(ctx, envelope.sessionId, requestId);
     const createdAt = ctx.clock.now().toISOString();
     const challengeId = hashJson({ sessionId: envelope.sessionId, payload, createdAt });
-    ctx.db.sqlite
-      .prepare(
-        `INSERT INTO source_challenges
-          (challenge_id, session_id, source_hash, reason_hash, evidence_ref, status, created_at)
-         VALUES (?, ?, ?, ?, ?, 'pending_chain_log', ?)`,
-      )
-      .run(challengeId, envelope.sessionId, payload.sourceHash, payload.reasonHash, payload.evidenceRef ?? null, createdAt);
-    const event = appendEvidenceEvent(ctx, {
-      sessionId: envelope.sessionId,
-      authority: "operator",
-      kind: "source.challenge.pending",
-      payload: {
-        challengeId,
-        sourceHash: payload.sourceHash,
-        reasonHash: payload.reasonHash,
-        status: "pending_chain_log",
-      },
+    const event = withImmediateTransaction(ctx, () => {
+      ctx.db.sqlite
+        .prepare(
+          `INSERT INTO source_challenges
+            (challenge_id, session_id, source_hash, reason_hash, evidence_ref, status, created_at)
+           VALUES (?, ?, ?, ?, ?, 'pending_chain_log', ?)`,
+        )
+        .run(challengeId, envelope.sessionId, payload.sourceHash, payload.reasonHash, payload.evidenceRef ?? null, createdAt);
+      recordOperatorKeyUse(ctx, {
+        sessionId: envelope.sessionId,
+        role: "challenge_submitter",
+        method: "SourceStateRegistry.challengeSource",
+        requestId,
+        operationId: challengeId,
+        authorizedMethods: ["SourceStateRegistry.challengeSource(bytes32,bytes32)"],
+      });
+      return appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "operator",
+        kind: "source.challenge.pending",
+        payload: {
+          challengeId,
+          sourceHash: payload.sourceHash,
+          reasonHash: payload.reasonHash,
+          status: "pending_chain_log",
+        },
+      });
     });
     return {
       ok: true,
@@ -648,42 +658,52 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
       modes: LOCKED_RUNTIME_MODES,
     });
     const quoteId = hashJson({ quoteHash, requestId });
-    ctx.db.sqlite
-      .prepare(
-        `INSERT INTO quotes
-          (quote_id, session_id, spend_id, preflight_id, artifact_commitment, price_disclosure_hash, source_state_snapshot_hash,
-           price_atomic, quote_nonce, valid_until_block, quote_hash, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mocked_after_preflight_not_chain_settleable', ?)`,
-      )
-      .run(
-        quoteId,
-        envelope.sessionId,
-        payload.spendId,
-        payload.preflightId,
-        payload.artifactCommitment,
-        priceDisclosureHash,
-        sourceStateSnapshotHash,
-        payload.priceAtomic,
-        payload.quoteNonce,
-        payload.validUntilBlock,
-        quoteHash,
-        createdAt,
-      );
-    const event = appendEvidenceEvent(ctx, {
-      sessionId: envelope.sessionId,
-      authority: "advisory",
-      kind: "quote.signed.mocked",
-      payload: {
-        quoteId,
-        quoteHash,
-        spendId: payload.spendId,
-        preflightId: payload.preflightId,
-        artifactCommitment: payload.artifactCommitment,
-        priceDisclosureHash,
-        sourceStateSnapshotHash,
-        quoteSignedAfterPreflight: true,
-        status: "mocked_after_preflight_not_chain_settleable",
-      },
+    const event = withImmediateTransaction(ctx, () => {
+      ctx.db.sqlite
+        .prepare(
+          `INSERT INTO quotes
+            (quote_id, session_id, spend_id, preflight_id, artifact_commitment, price_disclosure_hash, source_state_snapshot_hash,
+             price_atomic, quote_nonce, valid_until_block, quote_hash, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mocked_after_preflight_not_chain_settleable', ?)`,
+        )
+        .run(
+          quoteId,
+          envelope.sessionId,
+          payload.spendId,
+          payload.preflightId,
+          payload.artifactCommitment,
+          priceDisclosureHash,
+          sourceStateSnapshotHash,
+          payload.priceAtomic,
+          payload.quoteNonce,
+          payload.validUntilBlock,
+          quoteHash,
+          createdAt,
+        );
+      recordOperatorKeyUse(ctx, {
+        sessionId: envelope.sessionId,
+        role: "quote_signer",
+        method: "ArtifactQuote.sign",
+        requestId,
+        operationId: quoteId,
+        authorizedMethods: ["ArtifactQuote.sign(sessionId,spendId,artifactCommitment,priceAtomic,quoteNonce,validUntilBlock)"],
+      });
+      return appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "advisory",
+        kind: "quote.signed.mocked",
+        payload: {
+          quoteId,
+          quoteHash,
+          spendId: payload.spendId,
+          preflightId: payload.preflightId,
+          artifactCommitment: payload.artifactCommitment,
+          priceDisclosureHash,
+          sourceStateSnapshotHash,
+          quoteSignedAfterPreflight: true,
+          status: "mocked_after_preflight_not_chain_settleable",
+        },
+      });
     });
     return {
       ok: true,
@@ -1259,6 +1279,7 @@ export function appendEvidenceEvent(
       | "artifact.preflight.pending"
       | "quote.signed.mocked"
       | "artifact.refund.pending"
+      | "operator.key_used"
       | "gate.spend_tripped.observed"
       | "gate.spend_settled.observed"
       | "gate.spend_tripped"
@@ -1558,6 +1579,55 @@ function requireSpendPayer(spend: Row, payer: string, requestId: string): string
     });
   }
   return registeredPayer;
+}
+
+function recordOperatorKeyUse(
+  ctx: ServiceCtx,
+  input: {
+    sessionId: string;
+    role: "challenge_submitter" | "quote_signer" | "artifact_signer";
+    method: string;
+    requestId: string;
+    operationId: string;
+    authorizedMethods: string[];
+  },
+): EvidenceEvent {
+  const normalizedMethods = [...input.authorizedMethods].sort();
+  const authorizedMethodsHash = hashJson(normalizedMethods);
+  const keyId = hashJson({
+    role: input.role,
+    authority: "operator",
+    authorizedMethodsHash,
+  });
+  const now = ctx.clock.now().toISOString();
+  ctx.db.sqlite
+    .prepare(
+      `INSERT INTO operator_keys
+        (key_id, role, authority, authorized_methods_hash, authorized_methods_json, status, use_count, created_at, last_used_at)
+       VALUES (?, ?, 'operator', ?, ?, 'active_demo_key', 0, ?, NULL)
+       ON CONFLICT(key_id) DO NOTHING`,
+    )
+    .run(keyId, input.role, authorizedMethodsHash, canonicalizeJson(normalizedMethods), now);
+  ctx.db.sqlite
+    .prepare("UPDATE operator_keys SET use_count = use_count + 1, last_used_at = ? WHERE key_id = ?")
+    .run(now, keyId);
+  return appendEvidenceEvent(ctx, {
+    sessionId: input.sessionId,
+    authority: "operator",
+    kind: "operator.key_used",
+    payload: {
+      keyId,
+      role: input.role,
+      authority: "operator",
+      method: input.method,
+      operationId: input.operationId,
+      requestId: input.requestId,
+      authorizedMethodsHash,
+      status: "active_demo_key",
+      secretMaterialStored: false,
+      winnerClaimAllowed: false,
+    },
+  });
 }
 
 function requireFinalizedSettlement(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): void {

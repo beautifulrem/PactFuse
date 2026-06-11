@@ -77,3 +77,15 @@ export const gateChainEvents = sqliteTable(
     ),
   }),
 );
+
+export const operatorKeys = sqliteTable("operator_keys", {
+  keyId: text("key_id").primaryKey(),
+  role: text("role").notNull(),
+  authority: text("authority").notNull(),
+  authorizedMethodsHash: text("authorized_methods_hash").notNull(),
+  authorizedMethodsJson: text("authorized_methods_json").notNull(),
+  status: text("status").notNull(),
+  useCount: integer("use_count").notNull().default(0),
+  createdAt: text("created_at").notNull(),
+  lastUsedAt: text("last_used_at"),
+});
