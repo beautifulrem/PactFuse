@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 
 const BAD_EVIDENCE_VALUES = new Set(["pending", "fixture", "manual", "blocked"]);
 const INACTIVE_BRANCH_NULL_PATHS = new Set(["paymentProof.permit", "paymentProof.gatePaid"]);
+const HEX32_RE = /^0x[0-9a-fA-F]{64}$/;
 
 function usage() {
   console.error("Usage: node packages/verifier/pactfuse-verify-receipt.mjs [--schema-only] <receipt-pack.json>");
@@ -131,6 +132,14 @@ function asText(value) {
 
 function isEvmAddress(value) {
   return /^0x[a-fA-F0-9]{40}$/.test(value);
+}
+
+function isHex32(value) {
+  return typeof value === "string" && HEX32_RE.test(value);
+}
+
+function lowerHex(value) {
+  return typeof value === "string" ? value.toLowerCase() : value;
 }
 
 function decimal(value) {
@@ -630,6 +639,26 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   if (bundle.bundleType !== "PACTFUSE_EVIDENCE_V1") {
     errors.push("bundleType must be PACTFUSE_EVIDENCE_V1");
   }
+  if (!isHex32(bundle.sessionId)) {
+    errors.push("sessionId must be a 32-byte hex string");
+  }
+  if (bundle.summaryMode !== true) {
+    errors.push("summaryMode must be true");
+  }
+  if (!Number.isInteger(bundle.asOfEventSeq) || bundle.asOfEventSeq < 0 || bundle.asOfEventSeq > 200) {
+    errors.push("asOfEventSeq must be an integer in [0,200]");
+  }
+  if (!Number.isInteger(bundle.asOfMcpAdapterCallCount) || bundle.asOfMcpAdapterCallCount < 0 || bundle.asOfMcpAdapterCallCount > 200) {
+    errors.push("asOfMcpAdapterCallCount must be an integer in [0,200]");
+  }
+  if (bundle.winnerClaimAllowed !== false) {
+    errors.push("replay bundle winnerClaimAllowed must be false unless the final verifier is complete");
+  }
+  if (!isObject(bundle.judgeCheck) || bundle.judgeCheck.sessionId !== bundle.sessionId || bundle.judgeCheck.winnerClaimAllowed !== false) {
+    errors.push("judgeCheck must be bound to the replay bundle session and winnerClaimAllowed=false");
+  } else if (!Array.isArray(bundle.judgeCheck.rows) || bundle.judgeCheck.rows.length !== 6) {
+    errors.push("judgeCheck.rows must contain six rows");
+  }
   if (!Array.isArray(bundle.events)) {
     errors.push("events must be an array");
   } else {
@@ -644,6 +673,93 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   }
   const rawBundles = Array.isArray(bundle.rawCawReceiptBundles) ? bundle.rawCawReceiptBundles : [];
   const canonicalReceipts = Array.isArray(bundle.canonicalCawReceipts) ? bundle.canonicalCawReceipts : [];
+  const preflights = Array.isArray(bundle.artifactPreflights) ? bundle.artifactPreflights : [];
+  const quotes = Array.isArray(bundle.quotes) ? bundle.quotes : [];
+  const accessTokens = Array.isArray(bundle.artifactAccessTokens) ? bundle.artifactAccessTokens : [];
+  const preflightsById = new Map(preflights.filter(isObject).map((preflight) => [preflight.preflightId, preflight]));
+  const quotesById = new Map(quotes.filter(isObject).map((quote) => [quote.quoteId, quote]));
+  for (const preflight of preflights) {
+    if (!isObject(preflight)) {
+      errors.push("artifactPreflights entries must be objects");
+      continue;
+    }
+    if (lowerHex(preflight.artifactCid) !== `sha256:${asText(preflight.artifactHashPreview).toLowerCase()}`) {
+      errors.push(`artifact preflight ${preflight.preflightId ?? "-"} artifactCid does not match artifactHashPreview`);
+    }
+  }
+  for (const quote of quotes) {
+    if (!isObject(quote)) {
+      errors.push("quotes entries must be objects");
+      continue;
+    }
+    const preflight = preflightsById.get(quote.preflightId);
+    if (!preflight) {
+      errors.push(`quote ${quote.quoteId ?? "-"} references missing artifact preflight`);
+      continue;
+    }
+    if (quote.spendId !== preflight.spendId) {
+      errors.push(`quote ${quote.quoteId ?? "-"} spendId does not match preflight`);
+    }
+    if (
+      lowerHex(quote.artifactCommitment) !== lowerHex(preflight.artifactHashPreview) ||
+      lowerHex(quote.artifactCid) !== lowerHex(preflight.artifactCid)
+    ) {
+      errors.push(`quote ${quote.quoteId ?? "-"} artifact commitment does not match preflight`);
+    }
+    const expectedQuoteHash = safeHashJson(
+      {
+        sessionId: bundle.sessionId,
+        spendId: quote.spendId,
+        preflightId: quote.preflightId,
+        artifactCommitment: lowerHex(quote.artifactCommitment),
+        priceAtomic: quote.priceAtomic,
+        quoteNonce: quote.quoteNonce,
+        validUntilBlock: quote.validUntilBlock,
+        artifactCid: lowerHex(quote.artifactCid),
+        priceDisclosureHash: quote.priceDisclosureHash,
+        sourceStateSnapshotHash: quote.sourceStateSnapshotHash,
+	        quoteSignedAfterPreflight: true,
+	        modes: {
+	          CLAIM_MODE: "simulated",
+	          PAYMENT_MODE: "mocked",
+	          TOKEN_MODE: "local-mocked",
+	          IDENTITY_MODE: "pending",
+	          WINNER_CLAIM_ALLOWED: false,
+	        },
+      },
+      `quote ${quote.quoteId ?? "-"} quoteHash body`,
+      errors,
+    );
+    if (expectedQuoteHash && lowerHex(quote.quoteHash) !== expectedQuoteHash) {
+      errors.push(`quote ${quote.quoteId ?? "-"} quoteHash does not recompute`);
+    }
+  }
+  for (const token of accessTokens) {
+    if (!isObject(token)) {
+      errors.push("artifactAccessTokens entries must be objects");
+      continue;
+    }
+    const payloadHash = safeHashJson(token.artifactPayload, `artifact access token ${token.tokenId ?? "-"} payload`, errors);
+    if (payloadHash && (payloadHash !== lowerHex(token.artifactPayloadHash) || payloadHash !== lowerHex(token.artifactHash))) {
+      errors.push(`artifact access token ${token.tokenId ?? "-"} payload hash does not match artifactHash`);
+    }
+    if (lowerHex(token.artifactCid) !== `sha256:${asText(token.artifactHash).toLowerCase()}`) {
+      errors.push(`artifact access token ${token.tokenId ?? "-"} artifactCid does not match artifactHash`);
+    }
+    const quote = quotesById.get(token.quoteId);
+    if (!quote) {
+      errors.push(`artifact access token ${token.tokenId ?? "-"} references missing quote`);
+      continue;
+    }
+    if (
+      token.spendId !== quote.spendId ||
+      token.preflightId !== quote.preflightId ||
+      lowerHex(token.artifactHash) !== lowerHex(quote.artifactCommitment) ||
+      lowerHex(token.artifactCid) !== lowerHex(quote.artifactCid)
+    ) {
+      errors.push(`artifact access token ${token.tokenId ?? "-"} is not bound to quote/preflight artifact`);
+    }
+  }
   const rawReceiptsByHash = new Map();
   for (const rawBundle of rawBundles) {
     if (!isObject(rawBundle)) {

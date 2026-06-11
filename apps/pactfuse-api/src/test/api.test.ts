@@ -12,6 +12,7 @@ import { completeJob, enqueueJob, leaseNextJob, requeueExpiredLeases } from "../
 import { INDEX_CHAIN_WINDOW_JOB_KIND, runIndexerWorkerOnce } from "../services/indexer-worker.js";
 import {
   createHttpsCawReceiptSource,
+  createHttpJsonRpcMcpLeaseClient,
   createStaticTemplateRegistry,
   createUnconfiguredCawReceiptSource,
   createUnconfiguredChainClient,
@@ -590,27 +591,33 @@ describe("pactfuse-api P0", () => {
       "currentBlockNumber",
       "rawLogHash",
     ]);
-    expect(json.paths["/api/v1/artifacts/preflight"].post["x-pactfuse-proof-fields"]).toEqual([
-      "preflightId",
-      "artifactHashPreview",
-      "priceDisclosureHash",
-      "winnerClaimAllowed",
-    ]);
+	    expect(json.paths["/api/v1/artifacts/preflight"].post["x-pactfuse-proof-fields"]).toEqual([
+	      "preflightId",
+	      "artifactHashPreview",
+	      "artifactCid",
+	      "priceDisclosureHash",
+	      "winnerClaimAllowed",
+	    ]);
     expect(json.paths["/api/v1/artifacts/preflight"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/ArtifactPreflightInput",
     );
-    expect(json.paths["/api/v1/quotes"].post["x-pactfuse-proof-fields"]).toEqual([
-      "preflightId",
-      "quoteSignedAfterPreflight",
-      "priceDisclosureHash",
-      "winnerClaimAllowed",
-    ]);
+	    expect(json.paths["/api/v1/quotes"].post["x-pactfuse-proof-fields"]).toEqual([
+	      "preflightId",
+	      "artifactCid",
+	      "quoteSignedAfterPreflight",
+	      "priceDisclosureHash",
+	      "winnerClaimAllowed",
+	    ]);
     expect(json.paths["/api/v1/quotes"].post.requestBody.content["application/json"].schema.$ref).toBe("#/components/schemas/QuoteInput");
-    expect(json.paths["/api/v1/artifacts/access-token"].post["x-pactfuse-proof-fields"]).toEqual([
-      "tokenId",
-      "tokenHash",
-      "verifierRunId",
-      "settlementEventId",
+	    expect(json.paths["/api/v1/artifacts/access-token"].post["x-pactfuse-proof-fields"]).toEqual([
+	      "tokenId",
+	      "tokenHash",
+	      "quoteId",
+	      "preflightId",
+	      "artifactCid",
+	      "artifactPayloadHash",
+	      "verifierRunId",
+	      "settlementEventId",
       "bearerBound",
       "winnerClaimAllowed",
     ]);
@@ -628,14 +635,18 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/artifacts/access-token"].post.responses["202"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/ArtifactAccessIssueResponse",
     );
-    expect(json.components.schemas.ArtifactAccessIssuePayload.required).toEqual(["spendId", "payer", "artifactHash"]);
+    expect(json.components.schemas.ArtifactAccessIssuePayload.required).toEqual(["spendId", "payer", "quoteId", "artifactHash", "artifactPayload"]);
     expect(json.components.schemas.ArtifactAccessIssueResponse.oneOf[0].properties.data.required).toEqual([
       "tokenId",
       "accessToken",
       "tokenHash",
       "spendId",
       "payer",
+      "quoteId",
+      "preflightId",
       "artifactHash",
+      "artifactCid",
+      "artifactPayloadHash",
       "verifierRunId",
       "settlementEventId",
       "bearerBound",
@@ -933,6 +944,51 @@ describe("pactfuse-api P0", () => {
 
     expect(res.status).toBe(423);
     expect(res.json.error.code).toBe("proof_pending");
+  });
+
+  it("normalizes source hashes before source registration and spend binding", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-source-hash-canonical");
+    const lowerSourceHash = hex32("source");
+    const upperSourceHash = `0x${lowerSourceHash.slice(2).toUpperCase()}`;
+    const source = await post(app, "/api/v1/sources/register", {
+      sessionId,
+      idempotencyKey: "src-register-uppercase",
+      payload: {
+        sourceId: "clean-source",
+        sourceHash: upperSourceHash,
+        manifestUrl: "https://example.com/manifest.json",
+        manifestHash: hex32("manifest"),
+        capabilityVector: { has_write_file: false },
+      },
+    });
+    const spendId = await computeSpendIdForTest(app, sessionId, [upperSourceHash]);
+    const spend = await post(app, "/api/v1/spends/register-batch", {
+      sessionId,
+      idempotencyKey: "spend-register-uppercase-source",
+      payload: {
+        spends: [
+          {
+            spendId,
+            pactId: "pact-c",
+            toolId: "code-scan",
+            payer: "0x1234",
+            agentWallet: "0xabcd",
+            sourceHashes: [upperSourceHash],
+            maxPriceAtomic: "1000",
+            nonce: "nonce-1",
+          },
+        ],
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(source.status).toBe(201);
+    expect(source.json.data.sourceHash).toBe(lowerSourceHash);
+    expect(spend.status).toBe(201);
+    expect(replayJson.data.sources[0].sourceHash).toBe(lowerSourceHash);
+    expect(replayJson.data.spends[0].sourceHashes).toEqual([lowerSourceHash]);
   });
 
   it("blocks rebinding an existing spend to a different payer or price", async () => {
@@ -1307,7 +1363,7 @@ describe("pactfuse-api P0", () => {
     expect(event.payload.rawReceiptBundleHash).toBe(ingest.json.data.rawReceiptBundleHash);
     expect(cawJudgeRow).toEqual(
       expect.objectContaining({
-        status: "pass",
+        status: "pending",
         authority: "delivery",
         evidenceEventId: ingest.json.evidenceEventId,
       }),
@@ -1893,6 +1949,9 @@ describe("pactfuse-api P0", () => {
     const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
     const replayJson = await replay.json();
     const reorgEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "reorg.invalidated");
+    const judge = await app.request(`/api/v1/evidence/judge-check?sessionId=${sessionId}`);
+    const judgeJson = await judge.json();
+    const settlementRow = judgeJson.data.rows.find((row: { rowId: string }) => row.rowId === "c_settlement");
 
     expect(reorg.status).toBe(202);
     expect(reorg.json.data.finalityStatus).toBe("reorg_invalidated");
@@ -1913,6 +1972,13 @@ describe("pactfuse-api P0", () => {
     expect(verify.json.data.schemaOk).toBe(false);
     expect(verify.json.data.winnerClaimAllowed).toBe(false);
     expect(verify.json.data.errors.some((error: string) => error.includes("reorg.invalidated"))).toBe(true);
+    expect(settlementRow).toEqual(
+      expect.objectContaining({
+        status: "blocked",
+        authority: "proof",
+        evidenceEventId: reorgEvent?.eventId,
+      }),
+    );
   });
 
   it("keeps artifact reads bearer-bound and validates path parameters", async () => {
@@ -1920,9 +1986,11 @@ describe("pactfuse-api P0", () => {
     const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-artifact");
     const spendId = await registerSpend(app, sessionId);
-    const artifactHash = hex32("artifact");
+    const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact");
+    const { artifactHash, artifactPayload, quoteId } = quoted;
     const payer = "0x1234";
     const artifactUrl = `/api/v1/artifacts/${sessionId}/${spendId}/${payer}/${artifactHash}`;
+    const uppercaseArtifactHash = `0x${artifactHash.slice(2).toUpperCase()}`;
     const wrongPayer = "0xabcd";
 
     const pending = await app.request(artifactUrl);
@@ -1936,7 +2004,9 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         payer,
+        quoteId,
         artifactHash,
+        artifactPayload,
       },
     });
     const bearerToken = issued.json.data.accessToken as string;
@@ -1946,7 +2016,9 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         payer,
+        quoteId,
         artifactHash,
+        artifactPayload,
       },
     });
     const duplicateIssue = await post(app, "/api/v1/artifacts/access-token", {
@@ -1955,7 +2027,9 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         payer,
+        quoteId,
         artifactHash,
+        artifactPayload,
       },
     });
     const tokenRow = ctx.db.sqlite
@@ -1974,6 +2048,10 @@ describe("pactfuse-api P0", () => {
     const wrongBearerJson = await wrongBearer.json();
     const allowed = await app.request(artifactUrl, { headers: { authorization: `Bearer ${bearerToken}` } });
     const allowedJson = await allowed.json();
+    const allowedUppercaseHash = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/${payer}/${uppercaseArtifactHash}`, {
+      headers: { authorization: `Bearer ${bearerToken}` },
+    });
+    const allowedUppercaseHashJson = await allowedUppercaseHash.json();
     const payerMismatch = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/${wrongPayer}/${artifactHash}`, {
       headers: { authorization: `Bearer ${bearerToken}` },
     });
@@ -2031,6 +2109,8 @@ describe("pactfuse-api P0", () => {
         winnerClaimAllowed: false,
       }),
     );
+    expect(allowedUppercaseHash.status).toBe(200);
+    expect(allowedUppercaseHashJson.data.artifactPayloadHash).toBe(artifactHash);
     expect(payerMismatch.status).toBe(422);
     expect(payerMismatchJson.error.code).toBe("proof_blocked");
   });
@@ -2074,6 +2154,149 @@ describe("pactfuse-api P0", () => {
     expect(verifyJson.data.errors.some((error: string) => error.includes("missing issued_by_verifier_run_id"))).toBe(true);
   });
 
+  it("blocks artifact access issuance when the requested artifact diverges from the quote", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const sessionId = await createSession(app, "sess-artifact-quote-mismatch");
+    const spendId = await registerSpend(app, sessionId);
+    const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact-quote-bound");
+    const differentPayload = artifactPayloadForTest("artifact-quote-tampered");
+    const differentHash = hashForTestJson(differentPayload);
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-quote-mismatch");
+
+    const issue = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-artifact-quote-mismatch",
+      payload: {
+        spendId,
+        payer: "0x1234",
+        quoteId: quoted.quoteId,
+        artifactHash: differentHash,
+        artifactPayload: differentPayload,
+      },
+    });
+
+    expect(issue.status).toBe(422);
+    expect(issue.json.error.code).toBe("proof_blocked");
+    expect(issue.json.error.message).toContain("quote commitment");
+  });
+
+  it("blocks artifact access issuance for overpriced or expired quotes", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const overpricedSessionId = await createSession(app, "sess-artifact-overpriced-quote");
+    const overpricedSpendId = await registerSpend(app, overpricedSessionId);
+    const overpriced = await quoteArtifactForTest(app, overpricedSessionId, overpricedSpendId, "artifact-overpriced", { priceAtomic: "1001" });
+    await finalizeSpendSettlement(app, ctx, logs, overpricedSessionId, overpricedSpendId, "artifact-overpriced");
+
+    const overpricedIssue = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId: overpricedSessionId,
+      idempotencyKey: "issue-overpriced-artifact",
+      payload: {
+        spendId: overpricedSpendId,
+        payer: "0x1234",
+        quoteId: overpriced.quoteId,
+        artifactHash: overpriced.artifactHash,
+        artifactPayload: overpriced.artifactPayload,
+      },
+    });
+
+    const expiredSessionId = await createSession(app, "sess-artifact-expired-quote");
+    const expiredSpendId = await registerSpend(app, expiredSessionId);
+    const expired = await quoteArtifactForTest(app, expiredSessionId, expiredSpendId, "artifact-expired", { validUntilBlock: "99" });
+    await finalizeSpendSettlement(app, ctx, logs, expiredSessionId, expiredSpendId, "artifact-expired");
+    const expiredIssue = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId: expiredSessionId,
+      idempotencyKey: "issue-expired-artifact",
+      payload: {
+        spendId: expiredSpendId,
+        payer: "0x1234",
+        quoteId: expired.quoteId,
+        artifactHash: expired.artifactHash,
+        artifactPayload: expired.artifactPayload,
+      },
+    });
+
+    expect(overpricedIssue.status).toBe(422);
+    expect(overpricedIssue.json.error.code).toBe("proof_blocked");
+    expect(overpricedIssue.json.error.message).toContain("price exceeds");
+    expect(expiredIssue.status).toBe(422);
+    expect(expiredIssue.json.error.code).toBe("proof_blocked");
+    expect(expiredIssue.json.error.message).toContain("expired");
+  });
+
+  it("blocks oversized artifact payloads before issuing bearer access", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const sessionId = await createSession(app, "sess-artifact-large-payload");
+    const spendId = await registerSpend(app, sessionId);
+    const artifactPayload = { artifactType: "source-bound-code-scan-mcp-lease", content: "x".repeat(300 * 1024) };
+    const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact-large-payload", { artifactPayload });
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-large-payload");
+
+    const issue = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-large-artifact",
+      payload: {
+        spendId,
+        payer: "0x1234",
+        quoteId: quoted.quoteId,
+        artifactHash: quoted.artifactHash,
+        artifactPayload,
+      },
+    });
+
+    expect(issue.status).toBe(422);
+    expect(issue.json.error.code).toBe("proof_blocked");
+    expect(issue.json.error.message).toContain("payload exceeds");
+  });
+
+  it("blocks artifact token issuance that would exceed the replay summary cap", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const sessionId = await createSession(app, "sess-artifact-summary-cap");
+    const spendId = await registerSpend(app, sessionId);
+    const quoted = await quoteArtifactForTest(app, sessionId, spendId, "artifact-summary-cap");
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-summary-cap");
+    const countRow = ctx.db.sqlite.prepare("SELECT COUNT(*) AS count FROM evidence_events WHERE session_id = ?").get(sessionId) as { count: number };
+    for (let i = Number(countRow.count); i < 200; i += 1) {
+	      appendEvidenceEvent(ctx, {
+	        sessionId,
+	        authority: "operator",
+	        kind: "runner.heartbeat",
+	        payload: { i, winnerClaimAllowed: false },
+	      });
+    }
+
+    const issue = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-artifact-summary-cap",
+      payload: {
+        spendId,
+        payer: "0x1234",
+        quoteId: quoted.quoteId,
+        artifactHash: quoted.artifactHash,
+        artifactPayload: quoted.artifactPayload,
+      },
+    });
+
+    expect(issue.status).toBe(422);
+    expect(issue.json.error.code).toBe("proof_blocked");
+    expect(issue.json.error.message).toContain("replay summary cap");
+
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "operator",
+      kind: "runner.heartbeat",
+      payload: { overflow: true, winnerClaimAllowed: false },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    expect(replay.status).toBe(422);
+    expect(replayJson.error.code).toBe("proof_blocked");
+    expect(replayJson.error.message).toContain("replay summary cap");
+  });
+
   it("requires registered spends before artifact preflight", async () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-preflight-spend-required");
@@ -2084,6 +2307,7 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId: hex32("missing-spend"),
         artifactHashPreview: hex32("artifact-preview"),
+        artifactCid: artifactCidForTest(hex32("artifact-preview")),
         endpointUrl: "https://example.com/artifact",
         priceDisclosureHash: hex32("price-disclosure"),
         sourceStateSnapshotHash: hex32("source-state"),
@@ -2133,6 +2357,7 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         artifactHashPreview,
+        artifactCid: artifactCidForTest(artifactHashPreview),
         endpointUrl: "https://example.com/artifact",
         priceDisclosureHash,
         sourceStateSnapshotHash,
@@ -2216,6 +2441,7 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         artifactHashPreview: hex32("artifact-preview-original"),
+        artifactCid: artifactCidForTest(hex32("artifact-preview-original")),
         endpointUrl: "https://example.com/artifact",
         priceDisclosureHash: hex32("price-disclosure-mismatch"),
         sourceStateSnapshotHash: hex32("source-state-mismatch"),
@@ -2272,6 +2498,7 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         artifactHashPreview,
+        artifactCid: artifactCidForTest(artifactHashPreview),
         endpointUrl: "https://example.com/artifact",
         priceDisclosureHash: hex32("refund-price-disclosure"),
         sourceStateSnapshotHash: hex32("refund-source-state"),
@@ -2295,6 +2522,7 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         artifactHashPreview: hex32("refund-second-artifact-preview"),
+        artifactCid: artifactCidForTest(hex32("refund-second-artifact-preview")),
         endpointUrl: "https://example.com/artifact-2",
         priceDisclosureHash: hex32("refund-second-price-disclosure"),
         sourceStateSnapshotHash: hex32("refund-second-source-state"),
@@ -2354,13 +2582,15 @@ describe("pactfuse-api P0", () => {
     const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-refund-token-exclusive");
     const spendId = await registerSpend(app, sessionId);
-    const artifactHash = hex32("refund-token-artifact");
+    const artifactPayload = artifactPayloadForTest("refund-token-artifact");
+    const artifactHash = hashForTestJson(artifactPayload);
     const preflight = await post(app, "/api/v1/artifacts/preflight", {
       sessionId,
       idempotencyKey: "exclusive-preflight",
       payload: {
         spendId,
         artifactHashPreview: artifactHash,
+        artifactCid: artifactCidForTest(artifactHash),
         endpointUrl: "https://example.com/artifact",
         priceDisclosureHash: hex32("exclusive-price-disclosure"),
         sourceStateSnapshotHash: hex32("exclusive-source-state"),
@@ -2385,7 +2615,9 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         payer: "0x1234",
+        quoteId: quote.json.data.quoteId,
         artifactHash,
+        artifactPayload,
       },
     });
     const refundAfterToken = await post(app, "/api/v1/artifacts/refund", {
@@ -2400,13 +2632,15 @@ describe("pactfuse-api P0", () => {
 
     const secondSessionId = await createSession(app, "sess-token-refund-exclusive");
     const secondSpendId = await registerSpend(app, secondSessionId);
-    const secondArtifactHash = hex32("token-refund-artifact");
+    const secondArtifactPayload = artifactPayloadForTest("token-refund-artifact");
+    const secondArtifactHash = hashForTestJson(secondArtifactPayload);
     const secondPreflight = await post(app, "/api/v1/artifacts/preflight", {
       sessionId: secondSessionId,
       idempotencyKey: "exclusive-second-preflight",
       payload: {
         spendId: secondSpendId,
         artifactHashPreview: secondArtifactHash,
+        artifactCid: artifactCidForTest(secondArtifactHash),
         endpointUrl: "https://example.com/artifact-2",
         priceDisclosureHash: hex32("exclusive-second-price-disclosure"),
         sourceStateSnapshotHash: hex32("exclusive-second-source-state"),
@@ -2440,7 +2674,9 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId: secondSpendId,
         payer: "0x1234",
+        quoteId: secondQuote.json.data.quoteId,
         artifactHash: secondArtifactHash,
+        artifactPayload: secondArtifactPayload,
       },
     });
 
@@ -2622,6 +2858,180 @@ describe("pactfuse-api P0", () => {
         evidenceEventId: proofEvent?.eventId,
       }),
     );
+  });
+
+  it("blocks indexed SourceChallenged logs for unregistered or unbound sources", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-indexer-unbound-source");
+    const sourceHash = hex32("unbound-source");
+    const reasonHash = hex32("unbound-source-reason");
+    const challenge = await post(app, "/api/v1/sources/challenge", {
+      sessionId,
+      idempotencyKey: "unbound-source-challenge",
+      payload: {
+        sourceHash,
+        reasonHash,
+        evidenceRef: "https://example.com/unbound-source-challenge.json",
+      },
+    });
+    logs.push(
+      indexerLog("unbound-source-challenged", 100, {
+        eventName: "SourceChallenged",
+        event: "SourceChallenged",
+        sessionId,
+        sourceHash,
+        reasonHash,
+        args: { sessionId, sourceHash, reasonHash },
+        transactionHash: hex32("unbound-source-challenged-tx"),
+        rawLogHash: hex32("unbound-source-challenged-log"),
+      }),
+    );
+
+    const result = await runIndexerWorkerOnce(ctx, {
+      leaseOwner: "test-indexer-unbound-source",
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 10, address: INDEXER_ADDRESS }],
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const judge = await app.request(`/api/v1/evidence/judge-check?sessionId=${sessionId}`);
+    const judgeJson = await judge.json();
+    const sourceRow = judgeJson.data.rows.find((row: { rowId: string }) => row.rowId === "source_challenge");
+
+    expect(challenge.status).toBe(202);
+    expect(result.status).toBe("blocked");
+    expect(result.reason).toContain("unregistered source");
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("source.challenge.confirmed");
+    expect(sourceRow.status).not.toBe("pass");
+  });
+
+  it("blocks indexed SourceChallenged logs for registered sources that are not spend-bound", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-indexer-registered-unbound-source");
+    const sourceHash = hex32("source");
+    const reasonHash = hex32("registered-unbound-source-reason");
+    await registerSource(app, sessionId);
+    const challenge = await post(app, "/api/v1/sources/challenge", {
+      sessionId,
+      idempotencyKey: "registered-unbound-source-challenge",
+      payload: {
+        sourceHash,
+        reasonHash,
+        evidenceRef: "https://example.com/registered-unbound-source-challenge.json",
+      },
+    });
+    logs.push(
+      indexerLog("registered-unbound-source-challenged", 100, {
+        eventName: "SourceChallenged",
+        event: "SourceChallenged",
+        sessionId,
+        sourceHash,
+        reasonHash,
+        args: { sessionId, sourceHash, reasonHash },
+        transactionHash: hex32("registered-unbound-source-challenged-tx"),
+        rawLogHash: hex32("registered-unbound-source-challenged-log"),
+      }),
+    );
+
+    const result = await runIndexerWorkerOnce(ctx, {
+      leaseOwner: "test-indexer-registered-unbound-source",
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 10, address: INDEXER_ADDRESS }],
+    });
+
+    expect(challenge.status).toBe(202);
+    expect(result.status).toBe("blocked");
+    expect(result.reason).toContain("not bound");
+  });
+
+  it("blocks indexed SourceChallenged logs without a pending operator challenge", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-indexer-source-no-pending-challenge");
+    await registerSpend(app, sessionId);
+    const sourceHash = hex32("source");
+    const reasonHash = hex32("source-no-pending-reason");
+    logs.push(
+      indexerLog("source-no-pending-challenged", 100, {
+        eventName: "SourceChallenged",
+        event: "SourceChallenged",
+        sessionId,
+        sourceHash,
+        reasonHash,
+        args: { sessionId, sourceHash, reasonHash },
+        transactionHash: hex32("source-no-pending-challenged-tx"),
+        rawLogHash: hex32("source-no-pending-challenged-log"),
+      }),
+    );
+
+    const result = await runIndexerWorkerOnce(ctx, {
+      leaseOwner: "test-indexer-source-no-pending",
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 10, address: INDEXER_ADDRESS }],
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.reason).toContain("pending source challenge");
+  });
+
+  it("normalizes uppercase indexed SourceChallenged hashes before updating source proof status", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 103, logs }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
+    });
+    const sessionId = await createSession(app, "sess-indexer-uppercase-source-challenge");
+    await registerSpend(app, sessionId);
+    const sourceHash = hex32("source");
+    const reasonHash = hex32("uppercase-source-reason");
+    const uppercaseSourceHash = `0x${sourceHash.slice(2).toUpperCase()}`;
+    const uppercaseReasonHash = `0x${reasonHash.slice(2).toUpperCase()}`;
+    const challenge = await post(app, "/api/v1/sources/challenge", {
+      sessionId,
+      idempotencyKey: "uppercase-source-challenge",
+      payload: {
+        sourceHash,
+        reasonHash,
+        evidenceRef: "https://example.com/uppercase-source-challenge.json",
+      },
+    });
+    logs.push(
+      indexerLog("uppercase-source-challenged", 100, {
+        eventName: "SourceChallenged",
+        event: "SourceChallenged",
+        sessionId,
+        sourceHash: uppercaseSourceHash,
+        reasonHash: uppercaseReasonHash,
+        args: { sessionId, sourceHash: uppercaseSourceHash, reasonHash: uppercaseReasonHash },
+        transactionHash: hex32("uppercase-source-challenged-tx"),
+        rawLogHash: hex32("uppercase-source-challenged-log"),
+      }),
+    );
+
+    const result = await runIndexerWorkerOnce(ctx, {
+      leaseOwner: "test-indexer-uppercase-source",
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 10, address: INDEXER_ADDRESS }],
+    });
+    const source = ctx.db.sqlite
+      .prepare("SELECT proof_status FROM sources WHERE session_id = ? AND source_hash = ?")
+      .get(sessionId, sourceHash) as { proof_status: string };
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const proofEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "source.challenge.confirmed");
+
+    expect(challenge.status).toBe(202);
+    expect(result.status).toBe("succeeded");
+    expect(source.proof_status).toBe("challenged");
+    expect(proofEvent.payload.sourceHash).toBe(sourceHash);
+    expect(proofEvent.payload.reasonHash).toBe(reasonHash);
   });
 
   it("keeps indexer worker lease recovery scoped and blocks malformed indexer jobs", async () => {
@@ -2895,7 +3305,7 @@ describe("pactfuse-api P0", () => {
     expect(cursor).toEqual(expect.objectContaining({ last_indexed_block: 100, status: "caught_up" }));
   });
 
-  it("marks indexer provider failures degraded and keeps verifier output fail-closed", async () => {
+	  it("marks indexer provider failures degraded and keeps verifier output fail-closed", async () => {
     const offline = makeApp(":memory:", {
       chain: createFakeIndexerChainClient({ ready: false, reason: "rpc offline" }),
     }).app;
@@ -2935,11 +3345,38 @@ describe("pactfuse-api P0", () => {
     expect(statusJson.data.cursors[0].reason).toContain("chain log backfill failed");
     expect(verify.status).toBe(200);
     expect(verify.json.data.schemaOk).toBe(false);
-    expect(verify.json.data.errors.some((error: string) => error.includes("chain indexer cursor gate:indexer"))).toBe(true);
-    expect(verify.json.data.winnerClaimAllowed).toBe(false);
-  });
+	    expect(verify.json.data.errors.some((error: string) => error.includes("chain indexer cursor gate:indexer"))).toBe(true);
+	    expect(verify.json.data.winnerClaimAllowed).toBe(false);
+	  });
 
-  it("records MCP adapter calls with request and response hashes", async () => {
+	  it("fails verifier replay cleanliness when summary snapshots exceed the cap", async () => {
+	    const { app, ctx } = makeApp();
+	    const sessionId = await createSession(app, "sess-replay-summary-cap");
+	    for (let i = 0; i < 200; i += 1) {
+	      appendEvidenceEvent(ctx, {
+	        sessionId,
+	        authority: "operator",
+	        kind: "runner.heartbeat",
+	        payload: { i, winnerClaimAllowed: false },
+	      });
+	    }
+	    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+	    const replayJson = await replay.json();
+	    const verify = await post(app, "/api/v1/evidence/verify", {
+	      sessionId,
+	      idempotencyKey: "verify-replay-summary-cap",
+	      payload: { schemaOnly: true },
+	    });
+
+	    expect(replay.status).toBe(422);
+	    expect(replayJson.error.code).toBe("proof_blocked");
+	    expect(replayJson.error.message).toContain("replay summary cap");
+	    expect(verify.status).toBe(200);
+	    expect(verify.json.data.schemaOk).toBe(false);
+	    expect(verify.json.data.errors.some((error: string) => error.includes("exceeding replay summary cap"))).toBe(true);
+	  });
+
+	  it("records MCP adapter calls with request and response hashes", async () => {
     const { app, ctx } = makeApp();
     const sessionId = await createSession(app, "sess-mcp-audit");
 
@@ -3439,7 +3876,8 @@ describe("pactfuse-api P0", () => {
     const spendId = await registerSpend(app, sessionId);
     const payer = "0x1234";
     const wrongPayer = "0xabcd";
-    const artifactHash = hex32("lease-artifact-active");
+    const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-artifact-active");
+    const { artifactHash, artifactPayload, quoteId } = quoted;
     await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-settlement");
     const issued = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
@@ -3447,7 +3885,9 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         payer,
+        quoteId,
         artifactHash,
+        artifactPayload,
       },
     });
     const bearerToken = issued.json.data.accessToken as string;
@@ -3594,7 +4034,8 @@ describe("pactfuse-api P0", () => {
     const sessionId = await createSession(app, "sess-lease-transcript-success");
     const spendId = await registerSpend(app, sessionId);
     const payer = "0x1234";
-    const artifactHash = hex32("lease-artifact-transcript");
+    const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-artifact-transcript");
+    const { artifactHash, artifactPayload, quoteId } = quoted;
     await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-transcript-settlement");
     const issued = await post(app, "/api/v1/artifacts/access-token", {
       sessionId,
@@ -3602,7 +4043,9 @@ describe("pactfuse-api P0", () => {
       payload: {
         spendId,
         payer,
+        quoteId,
         artifactHash,
+        artifactPayload,
       },
     });
     const bearerToken = issued.json.data.accessToken as string;
@@ -3623,6 +4066,39 @@ describe("pactfuse-api P0", () => {
       },
       { authorization: `Bearer ${bearerToken}` },
     );
+    const repeatedLease = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId,
+        idempotencyKey: "lease-transcript-repeat",
+        payload: {
+          spendId,
+          payer,
+          artifactHash,
+          targetRepo: "https://github.com/example/independent-target",
+          targetCommit: "abcdef123456",
+        },
+      },
+      { authorization: `Bearer ${bearerToken}` },
+    );
+    const succeededLeaseCount = ctx.db.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM lease_runs WHERE session_id = ? AND artifact_token_id = ? AND status = 'succeeded_live_mcp_transcript'")
+      .get(sessionId, issued.json.data.tokenId) as { count: number };
+    const consumedToken = ctx.db.sqlite
+      .prepare("SELECT status FROM artifact_access_tokens WHERE session_id = ? AND token_id = ?")
+      .get(sessionId, issued.json.data.tokenId) as { status: string };
+    const duplicateAfterLease = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-token-after-lease-consumed",
+      payload: {
+        spendId,
+        payer,
+        quoteId,
+        artifactHash,
+        artifactPayload,
+      },
+    });
     const transcript = await app.request(`/api/v1/evidence/agent-transcript?sessionId=${sessionId}`);
     const transcriptJson = await transcript.json();
     const heartbeat = await app.request(`/api/v1/evidence/runner-heartbeat?sessionId=${sessionId}`);
@@ -3651,6 +4127,11 @@ describe("pactfuse-api P0", () => {
 
     expect(issued.status).toBe(202);
     expect(lease.status).toBe(202);
+    expect(repeatedLease.status).toBe(422);
+    expect(repeatedLease.json.error.code).toBe("proof_blocked");
+    expect(succeededLeaseCount.count).toBe(1);
+    expect(consumedToken.status).toBe("consumed");
+    expect(duplicateAfterLease.status).toBe(409);
     expect(lease.json.data).toEqual(
       expect.objectContaining({
         leaseRunId: expect.stringMatching(/^0x[0-9a-f]{64}$/),
@@ -3745,6 +4226,542 @@ describe("pactfuse-api P0", () => {
     expect(verifyTamperedLease.status).toBe(200);
     expect(verifyTamperedLease.json.data.schemaOk).toBe(false);
     expect(verifyTamperedLease.json.data.errors).toContain("replayBundle.leaseRuns does not match the server snapshot");
+  });
+
+  it("executes live HTTP MCP lease only when tools/list exposes the unique read-only PactFuse tool", async () => {
+    const mcp = await startMcpJsonRpcServer((request) => {
+      if (request.method === "tools/list") {
+        return {
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { tools: [leaseToolDefinitionForTest()] },
+        };
+      }
+      return {
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { content: [{ type: "text", text: "clean lease complete" }] },
+      };
+    });
+    try {
+      const logs: Array<Record<string, unknown>> = [];
+      const { app, ctx } = makeApp(":memory:", {
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
+      });
+      const sessionId = await createSession(app, "sess-lease-http-mcp-success");
+      const spendId = await registerSpend(app, sessionId);
+      const payer = "0x1234";
+      const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-http-mcp-success");
+      await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-http-mcp-success");
+      const issued = await post(app, "/api/v1/artifacts/access-token", {
+        sessionId,
+        idempotencyKey: "issue-http-mcp-success-token",
+        payload: {
+          spendId,
+          payer,
+          quoteId: quoted.quoteId,
+          artifactHash: quoted.artifactHash,
+          artifactPayload: quoted.artifactPayload,
+        },
+      });
+      const lease = await post(
+        app,
+        "/api/v1/lease/execute",
+        {
+          sessionId,
+          idempotencyKey: "lease-http-mcp-success",
+          payload: {
+            spendId,
+            payer,
+            artifactHash: quoted.artifactHash,
+            targetRepo: "https://github.com/example/independent-target",
+            targetCommit: "abcdef123456",
+          },
+        },
+        { authorization: `Bearer ${issued.json.data.accessToken}` },
+      );
+      const tokenRow = ctx.db.sqlite
+        .prepare("SELECT status FROM artifact_access_tokens WHERE session_id = ? AND token_id = ?")
+        .get(sessionId, issued.json.data.tokenId) as { status: string };
+
+      expect(issued.status).toBe(202);
+      expect(lease.status).toBe(202);
+      expect(lease.json.data.status).toBe("succeeded_live_mcp_transcript");
+      expect(tokenRow.status).toBe("consumed");
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/call"]);
+    } finally {
+      await mcp.close();
+    }
+  });
+
+  it("terminates artifact tokens after tools/call failure so untrusted side effects cannot be replayed", async () => {
+    const mcp = await startMcpJsonRpcServer((request) => {
+      if (request.method === "tools/list") {
+        return {
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { tools: [leaseToolDefinitionForTest()] },
+        };
+      }
+      return {
+        jsonrpc: "2.0",
+        id: request.id,
+        error: { code: -32000, message: "tool failed after execution" },
+      };
+    });
+    try {
+      const logs: Array<Record<string, unknown>> = [];
+      const { app, ctx } = makeApp(":memory:", {
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
+      });
+      const sessionId = await createSession(app, "sess-lease-call-failure-blocks-token");
+      const spendId = await registerSpend(app, sessionId);
+      const payer = "0x1234";
+      const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-call-failure-blocks-token");
+      await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-call-failure-blocks-token");
+      const issued = await post(app, "/api/v1/artifacts/access-token", {
+        sessionId,
+        idempotencyKey: "issue-call-failure-token",
+        payload: {
+          spendId,
+          payer,
+          quoteId: quoted.quoteId,
+          artifactHash: quoted.artifactHash,
+          artifactPayload: quoted.artifactPayload,
+        },
+      });
+      const body = (idempotencyKey: string) => ({
+        sessionId,
+        idempotencyKey,
+        payload: {
+          spendId,
+          payer,
+          artifactHash: quoted.artifactHash,
+          targetRepo: "https://github.com/example/independent-target",
+          targetCommit: "abcdef123456",
+        },
+      });
+
+      const first = await post(app, "/api/v1/lease/execute", body("lease-call-failure-a"), {
+        authorization: `Bearer ${issued.json.data.accessToken}`,
+      });
+      const second = await post(app, "/api/v1/lease/execute", body("lease-call-failure-b"), {
+        authorization: `Bearer ${issued.json.data.accessToken}`,
+      });
+      const tokenRow = ctx.db.sqlite
+        .prepare("SELECT status FROM artifact_access_tokens WHERE session_id = ? AND token_id = ?")
+        .get(sessionId, issued.json.data.tokenId) as { status: string };
+
+      expect(issued.status).toBe(202);
+      expect(first.status).toBe(202);
+      expect(first.json.data.status).toBe("blocked_mcp_execution_failed");
+      expect(second.status).toBe(422);
+      expect(second.json.error.code).toBe("proof_blocked");
+      expect(tokenRow.status).toBe("blocked");
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/call"]);
+    } finally {
+      await mcp.close();
+    }
+  });
+
+  it("reconciles expired consuming lease claims into blocked evidence instead of leaving permanent half-state", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    let executeCalls = 0;
+    const mcpLease: McpLeaseClient = {
+      async status() {
+        return { name: "mcp_lease", mode: "fixture", ready: true, reason: "should not execute" };
+      },
+      async executeCleanLease(input) {
+        executeCalls += 1;
+        return createFakeMcpLeaseClient().executeCleanLease(input);
+      },
+    };
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+      mcpLease,
+    });
+    const sessionId = await createSession(app, "sess-lease-expired-consuming");
+    const spendId = await registerSpend(app, sessionId);
+    const payer = "0x1234";
+    const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-expired-consuming");
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-expired-consuming");
+    const issued = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-expired-consuming-token",
+      payload: {
+        spendId,
+        payer,
+        quoteId: quoted.quoteId,
+        artifactHash: quoted.artifactHash,
+        artifactPayload: quoted.artifactPayload,
+      },
+    });
+    const expiredLeaseRunId = hex32("expired-consuming-lease-run");
+    ctx.db.sqlite
+      .prepare(
+        `UPDATE artifact_access_tokens
+         SET status = 'consuming', lease_claim_json = ?, lease_claimed_at = ?
+         WHERE session_id = ? AND token_id = ?`,
+      )
+      .run(
+        canonicalizeJson({
+          requestId: "req_expired_consuming",
+          leaseRunId: expiredLeaseRunId,
+          spendId,
+          payer,
+          artifactHash: quoted.artifactHash,
+          targetRepo: "https://github.com/example/independent-target",
+          targetCommit: "abcdef123456",
+          settlementEventId: issued.json.data.settlementEventId,
+        }),
+        "2026-06-10T23:50:00.000Z",
+        sessionId,
+        issued.json.data.tokenId,
+      );
+
+    const lease = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId,
+        idempotencyKey: "lease-expired-consuming",
+        payload: {
+          spendId,
+          payer,
+          artifactHash: quoted.artifactHash,
+          targetRepo: "https://github.com/example/independent-target",
+          targetCommit: "abcdef123456",
+        },
+      },
+      { authorization: `Bearer ${issued.json.data.accessToken}` },
+    );
+    const tokenRow = ctx.db.sqlite
+      .prepare("SELECT status FROM artifact_access_tokens WHERE session_id = ? AND token_id = ?")
+      .get(sessionId, issued.json.data.tokenId) as { status: string };
+    const blockedLease = ctx.db.sqlite
+      .prepare("SELECT status FROM lease_runs WHERE session_id = ? AND lease_run_id = ?")
+      .get(sessionId, expiredLeaseRunId) as { status: string };
+
+    expect(issued.status).toBe(202);
+    expect(lease.status).toBe(422);
+    expect(lease.json.error.code).toBe("proof_blocked");
+    expect(tokenRow.status).toBe("blocked");
+    expect(blockedLease.status).toBe("blocked_mcp_execution_failed");
+    expect(executeCalls).toBe(0);
+  });
+
+  it("rejects dangerous configured lease MCP tool names before network execution", () => {
+    expect(() =>
+      createHttpJsonRpcMcpLeaseClient({
+        endpointUrl: "http://127.0.0.1:1",
+        toolName: "pactfuse_shell_exec",
+      }),
+    ).toThrow("must not describe write");
+  });
+
+  it("blocks live MCP lease execution when tools/list exposes disallowed capabilities", async () => {
+    const mcp = await startMcpJsonRpcServer((request) => {
+      if (request.method === "tools/list") {
+        return {
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            tools: [leaseToolDefinitionForTest(), { name: "write_file" }],
+          },
+        };
+      }
+      return {
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { content: [{ type: "text", text: "should-not-run" }] },
+      };
+    });
+    try {
+      const logs: Array<Record<string, unknown>> = [];
+      const { app, ctx } = makeApp(":memory:", {
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
+      });
+      const sessionId = await createSession(app, "sess-lease-dangerous-tools");
+      const spendId = await registerSpend(app, sessionId);
+      const payer = "0x1234";
+      const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-dangerous-tools");
+      await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-dangerous-tools");
+      const issued = await post(app, "/api/v1/artifacts/access-token", {
+        sessionId,
+        idempotencyKey: "issue-dangerous-tools-token",
+        payload: {
+          spendId,
+          payer,
+          quoteId: quoted.quoteId,
+          artifactHash: quoted.artifactHash,
+          artifactPayload: quoted.artifactPayload,
+        },
+      });
+      const lease = await post(
+        app,
+        "/api/v1/lease/execute",
+        {
+          sessionId,
+          idempotencyKey: "lease-dangerous-tools",
+          payload: {
+            spendId,
+            payer,
+            artifactHash: quoted.artifactHash,
+            targetRepo: "https://github.com/example/independent-target",
+            targetCommit: "abcdef123456",
+          },
+        },
+        { authorization: `Bearer ${issued.json.data.accessToken}` },
+      );
+      const succeededLeaseCount = ctx.db.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM lease_runs WHERE session_id = ? AND status = 'succeeded_live_mcp_transcript'")
+        .get(sessionId) as { count: number };
+
+      expect(issued.status).toBe(202);
+      expect(lease.status).toBe(202);
+      expect(lease.json.data.status).toBe("blocked_mcp_execution_failed");
+      expect(lease.json.data.winnerClaimAllowed).toBe(false);
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list"]);
+      expect(succeededLeaseCount.count).toBe(0);
+    } finally {
+      await mcp.close();
+    }
+  });
+
+  it("blocks live MCP lease execution when the required tool omits read-only schema metadata", async () => {
+    const mcp = await startMcpJsonRpcServer((request) => {
+      if (request.method === "tools/list") {
+        return {
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            tools: [{ name: "pactfuse_code_scan" }],
+          },
+        };
+      }
+      return {
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { content: [{ type: "text", text: "should-not-run" }] },
+      };
+    });
+    try {
+      const logs: Array<Record<string, unknown>> = [];
+      const { app, ctx } = makeApp(":memory:", {
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
+      });
+      const sessionId = await createSession(app, "sess-lease-missing-tool-metadata");
+      const spendId = await registerSpend(app, sessionId);
+      const payer = "0x1234";
+      const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-missing-tool-metadata");
+      await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-missing-tool-metadata");
+      const issued = await post(app, "/api/v1/artifacts/access-token", {
+        sessionId,
+        idempotencyKey: "issue-missing-tool-metadata-token",
+        payload: {
+          spendId,
+          payer,
+          quoteId: quoted.quoteId,
+          artifactHash: quoted.artifactHash,
+          artifactPayload: quoted.artifactPayload,
+        },
+      });
+      const lease = await post(
+        app,
+        "/api/v1/lease/execute",
+        {
+          sessionId,
+          idempotencyKey: "lease-missing-tool-metadata",
+          payload: {
+            spendId,
+            payer,
+            artifactHash: quoted.artifactHash,
+            targetRepo: "https://github.com/example/independent-target",
+            targetCommit: "abcdef123456",
+          },
+        },
+        { authorization: `Bearer ${issued.json.data.accessToken}` },
+      );
+
+      expect(issued.status).toBe(202);
+      expect(lease.status).toBe(202);
+      expect(lease.json.data.status).toBe("blocked_mcp_execution_failed");
+      expect(lease.json.data.winnerClaimAllowed).toBe(false);
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list"]);
+    } finally {
+      await mcp.close();
+    }
+  });
+
+  it("serializes concurrent lease executions for the same artifact token before external MCP side effects", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    let executeCalls = 0;
+    let releaseLease!: () => void;
+    let markStarted!: () => void;
+    const leaseStarted = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const releaseSignal = new Promise<void>((resolve) => {
+      releaseLease = resolve;
+    });
+    const fakeMcp = createFakeMcpLeaseClient();
+    const mcpLease: McpLeaseClient = {
+      async status() {
+        return {
+          name: "mcp_lease",
+          mode: "fixture",
+          ready: true,
+          reason: "barrier MCP lease client",
+        };
+      },
+      async executeCleanLease(input) {
+        executeCalls += 1;
+        markStarted();
+        await releaseSignal;
+        return fakeMcp.executeCleanLease(input);
+      },
+    };
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+      mcpLease,
+    });
+    const sessionId = await createSession(app, "sess-lease-token-race");
+    const spendId = await registerSpend(app, sessionId);
+    const payer = "0x1234";
+    const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-token-race");
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-token-race");
+    const issued = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-lease-race-token",
+      payload: {
+        spendId,
+        payer,
+        quoteId: quoted.quoteId,
+        artifactHash: quoted.artifactHash,
+        artifactPayload: quoted.artifactPayload,
+      },
+    });
+    const body = (idempotencyKey: string) => ({
+      sessionId,
+      idempotencyKey,
+      payload: {
+        spendId,
+        payer,
+        artifactHash: quoted.artifactHash,
+        targetRepo: "https://github.com/example/independent-target",
+        targetCommit: "abcdef123456",
+      },
+    });
+
+    const first = post(app, "/api/v1/lease/execute", body("lease-race-a"), { authorization: `Bearer ${issued.json.data.accessToken}` });
+    await leaseStarted;
+    const second = post(app, "/api/v1/lease/execute", body("lease-race-b"), { authorization: `Bearer ${issued.json.data.accessToken}` });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(executeCalls).toBe(1);
+    releaseLease();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    const succeededLeaseCount = ctx.db.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM lease_runs WHERE session_id = ? AND artifact_token_id = ? AND status = 'succeeded_live_mcp_transcript'")
+      .get(sessionId, issued.json.data.tokenId) as { count: number };
+
+    expect(issued.status).toBe(202);
+    expect(firstResult.status).toBe(202);
+    expect(secondResult.status).toBe(422);
+    expect(secondResult.json.error.code).toBe("proof_blocked");
+    expect(executeCalls).toBe(1);
+    expect(succeededLeaseCount.count).toBe(1);
+  });
+
+  it("uses the database claim to block cross-instance lease execution before external MCP side effects", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-lease-claim-"));
+    const dbPath = join(dir, "pactfuse.sqlite");
+    try {
+      const logs: Array<Record<string, unknown>> = [];
+      let executeCalls = 0;
+      let releaseLease!: () => void;
+      let markStarted!: () => void;
+      const leaseStarted = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const releaseSignal = new Promise<void>((resolve) => {
+        releaseLease = resolve;
+      });
+      const fakeMcp = createFakeMcpLeaseClient();
+      const mcpLease: McpLeaseClient = {
+        async status() {
+          return { name: "mcp_lease", mode: "fixture", ready: true, reason: "barrier MCP lease client" };
+        },
+        async executeCleanLease(input) {
+          executeCalls += 1;
+          markStarted();
+          await releaseSignal;
+          return fakeMcp.executeCleanLease(input);
+        },
+      };
+      const first = makeApp(dbPath, {
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        mcpLease,
+      });
+      const sessionId = await createSession(first.app, "sess-cross-instance-lease-claim");
+      const spendId = await registerSpend(first.app, sessionId);
+      const payer = "0x1234";
+      const quoted = await quoteArtifactForTest(first.app, sessionId, spendId, "cross-instance-lease-claim");
+      await finalizeSpendSettlement(first.app, first.ctx, logs, sessionId, spendId, "cross-instance-lease-claim");
+      const issued = await post(first.app, "/api/v1/artifacts/access-token", {
+        sessionId,
+        idempotencyKey: "issue-cross-instance-token",
+        payload: {
+          spendId,
+          payer,
+          quoteId: quoted.quoteId,
+          artifactHash: quoted.artifactHash,
+          artifactPayload: quoted.artifactPayload,
+        },
+      });
+      const second = makeApp(dbPath, {
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        mcpLease: createFakeMcpLeaseClient(),
+      });
+      const body = (idempotencyKey: string) => ({
+        sessionId,
+        idempotencyKey,
+        payload: {
+          spendId,
+          payer,
+          artifactHash: quoted.artifactHash,
+          targetRepo: "https://github.com/example/independent-target",
+          targetCommit: "abcdef123456",
+        },
+      });
+
+      const firstLease = post(first.app, "/api/v1/lease/execute", body("lease-cross-instance-a"), {
+        authorization: `Bearer ${issued.json.data.accessToken}`,
+      });
+      await leaseStarted;
+      const secondLease = await post(second.app, "/api/v1/lease/execute", body("lease-cross-instance-b"), {
+        authorization: `Bearer ${issued.json.data.accessToken}`,
+      });
+      expect(secondLease.status).toBe(422);
+      expect(secondLease.json.error.code).toBe("proof_blocked");
+      expect(executeCalls).toBe(1);
+      releaseLease();
+      const firstResult = await firstLease;
+      const succeededLeaseCount = first.ctx.db.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM lease_runs WHERE session_id = ? AND artifact_token_id = ? AND status = 'succeeded_live_mcp_transcript'")
+        .get(sessionId, issued.json.data.tokenId) as { count: number };
+
+      expect(issued.status).toBe(202);
+      expect(firstResult.status).toBe(202);
+      expect(succeededLeaseCount.count).toBe(1);
+      first.ctx.db.sqlite.close();
+      second.ctx.db.sqlite.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("surfaces fail-closed proof providers and binds Pact template hashes", async () => {
@@ -3873,6 +4890,65 @@ async function registerSpend(app: ReturnType<typeof createApp>, sessionId: strin
   });
   expect(res.status).toBe(201);
   return spendId;
+}
+
+function artifactCidForTest(artifactHash: string): string {
+  return `sha256:${artifactHash.toLowerCase()}`;
+}
+
+function artifactPayloadForTest(seed: string): Record<string, unknown> {
+  return { artifactType: "source-bound-code-scan-mcp-lease", seed, content: `scan:${seed}` };
+}
+
+async function quoteArtifactForTest(
+  app: ReturnType<typeof createApp>,
+  sessionId: string,
+  spendId: string,
+  seed: string,
+  options: { artifactPayload?: Record<string, unknown>; priceAtomic?: string; validUntilBlock?: string } = {},
+): Promise<{
+  artifactPayload: Record<string, unknown>;
+  artifactHash: `0x${string}`;
+  artifactCid: string;
+  preflightId: string;
+  quoteId: string;
+}> {
+  const artifactPayload = options.artifactPayload ?? artifactPayloadForTest(seed);
+  const artifactHash = hashForTestJson(artifactPayload);
+  const artifactCid = artifactCidForTest(artifactHash);
+  const preflight = await post(app, "/api/v1/artifacts/preflight", {
+    sessionId,
+    idempotencyKey: `${seed}-preflight`,
+    payload: {
+      spendId,
+      artifactHashPreview: artifactHash,
+      artifactCid,
+      endpointUrl: `https://example.com/${seed}.json`,
+      priceDisclosureHash: hex32(`${seed}-price`),
+      sourceStateSnapshotHash: hex32(`${seed}-source-state`),
+    },
+  });
+  expect(preflight.status).toBe(202);
+  const quote = await post(app, "/api/v1/quotes", {
+    sessionId,
+    idempotencyKey: `${seed}-quote`,
+    payload: {
+      spendId,
+      preflightId: preflight.json.data.preflightId,
+      artifactCommitment: artifactHash,
+      priceAtomic: options.priceAtomic ?? "1000",
+      quoteNonce: `${seed}-quote-nonce`,
+      validUntilBlock: options.validUntilBlock ?? "1000000",
+    },
+  });
+  expect(quote.status).toBe(201);
+  return {
+    artifactPayload,
+    artifactHash,
+    artifactCid,
+    preflightId: preflight.json.data.preflightId,
+    quoteId: quote.json.data.quoteId,
+  };
 }
 
 const INDEXER_ADDRESS = "0x1111111111111111111111111111111111111111";
@@ -4134,6 +5210,13 @@ async function computeSpendIdForTest(
   const normalizedSourceHashes = [...sourceHashes].map((sourceHash) => sourceHash.toLowerCase()).sort();
   const runConfigHash = sessionJson.data.runConfigHash as string;
   const sourceSetHash = keccakJsonForTest(normalizedSourceHashes);
+  const sourceCapabilitySnapshotHash = hashForTestJson([
+    {
+      sourceHash: hex32("source"),
+      manifestHash: hex32("manifest"),
+      capabilityVector: { has_write_file: false },
+    },
+  ]);
   const sessionCommitment = keccakJsonForTest({ sessionId: sessionId.toLowerCase(), runConfigHash });
   return keccakJsonForTest({
     runConfigHash,
@@ -4141,6 +5224,7 @@ async function computeSpendIdForTest(
     pactId: "pact-c",
     toolId: "code-scan",
     sourceSetHash,
+    sourceCapabilitySnapshotHash,
     payer: "0x1234",
     agentWallet: "0xabcd",
     maxPriceAtomic: "1000",
@@ -4331,6 +5415,70 @@ function createFakeMcpLeaseClient(toolName = "pactfuse_code_scan"): McpLeaseClie
         output: callResponse,
       };
     },
+  };
+}
+
+function leaseToolDefinitionForTest(name = "pactfuse_code_scan"): Record<string, unknown> {
+  const properties = Object.fromEntries(
+    ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"].map((field) => [
+      field,
+      { type: "string" },
+    ]),
+  );
+  return {
+    name,
+    description: "Deterministic read-only code scan",
+    inputSchema: {
+      type: "object",
+      properties,
+      required: Object.keys(properties),
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true },
+  };
+}
+
+async function startMcpJsonRpcServer(respond: (request: Record<string, unknown>) => Record<string, unknown>): Promise<{
+  url: string;
+  calls: Array<Record<string, unknown>>;
+  close: () => Promise<void>;
+}> {
+  const calls: Array<Record<string, unknown>> = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      const request = JSON.parse(body) as Record<string, unknown>;
+      calls.push(request);
+      const response = respond(request);
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(response));
+    });
+  });
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("test MCP server did not bind to a TCP port");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    calls,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      }),
   };
 }
 

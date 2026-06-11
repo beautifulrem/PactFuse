@@ -70,9 +70,9 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.schemaErrors).toEqual([]);
   });
 
-  it.each([
-    [
-      "raw bundle hash",
+	  it.each([
+	    [
+	      "raw bundle hash",
       (bundle) => {
         bundle.rawCawReceiptBundles[0].rawBundleHash = hex32("bad-raw-bundle");
       },
@@ -97,18 +97,62 @@ describe("pactfuse receipt verifier contract", () => {
       (bundle) => {
         delete bundle.rawCawReceiptBundles[0].rawBundle;
       },
-      "rawBundle cannot be canonicalized",
-    ],
-  ])("rejects replay bundles with tampered %s", (_label, mutate, expected) => {
+	      "rawBundle cannot be canonicalized",
+	    ],
+	    [
+	      "quote hash",
+	      (bundle) => {
+	        bundle.quotes[0].quoteHash = hex32("bad-quote-hash");
+	      },
+	      "quoteHash does not recompute",
+	    ],
+	    [
+	      "quote price",
+	      (bundle) => {
+	        bundle.quotes[0].priceAtomic = "2000";
+	      },
+	      "quoteHash does not recompute",
+	    ],
+	    [
+	      "quote expiry",
+	      (bundle) => {
+	        bundle.quotes[0].validUntilBlock = "2";
+	      },
+	      "quoteHash does not recompute",
+	    ],
+	    [
+	      "artifact token payload",
+	      (bundle) => {
+	        bundle.artifactAccessTokens[0].artifactPayload.content = "tampered";
+	      },
+	      "payload hash does not match artifactHash",
+	    ],
+	  ])("rejects replay bundles with tampered %s", (_label, mutate, expected) => {
     const bundle = replayBundle();
     mutate(bundle);
     const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
 
     expect(result.schemaOk).toBe(false);
     expect(result.proofChipAllowed).toBe(false);
-    expect(result.errors.some((error) => error.includes(expected))).toBe(true);
-  });
-});
+	    expect(result.errors.some((error) => error.includes(expected))).toBe(true);
+	  });
+
+	  it("accepts uppercase artifact hex variants after canonical comparison", () => {
+	    const bundle = replayBundle();
+	    bundle.artifactPreflights[0].artifactHashPreview = uppercaseHexBody(bundle.artifactPreflights[0].artifactHashPreview);
+	    bundle.artifactPreflights[0].artifactCid = `sha256:${uppercaseHexBody(bundle.artifactPreflights[0].artifactHashPreview)}`;
+	    bundle.quotes[0].artifactCommitment = uppercaseHexBody(bundle.quotes[0].artifactCommitment);
+	    bundle.quotes[0].artifactCid = `sha256:${uppercaseHexBody(bundle.quotes[0].artifactCommitment)}`;
+	    bundle.artifactAccessTokens[0].artifactHash = uppercaseHexBody(bundle.artifactAccessTokens[0].artifactHash);
+	    bundle.artifactAccessTokens[0].artifactCid = `sha256:${uppercaseHexBody(bundle.artifactAccessTokens[0].artifactHash)}`;
+	    bundle.artifactAccessTokens[0].artifactPayloadHash = uppercaseHexBody(bundle.artifactAccessTokens[0].artifactPayloadHash);
+
+	    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+	    expect(result.schemaOk).toBe(true);
+	    expect(result.errors.some((error) => error.includes("artifact"))).toBe(false);
+	  });
+	});
 
 function pendingReceipt() {
   return JSON.parse(readFileSync(pendingReceiptPath, "utf8"));
@@ -117,8 +161,11 @@ function pendingReceipt() {
 function replayBundle() {
   const fetchedAt = "2026-06-11T00:00:00.000Z";
   const createdAt = "2026-06-11T00:00:01.000Z";
+  const sessionId = hex32("session-replay-1");
+  const operationId = hex32("op-activate");
+  const bundleId = hex32("bundle-1");
   const rawReceipt = {
-    operationId: "op-activate",
+    operationId,
     operationKind: "activate",
     walletAddress: "0x1111111111111111111111111111111111111111",
     policyDigest: hex32("policy"),
@@ -135,8 +182,8 @@ function replayBundle() {
   const rawBundle = {
     source: "caw-api",
     sourceLabel: "caw-api",
-    sessionId: "session-replay-1",
-    operationId: "op-activate",
+    sessionId,
+    operationId,
     operationKind: "activate",
     walletId: "wallet-1",
     fetchedAt,
@@ -146,9 +193,9 @@ function replayBundle() {
   };
   const rawReceiptHash = hashJson(rawReceipt);
   const rawCawReceiptBundle = {
-    bundleId: "bundle-1",
-    sessionId: "session-replay-1",
-    operationId: "op-activate",
+    bundleId,
+    sessionId,
+    operationId,
     operationKind: "activate",
     sourceLabel: "caw-api",
     fetchedAt,
@@ -157,9 +204,9 @@ function replayBundle() {
     createdAt,
   };
   const canonicalBase = {
-    bundleId: "bundle-1",
-    sessionId: "session-replay-1",
-    operationId: "op-activate",
+    bundleId,
+    sessionId,
+    operationId,
     operationKind: "activate",
     sourceLabel: "caw-api",
     walletAddress: rawReceipt.walletAddress,
@@ -181,40 +228,140 @@ function replayBundle() {
     canonicalReceiptHash: hashJson(canonicalBase),
     ...canonicalBase,
   };
-  const events = [
+	  const events = [
     {
       seq: 1,
       type: "caw.receipt.ingested.raw",
       eventHash: hex32("event-1"),
     },
-  ];
+	  ];
+	  const spendId = hex32("spend-artifact");
+	  const preflightId = hex32("artifact-preflight");
+	  const quoteId = hex32("artifact-quote");
+	  const tokenId = hex32("artifact-token");
+	  const artifactPayload = { artifactType: "source-bound-code-scan-mcp-lease", content: "scan-result" };
+	  const artifactHash = hashJson(artifactPayload);
+	  const artifactCid = `sha256:${artifactHash}`;
+	  const priceDisclosureHash = hex32("price-disclosure");
+	  const sourceStateSnapshotHash = hex32("source-state");
+	  const quoteHash = hashJson({
+	    sessionId,
+	    spendId,
+	    preflightId,
+	    artifactCommitment: artifactHash,
+	    priceAtomic: "1000",
+	    quoteNonce: "quote-nonce",
+	    validUntilBlock: "1000000",
+	    artifactCid,
+	    priceDisclosureHash,
+	    sourceStateSnapshotHash,
+	    quoteSignedAfterPreflight: true,
+	    modes: lockedRuntimeModes(),
+	  });
 
-  return {
+	  return {
     bundleType: "PACTFUSE_EVIDENCE_V1",
-    sessionId: "session-replay-1",
-    summaryMode: "full",
+    sessionId,
+    summaryMode: true,
     asOfEventSeq: 1,
+    asOfMcpAdapterCallCount: 0,
+    winnerClaimAllowed: false,
     eventRoot: hashJson(events.map((event) => event.eventHash)),
     agentTranscriptHash: hex32("agent-transcript"),
     events,
     sources: [],
     spends: [],
-    artifactPreflights: [],
-    quotes: [],
-    artifactAccessTokens: [],
+	    artifactPreflights: [
+	      {
+	        preflightId,
+	        sessionId,
+	        spendId,
+	        artifactHashPreview: artifactHash,
+	        artifactCid,
+	        endpointUrl: "https://example.com/artifact.json",
+	        priceDisclosureHash,
+	        sourceStateSnapshotHash,
+	        status: "pending_live_delivery",
+	        createdAt,
+	      },
+	    ],
+	    quotes: [
+	      {
+	        quoteId,
+	        sessionId,
+	        spendId,
+	        preflightId,
+	        artifactCommitment: artifactHash,
+	        artifactCid,
+	        priceDisclosureHash,
+	        sourceStateSnapshotHash,
+	        priceAtomic: "1000",
+	        quoteNonce: "quote-nonce",
+	        validUntilBlock: "1000000",
+	        quoteHash,
+	        status: "mocked_after_preflight_not_chain_settleable",
+	        createdAt,
+	      },
+	    ],
+	    artifactAccessTokens: [
+	      {
+	        tokenId,
+	        sessionId,
+	        spendId,
+	        payer: "0x1234",
+	        quoteId,
+	        preflightId,
+	        artifactHash,
+	        artifactCid,
+	        artifactPayloadHash: artifactHash,
+	        artifactPayload,
+	        tokenHash: hex32("artifact-token-hash"),
+	        status: "active",
+	        issuedByVerifierRunId: hex32("verifier-run"),
+	        settlementEventId: hex32("settlement-event"),
+	        createdAt,
+	      },
+	    ],
     mcpAdapterCalls: [],
     cawReceiptOperations: [],
     rawCawReceiptBundles: [rawCawReceiptBundle],
     canonicalCawReceipts: [canonicalReceipt],
     leaseRuns: [],
     judgeCheck: {
-      schema: "PACTFUSE_JUDGE_CHECK_V1",
-      sessionId: "session-replay-1",
-      createdAt,
-      verdict: "blocked",
-      checks: [],
+      sessionId,
+      winnerClaimAllowed: false,
+      rows: [
+        "caw_boundary",
+        "source_challenge",
+        "ab_trip",
+        "c_settlement",
+        "artifact_access",
+        "lease_execution",
+      ].map((rowId) => ({
+        rowId,
+        label: rowId,
+        status: "pending",
+        authority: "proof",
+        reason: "pending",
+        evidenceEventId: null,
+        evidenceUrl: null,
+      })),
     },
   };
+	}
+
+function lockedRuntimeModes() {
+  return {
+    CLAIM_MODE: "simulated",
+    PAYMENT_MODE: "mocked",
+    TOKEN_MODE: "local-mocked",
+    IDENTITY_MODE: "pending",
+    WINNER_CLAIM_ALLOWED: false,
+  };
+}
+
+function uppercaseHexBody(value) {
+  return `0x${String(value).slice(2).toUpperCase()}`;
 }
 
 function canonicalizeJson(value) {

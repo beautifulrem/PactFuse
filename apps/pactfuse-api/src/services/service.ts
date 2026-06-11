@@ -70,6 +70,9 @@ import {
 } from "../util.js";
 
 type Row = Record<string, unknown>;
+const REPLAY_SUMMARY_LIMIT = 200;
+const ARTIFACT_PAYLOAD_REPLAY_MAX_BYTES = 256 * 1024;
+const ARTIFACT_TOKEN_LEASE_CLAIM_TTL_MS = 5 * 60 * 1000;
 type ChainIndexerBackfillPayload = ChainIndexerBackfillInput["payload"];
 type NormalizedIndexedChainLog = {
   logId: `0x${string}`;
@@ -216,31 +219,51 @@ export async function registerSignedSource(
   const payload = parseStrict(SourceRegisterPayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("sources:register", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
+    const sourceHash = payload.sourceHash.toLowerCase();
     const createdAt = ctx.clock.now().toISOString();
-    ctx.db.sqlite
-      .prepare(
-        `INSERT OR REPLACE INTO sources
-          (source_id, session_id, source_hash, manifest_url, manifest_hash, issuer, signature, capability_vector_json, proof_status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
-      )
-      .run(
-        payload.sourceId,
-        envelope.sessionId,
-        payload.sourceHash,
-        payload.manifestUrl,
-        payload.manifestHash,
-        payload.issuer ?? null,
-        payload.signature ?? null,
-        canonicalizeJson(payload.capabilityVector),
-        createdAt,
+    const capabilityVectorJson = canonicalizeJson(payload.capabilityVector);
+    const existing = ctx.db.sqlite
+      .prepare("SELECT * FROM sources WHERE session_id = ? AND LOWER(source_hash) = ?")
+      .get(envelope.sessionId, sourceHash) as Row | undefined;
+    if (existing) {
+      assertExistingSourceMatches(
+        existing,
+        {
+          sourceId: payload.sourceId,
+          manifestUrl: payload.manifestUrl,
+          manifestHash: payload.manifestHash,
+          issuer: payload.issuer ?? null,
+          signature: payload.signature ?? null,
+          capabilityVectorJson,
+        },
+        requestId,
       );
+    } else {
+      ctx.db.sqlite
+        .prepare(
+          `INSERT INTO sources
+            (source_id, session_id, source_hash, manifest_url, manifest_hash, issuer, signature, capability_vector_json, proof_status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+        )
+        .run(
+          payload.sourceId,
+          envelope.sessionId,
+          sourceHash,
+          payload.manifestUrl,
+          payload.manifestHash,
+          payload.issuer ?? null,
+          payload.signature ?? null,
+          capabilityVectorJson,
+          createdAt,
+        );
+    }
     const event = appendEvidenceEvent(ctx, {
       sessionId: envelope.sessionId,
       authority: "operator",
       kind: "source.registered",
       payload: {
         sourceId: payload.sourceId,
-        sourceHash: payload.sourceHash,
+        sourceHash,
         manifestHash: payload.manifestHash,
         proofStatus: "pending",
       },
@@ -249,7 +272,7 @@ export async function registerSignedSource(
       ok: true,
       requestId,
       evidenceEventId: event.eventId,
-      data: { sourceHash: payload.sourceHash, status: "pending", winnerClaimAllowed: false },
+      data: { sourceHash, status: "pending", winnerClaimAllowed: false },
     };
   });
 }
@@ -259,8 +282,11 @@ export async function challengeSource(input: SessionScopedEnvelope, ctx: Service
   const payload = parseStrict(SourceChallengePayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("sources:challenge", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
+    const sourceHash = payload.sourceHash.toLowerCase();
+    const reasonHash = payload.reasonHash.toLowerCase();
     const createdAt = ctx.clock.now().toISOString();
-    const challengeId = hashJson({ sessionId: envelope.sessionId, payload, createdAt });
+    const normalizedPayload = { ...payload, sourceHash, reasonHash };
+    const challengeId = hashJson({ sessionId: envelope.sessionId, payload: normalizedPayload, createdAt });
     const event = withImmediateTransaction(ctx, () => {
       ctx.db.sqlite
         .prepare(
@@ -268,7 +294,7 @@ export async function challengeSource(input: SessionScopedEnvelope, ctx: Service
             (challenge_id, session_id, source_hash, reason_hash, evidence_ref, status, created_at)
            VALUES (?, ?, ?, ?, ?, 'pending_chain_log', ?)`,
         )
-        .run(challengeId, envelope.sessionId, payload.sourceHash, payload.reasonHash, payload.evidenceRef ?? null, createdAt);
+        .run(challengeId, envelope.sessionId, sourceHash, reasonHash, payload.evidenceRef ?? null, createdAt);
       recordOperatorKeyUse(ctx, {
         sessionId: envelope.sessionId,
         role: "challenge_submitter",
@@ -283,8 +309,8 @@ export async function challengeSource(input: SessionScopedEnvelope, ctx: Service
         kind: "source.challenge.pending",
         payload: {
           challengeId,
-          sourceHash: payload.sourceHash,
-          reasonHash: payload.reasonHash,
+          sourceHash,
+          reasonHash,
           status: "pending_chain_log",
         },
       });
@@ -323,10 +349,12 @@ export async function registerSourceBoundSpends(
       for (const spend of payload.spends) {
         const sourceHashes = normalizedSourceHashes(spend.sourceHashes);
         requireRegisteredSources(ctx, envelope.sessionId, sourceHashes, requestId);
+        const sourceCapabilitySnapshot = sourceCapabilitySnapshotFor(ctx, envelope.sessionId, sourceHashes);
         const binding = spendBindingFor(session, envelope.sessionId, {
           pactId: spend.pactId,
           toolId: spend.toolId,
           sourceHashes,
+          sourceCapabilitySnapshotHash: sourceCapabilitySnapshot.hash,
           payer: spend.payer,
           agentWallet: spend.agentWallet,
           maxPriceAtomic: spend.maxPriceAtomic,
@@ -403,6 +431,7 @@ export async function registerSourceBoundSpends(
           sessionCommitment: registeredSpends[0]?.sessionCommitment ?? null,
           spendIdBinding: "w8.1-keccak-jcs-v1",
           spendPreimages: registeredSpends.map((spend) => spend.spendPreimage),
+          sourceCapabilitySnapshotHashes: registeredSpends.map((spend) => String(spend.spendPreimage.sourceCapabilitySnapshotHash)),
           status: "registered_pending_chain_log",
         },
       });
@@ -666,7 +695,7 @@ export async function ingestCawReceiptBundle(
       });
       updateJudgeCheckRow(ctx, envelope.sessionId, {
         rowId: "caw_boundary",
-        status: "pass",
+        status: "pending",
         authority: "delivery",
         reason: "raw CAW receipt bundle ingested and canonicalized; final proof remains fail-closed",
         evidenceEventId: event.eventId,
@@ -1069,19 +1098,23 @@ export async function runArtifactPreflight(input: SessionScopedEnvelope, ctx: Se
   return withIdempotency(ctx, scoped("artifacts:preflight", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
     assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    const artifactHashPreview = payload.artifactHashPreview.toLowerCase();
+    const artifactCid = payload.artifactCid.toLowerCase();
     const createdAt = ctx.clock.now().toISOString();
     const preflightId = hashJson({ sessionId: envelope.sessionId, payload, requestId });
+    assertArtifactCidMatchesHash(artifactCid, artifactHashPreview, requestId);
     ctx.db.sqlite
       .prepare(
         `INSERT INTO artifact_preflights
-          (preflight_id, session_id, spend_id, artifact_hash_preview, endpoint_url, price_disclosure_hash, source_state_snapshot_hash, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_live_delivery', ?)`,
+          (preflight_id, session_id, spend_id, artifact_hash_preview, artifact_cid, endpoint_url, price_disclosure_hash, source_state_snapshot_hash, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_live_delivery', ?)`,
       )
       .run(
         preflightId,
         envelope.sessionId,
         payload.spendId,
-        payload.artifactHashPreview,
+        artifactHashPreview,
+        artifactCid,
         payload.endpointUrl,
         payload.priceDisclosureHash,
         payload.sourceStateSnapshotHash,
@@ -1094,7 +1127,8 @@ export async function runArtifactPreflight(input: SessionScopedEnvelope, ctx: Se
       payload: {
         preflightId,
         spendId: payload.spendId,
-        artifactHashPreview: payload.artifactHashPreview,
+        artifactHashPreview,
+        artifactCid,
         priceDisclosureHash: payload.priceDisclosureHash,
         sourceStateSnapshotHash: payload.sourceStateSnapshotHash,
         status: "pending_live_delivery",
@@ -1106,7 +1140,8 @@ export async function runArtifactPreflight(input: SessionScopedEnvelope, ctx: Se
       evidenceEventId: event.eventId,
       data: {
         preflightId,
-        artifactHashPreview: payload.artifactHashPreview,
+        artifactHashPreview,
+        artifactCid,
         priceDisclosureHash: payload.priceDisclosureHash,
         sourceStateSnapshotHash: payload.sourceStateSnapshotHash,
         status: "pending_live_delivery",
@@ -1123,12 +1158,20 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
     assertSession(ctx, envelope.sessionId, requestId);
     assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
     const preflight = requireQuotePreflight(ctx, envelope.sessionId, payload, requestId);
+    const artifactCid = String(preflight.artifact_cid);
+    const artifactCommitment = payload.artifactCommitment.toLowerCase();
     const priceDisclosureHash = String(preflight.price_disclosure_hash);
     const sourceStateSnapshotHash = String(preflight.source_state_snapshot_hash);
     const createdAt = ctx.clock.now().toISOString();
     const quoteHash = hashJson({
       sessionId: envelope.sessionId,
-      ...payload,
+      spendId: payload.spendId,
+      preflightId: payload.preflightId,
+      artifactCommitment,
+      priceAtomic: payload.priceAtomic,
+      quoteNonce: payload.quoteNonce,
+      validUntilBlock: payload.validUntilBlock,
+      artifactCid,
       priceDisclosureHash,
       sourceStateSnapshotHash,
       quoteSignedAfterPreflight: true,
@@ -1139,16 +1182,17 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
       ctx.db.sqlite
         .prepare(
           `INSERT INTO quotes
-            (quote_id, session_id, spend_id, preflight_id, artifact_commitment, price_disclosure_hash, source_state_snapshot_hash,
+            (quote_id, session_id, spend_id, preflight_id, artifact_commitment, artifact_cid, price_disclosure_hash, source_state_snapshot_hash,
              price_atomic, quote_nonce, valid_until_block, quote_hash, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mocked_after_preflight_not_chain_settleable', ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mocked_after_preflight_not_chain_settleable', ?)`,
         )
         .run(
           quoteId,
           envelope.sessionId,
           payload.spendId,
           payload.preflightId,
-          payload.artifactCommitment,
+          artifactCommitment,
+          artifactCid,
           priceDisclosureHash,
           sourceStateSnapshotHash,
           payload.priceAtomic,
@@ -1174,7 +1218,8 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
           quoteHash,
           spendId: payload.spendId,
           preflightId: payload.preflightId,
-          artifactCommitment: payload.artifactCommitment,
+          artifactCommitment,
+          artifactCid,
           priceDisclosureHash,
           sourceStateSnapshotHash,
           quoteSignedAfterPreflight: true,
@@ -1190,6 +1235,7 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
         quoteId,
         quoteHash,
         preflightId: payload.preflightId,
+        artifactCid,
         priceDisclosureHash,
         sourceStateSnapshotHash,
         quoteSignedAfterPreflight: true,
@@ -1258,97 +1304,138 @@ export async function issueArtifactAccessToken(input: SessionScopedEnvelope, ctx
     assertSession(ctx, envelope.sessionId, requestId);
     const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
     const payer = requireSpendPayer(spend, payload.payer, requestId);
+    const artifactHash = payload.artifactHash.toLowerCase();
     const settlement = requireFinalizedSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
     assertNoArtifactRefundPending(ctx, envelope.sessionId, payload.spendId, requestId);
-    assertNoActiveArtifactToken(ctx, envelope.sessionId, payload.spendId, requestId);
-
-    const replayBundle = assembleReplayBundleData(envelope.sessionId, ctx);
-    const { view, verifierInput } = await buildVerifierRunView(ctx, envelope.sessionId, {
-      replayBundle: replayBundle as unknown as Record<string, JsonValue>,
-      schemaOnly: true,
-    });
-    if (!view.schemaOk) {
-      throw Object.assign(new Error("artifact access token requires a schema-clean verifier run"), {
-        apiError: proofBlockedError(requestId, "artifact access token requires a schema-clean verifier run", { errors: view.errors }),
+    return withProcessLock(`artifact-token:${envelope.sessionId}:${payload.spendId}`, async () => {
+      assertNoActiveArtifactToken(ctx, envelope.sessionId, payload.spendId, requestId);
+      const artifactPayloadHash = hashJson(payload.artifactPayload);
+      const artifactPayloadJson = canonicalizeJson(payload.artifactPayload);
+      assertArtifactPayloadReplaySize(artifactPayloadJson, requestId);
+      if (artifactPayloadHash !== artifactHash) {
+        throw Object.assign(new Error("artifact payload hash does not match requested artifactHash"), {
+          apiError: proofBlockedError(requestId, "artifact payload hash does not match requested artifactHash", {
+            artifactHash,
+            artifactPayloadHash,
+          }),
+        });
+      }
+      const quoteBinding = requireArtifactQuoteBinding(
+        ctx,
+        envelope.sessionId,
+        {
+          spendId: payload.spendId,
+          quoteId: payload.quoteId,
+          artifactHash,
+          settlementBlockNumber: settlement.blockNumber,
+          spendMaxPriceAtomic: String(spend.max_price_atomic),
+        },
+        requestId,
+      );
+      const replayBundle = assembleReplayBundleData(envelope.sessionId, ctx);
+      const { view, verifierInput } = await buildVerifierRunView(ctx, envelope.sessionId, {
+        replayBundle: replayBundle as unknown as Record<string, JsonValue>,
+        schemaOnly: false,
       });
-    }
+      if (!view.schemaOk) {
+        throw Object.assign(new Error("artifact access token requires a replay-clean verifier run"), {
+          apiError: proofBlockedError(requestId, "artifact access token requires a replay-clean verifier run", { errors: view.errors }),
+        });
+      }
+      assertReplaySummaryRoomForArtifactIssue(ctx, envelope.sessionId, requestId);
 
-    const inputHash = hashJson(verifierInput);
-    const verifierRunId = hashJson({ sessionId: envelope.sessionId, inputHash, scope: "artifact_access_token", requestId });
-    const accessToken = `pf_at_${hashJson({ sessionId: envelope.sessionId, payload, verifierRunId, requestId }).slice(2)}`;
-    const tokenHash = sha256Hex(accessToken);
-    const tokenId = hashJson({ sessionId: envelope.sessionId, spendId: payload.spendId, payer, artifactHash: payload.artifactHash, tokenHash });
-    const event = withImmediateTransaction(ctx, () => {
-      ctx.db.sqlite
-        .prepare(
-          `INSERT INTO verifier_runs
-            (verifier_run_id, session_id, input_hash, result_json, schema_ok, proof_chip_allowed, winner_claim_allowed, final_verifier_complete, created_at)
-           VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)`,
-        )
-        .run(verifierRunId, envelope.sessionId, inputHash, canonicalizeJson(view), view.schemaOk ? 1 : 0, ctx.clock.now().toISOString());
-      ctx.db.sqlite
-        .prepare(
-          `INSERT INTO artifact_access_tokens
-            (token_id, session_id, spend_id, payer, artifact_hash, token_hash, status, issued_by_verifier_run_id, settlement_event_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
-        )
-        .run(
+      const inputHash = hashJson(verifierInput);
+      const verifierRunId = hashJson({ sessionId: envelope.sessionId, inputHash, scope: "artifact_access_token", requestId });
+      const normalizedPayload = { ...payload, artifactHash };
+      const accessToken = `pf_at_${hashJson({ sessionId: envelope.sessionId, payload: normalizedPayload, verifierRunId, requestId }).slice(2)}`;
+      const tokenHash = sha256Hex(accessToken);
+      const tokenId = hashJson({ sessionId: envelope.sessionId, spendId: payload.spendId, payer, artifactHash, tokenHash });
+      const event = withImmediateTransaction(ctx, () => {
+        ctx.db.sqlite
+          .prepare(
+            `INSERT INTO verifier_runs
+              (verifier_run_id, session_id, input_hash, result_json, schema_ok, proof_chip_allowed, winner_claim_allowed, final_verifier_complete, created_at)
+             VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)`,
+          )
+          .run(verifierRunId, envelope.sessionId, inputHash, canonicalizeJson(view), view.schemaOk ? 1 : 0, ctx.clock.now().toISOString());
+        ctx.db.sqlite
+          .prepare(
+            `INSERT INTO artifact_access_tokens
+              (token_id, session_id, spend_id, payer, quote_id, preflight_id, artifact_hash, artifact_cid,
+               artifact_payload_hash, artifact_payload_json, token_hash, status, issued_by_verifier_run_id, settlement_event_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+          )
+          .run(
+            tokenId,
+            envelope.sessionId,
+            payload.spendId,
+            payer,
+            payload.quoteId,
+            quoteBinding.preflightId,
+            artifactHash,
+            quoteBinding.artifactCid,
+            artifactPayloadHash,
+            artifactPayloadJson,
+            tokenHash,
+            verifierRunId,
+            settlement.finalizedEventId,
+            ctx.clock.now().toISOString(),
+          );
+        const issued = appendEvidenceEvent(ctx, {
+          sessionId: envelope.sessionId,
+          authority: "delivery",
+          kind: "artifact.access_token.issued",
+          payload: {
+            tokenId,
+            spendId: payload.spendId,
+            payer,
+            quoteId: payload.quoteId,
+            preflightId: quoteBinding.preflightId,
+            artifactHash,
+            artifactCid: quoteBinding.artifactCid,
+            artifactPayloadHash,
+            tokenHash,
+            verifierRunId,
+            settlementEventId: settlement.finalizedEventId,
+            status: "active_demo_verifier_gated",
+            proofAuthority: false,
+            winnerClaimAllowed: false,
+          },
+        });
+        updateJudgeCheckRow(ctx, envelope.sessionId, {
+          rowId: "artifact_access",
+          status: "pass",
+          authority: "delivery",
+          reason: "bearer token issued after finalized settlement, quote binding, and replay-clean verifier run",
+          evidenceEventId: issued.eventId,
+        });
+        return issued;
+      });
+
+      return {
+        ok: true,
+        requestId,
+        evidenceEventId: event.eventId,
+        data: {
           tokenId,
-          envelope.sessionId,
-          payload.spendId,
-          payer,
-          payload.artifactHash,
+          accessToken,
           tokenHash,
-          verifierRunId,
-          settlement.finalizedEventId,
-          ctx.clock.now().toISOString(),
-        );
-      const issued = appendEvidenceEvent(ctx, {
-        sessionId: envelope.sessionId,
-        authority: "delivery",
-        kind: "artifact.access_token.issued",
-        payload: {
-          tokenId,
           spendId: payload.spendId,
           payer,
-          artifactHash: payload.artifactHash,
-          tokenHash,
+          quoteId: payload.quoteId,
+          preflightId: quoteBinding.preflightId,
+          artifactHash,
+          artifactCid: quoteBinding.artifactCid,
+          artifactPayloadHash,
           verifierRunId,
           settlementEventId: settlement.finalizedEventId,
+          bearerBound: true,
           status: "active_demo_verifier_gated",
           proofAuthority: false,
           winnerClaimAllowed: false,
         },
-      });
-      updateJudgeCheckRow(ctx, envelope.sessionId, {
-        rowId: "artifact_access",
-        status: "pass",
-        authority: "delivery",
-        reason: "bearer token issued after finalized settlement and schema-clean verifier run",
-        evidenceEventId: issued.eventId,
-      });
-      return issued;
+      };
     });
-
-    return {
-      ok: true,
-      requestId,
-      evidenceEventId: event.eventId,
-      data: {
-        tokenId,
-        accessToken,
-        tokenHash,
-        spendId: payload.spendId,
-        payer,
-        artifactHash: payload.artifactHash,
-        verifierRunId,
-        settlementEventId: settlement.finalizedEventId,
-        bearerBound: true,
-        status: "active_demo_verifier_gated",
-        proofAuthority: false,
-        winnerClaimAllowed: false,
-      },
-    };
   });
 }
 
@@ -1368,6 +1455,7 @@ export async function executeLease(
       assertSession(ctx, envelope.sessionId, requestId);
       const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
       const payer = requireSpendPayer(spend, payload.payer, requestId);
+      const artifactHash = payload.artifactHash.toLowerCase();
       const settlement = requireFinalizedSettlement(ctx, envelope.sessionId, payload.spendId, requestId);
       assertNoArtifactRefundPending(ctx, envelope.sessionId, payload.spendId, requestId);
       const activeToken = requireActiveArtifactAccess(
@@ -1376,178 +1464,208 @@ export async function executeLease(
           sessionId: envelope.sessionId,
           spendId: payload.spendId,
           payer,
-          artifactHash: payload.artifactHash,
+          artifactHash,
           bearerToken,
         },
         requestId,
       );
-      const leaseRunId = hashJson({ sessionId: envelope.sessionId, payload, requestId });
-      let leaseExecution: McpLeaseExecutionResult;
-      try {
-        leaseExecution = await ctx.mcpLease.executeCleanLease({
-          sessionId: envelope.sessionId,
-          leaseRunId,
-          spendId: payload.spendId,
-          payer,
-          artifactHash: payload.artifactHash,
-          targetRepo: payload.targetRepo,
-          targetCommit: payload.targetCommit,
-        });
-      } catch (error) {
-        return recordBlockedLeaseExecution(ctx, {
-          requestId,
-          sessionId: envelope.sessionId,
-          spendId: payload.spendId,
-          payer,
-          artifactHash: payload.artifactHash,
-          targetRepo: payload.targetRepo,
-          targetCommit: payload.targetCommit,
-          leaseRunId,
-          settlementEventId: settlement.finalizedEventId,
-          artifactTokenId: String(activeToken.token_id),
-          status: error instanceof Error && !error.message.includes("unconfigured") ? "blocked_mcp_execution_failed" : "blocked_missing_runner_execution",
-          reason: error instanceof Error ? error.message : "lease MCP execution failed",
-        });
-      }
-
-      const listCall = recordMcpAdapterCall(
-        {
-          sessionId: envelope.sessionId,
-          auditNonce: `lease_${leaseRunId.slice(2, 22)}_tools_list`,
-          toolName: "tools/list",
-          request: jsonRecord(leaseExecution.toolsList.request),
-          response: jsonRecord(leaseExecution.toolsList.response),
-          status: "succeeded",
-        },
-        ctx,
-      );
-      const toolCall = recordMcpAdapterCall(
-        {
-          sessionId: envelope.sessionId,
-          auditNonce: `lease_${leaseRunId.slice(2, 22)}_tools_call`,
-          toolName: "tools/call",
-          request: jsonRecord(leaseExecution.toolsCall.request),
-          response: jsonRecord(leaseExecution.toolsCall.response),
-          status: "succeeded",
-        },
-        ctx,
-      );
-      const transcriptHash = hashJson({
-        format: "mcp-json-rpc",
-        sessionId: envelope.sessionId,
-        leaseRunId,
-        frameCallIds: [listCall.callId, toolCall.callId],
-        frames: [
-          { method: "tools/list", requestHash: listCall.requestHash, responseHash: listCall.responseHash },
-          { method: "tools/call", requestHash: toolCall.requestHash, responseHash: toolCall.responseHash },
-        ],
-      });
-      const toolsListHash = hashJson({ requestHash: listCall.requestHash, responseHash: listCall.responseHash });
-      const toolsCallHash = hashJson({ requestHash: toolCall.requestHash, responseHash: toolCall.responseHash });
-      const outputHash = hashJson(leaseExecution.output);
-      const leaseRunHash = hashJson({
-        sessionId: envelope.sessionId,
-        leaseRunId,
-        spendId: payload.spendId,
-        payer,
-        artifactHash: payload.artifactHash,
-        targetRepo: payload.targetRepo,
-        targetCommit: payload.targetCommit,
-        settlementEventId: settlement.finalizedEventId,
-        artifactTokenId: String(activeToken.token_id),
-        transcriptHash,
-        outputHash,
-      });
-      const now = ctx.clock.now().toISOString();
-      ctx.db.sqlite
-        .prepare(
-          `INSERT INTO lease_runs
-            (lease_run_id, session_id, spend_id, payer, artifact_hash, target_repo, target_commit, status, transcript_hash,
-             tools_list_hash, tools_call_hash, output_hash, lease_run_hash, settlement_event_id, artifact_token_id, completed_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'succeeded_live_mcp_transcript', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          leaseRunId,
+      return withProcessLock(`artifact-token-lease:${envelope.sessionId}:${String(activeToken.token_id)}`, async () => {
+        const artifactTokenId = String(activeToken.token_id);
+        assertArtifactTokenUnusedForLease(ctx, envelope.sessionId, artifactTokenId, requestId);
+        const leaseRunId = hashJson({ sessionId: envelope.sessionId, payload: { ...payload, artifactHash }, requestId });
+        claimArtifactTokenForLease(
+          ctx,
           envelope.sessionId,
-          payload.spendId,
-          payer,
-          payload.artifactHash,
-          payload.targetRepo,
-          payload.targetCommit,
-          transcriptHash,
-          toolsListHash,
-          toolsCallHash,
-          outputHash,
-          leaseRunHash,
-          settlement.finalizedEventId,
-          String(activeToken.token_id),
-          now,
-          now,
+          artifactTokenId,
+          {
+            requestId,
+            leaseRunId,
+            spendId: payload.spendId,
+            payer,
+            artifactHash,
+            targetRepo: payload.targetRepo,
+            targetCommit: payload.targetCommit,
+            settlementEventId: settlement.finalizedEventId,
+          },
+          requestId,
         );
-      const event = appendEvidenceEvent(ctx, {
-        sessionId: envelope.sessionId,
-        authority: "delivery",
-        kind: "lease.execution.succeeded",
-        payload: {
+        let leaseExecution: McpLeaseExecutionResult;
+        try {
+          leaseExecution = await ctx.mcpLease.executeCleanLease({
+            sessionId: envelope.sessionId,
+            leaseRunId,
+            spendId: payload.spendId,
+            payer,
+            artifactHash,
+            targetRepo: payload.targetRepo,
+            targetCommit: payload.targetCommit,
+          });
+        } catch (error) {
+          const failedStage = mcpLeaseFailureStage(error);
+          if (failedStage === "tools/list") {
+            releaseArtifactTokenLeaseClaim(ctx, envelope.sessionId, artifactTokenId);
+          } else {
+            blockArtifactTokenLeaseClaim(ctx, envelope.sessionId, artifactTokenId, requestId);
+          }
+          return recordBlockedLeaseExecution(ctx, {
+            requestId,
+            sessionId: envelope.sessionId,
+            spendId: payload.spendId,
+            payer,
+            artifactHash,
+            targetRepo: payload.targetRepo,
+            targetCommit: payload.targetCommit,
+            leaseRunId,
+            settlementEventId: settlement.finalizedEventId,
+            artifactTokenId,
+            status: error instanceof Error && !error.message.includes("unconfigured") ? "blocked_mcp_execution_failed" : "blocked_missing_runner_execution",
+            reason: error instanceof Error ? error.message : "lease MCP execution failed",
+          });
+        }
+
+        const listCall = recordMcpAdapterCall(
+          {
+            sessionId: envelope.sessionId,
+            auditNonce: `lease_${leaseRunId.slice(2, 22)}_tools_list`,
+            toolName: "tools/list",
+            request: jsonRecord(leaseExecution.toolsList.request),
+            response: jsonRecord(leaseExecution.toolsList.response),
+            status: "succeeded",
+          },
+          ctx,
+        );
+        const toolCall = recordMcpAdapterCall(
+          {
+            sessionId: envelope.sessionId,
+            auditNonce: `lease_${leaseRunId.slice(2, 22)}_tools_call`,
+            toolName: "tools/call",
+            request: jsonRecord(leaseExecution.toolsCall.request),
+            response: jsonRecord(leaseExecution.toolsCall.response),
+            status: "succeeded",
+          },
+          ctx,
+        );
+        const transcriptHash = hashJson({
+          format: "mcp-json-rpc",
+          sessionId: envelope.sessionId,
+          leaseRunId,
+          frameCallIds: [listCall.callId, toolCall.callId],
+          frames: [
+            { method: "tools/list", requestHash: listCall.requestHash, responseHash: listCall.responseHash },
+            { method: "tools/call", requestHash: toolCall.requestHash, responseHash: toolCall.responseHash },
+          ],
+        });
+        const toolsListHash = hashJson({ requestHash: listCall.requestHash, responseHash: listCall.responseHash });
+        const toolsCallHash = hashJson({ requestHash: toolCall.requestHash, responseHash: toolCall.responseHash });
+        const outputHash = hashJson(leaseExecution.output);
+        const leaseRunHash = hashJson({
+          sessionId: envelope.sessionId,
           leaseRunId,
           spendId: payload.spendId,
           payer,
-          artifactHash: payload.artifactHash,
+          artifactHash,
           targetRepo: payload.targetRepo,
           targetCommit: payload.targetCommit,
           settlementEventId: settlement.finalizedEventId,
-          artifactTokenId: String(activeToken.token_id),
+          artifactTokenId,
           transcriptHash,
-          toolsListHash,
-          toolsCallHash,
           outputHash,
-          leaseRunHash,
-          mcpToolName: leaseExecution.toolName,
-          bearerBound: true,
-          status: "succeeded_live_mcp_transcript",
-          proofAuthority: false,
-          winnerClaimAllowed: false,
-        },
-      });
-      appendEvidenceEvent(ctx, {
-        sessionId: envelope.sessionId,
-        authority: "delivery",
-        kind: "runner.heartbeat",
-        payload: {
-          step: "lease_executed",
-          leaseRunId,
-          transcriptHash,
-          leaseRunHash,
+        });
+        const now = ctx.clock.now().toISOString();
+        const event = withImmediateTransaction(ctx, () => {
+          markArtifactTokenConsumed(ctx, envelope.sessionId, artifactTokenId, requestId);
+          ctx.db.sqlite
+            .prepare(
+              `INSERT INTO lease_runs
+                (lease_run_id, session_id, spend_id, payer, artifact_hash, target_repo, target_commit, status, transcript_hash,
+                 tools_list_hash, tools_call_hash, output_hash, lease_run_hash, settlement_event_id, artifact_token_id, completed_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'succeeded_live_mcp_transcript', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              leaseRunId,
+              envelope.sessionId,
+              payload.spendId,
+              payer,
+              artifactHash,
+              payload.targetRepo,
+              payload.targetCommit,
+              transcriptHash,
+              toolsListHash,
+              toolsCallHash,
+              outputHash,
+              leaseRunHash,
+              settlement.finalizedEventId,
+              artifactTokenId,
+              now,
+              now,
+            );
+          const event = appendEvidenceEvent(ctx, {
+            sessionId: envelope.sessionId,
+            authority: "delivery",
+            kind: "lease.execution.succeeded",
+            payload: {
+              leaseRunId,
+              spendId: payload.spendId,
+              payer,
+              artifactHash,
+              targetRepo: payload.targetRepo,
+              targetCommit: payload.targetCommit,
+              settlementEventId: settlement.finalizedEventId,
+              artifactTokenId,
+              transcriptHash,
+              toolsListHash,
+              toolsCallHash,
+              outputHash,
+              leaseRunHash,
+              mcpToolName: leaseExecution.toolName,
+              bearerBound: true,
+              status: "succeeded_live_mcp_transcript",
+              proofAuthority: false,
+              winnerClaimAllowed: false,
+            },
+          });
+          appendEvidenceEvent(ctx, {
+            sessionId: envelope.sessionId,
+            authority: "delivery",
+            kind: "runner.heartbeat",
+            payload: {
+              step: "lease_executed",
+              leaseRunId,
+              transcriptHash,
+              leaseRunHash,
+              evidenceEventId: event.eventId,
+              winnerClaimAllowed: false,
+            },
+          });
+          updateJudgeCheckRow(ctx, envelope.sessionId, {
+            rowId: "lease_execution",
+            status: "pass",
+            authority: "delivery",
+            reason: "MCP tools/list and tools/call transcript recorded for bearer-bound clean lease",
+            evidenceEventId: event.eventId,
+          });
+          return event;
+        });
+        return {
+          ok: true,
+          requestId,
           evidenceEventId: event.eventId,
-          winnerClaimAllowed: false,
-        },
+          data: {
+            leaseRunId,
+            payer,
+            artifactHash,
+            bearerBound: true,
+            transcriptHash,
+            toolsListHash,
+            toolsCallHash,
+            outputHash,
+            leaseRunHash,
+            settlementEventId: settlement.finalizedEventId,
+            status: "succeeded_live_mcp_transcript",
+            winnerClaimAllowed: false,
+          },
+        };
       });
-      updateJudgeCheckRow(ctx, envelope.sessionId, {
-        rowId: "lease_execution",
-        status: "pass",
-        authority: "delivery",
-        reason: "MCP tools/list and tools/call transcript recorded for bearer-bound clean lease",
-        evidenceEventId: event.eventId,
-      });
-      return {
-        ok: true,
-        requestId,
-        evidenceEventId: event.eventId,
-        data: {
-          leaseRunId,
-          payer,
-          artifactHash: payload.artifactHash,
-          bearerBound: true,
-          transcriptHash,
-          toolsListHash,
-          toolsCallHash,
-          outputHash,
-          leaseRunHash,
-          settlementEventId: settlement.finalizedEventId,
-          status: "succeeded_live_mcp_transcript",
-          winnerClaimAllowed: false,
-        },
-      };
     },
   );
 }
@@ -1715,8 +1833,10 @@ async function buildVerifierRunView(
           warnings: [],
           errors: ["missing receipt or replayBundle; fail closed"],
         };
-  const eventLogErrors = [
-    ...verifyEventLogIntegrity(ctx, sessionId),
+	  const eventLogErrors = [
+	    ...verifyReplaySummaryCapIntegrity(ctx, sessionId),
+	    ...verifyEventLogIntegrity(ctx, sessionId),
+    ...verifySpendBindingIntegrity(ctx, sessionId),
     ...verifyMcpAdapterCallIntegrity(ctx, sessionId),
     ...verifyGateFinalityIntegrity(ctx, sessionId),
     ...verifyArtifactAccessTokenIntegrity(ctx, sessionId),
@@ -1765,6 +1885,7 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
   const requestId = newRequestId("replay_bundle");
   const parsedSessionId = parseStrict(Hex32Schema, sessionId);
   assertSession(ctx, parsedSessionId, requestId);
+  assertReplaySummaryWithinCap(ctx, parsedSessionId, requestId);
   const data = assembleReplayBundleData(parsedSessionId, ctx);
   const bundleBytes = Buffer.byteLength(canonicalizeJson(data), "utf8");
   if (bundleBytes > MAX_REPLAY_BUNDLE_BYTES) {
@@ -1782,17 +1903,17 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
 }
 
 function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBundleView {
-  const events = listEvents(ctx, sessionId, 0, 200);
-  const mcpAdapterCalls = listMcpAdapterCalls(ctx, sessionId, 200);
-  const sources = listSources(ctx, sessionId, 200);
-  const spends = listSpends(ctx, sessionId, 200);
-  const artifactPreflights = listArtifactPreflights(ctx, sessionId, 200);
-  const quotes = listQuotes(ctx, sessionId, 200);
-  const artifactAccessTokens = listArtifactAccessTokens(ctx, sessionId, 200);
-  const cawReceiptOperations = listCawReceiptOperations(ctx, sessionId, 200);
-  const rawCawReceiptBundles = listRawCawReceiptBundles(ctx, sessionId, 200);
-  const canonicalCawReceipts = listCanonicalCawReceipts(ctx, sessionId, 200);
-  const leaseRuns = listLeaseRuns(ctx, sessionId, 200);
+  const events = listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT);
+  const mcpAdapterCalls = listMcpAdapterCalls(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const sources = listSources(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const spends = listSpends(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const artifactPreflights = listArtifactPreflights(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const quotes = listQuotes(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const artifactAccessTokens = listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const cawReceiptOperations = listCawReceiptOperations(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const rawCawReceiptBundles = listRawCawReceiptBundles(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const canonicalCawReceipts = listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const leaseRuns = listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const agentTranscript = buildAgentTranscriptData(sessionId, ctx, mcpAdapterCalls.length);
   return ReplayBundleViewSchema.parse({
     bundleType: "PACTFUSE_EVIDENCE_V1",
@@ -1911,7 +2032,7 @@ export async function readArtifactAccess(
   const spend = assertSpend(ctx, sessionId, spendId, requestId);
   const payer = requireSpendPayer(spend, input.payer, requestId);
   requireFinalizedSettlement(ctx, sessionId, spendId, requestId);
-  requireActiveArtifactAccess(ctx, { ...input, sessionId, spendId, payer, artifactHash }, requestId);
+  const access = requireActiveArtifactAccess(ctx, { ...input, sessionId, spendId, payer, artifactHash }, requestId);
   return {
     ok: true,
     requestId,
@@ -1919,6 +2040,9 @@ export async function readArtifactAccess(
       sessionId,
       spendId,
       artifactHash,
+      artifactCid: access.artifact_cid,
+      artifactPayloadHash: access.artifact_payload_hash,
+      artifactPayload: JSON.parse(String(access.artifact_payload_json)),
       status: "available",
       winnerClaimAllowed: false,
     },
@@ -2710,7 +2834,7 @@ function assertSession(ctx: ServiceCtx, sessionId: string, requestId: string): v
 
 function assertSpend(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): Row {
   const spend = ctx.db.sqlite
-    .prepare("SELECT spend_id, payer FROM spends WHERE session_id = ? AND spend_id = ?")
+    .prepare("SELECT spend_id, payer, max_price_atomic FROM spends WHERE session_id = ? AND spend_id = ?")
     .get(sessionId, spendId) as Row | undefined;
   if (!spend) {
     throw Object.assign(new Error("spend not found"), { apiError: notFoundError(requestId, "spend") });
@@ -3190,7 +3314,7 @@ function requireFinalizedSettlement(
   sessionId: string,
   spendId: string,
   requestId: string,
-): { finalizedEventId: string; observedEventId: string } {
+): { finalizedEventId: string; observedEventId: string; blockNumber: number } {
   const invalidated = ctx.db.sqlite
     .prepare(
       `SELECT tx_hash, log_index
@@ -3208,7 +3332,7 @@ function requireFinalizedSettlement(
 
   const settlement = ctx.db.sqlite
     .prepare(
-      `SELECT status, observed_event_id, finalized_event_id, finality_depth, confirmations
+      `SELECT status, observed_event_id, finalized_event_id, finality_depth, confirmations, block_number
        FROM gate_chain_events
        WHERE session_id = ? AND spend_id = ? AND event_kind = 'SpendSettled'
        ORDER BY block_number DESC, log_index DESC
@@ -3228,6 +3352,7 @@ function requireFinalizedSettlement(
   return {
     finalizedEventId: String(settlement.finalized_event_id),
     observedEventId: String(settlement.observed_event_id),
+    blockNumber: Number(settlement.block_number),
   };
 }
 
@@ -3615,41 +3740,24 @@ function reconcileIndexedSourceChallenge(
   requestId: string,
 ): number {
   requireSessionRow(ctx, semantic.sessionId, requestId);
+  const sourceHash = semantic.sourceHash.toLowerCase() as `0x${string}`;
+  const reasonHash = semantic.reasonHash.toLowerCase() as `0x${string}`;
   const existingProof = indexedProofEventExists(ctx, semantic.sessionId, "source.challenge.confirmed", String(row.log_id));
   if (existingProof) {
     return 0;
   }
-  return withImmediateTransaction(ctx, () => {
-    const existingChallenge = ctx.db.sqlite
-      .prepare(
-        `SELECT challenge_id
-         FROM source_challenges
-         WHERE session_id = ? AND source_hash = ? AND reason_hash = ?
-         ORDER BY created_at ASC
-         LIMIT 1`,
-      )
-      .get(semantic.sessionId, semantic.sourceHash, semantic.reasonHash) as Row | undefined;
-    const challengeId =
-      typeof existingChallenge?.challenge_id === "string"
-        ? existingChallenge.challenge_id
-        : hashJson({ sessionId: semantic.sessionId, sourceHash: semantic.sourceHash, reasonHash: semantic.reasonHash, logId: row.log_id });
-    if (!existingChallenge) {
-      ctx.db.sqlite
-        .prepare(
-          `INSERT INTO source_challenges
-            (challenge_id, session_id, source_hash, reason_hash, evidence_ref, status, created_at)
-           VALUES (?, ?, ?, ?, NULL, 'indexed_confirmed', ?)`,
-        )
-        .run(challengeId, semantic.sessionId, semantic.sourceHash, semantic.reasonHash, ctx.clock.now().toISOString());
-    }
+  assertChallengedSourceBound(ctx, semantic.sessionId, sourceHash, requestId);
+	  const pendingChallenge = requirePendingSourceChallenge(ctx, semantic.sessionId, sourceHash, reasonHash, requestId);
+	  return withImmediateTransaction(ctx, () => {
+	    const challengeId = String(pendingChallenge.challenge_id);
     const proofEvent = appendEvidenceEvent(ctx, {
       sessionId: semantic.sessionId,
       authority: "proof",
       kind: "source.challenge.confirmed",
       payload: {
         challengeId,
-        sourceHash: semantic.sourceHash,
-        reasonHash: semantic.reasonHash,
+        sourceHash,
+        reasonHash,
         txHash: String(row.tx_hash),
         logIndex: Number(row.log_index),
         chainId: String(row.chain_id),
@@ -3669,7 +3777,7 @@ function reconcileIndexedSourceChallenge(
       .run(challengeId);
     ctx.db.sqlite
       .prepare("UPDATE sources SET proof_status = 'challenged' WHERE session_id = ? AND source_hash = ?")
-      .run(semantic.sessionId, semantic.sourceHash);
+      .run(semantic.sessionId, sourceHash);
     updateJudgeCheckRow(ctx, semantic.sessionId, {
       rowId: "source_challenge",
       status: "pass",
@@ -3698,6 +3806,50 @@ function indexedProofEventExists(ctx: ServiceCtx, sessionId: string, kind: "sour
       return false;
     }
   });
+}
+
+function assertChallengedSourceBound(ctx: ServiceCtx, sessionId: string, sourceHash: string, requestId: string): void {
+  const source = ctx.db.sqlite
+    .prepare("SELECT source_hash FROM sources WHERE session_id = ? AND LOWER(source_hash) = ?")
+    .get(sessionId, sourceHash.toLowerCase()) as Row | undefined;
+  if (!source) {
+    throw Object.assign(new Error("SourceChallenged log references an unregistered source"), {
+      apiError: proofBlockedError(requestId, "SourceChallenged log references an unregistered source", { sourceHash }),
+    });
+  }
+  const spends = ctx.db.sqlite
+    .prepare("SELECT spend_id, source_hashes_json FROM spends WHERE session_id = ?")
+    .all(sessionId) as Row[];
+  const bound = spends.some((row) => {
+    try {
+      return (JSON.parse(String(row.source_hashes_json)) as string[]).map((hash) => hash.toLowerCase()).includes(sourceHash.toLowerCase());
+    } catch {
+      return false;
+    }
+  });
+  if (!bound) {
+    throw Object.assign(new Error("SourceChallenged log references a source that is not bound to any spend"), {
+      apiError: proofBlockedError(requestId, "SourceChallenged log references a source that is not bound to any spend", { sourceHash }),
+    });
+  }
+}
+
+function requirePendingSourceChallenge(ctx: ServiceCtx, sessionId: string, sourceHash: string, reasonHash: string, requestId: string): Row {
+  const challenge = ctx.db.sqlite
+    .prepare(
+      `SELECT challenge_id, status
+       FROM source_challenges
+       WHERE session_id = ? AND LOWER(source_hash) = ? AND LOWER(reason_hash) = ?
+       ORDER BY created_at ASC
+       LIMIT 1`,
+    )
+    .get(sessionId, sourceHash.toLowerCase(), reasonHash.toLowerCase()) as Row | undefined;
+  if (!challenge || challenge.status !== "pending_chain_log") {
+    throw Object.assign(new Error("SourceChallenged log requires a pending source challenge"), {
+      apiError: proofBlockedError(requestId, "SourceChallenged log requires a pending source challenge", { sourceHash, reasonHash }),
+    });
+  }
+  return challenge;
 }
 
 function assertReceiptMatchesGatePayload(
@@ -4074,6 +4226,11 @@ function recordGateReorg(
   ctx.db.sqlite
     .prepare("UPDATE spends SET status = ? WHERE session_id = ? AND spend_id = ?")
     .run(gateSpendStatus(input.payload.event, "reorg"), input.sessionId, input.payload.spendId);
+  blockJudgeCheckRow(ctx, input.sessionId, {
+    rowId: input.payload.event === "SpendTripped" ? "ab_trip" : "c_settlement",
+    reason: `reorg invalidated finalized ${input.payload.event} proof`,
+    evidenceEventId: reorgEvent.eventId,
+  });
   return {
     ok: true,
     requestId: input.requestId,
@@ -4107,6 +4264,55 @@ function requireRegisteredSources(ctx: ServiceCtx, sessionId: string, sourceHash
       apiError: proofPendingError(requestId, "spend registration requires all source hashes to be registered first"),
     });
   }
+}
+
+function assertExistingSourceMatches(
+  row: Row,
+  expected: {
+    sourceId: string;
+    manifestUrl: string;
+    manifestHash: string;
+    issuer: string | null;
+    signature: string | null;
+    capabilityVectorJson: string;
+  },
+  requestId: string,
+): void {
+  const checks = [
+    ["source_id", expected.sourceId],
+    ["manifest_url", expected.manifestUrl],
+    ["manifest_hash", expected.manifestHash],
+    ["issuer", expected.issuer],
+    ["signature", expected.signature],
+    ["capability_vector_json", expected.capabilityVectorJson],
+  ] as const;
+  const changed = checks.find(([column, expectedValue]) => (row[column] ?? null) !== expectedValue);
+  if (changed) {
+    throw Object.assign(new Error("registered source cannot be rebound with different manifest or capabilities"), {
+      apiError: proofBlockedError(requestId, "registered source cannot be rebound with different manifest or capabilities", {
+        sourceHash: String(row.source_hash),
+        field: changed[0],
+      }),
+    });
+  }
+}
+
+function sourceCapabilitySnapshotFor(ctx: ServiceCtx, sessionId: string, sourceHashes: string[]): { hash: string; entries: JsonValue[] } {
+  const entries = sourceHashes.map((sourceHash) => {
+    const row = ctx.db.sqlite
+      .prepare(
+        `SELECT source_hash, manifest_hash, capability_vector_json
+         FROM sources
+         WHERE session_id = ? AND LOWER(source_hash) = ?`,
+      )
+      .get(sessionId, sourceHash) as Row | undefined;
+    return {
+      sourceHash,
+      manifestHash: String(row?.manifest_hash ?? ZERO_HASH),
+      capabilityVector: JSON.parse(String(row?.capability_vector_json ?? "{}")),
+    };
+  });
+  return { hash: hashJson(entries), entries };
 }
 
 function assertExistingSpendMatches(
@@ -4155,6 +4361,7 @@ function spendBindingFor(
     pactId: string;
     toolId: string;
     sourceHashes: string[];
+    sourceCapabilitySnapshotHash: string;
     payer: string;
     agentWallet: string;
     maxPriceAtomic: string;
@@ -4175,6 +4382,7 @@ function spendBindingFor(
     pactId: spend.pactId,
     toolId: spend.toolId,
     sourceSetHash,
+    sourceCapabilitySnapshotHash: spend.sourceCapabilitySnapshotHash,
     payer: spend.payer.toLowerCase(),
     agentWallet: spend.agentWallet.toLowerCase(),
     maxPriceAtomic: spend.maxPriceAtomic,
@@ -4199,13 +4407,16 @@ function requireActiveArtifactAccess(
   },
   requestId: string,
 ): Row {
+  reconcileExpiredArtifactTokenLeaseClaims(ctx, input.sessionId, requestId);
+  const requestedArtifactHash = input.artifactHash.toLowerCase();
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT token_id, token_hash, status, issued_by_verifier_run_id, settlement_event_id
+              , quote_id, preflight_id, artifact_cid, artifact_payload_hash, artifact_payload_json
        FROM artifact_access_tokens
-       WHERE session_id = ? AND spend_id = ? AND payer = ? AND artifact_hash = ?`,
+       WHERE session_id = ? AND spend_id = ? AND payer = ? AND LOWER(artifact_hash) = ?`,
     )
-    .all(input.sessionId, input.spendId, input.payer, input.artifactHash) as Row[];
+    .all(input.sessionId, input.spendId, input.payer, requestedArtifactHash) as Row[];
   if (rows.length === 0) {
     throw Object.assign(new Error("artifact access is pending live settlement and bearer-token proof"), {
       apiError: proofPendingError(requestId, "artifact access is pending live settlement and bearer-token proof"),
@@ -4217,6 +4428,28 @@ function requireActiveArtifactAccess(
     });
   }
   const tokenHash = sha256Hex(input.bearerToken);
+  const matchingToken = rows.find((row) => row.token_hash === tokenHash);
+  if (matchingToken?.status === "consuming") {
+    throw Object.assign(new Error("artifact access token is already being consumed by a lease execution"), {
+      apiError: proofBlockedError(requestId, "artifact access token is already being consumed by a lease execution", {
+        tokenId: String(matchingToken.token_id),
+      }),
+    });
+  }
+  if (matchingToken?.status === "consumed") {
+    throw Object.assign(new Error("artifact access token has already been consumed by a successful lease"), {
+      apiError: proofBlockedError(requestId, "artifact access token has already been consumed by a successful lease", {
+        tokenId: String(matchingToken.token_id),
+      }),
+    });
+  }
+  if (matchingToken?.status === "blocked") {
+    throw Object.assign(new Error("artifact access token was terminated after an untrusted lease attempt"), {
+      apiError: proofBlockedError(requestId, "artifact access token was terminated after an untrusted lease attempt", {
+        tokenId: String(matchingToken.token_id),
+      }),
+    });
+  }
   const active = rows.find(
     (row) =>
       row.status === "active" &&
@@ -4229,6 +4462,13 @@ function requireActiveArtifactAccess(
       apiError: forbiddenError(requestId, "artifact bearer token is not active for this access tuple"),
     });
   }
+  const recomputedPayloadHash = hashJson(JSON.parse(String(active.artifact_payload_json)));
+  if (recomputedPayloadHash !== String(active.artifact_payload_hash).toLowerCase() || recomputedPayloadHash !== requestedArtifactHash) {
+    throw Object.assign(new Error("artifact bearer token payload hash is inconsistent"), {
+      apiError: proofBlockedError(requestId, "artifact bearer token payload hash is inconsistent"),
+    });
+  }
+  assertArtifactCidMatchesHash(String(active.artifact_cid), input.artifactHash, requestId);
   const activeVerifierRunId = String(active.issued_by_verifier_run_id);
   const verifierRun = ctx.db.sqlite
     .prepare("SELECT schema_ok FROM verifier_runs WHERE session_id = ? AND verifier_run_id = ?")
@@ -4265,18 +4505,161 @@ function assertNoArtifactRefundPending(ctx: ServiceCtx, sessionId: string, spend
   }
 }
 
+function assertArtifactCidMatchesHash(artifactCid: string, artifactHash: string, requestId: string): void {
+  const expected = `sha256:${artifactHash.toLowerCase()}`;
+  if (artifactCid.toLowerCase() !== expected) {
+    throw Object.assign(new Error("artifactCid must be the sha256 content address of artifactHash"), {
+      apiError: proofBlockedError(requestId, "artifactCid must be the sha256 content address of artifactHash", {
+        artifactCid,
+        expected,
+      }),
+    });
+  }
+}
+
 function assertNoActiveArtifactToken(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): void {
+  reconcileExpiredArtifactTokenLeaseClaims(ctx, sessionId, requestId);
   const row = ctx.db.sqlite
     .prepare(
       `SELECT token_id
        FROM artifact_access_tokens
-       WHERE session_id = ? AND spend_id = ? AND status = 'active'
+       WHERE session_id = ? AND spend_id = ? AND status IN ('active', 'consuming', 'consumed', 'blocked')
        LIMIT 1`,
     )
     .get(sessionId, spendId) as Row | undefined;
   if (row) {
     throw Object.assign(new Error("active artifact access token already exists for spend"), {
       apiError: conflictError(requestId, "active artifact access token already exists for spend"),
+    });
+  }
+}
+
+function claimArtifactTokenForLease(
+  ctx: ServiceCtx,
+  sessionId: string,
+  artifactTokenId: string,
+  leaseClaim: Record<string, JsonValue>,
+  requestId: string,
+): void {
+  const result = ctx.db.sqlite
+    .prepare(
+      `UPDATE artifact_access_tokens
+       SET status = 'consuming', lease_claim_json = ?, lease_claimed_at = ?
+       WHERE session_id = ? AND token_id = ? AND status = 'active'`,
+    )
+    .run(canonicalizeJson(leaseClaim), ctx.clock.now().toISOString(), sessionId, artifactTokenId);
+  if (Number(result.changes) !== 1) {
+    throw Object.assign(new Error("artifact access token could not be claimed for lease execution"), {
+      apiError: proofBlockedError(requestId, "artifact access token could not be claimed for lease execution", {
+        artifactTokenId,
+      }),
+    });
+  }
+}
+
+function releaseArtifactTokenLeaseClaim(ctx: ServiceCtx, sessionId: string, artifactTokenId: string): void {
+  ctx.db.sqlite
+    .prepare(
+      `UPDATE artifact_access_tokens
+       SET status = 'active', lease_claim_json = NULL, lease_claimed_at = NULL
+       WHERE session_id = ? AND token_id = ? AND status = 'consuming'`,
+    )
+    .run(sessionId, artifactTokenId);
+}
+
+function blockArtifactTokenLeaseClaim(ctx: ServiceCtx, sessionId: string, artifactTokenId: string, requestId: string): void {
+  const result = ctx.db.sqlite
+    .prepare(
+      `UPDATE artifact_access_tokens
+       SET status = 'blocked'
+       WHERE session_id = ? AND token_id = ? AND status = 'consuming'`,
+    )
+    .run(sessionId, artifactTokenId);
+  if (Number(result.changes) !== 1) {
+    throw Object.assign(new Error("artifact access token claim could not be terminated"), {
+      apiError: proofBlockedError(requestId, "artifact access token claim could not be terminated", {
+        artifactTokenId,
+      }),
+    });
+  }
+}
+
+function markArtifactTokenConsumed(ctx: ServiceCtx, sessionId: string, artifactTokenId: string, requestId: string): void {
+  const result = ctx.db.sqlite
+    .prepare(
+      `UPDATE artifact_access_tokens
+       SET status = 'consumed'
+       WHERE session_id = ? AND token_id = ? AND status = 'consuming'`,
+    )
+    .run(sessionId, artifactTokenId);
+  if (Number(result.changes) !== 1) {
+    throw Object.assign(new Error("artifact access token claim was not open during lease completion"), {
+      apiError: proofBlockedError(requestId, "artifact access token claim was not open during lease completion", {
+        artifactTokenId,
+      }),
+    });
+  }
+}
+
+function reconcileExpiredArtifactTokenLeaseClaims(ctx: ServiceCtx, sessionId: string, requestId: string): void {
+  const nowMs = ctx.clock.now().getTime();
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT token_id, lease_claim_json, lease_claimed_at
+       FROM artifact_access_tokens
+       WHERE session_id = ? AND status = 'consuming'`,
+    )
+    .all(sessionId) as Row[];
+  for (const row of rows) {
+    const claimedAt = new Date(String(row.lease_claimed_at ?? "")).getTime();
+    if (!Number.isFinite(claimedAt) || nowMs - claimedAt < ARTIFACT_TOKEN_LEASE_CLAIM_TTL_MS) {
+      continue;
+    }
+    let claim: Record<string, JsonValue> | null = null;
+    try {
+      const parsed = JSON.parse(String(row.lease_claim_json ?? "{}")) as unknown;
+      claim = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, JsonValue>) : null;
+    } catch {
+      claim = null;
+    }
+    blockArtifactTokenLeaseClaim(ctx, sessionId, String(row.token_id), requestId);
+    recordBlockedLeaseExecution(ctx, {
+      requestId,
+      sessionId,
+      spendId: String(claim?.spendId ?? ZERO_HASH),
+      payer: String(claim?.payer ?? "0x0"),
+      artifactHash: String(claim?.artifactHash ?? ZERO_HASH),
+      targetRepo: String(claim?.targetRepo ?? "unknown"),
+      targetCommit: String(claim?.targetCommit ?? "unknown"),
+      leaseRunId: String(claim?.leaseRunId ?? hashJson({ sessionId, tokenId: row.token_id, expiredLeaseClaim: true })),
+      settlementEventId: String(claim?.settlementEventId ?? ZERO_HASH),
+      artifactTokenId: String(row.token_id),
+      status: "blocked_mcp_execution_failed",
+      reason: "artifact access token lease claim expired before completed MCP transcript evidence",
+    });
+  }
+}
+
+function mcpLeaseFailureStage(error: unknown): string | null {
+  return error && typeof error === "object" && typeof (error as { leaseStage?: unknown }).leaseStage === "string"
+    ? (error as { leaseStage: string }).leaseStage
+    : null;
+}
+
+function assertArtifactTokenUnusedForLease(ctx: ServiceCtx, sessionId: string, artifactTokenId: string, requestId: string): void {
+  const row = ctx.db.sqlite
+    .prepare(
+      `SELECT lease_run_id
+       FROM lease_runs
+       WHERE session_id = ? AND artifact_token_id = ? AND status = 'succeeded_live_mcp_transcript'
+       LIMIT 1`,
+    )
+    .get(sessionId, artifactTokenId) as Row | undefined;
+  if (row) {
+    throw Object.assign(new Error("artifact access token has already been consumed by a successful lease"), {
+      apiError: proofBlockedError(requestId, "artifact access token has already been consumed by a successful lease", {
+        leaseRunId: String(row.lease_run_id),
+      }),
     });
   }
 }
@@ -4289,7 +4672,7 @@ function requireQuotePreflight(
 ): Row {
   const preflight = ctx.db.sqlite
     .prepare(
-      `SELECT preflight_id, spend_id, artifact_hash_preview, price_disclosure_hash, source_state_snapshot_hash, status
+      `SELECT preflight_id, spend_id, artifact_hash_preview, artifact_cid, price_disclosure_hash, source_state_snapshot_hash, status
        FROM artifact_preflights
        WHERE session_id = ? AND preflight_id = ? AND spend_id = ?`,
     )
@@ -4306,7 +4689,7 @@ function requireQuotePreflight(
       }),
     });
   }
-  if (preflight.artifact_hash_preview !== payload.artifactCommitment) {
+  if (String(preflight.artifact_hash_preview).toLowerCase() !== payload.artifactCommitment.toLowerCase()) {
     throw Object.assign(new Error("quote artifact commitment does not match preflight preview"), {
       apiError: proofBlockedError(requestId, "quote artifact commitment must match the artifact preflight preview", {
         preflightId: payload.preflightId,
@@ -4314,6 +4697,79 @@ function requireQuotePreflight(
     });
   }
   return preflight;
+}
+
+function requireArtifactQuoteBinding(
+  ctx: ServiceCtx,
+  sessionId: string,
+  input: {
+    spendId: string;
+    quoteId: string;
+    artifactHash: string;
+    settlementBlockNumber: number;
+    spendMaxPriceAtomic: string;
+  },
+  requestId: string,
+): { preflightId: string; artifactCid: string } {
+  const quote = ctx.db.sqlite
+    .prepare(
+      `SELECT quote_id, preflight_id, artifact_commitment, artifact_cid, price_atomic, valid_until_block, status
+       FROM quotes
+       WHERE session_id = ? AND spend_id = ? AND quote_id = ?`,
+    )
+    .get(sessionId, input.spendId, input.quoteId) as Row | undefined;
+  if (!quote) {
+    throw Object.assign(new Error("artifact access requires a signed quote for the spend"), {
+      apiError: proofPendingError(requestId, "artifact access requires a signed quote for the spend"),
+    });
+  }
+  if (quote.status !== "mocked_after_preflight_not_chain_settleable") {
+    throw Object.assign(new Error("artifact quote is not in an issuable state"), {
+      apiError: proofBlockedError(requestId, "artifact quote is not in an issuable state"),
+    });
+  }
+  if (String(quote.artifact_commitment).toLowerCase() !== input.artifactHash.toLowerCase()) {
+    throw Object.assign(new Error("artifact quote commitment does not match requested artifactHash"), {
+      apiError: proofBlockedError(requestId, "artifact quote commitment does not match requested artifactHash", {
+        quoteId: input.quoteId,
+      }),
+    });
+  }
+  const artifactCid = String(quote.artifact_cid);
+  assertArtifactCidMatchesHash(artifactCid, input.artifactHash, requestId);
+  if (BigInt(String(quote.price_atomic)) > BigInt(input.spendMaxPriceAtomic)) {
+    throw Object.assign(new Error("artifact quote price exceeds spend maxPriceAtomic"), {
+      apiError: proofBlockedError(requestId, "artifact quote price exceeds spend maxPriceAtomic"),
+    });
+  }
+  if (BigInt(String(quote.valid_until_block)) < BigInt(input.settlementBlockNumber)) {
+    throw Object.assign(new Error("artifact quote expired before finalized settlement"), {
+      apiError: proofBlockedError(requestId, "artifact quote expired before finalized settlement", {
+        validUntilBlock: String(quote.valid_until_block),
+        settlementBlockNumber: input.settlementBlockNumber,
+      }),
+    });
+  }
+  const preflight = ctx.db.sqlite
+    .prepare(
+      `SELECT artifact_hash_preview, artifact_cid, status
+       FROM artifact_preflights
+       WHERE session_id = ? AND spend_id = ? AND preflight_id = ?`,
+    )
+    .get(sessionId, input.spendId, String(quote.preflight_id)) as Row | undefined;
+  if (
+    !preflight ||
+    preflight.status !== "pending_live_delivery" ||
+    String(preflight.artifact_hash_preview).toLowerCase() !== input.artifactHash.toLowerCase() ||
+    String(preflight.artifact_cid).toLowerCase() !== artifactCid.toLowerCase()
+  ) {
+    throw Object.assign(new Error("artifact quote is not bound to a matching preflight"), {
+      apiError: proofBlockedError(requestId, "artifact quote is not bound to a matching preflight", {
+        quoteId: input.quoteId,
+      }),
+    });
+  }
+  return { preflightId: String(quote.preflight_id), artifactCid };
 }
 
 function insertPendingJudgeRows(ctx: ServiceCtx, sessionId: string, createdAt: string): void {
@@ -4384,6 +4840,24 @@ function updateJudgeCheckRow(
          AND status IN ('pending', 'blocked', 'manual', 'fixture')`,
     )
     .run(input.status, input.authority, input.reason, input.evidenceEventId, sessionId, input.rowId);
+}
+
+function blockJudgeCheckRow(
+  ctx: ServiceCtx,
+  sessionId: string,
+  input: {
+    rowId: "ab_trip" | "c_settlement";
+    reason: string;
+    evidenceEventId: string;
+  },
+): void {
+  ctx.db.sqlite
+    .prepare(
+      `UPDATE judge_check_rows
+       SET status = 'blocked', authority = 'proof', reason = ?, evidence_event_id = ?
+       WHERE session_id = ? AND row_id = ?`,
+    )
+    .run(input.reason, input.evidenceEventId, sessionId, input.rowId);
 }
 
 function evidenceEventFromRow(row: Row): EvidenceEvent {
@@ -4486,6 +4960,7 @@ function listArtifactPreflights(ctx: ServiceCtx, sessionId: string, limit: numbe
       sessionId: row.session_id,
       spendId: row.spend_id,
       artifactHashPreview: row.artifact_hash_preview,
+      artifactCid: row.artifact_cid,
       endpointUrl: row.endpoint_url,
       priceDisclosureHash: row.price_disclosure_hash,
       sourceStateSnapshotHash: row.source_state_snapshot_hash,
@@ -4512,6 +4987,7 @@ function listQuotes(ctx: ServiceCtx, sessionId: string, limit: number) {
       spendId: row.spend_id,
       preflightId: row.preflight_id,
       artifactCommitment: row.artifact_commitment,
+      artifactCid: row.artifact_cid,
       priceDisclosureHash: row.price_disclosure_hash,
       sourceStateSnapshotHash: row.source_state_snapshot_hash,
       priceAtomic: row.price_atomic,
@@ -4540,7 +5016,12 @@ function listArtifactAccessTokens(ctx: ServiceCtx, sessionId: string, limit: num
       sessionId: row.session_id,
       spendId: row.spend_id,
       payer: row.payer,
+      quoteId: row.quote_id,
+      preflightId: row.preflight_id,
       artifactHash: row.artifact_hash,
+      artifactCid: row.artifact_cid,
+      artifactPayloadHash: row.artifact_payload_hash,
+      artifactPayload: JSON.parse(String(row.artifact_payload_json)),
       tokenHash: row.token_hash,
       status: row.status,
       issuedByVerifierRunId: row.issued_by_verifier_run_id ?? null,
@@ -4719,8 +5200,80 @@ function listLeaseRuns(ctx: ServiceCtx, sessionId: string, limit: number) {
   );
 }
 
+function verifyReplaySummaryCapIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  const errors: string[] = [];
+  const counts = replaySummaryCounts(ctx, sessionId);
+  for (const [label, count] of Object.entries(counts)) {
+    if (count > REPLAY_SUMMARY_LIMIT) {
+      errors.push(`${label} has ${count} rows, exceeding replay summary cap ${REPLAY_SUMMARY_LIMIT}; full proof requires paged/Merkle replay`);
+    }
+  }
+  return errors;
+}
+
+function assertReplaySummaryRoomForArtifactIssue(ctx: ServiceCtx, sessionId: string, requestId: string): void {
+  const counts = replaySummaryCounts(ctx, sessionId);
+  const eventCount = counts["replayBundle.events"] ?? 0;
+  const artifactAccessTokenCount = counts["replayBundle.artifactAccessTokens"] ?? 0;
+  if (eventCount >= REPLAY_SUMMARY_LIMIT || artifactAccessTokenCount >= REPLAY_SUMMARY_LIMIT) {
+    throw Object.assign(new Error("artifact access token would exceed replay summary cap"), {
+      apiError: proofBlockedError(requestId, "artifact access token would exceed replay summary cap", {
+        eventCount,
+        artifactAccessTokenCount,
+        replaySummaryLimit: REPLAY_SUMMARY_LIMIT,
+      }),
+    });
+  }
+}
+
+function assertReplaySummaryWithinCap(ctx: ServiceCtx, sessionId: string, requestId: string): void {
+  const counts = replaySummaryCounts(ctx, sessionId);
+  const overflowing = Object.fromEntries(Object.entries(counts).filter(([, count]) => count > REPLAY_SUMMARY_LIMIT));
+  if (Object.keys(overflowing).length > 0) {
+    throw Object.assign(new Error("replay bundle exceeds replay summary cap"), {
+      apiError: proofBlockedError(requestId, "replay bundle exceeds replay summary cap; full proof requires paged/Merkle replay", {
+        replaySummaryLimit: REPLAY_SUMMARY_LIMIT,
+        counts: overflowing,
+      }),
+    });
+  }
+}
+
+function assertArtifactPayloadReplaySize(artifactPayloadJson: string, requestId: string): void {
+  const payloadBytes = Buffer.byteLength(artifactPayloadJson, "utf8");
+  if (payloadBytes > ARTIFACT_PAYLOAD_REPLAY_MAX_BYTES) {
+    throw Object.assign(new Error("artifact payload exceeds replay-safe size"), {
+      apiError: proofBlockedError(requestId, "artifact payload exceeds replay-safe size", {
+        payloadBytes,
+        maxPayloadBytes: ARTIFACT_PAYLOAD_REPLAY_MAX_BYTES,
+      }),
+    });
+  }
+}
+
+function replaySummaryCounts(ctx: ServiceCtx, sessionId: string): Record<string, number> {
+  return {
+    "replayBundle.events": countRows(ctx, "evidence_events", "session_id = ?", [sessionId]),
+    "replayBundle.sources": countRows(ctx, "sources", "session_id = ?", [sessionId]),
+    "replayBundle.spends": countRows(ctx, "spends", "session_id = ?", [sessionId]),
+    "replayBundle.artifactPreflights": countRows(ctx, "artifact_preflights", "session_id = ?", [sessionId]),
+    "replayBundle.quotes": countRows(ctx, "quotes", "session_id = ?", [sessionId]),
+    "replayBundle.artifactAccessTokens": countRows(ctx, "artifact_access_tokens", "session_id = ?", [sessionId]),
+    "replayBundle.mcpAdapterCalls": countRows(ctx, "mcp_adapter_calls", "session_id = ?", [sessionId]),
+    "replayBundle.cawReceiptOperations": countRows(ctx, "caw_receipt_operations", "session_id = ?", [sessionId]),
+    "replayBundle.rawCawReceiptBundles": countRows(ctx, "caw_raw_receipt_bundles", "session_id = ?", [sessionId]),
+    "replayBundle.canonicalCawReceipts": countRows(ctx, "caw_canonical_receipts", "session_id = ?", [sessionId]),
+    "replayBundle.leaseRuns": countRows(ctx, "lease_runs", "session_id = ?", [sessionId]),
+  };
+}
+
+function countRows(ctx: ServiceCtx, table: string, where: string, values: string[]): number {
+  const row = ctx.db.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${where}`).get(...values) as Row;
+  return Number(row.count ?? 0);
+}
+
 function verifyEventLogIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
-  const events = listEvents(ctx, sessionId, 0, 200);
+  const events = listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT);
   const errors: string[] = [];
   let expectedSeq = 1;
   let expectedPrevProofHash: string = ZERO_HASH;
@@ -4738,6 +5291,49 @@ function verifyEventLogIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
       errors.push(`non-proof event carries proof predecessor at event ${event.eventId}`);
     }
     expectedSeq += 1;
+  }
+  return errors;
+}
+
+function verifySpendBindingIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  const errors: string[] = [];
+  const session = ctx.db.sqlite.prepare("SELECT * FROM sessions WHERE session_id = ?").get(sessionId) as Row | undefined;
+  if (!session) {
+    return ["session row is missing during spend binding verification"];
+  }
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT spend_id, pact_id, tool_id, payer, agent_wallet, source_hashes_json, source_set_hash,
+              session_commitment, spend_preimage_json, max_price_atomic, nonce
+       FROM spends
+       WHERE session_id = ?
+       ORDER BY created_at ASC, spend_id ASC`,
+    )
+    .all(sessionId) as Row[];
+  for (const row of rows) {
+    const sourceHashes = JSON.parse(String(row.source_hashes_json)) as string[];
+    const sourceCapabilitySnapshot = sourceCapabilitySnapshotFor(ctx, sessionId, sourceHashes);
+    const binding = spendBindingFor(session, sessionId, {
+      pactId: String(row.pact_id),
+      toolId: String(row.tool_id),
+      sourceHashes,
+      sourceCapabilitySnapshotHash: sourceCapabilitySnapshot.hash,
+      payer: String(row.payer),
+      agentWallet: String(row.agent_wallet),
+      maxPriceAtomic: String(row.max_price_atomic),
+      nonce: String(row.nonce),
+    });
+    const checks = [
+      ["spend_id", binding.spendId],
+      ["source_set_hash", binding.sourceSetHash],
+      ["session_commitment", binding.sessionCommitment],
+      ["spend_preimage_json", canonicalizeJson(binding.spendPreimage)],
+    ] as const;
+    for (const [field, expected] of checks) {
+      if (String(row[field]) !== expected) {
+        errors.push(`spend ${row.spend_id} ${field} does not match recomputed source/capability binding`);
+      }
+    }
   }
   return errors;
 }
@@ -4899,8 +5495,9 @@ function verifyArtifactAccessTokenIntegrity(ctx: ServiceCtx, sessionId: string):
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT token_id, spend_id, payer, artifact_hash, token_hash, status, issued_by_verifier_run_id, settlement_event_id
+              , quote_id, preflight_id, artifact_cid, artifact_payload_hash, artifact_payload_json
        FROM artifact_access_tokens
-       WHERE session_id = ? AND status = 'active'
+       WHERE session_id = ? AND status IN ('active', 'consuming', 'consumed')
        ORDER BY created_at ASC`,
     )
     .all(sessionId) as Row[];
@@ -4915,21 +5512,82 @@ function verifyArtifactAccessTokenIntegrity(ctx: ServiceCtx, sessionId: string):
   );
   for (const row of rows) {
     const tokenId = String(row.token_id);
+    const tokenStatus = String(row.status);
+    const rowArtifactHash = String(row.artifact_hash).toLowerCase();
+    const rowArtifactCid = String(row.artifact_cid).toLowerCase();
+    const rowArtifactPayloadHash = String(row.artifact_payload_hash).toLowerCase();
     const verifierRunId = typeof row.issued_by_verifier_run_id === "string" ? row.issued_by_verifier_run_id : null;
     const settlementEventId = typeof row.settlement_event_id === "string" ? row.settlement_event_id : null;
+    if (tokenStatus === "consuming") {
+      errors.push(`artifact token ${tokenId} is stuck in consuming state without completed lease evidence`);
+    }
+    if (tokenStatus === "consumed") {
+      const lease = ctx.db.sqlite
+        .prepare(
+          `SELECT lease_run_id
+           FROM lease_runs
+           WHERE session_id = ? AND artifact_token_id = ? AND status = 'succeeded_live_mcp_transcript'
+           LIMIT 1`,
+        )
+        .get(sessionId, tokenId) as Row | undefined;
+      if (!lease) {
+        errors.push(`consumed artifact token ${tokenId} has no successful lease run`);
+      }
+    }
+    if (tokenStatus === "blocked") {
+      const lease = ctx.db.sqlite
+        .prepare(
+          `SELECT lease_run_id
+           FROM lease_runs
+           WHERE session_id = ? AND artifact_token_id = ? AND status IN ('blocked_missing_runner_execution', 'blocked_mcp_execution_failed')
+           LIMIT 1`,
+        )
+        .get(sessionId, tokenId) as Row | undefined;
+      if (!lease) {
+        errors.push(`blocked artifact token ${tokenId} has no blocked lease run`);
+      }
+    }
     if (!verifierRunId) {
-      errors.push(`active artifact token ${tokenId} is missing issued_by_verifier_run_id`);
+      errors.push(`artifact token ${tokenId} is missing issued_by_verifier_run_id`);
       continue;
     }
     if (!settlementEventId) {
-      errors.push(`active artifact token ${tokenId} is missing settlement_event_id`);
+      errors.push(`artifact token ${tokenId} is missing settlement_event_id`);
       continue;
     }
     const verifierRun = ctx.db.sqlite
       .prepare("SELECT schema_ok FROM verifier_runs WHERE session_id = ? AND verifier_run_id = ?")
       .get(sessionId, verifierRunId) as Row | undefined;
     if (!verifierRun || Number(verifierRun.schema_ok) !== 1) {
-      errors.push(`active artifact token ${tokenId} references missing or failed verifier run`);
+      errors.push(`artifact token ${tokenId} references missing or failed verifier run`);
+    }
+    let artifactPayloadHash: string | null = null;
+    try {
+      artifactPayloadHash = hashJson(JSON.parse(String(row.artifact_payload_json)));
+    } catch {
+      errors.push(`artifact token ${tokenId} has invalid artifact_payload_json`);
+    }
+    if (artifactPayloadHash && (artifactPayloadHash !== rowArtifactPayloadHash || artifactPayloadHash !== rowArtifactHash)) {
+      errors.push(`artifact token ${tokenId} artifact payload hash does not match artifactHash`);
+    }
+    const expectedCid = `sha256:${rowArtifactHash}`;
+    if (rowArtifactCid !== expectedCid) {
+      errors.push(`artifact token ${tokenId} artifact_cid does not match artifactHash`);
+    }
+    const quote = ctx.db.sqlite
+      .prepare(
+        `SELECT quote_id, preflight_id, artifact_commitment, artifact_cid
+         FROM quotes
+         WHERE session_id = ? AND spend_id = ? AND quote_id = ?`,
+      )
+      .get(sessionId, String(row.spend_id), String(row.quote_id)) as Row | undefined;
+    if (
+      !quote ||
+      String(quote.artifact_commitment).toLowerCase() !== rowArtifactHash ||
+      String(quote.preflight_id) !== row.preflight_id ||
+      String(quote.artifact_cid).toLowerCase() !== rowArtifactCid
+    ) {
+      errors.push(`artifact token ${tokenId} is not bound to its quote artifact commitment`);
     }
     const settlement = ctx.db.sqlite
       .prepare(
@@ -4944,17 +5602,21 @@ function verifyArtifactAccessTokenIntegrity(ctx: ServiceCtx, sessionId: string):
       settlement.event_kind !== "SpendSettled" ||
       settlement.status !== "finalized"
     ) {
-      errors.push(`active artifact token ${tokenId} is not bound to a finalized SpendSettled event`);
+      errors.push(`artifact token ${tokenId} is not bound to a finalized SpendSettled event`);
     }
     const event = issuedByTokenId.get(tokenId);
     if (!event) {
-      errors.push(`active artifact token ${tokenId} has no artifact.access_token.issued evidence event`);
+      errors.push(`artifact token ${tokenId} has no artifact.access_token.issued evidence event`);
       continue;
     }
     const expectedFields = [
       ["spendId", row.spend_id],
       ["payer", row.payer],
+      ["quoteId", row.quote_id],
+      ["preflightId", row.preflight_id],
       ["artifactHash", row.artifact_hash],
+      ["artifactCid", row.artifact_cid],
+      ["artifactPayloadHash", row.artifact_payload_hash],
       ["tokenHash", row.token_hash],
       ["verifierRunId", verifierRunId],
       ["settlementEventId", settlementEventId],
@@ -5155,15 +5817,15 @@ function verifyReplayBundleBindings(
   if (typeof bundle.sessionId === "string" && bundle.sessionId !== sessionId) {
     errors.push("replayBundle.sessionId must match verifier sessionId");
   }
-  const asOfCount =
-    typeof bundle.asOfMcpAdapterCallCount === "number" && Number.isInteger(bundle.asOfMcpAdapterCallCount)
-      ? Math.max(0, Math.min(bundle.asOfMcpAdapterCallCount, 200))
-      : 200;
-  const asOfEventSeq =
-    typeof bundle.asOfEventSeq === "number" && Number.isInteger(bundle.asOfEventSeq)
-      ? Math.max(0, Math.min(bundle.asOfEventSeq, 200))
-      : 200;
-  const expectedEvents = listEvents(ctx, sessionId, 0, 200).filter((event) => event.eventSeq <= asOfEventSeq);
+	  const asOfCount =
+	    typeof bundle.asOfMcpAdapterCallCount === "number" && Number.isInteger(bundle.asOfMcpAdapterCallCount)
+	      ? Math.max(0, Math.min(bundle.asOfMcpAdapterCallCount, REPLAY_SUMMARY_LIMIT))
+	      : REPLAY_SUMMARY_LIMIT;
+	  const asOfEventSeq =
+	    typeof bundle.asOfEventSeq === "number" && Number.isInteger(bundle.asOfEventSeq)
+	      ? Math.max(0, Math.min(bundle.asOfEventSeq, REPLAY_SUMMARY_LIMIT))
+	      : REPLAY_SUMMARY_LIMIT;
+	  const expectedEvents = listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT).filter((event) => event.eventSeq <= asOfEventSeq);
   const expectedEventRoot = hashJson(expectedEvents.map((event) => event.eventHash));
   if (bundle.eventRoot !== expectedEventRoot) {
     errors.push("replayBundle.eventRoot does not match the server event snapshot");
@@ -5172,16 +5834,16 @@ function verifyReplayBundleBindings(
     errors.push("replayBundle.agentTranscriptHash does not match the server transcript snapshot");
   }
   compareReplaySnapshot(errors, "replayBundle.events", bundle.events, expectedEvents);
-  compareReplaySnapshot(errors, "replayBundle.sources", bundle.sources, listSources(ctx, sessionId, 200));
-  compareReplaySnapshot(errors, "replayBundle.spends", bundle.spends, listSpends(ctx, sessionId, 200));
-  compareReplaySnapshot(errors, "replayBundle.artifactPreflights", bundle.artifactPreflights, listArtifactPreflights(ctx, sessionId, 200));
-  compareReplaySnapshot(errors, "replayBundle.quotes", bundle.quotes, listQuotes(ctx, sessionId, 200));
-  compareReplaySnapshot(errors, "replayBundle.artifactAccessTokens", bundle.artifactAccessTokens, listArtifactAccessTokens(ctx, sessionId, 200));
-  compareReplaySnapshot(errors, "replayBundle.mcpAdapterCalls", bundle.mcpAdapterCalls, listMcpAdapterCalls(ctx, sessionId, asOfCount));
-  compareReplaySnapshot(errors, "replayBundle.cawReceiptOperations", bundle.cawReceiptOperations, listCawReceiptOperations(ctx, sessionId, 200));
-  compareReplaySnapshot(errors, "replayBundle.rawCawReceiptBundles", bundle.rawCawReceiptBundles, listRawCawReceiptBundles(ctx, sessionId, 200));
-  compareReplaySnapshot(errors, "replayBundle.canonicalCawReceipts", bundle.canonicalCawReceipts, listCanonicalCawReceipts(ctx, sessionId, 200));
-  compareReplaySnapshot(errors, "replayBundle.leaseRuns", bundle.leaseRuns, listLeaseRuns(ctx, sessionId, 200));
+	  compareReplaySnapshot(errors, "replayBundle.sources", bundle.sources, listSources(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+	  compareReplaySnapshot(errors, "replayBundle.spends", bundle.spends, listSpends(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+	  compareReplaySnapshot(errors, "replayBundle.artifactPreflights", bundle.artifactPreflights, listArtifactPreflights(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+	  compareReplaySnapshot(errors, "replayBundle.quotes", bundle.quotes, listQuotes(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+	  compareReplaySnapshot(errors, "replayBundle.artifactAccessTokens", bundle.artifactAccessTokens, listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+	  compareReplaySnapshot(errors, "replayBundle.mcpAdapterCalls", bundle.mcpAdapterCalls, listMcpAdapterCalls(ctx, sessionId, asOfCount));
+	  compareReplaySnapshot(errors, "replayBundle.cawReceiptOperations", bundle.cawReceiptOperations, listCawReceiptOperations(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+	  compareReplaySnapshot(errors, "replayBundle.rawCawReceiptBundles", bundle.rawCawReceiptBundles, listRawCawReceiptBundles(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+	  compareReplaySnapshot(errors, "replayBundle.canonicalCawReceipts", bundle.canonicalCawReceipts, listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
+	  compareReplaySnapshot(errors, "replayBundle.leaseRuns", bundle.leaseRuns, listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.judgeCheck", bundle.judgeCheck, readJudgeCheckData(sessionId, ctx));
   return errors;
 }

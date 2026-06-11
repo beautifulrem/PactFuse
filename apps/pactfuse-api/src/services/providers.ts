@@ -18,6 +18,9 @@ const DEFAULT_TEMPLATES: Array<{ mode: PactTemplateBinding["mode"]; path: string
   { mode: "permit-payment-real", path: "../../../../pact-template/permit-payment-real.appendix.json" },
 ];
 const MAX_MCP_RESPONSE_BYTES = 512 * 1024;
+const REQUIRED_LEASE_TOOL_ARGUMENTS = ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"] as const;
+const DANGEROUS_TOOL_NAME_PATTERN =
+  /(write|edit|delete|remove|shell|exec|terminal|command|commit|push|deploy|transfer|send|apply|patch|modify|create|move|copy|rename|upload|download|file|fs|process|subprocess)/;
 
 export function createUnconfiguredChainClient(): ChainClient {
   return {
@@ -211,7 +214,7 @@ export function createHttpJsonRpcMcpLeaseClient(input: {
   toolName?: string;
   timeoutMs?: number;
 }): McpLeaseClient {
-  const toolName = input.toolName ?? "pactfuse_code_scan";
+  const toolName = normalizeLeaseToolName(input.toolName ?? "pactfuse_code_scan");
   const timeoutMs = input.timeoutMs ?? 10_000;
   return {
     async status() {
@@ -236,8 +239,11 @@ export function createHttpJsonRpcMcpLeaseClient(input: {
     },
     async executeCleanLease(leaseInput) {
       const toolsListRequest = jsonRpcRequest("tools/list", {});
-      const toolsListResponse = await postJsonRpc(input.endpointUrl, toolsListRequest, timeoutMs);
-      assertToolListed(toolsListResponse, toolName);
+      const toolsListResponse = await withMcpStage("tools/list", async () => {
+        const response = await postJsonRpc(input.endpointUrl, toolsListRequest, timeoutMs);
+        assertToolListed(response, toolName);
+        return response;
+      });
       const toolsCallRequest = jsonRpcRequest("tools/call", {
         name: toolName,
         arguments: {
@@ -250,8 +256,11 @@ export function createHttpJsonRpcMcpLeaseClient(input: {
           targetCommit: leaseInput.targetCommit,
         },
       });
-      const toolsCallResponse = await postJsonRpc(input.endpointUrl, toolsCallRequest, timeoutMs);
-      assertJsonRpcSuccess(toolsCallResponse, "tools/call");
+      const toolsCallResponse = await withMcpStage("tools/call", async () => {
+        const response = await postJsonRpc(input.endpointUrl, toolsCallRequest, timeoutMs);
+        assertJsonRpcSuccess(response, "tools/call");
+        return response;
+      });
       return {
         toolName,
         toolsList: {
@@ -268,6 +277,17 @@ export function createHttpJsonRpcMcpLeaseClient(input: {
       } satisfies McpLeaseExecutionResult;
     },
   };
+}
+
+async function withMcpStage<T>(stage: "tools/list" | "tools/call", fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (error instanceof Error) {
+      (error as Error & { leaseStage?: string }).leaseStage = stage;
+    }
+    throw error;
+  }
 }
 
 export function createLocalTemplateRegistry(): PactTemplateRegistry {
@@ -351,11 +371,59 @@ function assertToolListed(response: Record<string, unknown>, toolName: string): 
   if (!Array.isArray(tools)) {
     throw new Error("tools/list result must include a tools array");
   }
-  const names = tools
-    .map((tool) => (tool && typeof tool === "object" && !Array.isArray(tool) ? (tool as Record<string, unknown>).name : null))
-    .filter((name): name is string => typeof name === "string");
-  if (!names.includes(toolName)) {
-    throw new Error(`tools/list did not expose required tool ${toolName}`);
+  if (tools.length !== 1) {
+    throw new Error("tools/list must expose exactly one PactFuse lease tool");
+  }
+  const [tool] = tools;
+  if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
+    throw new Error("tools/list tool entry must be an object");
+  }
+  const toolRecord = tool as Record<string, unknown>;
+  if (toolRecord.name !== toolName) {
+    throw new Error(`tools/list did not expose the required unique tool ${toolName}`);
+  }
+  assertLeaseToolDefinition(toolRecord);
+}
+
+function normalizeLeaseToolName(toolName: string): string {
+  if (!/^pactfuse_[a-z0-9_:-]{1,80}$/.test(toolName)) {
+    throw new Error("lease MCP tool name must be a controlled pactfuse_* capability");
+  }
+  if (DANGEROUS_TOOL_NAME_PATTERN.test(toolName.toLowerCase())) {
+    throw new Error("lease MCP tool name must not describe write, execution, transfer, or file capabilities");
+  }
+  return toolName;
+}
+
+function assertLeaseToolDefinition(tool: Record<string, unknown>): void {
+  const annotations = tool.annotations;
+  if (!annotations || typeof annotations !== "object" || Array.isArray(annotations) || (annotations as Record<string, unknown>).readOnlyHint !== true) {
+    throw new Error("lease MCP tool must advertise annotations.readOnlyHint=true");
+  }
+  const inputSchema = tool.inputSchema;
+  if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) {
+    throw new Error("lease MCP tool must expose an inputSchema object");
+  }
+  const schema = inputSchema as Record<string, unknown>;
+  if (schema.type !== "object") {
+    throw new Error("lease MCP tool inputSchema.type must be object");
+  }
+  if (schema.additionalProperties !== false) {
+    throw new Error("lease MCP tool inputSchema must set additionalProperties=false");
+  }
+  const properties = schema.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
+    throw new Error("lease MCP tool inputSchema must declare properties");
+  }
+  const required = schema.required;
+  if (!Array.isArray(required)) {
+    throw new Error("lease MCP tool inputSchema must declare required fields");
+  }
+  const propertyNames = new Set(Object.keys(properties as Record<string, unknown>));
+  const requiredNames = new Set(required.filter((field): field is string => typeof field === "string"));
+  const missing = REQUIRED_LEASE_TOOL_ARGUMENTS.filter((field) => !propertyNames.has(field) || !requiredNames.has(field));
+  if (missing.length > 0) {
+    throw new Error(`lease MCP tool inputSchema is missing required PactFuse fields: ${missing.join(",")}`);
   }
 }
 

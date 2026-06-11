@@ -10,6 +10,7 @@ export const LOCKED_RUNTIME_MODES = {
 
 export const HexSchema = z.string().regex(/^0x[0-9a-fA-F]+$/);
 export const Hex32Schema = z.string().regex(/^0x[0-9a-fA-F]{64}$/);
+export const ArtifactCidSchema = z.string().regex(/^sha256:0x[0-9a-fA-F]{64}$/);
 export const IdempotencyKeySchema = z.string().min(4).max(160).regex(/^[a-z][a-z0-9:_-]+$/);
 export const DecimalStringSchema = z.string().regex(/^(0|[1-9][0-9]*)$/);
 export const IsoDateStringSchema = z.string().datetime({ offset: true });
@@ -155,6 +156,7 @@ export const ArtifactPreflightPayloadSchema = z
   .object({
     spendId: Hex32Schema,
     artifactHashPreview: Hex32Schema,
+    artifactCid: ArtifactCidSchema,
     endpointUrl: z.string().min(1).max(500),
     priceDisclosureHash: Hex32Schema,
     sourceStateSnapshotHash: Hex32Schema,
@@ -184,7 +186,9 @@ export const ArtifactAccessIssuePayloadSchema = z
   .object({
     spendId: Hex32Schema,
     payer: HexSchema,
+    quoteId: Hex32Schema,
     artifactHash: Hex32Schema,
+    artifactPayload: JsonObjectSchema,
   })
   .strict();
 
@@ -469,6 +473,7 @@ export const ArtifactPreflightViewSchema = z
     sessionId: Hex32Schema,
     spendId: Hex32Schema,
     artifactHashPreview: Hex32Schema,
+    artifactCid: ArtifactCidSchema,
     endpointUrl: z.string().min(1).max(500),
     priceDisclosureHash: Hex32Schema,
     sourceStateSnapshotHash: Hex32Schema,
@@ -484,6 +489,7 @@ export const QuoteViewSchema = z
     spendId: Hex32Schema,
     preflightId: Hex32Schema,
     artifactCommitment: Hex32Schema,
+    artifactCid: ArtifactCidSchema,
     priceDisclosureHash: Hex32Schema,
     sourceStateSnapshotHash: Hex32Schema,
     priceAtomic: DecimalStringSchema,
@@ -501,9 +507,14 @@ export const ArtifactAccessTokenViewSchema = z
     sessionId: Hex32Schema,
     spendId: Hex32Schema,
     payer: HexSchema,
+    quoteId: Hex32Schema,
+    preflightId: Hex32Schema,
     artifactHash: Hex32Schema,
+    artifactCid: ArtifactCidSchema,
+    artifactPayloadHash: Hex32Schema,
+    artifactPayload: JsonObjectSchema,
     tokenHash: Hex32Schema,
-    status: z.enum(["active"]),
+    status: z.enum(["active", "consuming", "consumed", "blocked"]),
     issuedByVerifierRunId: Hex32Schema.nullable(),
     settlementEventId: Hex32Schema.nullable(),
     createdAt: IsoDateStringSchema,
