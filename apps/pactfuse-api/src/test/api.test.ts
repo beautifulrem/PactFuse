@@ -1460,8 +1460,9 @@ describe("pactfuse-api P0", () => {
     expect(kinds).not.toContain("gate.spend_settled");
   });
 
-  it("finalizes gate settlement only at configured depth and records a matching proof row", async () => {
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeGateChainClient() });
+  it("finalizes gate settlement only from indexed public-chain logs and records a matching proof row", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-gate-finalized", { finalityDepth: 2 });
     const spendId = await registerSpend(app, sessionId);
     const observedBody = gateEventEnvelope(sessionId, spendId, "gate-finalized-observed", {
@@ -1475,9 +1476,23 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "gate-finalized-depth",
       payload: { ...observedBody.payload, currentBlockNumber: 101 },
     };
+    logs.push(
+      indexerLog("gate-finalized", 100, {
+        eventName: "SpendSettled",
+        event: "SpendSettled",
+        sessionId,
+        spendId,
+        args: { sessionId, spendId },
+        transactionHash: hex32("gate-finalized-tx"),
+        rawLogHash: hex32("gate-finalized-log"),
+      }),
+    );
 
     const observed = await postSignedGateEvent(app, observedBody);
     const finalized = await postSignedGateEvent(app, finalizedBody);
+    const worker = await runIndexerWorkerOnce(ctx, {
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 1, address: INDEXER_ADDRESS }],
+    });
     const staleReplay = await postSignedGateEvent(app, {
       ...observedBody,
       idempotencyKey: "gate-finalized-stale-replay",
@@ -1501,19 +1516,20 @@ describe("pactfuse-api P0", () => {
     expect(observed.status).toBe(202);
     expect(observed.json.data.finalityStatus).toBe("observed_finalizing");
     expect(finalized.status).toBe(202);
-    expect(finalized.json.data.finalityStatus).toBe("finalized");
+    expect(finalized.json.data.finalityStatus).toBe("observed_finalizing");
     expect(finalized.json.data.confirmations).toBe(2);
-    expect(finalized.json.data.proofAuthority).toBe(true);
+    expect(finalized.json.data.proofAuthority).toBe(false);
+    expect(worker.status).toBe("succeeded");
     expect(staleReplay.status).toBe(202);
     expect(staleReplay.json.data.finalityStatus).toBe("finalized");
     expect(staleReplay.json.data.confirmations).toBe(2);
     expect(row.status).toBe("finalized");
     expect(row.confirmations).toBe(2);
     expect(row.observed_event_id).toBe(observed.json.data.observedEventId);
-    expect(row.finalized_event_id).toBe(finalized.json.data.finalizedEventId);
+    expect(row.finalized_event_id).toBe(proofEvent?.eventId);
     expect(proofEvent).toEqual(
       expect.objectContaining({
-        eventId: finalized.json.data.finalizedEventId,
+        eventId: staleReplay.json.data.finalizedEventId,
         authority: "proof",
       }),
     );
@@ -1522,6 +1538,8 @@ describe("pactfuse-api P0", () => {
       expect.objectContaining({
         gateEventId: finalized.json.data.gateEventId,
         observedEventId: observedEvent?.eventId,
+        indexedLogId: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        cursorId: "gate:indexer",
         finalityStatus: "finalized",
         proofAuthority: true,
         winnerClaimAllowed: false,
@@ -1601,10 +1619,11 @@ describe("pactfuse-api P0", () => {
   });
 
   it("blocks verifier and same-log revival after a finalized gate reorg", async () => {
-    const { app } = makeApp(":memory:", { chain: createFakeGateChainClient() });
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-gate-reorg", { finalityDepth: 2 });
     const spendId = await registerSpend(app, sessionId);
-    const finalized = await finalizeSpendSettlement(app, sessionId, spendId, "gate-reorg");
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "gate-reorg");
     const reorgBody = gateEventEnvelope(sessionId, spendId, "gate-reorg-invalidated", {
       txHash: hex32("gate-reorg-tx"),
       rawLogHash: hex32("gate-reorg-log"),
@@ -1654,7 +1673,8 @@ describe("pactfuse-api P0", () => {
   });
 
   it("keeps artifact reads bearer-bound and validates path parameters", async () => {
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeGateChainClient() });
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-artifact");
     const spendId = await registerSpend(app, sessionId);
     const artifactHash = hex32("artifact");
@@ -1668,7 +1688,7 @@ describe("pactfuse-api P0", () => {
     const pendingJson = await pending.json();
     const invalidPayer = await app.request(`/api/v1/artifacts/${sessionId}/${spendId}/not-a-hex/${artifactHash}`);
     const invalidJson = await invalidPayer.json();
-    await finalizeSpendSettlement(app, sessionId, spendId, "artifact-settlement");
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "artifact-settlement");
     ctx.db.sqlite
       .prepare(
         `INSERT INTO artifact_access_tokens
@@ -2072,11 +2092,45 @@ describe("pactfuse-api P0", () => {
   });
 
   it("runs the indexer worker from configured cursors and advances startup windows without manual HTTP backfill", async () => {
-    const logs = [100, 101, 102, 103, 104].map((block) => indexerLog(`worker-${block}`, block));
-    const { ctx } = makeApp(":memory:", {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", {
       chain: createFakeIndexerChainClient({ currentBlockNumber: 105, logs }),
       requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", address: INDEXER_ADDRESS, topics: [], finalityDepth: 2 }],
     });
+    const sessionId = await createSession(app, "sess-indexer-worker-visible");
+    const spendId = await registerSpend(app, sessionId);
+    const challengeReasonHash = hex32("worker-source-reason");
+    const challenge = await post(app, "/api/v1/sources/challenge", {
+      sessionId,
+      idempotencyKey: "worker-source-challenge",
+      payload: {
+        sourceHash: hex32("source"),
+        reasonHash: challengeReasonHash,
+        evidenceRef: "https://example.com/worker-source-challenge.json",
+      },
+    });
+    logs.push(
+      indexerLog("worker-settled", 100, {
+        eventName: "SpendSettled",
+        event: "SpendSettled",
+        sessionId,
+        spendId,
+        args: { sessionId, spendId },
+        transactionHash: hex32("worker-settled-tx"),
+        rawLogHash: hex32("worker-settled-log"),
+      }),
+      indexerLog("worker-source-challenged", 101, {
+        eventName: "SourceChallenged",
+        event: "SourceChallenged",
+        sessionId,
+        sourceHash: hex32("source"),
+        reasonHash: challengeReasonHash,
+        args: { sessionId, sourceHash: hex32("source"), reasonHash: challengeReasonHash },
+        transactionHash: hex32("worker-source-challenged-tx"),
+        rawLogHash: hex32("worker-source-challenged-log"),
+      }),
+      ...[101, 102, 103, 104].map((block) => indexerLog(`worker-${block}`, block)),
+    );
     const options = {
       leaseOwner: "test-indexer-worker",
       cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 2, address: INDEXER_ADDRESS }],
@@ -2089,12 +2143,60 @@ describe("pactfuse-api P0", () => {
       "gate:indexer",
     ) as Record<string, unknown>;
     const count = ctx.db.sqlite.prepare("SELECT COUNT(*) AS count FROM chain_indexed_logs").get() as Record<string, unknown>;
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const judge = await app.request(`/api/v1/evidence/judge-check?sessionId=${sessionId}`);
+    const judgeJson = await judge.json();
+    const proofEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "gate.spend_settled");
+    const sourceProofEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "source.challenge.confirmed");
+    const sourceRow = judgeJson.data.rows.find((row: { rowId: string }) => row.rowId === "source_challenge");
+    const settlementRow = judgeJson.data.rows.find((row: { rowId: string }) => row.rowId === "c_settlement");
 
+    expect(challenge.status).toBe(202);
     expect(first.status).toBe("succeeded");
     expect(second.status).toBe("succeeded");
     expect(third.status).toBe("succeeded");
     expect(cursor).toEqual(expect.objectContaining({ last_indexed_block: 104, lag_blocks: 0, status: "caught_up" }));
-    expect(Number(count.count)).toBe(5);
+    expect(Number(count.count)).toBe(6);
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("indexer.worker.succeeded");
+    expect(proofEvent).toEqual(
+      expect.objectContaining({
+        authority: "proof",
+        payload: expect.objectContaining({
+          spendId,
+          cursorId: "gate:indexer",
+          indexedLogId: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        }),
+      }),
+    );
+    expect(sourceProofEvent).toEqual(
+      expect.objectContaining({
+        authority: "proof",
+        payload: expect.objectContaining({
+          sourceHash: hex32("source"),
+          reasonHash: challengeReasonHash,
+          cursorId: "gate:indexer",
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        }),
+      }),
+    );
+    expect(sourceRow).toEqual(
+      expect.objectContaining({
+        status: "pass",
+        authority: "proof",
+        evidenceEventId: sourceProofEvent?.eventId,
+      }),
+    );
+    expect(settlementRow).toEqual(
+      expect.objectContaining({
+        status: "pass",
+        authority: "proof",
+        evidenceEventId: proofEvent?.eventId,
+      }),
+    );
   });
 
   it("keeps indexer worker lease recovery scoped and blocks malformed indexer jobs", async () => {
@@ -2127,6 +2229,53 @@ describe("pactfuse-api P0", () => {
     expect(malformed.status).toBe("blocked");
     expect(malformedJob.status).toBe("blocked");
     expect(malformedJob.locked_at).toBeNull();
+  });
+
+  it("keeps global indexer retry and blocked states out of unrelated session replay", async () => {
+    const retryingApp = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({
+        currentBlockNumber: 105,
+        logs: [indexerLog("retry-worker", 100)],
+        getLogsError: new Error("rpc unavailable"),
+      }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", topics: [], finalityDepth: 2 }],
+    });
+    const retrySessionId = await createSession(retryingApp.app, "sess-indexer-worker-retry-visible");
+    const retrying = await runIndexerWorkerOnce(retryingApp.ctx, {
+      cursors: [{ cursorId: "gate:indexer", chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 1 }],
+      retryDelayMs: 1_000,
+    });
+    const retryReplay = await retryingApp.app.request(`/api/v1/evidence/replay-bundle?sessionId=${retrySessionId}`);
+    const retryReplayJson = await retryReplay.json();
+    const retryJudge = await retryingApp.app.request(`/api/v1/evidence/judge-check?sessionId=${retrySessionId}`);
+    const retryJudgeJson = await retryJudge.json();
+
+    const blockedApp = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 105, logs: [] }),
+      requiredIndexerCursors: [{ cursorId: "gate:indexer", chainId: "84532", topics: [], finalityDepth: 2 }],
+    });
+    const blockedSessionId = await createSession(blockedApp.app, "sess-indexer-worker-blocked-visible");
+    enqueueJob(blockedApp.ctx, {
+      kind: INDEX_CHAIN_WINDOW_JOB_KIND,
+      dedupeKey: "bad:indexer:visible",
+      payload: { malformed: true },
+    });
+    const blocked = await runIndexerWorkerOnce(blockedApp.ctx, { cursors: [] });
+    const blockedReplay = await blockedApp.app.request(`/api/v1/evidence/replay-bundle?sessionId=${blockedSessionId}`);
+    const blockedReplayJson = await blockedReplay.json();
+    const blockedJudge = await blockedApp.app.request(`/api/v1/evidence/judge-check?sessionId=${blockedSessionId}`);
+    const blockedJudgeJson = await blockedJudge.json();
+
+    expect(retrying.status).toBe("retrying");
+    expect(retryReplayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("indexer.worker.retrying");
+    expect(retryJudgeJson.data.rows.find((row: { rowId: string }) => row.rowId === "c_settlement")).toEqual(
+      expect.objectContaining({ status: "pending", authority: "proof", evidenceEventId: null }),
+    );
+    expect(blocked.status).toBe("blocked");
+    expect(blockedReplayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("indexer.worker.blocked");
+    expect(blockedJudgeJson.data.rows.find((row: { rowId: string }) => row.rowId === "c_settlement")).toEqual(
+      expect.objectContaining({ status: "pending", authority: "proof", evidenceEventId: null }),
+    );
   });
 
   it("backfills indexed chain logs in capped windows and replays duplicate windows exactly once", async () => {
@@ -2847,7 +2996,8 @@ describe("pactfuse-api P0", () => {
   });
 
   it("requires a matching bearer-bound artifact token before lease execution", async () => {
-    const { app, ctx } = makeApp(":memory:", { chain: createFakeGateChainClient() });
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
     const sessionId = await createSession(app, "sess-lease-bearer-bound");
     const spendId = await registerSpend(app, sessionId);
     const payer = "0x1234";
@@ -2855,7 +3005,7 @@ describe("pactfuse-api P0", () => {
     const artifactHash = hex32("lease-artifact-active");
     const bearerToken = "lease-access-token";
     const wrongPayerToken = "lease-wrong-payer-token";
-    await finalizeSpendSettlement(app, sessionId, spendId, "lease-settlement");
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-settlement");
     ctx.db.sqlite
       .prepare(
         `INSERT INTO artifact_access_tokens
@@ -3150,9 +3300,12 @@ function createFakeIndexerChainClient(config: {
       return config.currentBlockNumber ?? 101;
     },
     async getTransactionReceipt(txHash: string) {
+      const matchingLog = (config.logs ?? []).find((log) => {
+        return typeof log.transactionHash === "string" && log.transactionHash.toLowerCase() === txHash.toLowerCase();
+      });
       return {
         transactionHash: txHash,
-        blockNumber: config.currentBlockNumber ?? 101,
+        blockNumber: matchingLog?.blockNumber ?? config.currentBlockNumber ?? 101,
         status: "success",
       };
     },
@@ -3160,13 +3313,33 @@ function createFakeIndexerChainClient(config: {
       if (config.getLogsError) {
         throw config.getLogsError;
       }
+      if (query.reorged === true) {
+        return [];
+      }
       const fromBlock = Number(query.fromBlock ?? query.blockNumber ?? 0);
       const toBlock = Number(query.toBlock ?? query.blockNumber ?? fromBlock);
       const address = typeof query.address === "string" ? query.address.toLowerCase() : null;
+      const txHash = typeof query.txHash === "string" ? query.txHash.toLowerCase() : null;
+      const logIndex = query.logIndex === undefined ? null : Number(query.logIndex);
+      const event = typeof query.event === "string" ? query.event : null;
+      const spendId = typeof query.spendId === "string" ? query.spendId.toLowerCase() : null;
       return (config.logs ?? []).filter((log) => {
         const blockNumber = Number(log.blockNumber);
         const logAddress = typeof log.address === "string" ? log.address.toLowerCase() : null;
-        return blockNumber >= fromBlock && blockNumber <= toBlock && (!address || logAddress === address);
+        const logTxHash = typeof log.transactionHash === "string" ? log.transactionHash.toLowerCase() : null;
+        const logIndexValue = log.logIndex === undefined ? null : Number(log.logIndex);
+        const logEvent = typeof log.eventName === "string" ? log.eventName : typeof log.event === "string" ? log.event : null;
+        const args = log.args && typeof log.args === "object" && !Array.isArray(log.args) ? (log.args as Record<string, unknown>) : {};
+        const logSpendId = typeof args.spendId === "string" ? args.spendId.toLowerCase() : typeof log.spendId === "string" ? log.spendId.toLowerCase() : null;
+        return (
+          blockNumber >= fromBlock &&
+          blockNumber <= toBlock &&
+          (!address || logAddress === address) &&
+          (!txHash || logTxHash === txHash) &&
+          (logIndex === null || logIndexValue === logIndex) &&
+          (!event || logEvent === event) &&
+          (!spendId || logSpendId === spendId)
+        );
       });
     },
   };
@@ -3308,6 +3481,8 @@ async function postSignedGateEvent(app: ReturnType<typeof createApp>, body: Reco
 
 async function finalizeSpendSettlement(
   app: ReturnType<typeof createApp>,
+  ctx: ServiceCtx,
+  logs: Array<Record<string, unknown>>,
   sessionId: string,
   spendId: string,
   key: string,
@@ -3318,21 +3493,35 @@ async function finalizeSpendSettlement(
     blockNumber: 100,
     currentBlockNumber: 100,
   });
-  const finalizedBody = {
-    ...observedBody,
-    idempotencyKey: `${key}-finalized`,
-    payload: {
-      ...(observedBody.payload as Record<string, unknown>),
-      currentBlockNumber: 101,
-    },
-  };
   const observed = await postSignedGateEvent(app, observedBody);
-  const finalized = await postSignedGateEvent(app, finalizedBody);
+  logs.push(
+    indexerLog(key, 100, {
+      eventName: "SpendSettled",
+      event: "SpendSettled",
+      sessionId,
+      spendId,
+      args: { sessionId, spendId },
+      transactionHash: hex32(`${key}-tx`),
+      rawLogHash: hex32(`${key}-log`),
+    }),
+  );
+  const worker = await runIndexerWorkerOnce(ctx, {
+    cursors: [{ cursorId: `gate:${key}`, chainId: "84532", startBlock: 100, finalityDepth: 2, maxWindowBlocks: 1, address: INDEXER_ADDRESS }],
+  });
+  const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+  const replayJson = await replay.json();
+  const proofEvent = replayJson.data.events.find((event: { kind: string; payload: Record<string, unknown> }) => {
+    return event.kind === "gate.spend_settled" && event.payload.spendId === spendId;
+  });
 
   expect(observed.status).toBe(202);
-  expect(finalized.status).toBe(202);
-  expect(finalized.json.data.finalityStatus).toBe("finalized");
-  return finalized.json.data;
+  expect(worker.status).toBe("succeeded");
+  expect(proofEvent).toEqual(expect.objectContaining({ authority: "proof" }));
+  return {
+    ...(proofEvent.payload as Record<string, unknown>),
+    finalizedEventId: proofEvent.eventId,
+    observedEventId: observed.json.data.observedEventId,
+  };
 }
 
 async function computeSpendIdForTest(

@@ -305,6 +305,7 @@ export const EvidenceEventKindSchema = z.enum([
   "session.created",
   "source.registered",
   "source.challenge.pending",
+  "source.challenge.confirmed",
   "spend.registered",
   "caw.operation.built",
   "caw.receipt.ingested.fixture",

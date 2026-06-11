@@ -76,6 +76,13 @@ type NormalizedIndexedChainLog = {
   createdAt: string;
   raw: JsonValue;
 };
+type IndexedLogProofRef = {
+  indexedLogId: `0x${string}`;
+  cursorId: string;
+  indexedRawLogHash: `0x${string}`;
+  finalizedHeadBlock: number;
+  latestHeadBlock: number;
+};
 type CawReceiptIngestData = {
   receiptBundleHash: `0x${string}`;
   rawReceiptBundleHash?: `0x${string}`;
@@ -769,39 +776,56 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
         };
       }
 
-      const finalizedEventId =
-        typeof existing?.finalized_event_id === "string"
-          ? existing.finalized_event_id
-          : appendGateFinalizedEvent(ctx, envelope.sessionId, gatePayload, gateEventId, observedEventId, finalityDepth, confirmations).eventId;
-      const finalizeResult = ctx.db.sqlite
+      if (existing?.status === "finalized") {
+        if (typeof existing.finalized_event_id !== "string") {
+          throw Object.assign(new Error("finalized gate event is missing its proof event id"), {
+            apiError: proofBlockedError(requestId, "finalized gate event is missing its proof event id"),
+          });
+        }
+        return {
+          ok: true,
+          requestId,
+          evidenceEventId: existing.finalized_event_id,
+          data: {
+            gateEventId,
+            spendId: gatePayload.spendId,
+            event: gatePayload.event,
+            finalityStatus: "finalized",
+            confirmations: Number(existing.confirmations),
+            finalityDepth: Number(existing.finality_depth),
+            observedEventId,
+            finalizedEventId: existing.finalized_event_id,
+            proofAuthority: true,
+            winnerClaimAllowed: false,
+          },
+        };
+      }
+      const observedUpdate = ctx.db.sqlite
         .prepare(
           `UPDATE gate_chain_events
-           SET current_block_number = ?, confirmations = ?, status = 'finalized', finalized_event_id = ?, updated_at = ?
+           SET current_block_number = ?, confirmations = ?, status = 'observed_finalizing', updated_at = ?
            WHERE gate_event_id = ?`,
         )
-        .run(gatePayload.currentBlockNumber, confirmations, finalizedEventId, ctx.clock.now().toISOString(), gateEventId);
-      if (finalizeResult.changes !== 1) {
-        throw Object.assign(new Error("finalized gate event did not update the observed gate row"), {
-          apiError: proofBlockedError(requestId, "finalized gate event did not update the observed gate row"),
+        .run(gatePayload.currentBlockNumber, confirmations, ctx.clock.now().toISOString(), gateEventId);
+      if (observedUpdate.changes !== 1) {
+        throw Object.assign(new Error("gate observation did not update its gate row"), {
+          apiError: proofBlockedError(requestId, "gate observation did not update its gate row"),
         });
       }
-      ctx.db.sqlite
-        .prepare("UPDATE spends SET status = ? WHERE session_id = ? AND spend_id = ?")
-        .run(gateSpendStatus(gatePayload.event, "finalized"), envelope.sessionId, gatePayload.spendId);
       return {
         ok: true,
         requestId,
-        evidenceEventId: finalizedEventId,
+        evidenceEventId: observedEventId,
         data: {
           gateEventId,
           spendId: gatePayload.spendId,
           event: gatePayload.event,
-          finalityStatus: "finalized",
+          finalityStatus: "observed_finalizing",
           confirmations,
           finalityDepth,
           observedEventId,
-          finalizedEventId,
-          proofAuthority: true,
+          finalizedEventId: null,
+          proofAuthority: false,
           winnerClaimAllowed: false,
         },
       };
@@ -926,6 +950,37 @@ export async function indexChainWindow(input: ChainIndexerBackfillInput, ctx: Se
       };
     }),
   );
+}
+
+export function reconcileIndexedEvents(
+  ctx: ServiceCtx,
+  input: { cursorId?: string; requestId?: string; limit?: number } = {},
+): { reconciledEventCount: number } {
+  const requestId = input.requestId ?? newRequestId("indexer_reconcile");
+  const limit = input.limit ?? 500;
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT l.*, c.latest_head_block, c.finalized_head_block, c.finality_depth
+       FROM chain_indexed_logs l
+       JOIN chain_indexer_cursors c ON c.cursor_id = l.cursor_id
+       WHERE (? IS NULL OR l.cursor_id = ?)
+       ORDER BY l.block_number ASC, l.log_index ASC, l.log_id ASC
+       LIMIT ?`,
+    )
+    .all(input.cursorId ?? null, input.cursorId ?? null, limit) as Row[];
+  let reconciledEventCount = 0;
+  for (const row of rows) {
+    const semantic = indexedLogSemanticEvent(row);
+    if (!semantic) {
+      continue;
+    }
+    if (semantic.event === "SourceChallenged") {
+      reconciledEventCount += reconcileIndexedSourceChallenge(ctx, row, semantic, requestId);
+    } else {
+      reconciledEventCount += reconcileIndexedGateEvent(ctx, row, semantic, requestId);
+    }
+  }
+  return { reconciledEventCount };
 }
 
 export async function readChainIndexerStatus(ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
@@ -1690,6 +1745,7 @@ export function appendEvidenceEvent(
       | "session.created"
       | "source.registered"
       | "source.challenge.pending"
+      | "source.challenge.confirmed"
       | "spend.registered"
       | "caw.operation.built"
       | "caw.receipt.ingested.fixture"
@@ -2957,6 +3013,289 @@ function requiredChainHex32(value: unknown, field: string, requestId: string): `
   return hex as `0x${string}`;
 }
 
+function optionalHex32(value: unknown): `0x${string}` | null {
+  return typeof value === "string" && Hex32Schema.safeParse(value).success ? (value as `0x${string}`) : null;
+}
+
+function indexedLogSemanticEvent(
+  row: Row,
+):
+  | {
+      event: "SpendTripped" | "SpendSettled";
+      sessionId: `0x${string}`;
+      spendId: `0x${string}`;
+    }
+  | {
+      event: "SourceChallenged";
+      sessionId: `0x${string}`;
+      sourceHash: `0x${string}`;
+      reasonHash: `0x${string}`;
+    }
+  | null {
+  let raw: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(String(row.raw_log_json)) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    raw = parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const args = raw.args && typeof raw.args === "object" && !Array.isArray(raw.args) ? (raw.args as Record<string, unknown>) : {};
+  const event = semanticEventName(raw.event ?? raw.eventName ?? raw.name);
+  const sessionId = optionalHex32(raw.sessionId ?? args.sessionId);
+  if (!event || !sessionId) {
+    return null;
+  }
+  if (event === "SpendTripped" || event === "SpendSettled") {
+    const spendId = optionalHex32(raw.spendId ?? args.spendId);
+    return spendId ? { event, sessionId, spendId } : null;
+  }
+  const sourceHash = optionalHex32(raw.sourceHash ?? args.sourceHash);
+  const reasonHash = optionalHex32(raw.reasonHash ?? args.reasonHash);
+  return sourceHash && reasonHash ? { event, sessionId, sourceHash, reasonHash } : null;
+}
+
+function semanticEventName(value: unknown): "SpendTripped" | "SpendSettled" | "SourceChallenged" | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+  if (normalized === "spendtripped") {
+    return "SpendTripped";
+  }
+  if (normalized === "spendsettled") {
+    return "SpendSettled";
+  }
+  if (normalized === "sourcechallenged") {
+    return "SourceChallenged";
+  }
+  return null;
+}
+
+function indexedLogProofRef(row: Row): IndexedLogProofRef {
+  return {
+    indexedLogId: String(row.log_id) as `0x${string}`,
+    cursorId: String(row.cursor_id),
+    indexedRawLogHash: String(row.raw_log_hash) as `0x${string}`,
+    finalizedHeadBlock: Number(row.finalized_head_block),
+    latestHeadBlock: Number(row.latest_head_block),
+  };
+}
+
+function reconcileIndexedGateEvent(
+  ctx: ServiceCtx,
+  row: Row,
+  semantic: { event: "SpendTripped" | "SpendSettled"; sessionId: `0x${string}`; spendId: `0x${string}` },
+  requestId: string,
+): number {
+  const session = requireSessionRow(ctx, semantic.sessionId, requestId);
+  assertSpend(ctx, semantic.sessionId, semantic.spendId, requestId);
+  const blockNumber = Number(row.block_number);
+  const latestHeadBlock = Number(row.latest_head_block);
+  const finalizedHeadBlock = Number(row.finalized_head_block);
+  const finalityDepth = Math.max(Number(row.finality_depth), finalityDepthForSession(session));
+  const confirmations = latestHeadBlock >= blockNumber ? latestHeadBlock - blockNumber + 1 : 0;
+  if (blockNumber > finalizedHeadBlock || confirmations < finalityDepth) {
+    return 0;
+  }
+  const gatePayload = {
+    event: semantic.event,
+    spendId: semantic.spendId,
+    txHash: String(row.tx_hash),
+    logIndex: Number(row.log_index),
+    chainId: String(row.chain_id),
+    blockNumber,
+    currentBlockNumber: latestHeadBlock,
+    rawLogHash: String(row.raw_log_hash),
+  };
+  const gateEventId = hashJson({
+    sessionId: semantic.sessionId,
+    event: semantic.event,
+    spendId: semantic.spendId,
+    txHash: gatePayload.txHash,
+    logIndex: gatePayload.logIndex,
+    chainId: gatePayload.chainId,
+    rawLogHash: gatePayload.rawLogHash,
+  });
+  return withImmediateTransaction(ctx, () => {
+    const existing = ctx.db.sqlite
+      .prepare(
+        `SELECT *
+         FROM gate_chain_events
+         WHERE session_id = ? AND tx_hash = ? AND log_index = ? AND event_kind = ?`,
+      )
+      .get(semantic.sessionId, gatePayload.txHash, gatePayload.logIndex, semantic.event) as Row | undefined;
+    if (existing) {
+      assertGateEventRowMatches(existing, gatePayload, gateEventId, requestId);
+      if (existing.status === "reorg_invalidated" || typeof existing.reorg_event_id === "string") {
+        throw Object.assign(new Error("cannot reconcile a reorg-invalidated gate event"), {
+          apiError: proofBlockedError(requestId, "cannot reconcile a reorg-invalidated gate event"),
+        });
+      }
+      if (typeof existing.finalized_event_id === "string") {
+        return 0;
+      }
+    }
+    const observedEventId =
+      typeof existing?.observed_event_id === "string"
+        ? existing.observed_event_id
+        : appendGateObservedEvent(ctx, semantic.sessionId, gatePayload, gateEventId, finalityDepth, confirmations).eventId;
+    if (!existing) {
+      ctx.db.sqlite
+        .prepare(
+          `INSERT INTO gate_chain_events
+            (gate_event_id, session_id, spend_id, event_kind, tx_hash, log_index, chain_id, block_number, current_block_number,
+             finality_depth, confirmations, raw_log_hash, status, observed_event_id, finalized_event_id, reorg_event_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'observed_finalizing', ?, NULL, NULL, ?, ?)`,
+        )
+        .run(
+          gateEventId,
+          semantic.sessionId,
+          semantic.spendId,
+          semantic.event,
+          gatePayload.txHash,
+          gatePayload.logIndex,
+          gatePayload.chainId,
+          blockNumber,
+          latestHeadBlock,
+          finalityDepth,
+          confirmations,
+          gatePayload.rawLogHash,
+          observedEventId,
+          ctx.clock.now().toISOString(),
+          ctx.clock.now().toISOString(),
+        );
+    }
+    const proofEvent = appendGateFinalizedEvent(
+      ctx,
+      semantic.sessionId,
+      gatePayload,
+      gateEventId,
+      observedEventId,
+      finalityDepth,
+      confirmations,
+      indexedLogProofRef(row),
+    );
+    const finalizeResult = ctx.db.sqlite
+      .prepare(
+        `UPDATE gate_chain_events
+         SET current_block_number = ?, confirmations = ?, status = 'finalized', finalized_event_id = ?, updated_at = ?
+         WHERE gate_event_id = ?`,
+      )
+      .run(latestHeadBlock, confirmations, proofEvent.eventId, ctx.clock.now().toISOString(), gateEventId);
+    if (finalizeResult.changes !== 1) {
+      throw Object.assign(new Error("indexed gate event did not update its gate row"), {
+        apiError: proofBlockedError(requestId, "indexed gate event did not update its gate row"),
+      });
+    }
+    ctx.db.sqlite
+      .prepare("UPDATE spends SET status = ? WHERE session_id = ? AND spend_id = ?")
+      .run(gateSpendStatus(semantic.event, "finalized"), semantic.sessionId, semantic.spendId);
+    updateJudgeCheckRow(ctx, semantic.sessionId, {
+      rowId: semantic.event === "SpendTripped" ? "ab_trip" : "c_settlement",
+      status: "pass",
+      authority: "proof",
+      reason: `indexed public-chain ${semantic.event} log finalized from cursor ${row.cursor_id}`,
+      evidenceEventId: proofEvent.eventId,
+    });
+    return 1;
+  });
+}
+
+function reconcileIndexedSourceChallenge(
+  ctx: ServiceCtx,
+  row: Row,
+  semantic: { event: "SourceChallenged"; sessionId: `0x${string}`; sourceHash: `0x${string}`; reasonHash: `0x${string}` },
+  requestId: string,
+): number {
+  requireSessionRow(ctx, semantic.sessionId, requestId);
+  const existingProof = indexedProofEventExists(ctx, semantic.sessionId, "source.challenge.confirmed", String(row.log_id));
+  if (existingProof) {
+    return 0;
+  }
+  return withImmediateTransaction(ctx, () => {
+    const existingChallenge = ctx.db.sqlite
+      .prepare(
+        `SELECT challenge_id
+         FROM source_challenges
+         WHERE session_id = ? AND source_hash = ? AND reason_hash = ?
+         ORDER BY created_at ASC
+         LIMIT 1`,
+      )
+      .get(semantic.sessionId, semantic.sourceHash, semantic.reasonHash) as Row | undefined;
+    const challengeId =
+      typeof existingChallenge?.challenge_id === "string"
+        ? existingChallenge.challenge_id
+        : hashJson({ sessionId: semantic.sessionId, sourceHash: semantic.sourceHash, reasonHash: semantic.reasonHash, logId: row.log_id });
+    if (!existingChallenge) {
+      ctx.db.sqlite
+        .prepare(
+          `INSERT INTO source_challenges
+            (challenge_id, session_id, source_hash, reason_hash, evidence_ref, status, created_at)
+           VALUES (?, ?, ?, ?, NULL, 'indexed_confirmed', ?)`,
+        )
+        .run(challengeId, semantic.sessionId, semantic.sourceHash, semantic.reasonHash, ctx.clock.now().toISOString());
+    }
+    const proofEvent = appendEvidenceEvent(ctx, {
+      sessionId: semantic.sessionId,
+      authority: "proof",
+      kind: "source.challenge.confirmed",
+      payload: {
+        challengeId,
+        sourceHash: semantic.sourceHash,
+        reasonHash: semantic.reasonHash,
+        txHash: String(row.tx_hash),
+        logIndex: Number(row.log_index),
+        chainId: String(row.chain_id),
+        blockNumber: Number(row.block_number),
+        indexedLogId: String(row.log_id),
+        cursorId: String(row.cursor_id),
+        indexedRawLogHash: String(row.raw_log_hash),
+        finalizedHeadBlock: Number(row.finalized_head_block),
+        latestHeadBlock: Number(row.latest_head_block),
+        finalityStatus: "finalized",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+    ctx.db.sqlite
+      .prepare("UPDATE source_challenges SET status = 'indexed_confirmed' WHERE challenge_id = ?")
+      .run(challengeId);
+    ctx.db.sqlite
+      .prepare("UPDATE sources SET proof_status = 'challenged' WHERE session_id = ? AND source_hash = ?")
+      .run(semantic.sessionId, semantic.sourceHash);
+    updateJudgeCheckRow(ctx, semantic.sessionId, {
+      rowId: "source_challenge",
+      status: "pass",
+      authority: "proof",
+      reason: `indexed public-chain SourceChallenged log finalized from cursor ${row.cursor_id}`,
+      evidenceEventId: proofEvent.eventId,
+    });
+    return 1;
+  });
+}
+
+function indexedProofEventExists(ctx: ServiceCtx, sessionId: string, kind: "source.challenge.confirmed", indexedLogId: string): boolean {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT payload_json
+       FROM evidence_events
+       WHERE session_id = ? AND kind = ?
+       ORDER BY event_seq ASC`,
+    )
+    .all(sessionId, kind) as Row[];
+  return rows.some((row) => {
+    try {
+      const payload = JSON.parse(String(row.payload_json)) as { indexedLogId?: unknown };
+      return payload.indexedLogId === indexedLogId;
+    } catch {
+      return false;
+    }
+  });
+}
+
 function assertReceiptMatchesGatePayload(
   receipt: Record<string, unknown>,
   payload: { txHash: string; blockNumber: number },
@@ -3163,6 +3502,7 @@ function gateEventPayload(
   confirmations: number,
   finalityStatus: "observed_finalizing" | "finalized",
   observedEventId: string | null,
+  indexedLogRef?: IndexedLogProofRef,
 ): Record<string, JsonValue> {
   return {
     gateEventId,
@@ -3178,6 +3518,15 @@ function gateEventPayload(
     finalityDepth,
     finalityStatus,
     observedEventId,
+    ...(indexedLogRef
+      ? {
+          indexedLogId: indexedLogRef.indexedLogId,
+          cursorId: indexedLogRef.cursorId,
+          indexedRawLogHash: indexedLogRef.indexedRawLogHash,
+          finalizedHeadBlock: indexedLogRef.finalizedHeadBlock,
+          latestHeadBlock: indexedLogRef.latestHeadBlock,
+        }
+      : {}),
     proofAuthority: finalityStatus === "finalized",
     winnerClaimAllowed: false,
   };
@@ -3229,12 +3578,13 @@ function appendGateFinalizedEvent(
   observedEventId: string,
   finalityDepth: number,
   confirmations: number,
+  indexedLogRef: IndexedLogProofRef,
 ): EvidenceEvent {
   return appendEvidenceEvent(ctx, {
     sessionId,
     authority: "proof",
     kind: gateFinalizedKind(payload.event),
-    payload: gateEventPayload(payload, gateEventId, finalityDepth, confirmations, "finalized", observedEventId),
+    payload: gateEventPayload(payload, gateEventId, finalityDepth, confirmations, "finalized", observedEventId, indexedLogRef),
   });
 }
 
@@ -3504,6 +3854,28 @@ function readJudgeCheckData(sessionId: string, ctx: ServiceCtx): JudgeCheckView 
       evidenceUrl: row.evidence_url,
     })),
   });
+}
+
+function updateJudgeCheckRow(
+  ctx: ServiceCtx,
+  sessionId: string,
+  input: {
+    rowId: "source_challenge" | "ab_trip" | "c_settlement";
+    status: "pass" | "pending" | "blocked";
+    authority: "proof" | "advisory";
+    reason: string;
+    evidenceEventId: string;
+  },
+): void {
+  ctx.db.sqlite
+    .prepare(
+      `UPDATE judge_check_rows
+       SET status = ?, authority = ?, reason = ?, evidence_event_id = ?
+       WHERE session_id = ?
+         AND row_id = ?
+         AND status IN ('pending', 'blocked')`,
+    )
+    .run(input.status, input.authority, input.reason, input.evidenceEventId, sessionId, input.rowId);
 }
 
 function evidenceEventFromRow(row: Row): EvidenceEvent {
@@ -3789,6 +4161,36 @@ function verifyGateFinalityIntegrity(ctx: ServiceCtx, sessionId: string): string
     }
     if (payload.finalityStatus !== "finalized" || payload.proofAuthority !== true) {
       errors.push(`gate proof event ${event.eventId} does not carry finalized proof authority payload`);
+    }
+    const indexedLogId = typeof payload.indexedLogId === "string" ? payload.indexedLogId : null;
+    if (!indexedLogId) {
+      errors.push(`gate proof event ${event.eventId} is missing indexedLogId`);
+    } else {
+      const indexedLog = ctx.db.sqlite
+        .prepare(
+          `SELECT log_id, cursor_id, chain_id, tx_hash, log_index, block_number, raw_log_hash
+           FROM chain_indexed_logs
+           WHERE log_id = ?`,
+        )
+        .get(indexedLogId) as Row | undefined;
+      if (!indexedLog) {
+        errors.push(`gate proof event ${event.eventId} references missing indexed log ${indexedLogId}`);
+      } else {
+        const indexedChecks = [
+          ["cursorId", indexedLog.cursor_id],
+          ["chainId", indexedLog.chain_id],
+          ["txHash", indexedLog.tx_hash],
+          ["indexedRawLogHash", indexedLog.raw_log_hash],
+        ] as const;
+        for (const [field, expected] of indexedChecks) {
+          if (payload[field] !== expected) {
+            errors.push(`gate proof event ${event.eventId} payload.${field} does not match indexed log`);
+          }
+        }
+        if (Number(payload.logIndex) !== Number(indexedLog.log_index) || Number(payload.blockNumber) !== Number(indexedLog.block_number)) {
+          errors.push(`gate proof event ${event.eventId} log position does not match indexed log`);
+        }
+      }
     }
   }
   return errors;

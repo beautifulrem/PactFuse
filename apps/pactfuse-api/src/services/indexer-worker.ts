@@ -7,7 +7,7 @@ import {
 import type { ServiceCtx, ServiceResult } from "../types.js";
 import { hashJson, newRequestId, toApiError } from "../util.js";
 import { completeJob, enqueueJob, leaseNextJob, requeueExpiredLeasesForKinds, retryJob, type JobLease, type JobStatus } from "./jobs.js";
-import { indexChainWindow } from "./service.js";
+import { indexChainWindow, reconcileIndexedEvents } from "./service.js";
 
 export const INDEX_CHAIN_WINDOW_JOB_KIND = "index-chain-window";
 
@@ -90,6 +90,33 @@ export async function runIndexerWorkerOnce(ctx: ServiceCtx, options: IndexerWork
   }
 
   const parsedResult = ChainIndexerBackfillResultSchema.parse(result.data);
+  let reconciledEventCount = 0;
+  try {
+    reconciledEventCount = reconcileIndexedEvents(ctx, {
+      cursorId: parsedResult.cursor.cursorId,
+      requestId: result.requestId,
+    }).reconciledEventCount;
+  } catch (error) {
+    const requestId = newRequestId("indexer_reconcile_error");
+    const apiError = toApiError(error, requestId);
+    if (apiError.retryable) {
+      return {
+        status: "retrying",
+        job: retryJob(ctx, lease.jobId, leaseToken, nextAttemptIso(ctx, options.retryDelayMs)),
+        seededJobs,
+        requeuedLeases,
+        reason: apiError.message,
+      };
+    }
+    const terminalStatus: Extract<JobStatus, "failed" | "blocked"> = apiError.code === "proof_blocked" ? "blocked" : "failed";
+    return {
+      status: terminalStatus,
+      job: completeJob(ctx, lease.jobId, leaseToken, terminalStatus),
+      seededJobs,
+      requeuedLeases,
+      reason: apiError.message,
+    };
+  }
   const completed = completeJob(ctx, lease.jobId, leaseToken, "succeeded");
   let queuedNextJobs = 0;
   if (parsedResult.cursor.lastIndexedBlock !== null && parsedResult.cursor.lagBlocks > 0) {
@@ -109,6 +136,12 @@ export async function runIndexerWorkerOnce(ctx: ServiceCtx, options: IndexerWork
       nextPayload.address = parsedResult.cursor.address;
     }
     queuedNextJobs = enqueueKnownIndexerWindow(ctx, nextPayload).length;
+  }
+  if (reconciledEventCount > 0) {
+    ctx.logger.info(
+      { cursorId: parsedResult.cursor.cursorId, reconciledEventCount },
+      "reconciled indexed chain logs",
+    );
   }
   return { status: "succeeded", job: completed, seededJobs, requeuedLeases, queuedNextJobs };
 }
