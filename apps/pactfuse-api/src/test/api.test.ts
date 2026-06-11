@@ -15,16 +15,16 @@ import {
 } from "../services/providers.js";
 import { appendEvidenceEvent, recordMcpAdapterCall } from "../services/service.js";
 import { createVerifierAdapter } from "../services/verifier.js";
-import type { ServiceCtx } from "../types.js";
+import type { ChainClient, ServiceCtx } from "../types.js";
 
 const MCP_AUDIT_TOKEN = "test-mcp-audit-token";
 
-function makeApp(dbPath = ":memory:", options: { mcpAuditSecret?: string | null } = {}) {
+function makeApp(dbPath = ":memory:", options: { chain?: ChainClient; mcpAuditSecret?: string | null } = {}) {
   const mcpAuditSecret = options.mcpAuditSecret === undefined ? MCP_AUDIT_TOKEN : options.mcpAuditSecret;
   const ctx: ServiceCtx = {
     db: openPactFuseDb(dbPath),
     verifier: createVerifierAdapter(),
-    chain: createUnconfiguredChainClient(),
+    chain: options.chain ?? createUnconfiguredChainClient(),
     caw: createUnconfiguredCawReceiptSource(),
     templates: createStaticTemplateRegistry([
       {
@@ -671,8 +671,38 @@ describe("pactfuse-api P0", () => {
     expect(events.map((event) => event.kind)).not.toContain("gate.spend_settled");
   });
 
+  it("keeps finalized gate proof pending when no chain provider can re-fetch the log", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-gate-finality-unconfigured", { finalityDepth: 2 });
+    const spendId = await registerSpend(app, sessionId);
+    const observedBody = gateEventEnvelope(sessionId, spendId, "gate-unconfigured-observed", {
+      blockNumber: 100,
+      currentBlockNumber: 100,
+      txHash: hex32("gate-unconfigured-tx"),
+      rawLogHash: hex32("gate-unconfigured-log"),
+    });
+    const finalizedBody = {
+      ...observedBody,
+      idempotencyKey: "gate-unconfigured-finalized",
+      payload: { ...observedBody.payload, currentBlockNumber: 101 },
+    };
+
+    const observed = await postSignedGateEvent(app, observedBody);
+    const finalized = await postSignedGateEvent(app, finalizedBody);
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const kinds = replayJson.data.events.map((event: { kind: string }) => event.kind);
+
+    expect(observed.status).toBe(202);
+    expect(finalized.status).toBe(423);
+    expect(finalized.json.error.code).toBe("proof_pending");
+    expect(finalized.json.error.message).toContain("chain proof provider is not ready");
+    expect(kinds).toContain("gate.spend_settled.observed");
+    expect(kinds).not.toContain("gate.spend_settled");
+  });
+
   it("finalizes gate settlement only at configured depth and records a matching proof row", async () => {
-    const { app, ctx } = makeApp();
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeGateChainClient() });
     const sessionId = await createSession(app, "sess-gate-finalized", { finalityDepth: 2 });
     const spendId = await registerSpend(app, sessionId);
     const observedBody = gateEventEnvelope(sessionId, spendId, "gate-finalized-observed", {
@@ -732,7 +762,7 @@ describe("pactfuse-api P0", () => {
   });
 
   it("blocks mutated gate log replay for the same tx/log/event identity", async () => {
-    const { app } = makeApp();
+    const { app } = makeApp(":memory:", { chain: createFakeGateChainClient() });
     const sessionId = await createSession(app, "sess-gate-mutated", { finalityDepth: 2 });
     const spendId = await registerSpend(app, sessionId);
     const observedBody = gateEventEnvelope(sessionId, spendId, "gate-mutated-observed", {
@@ -765,7 +795,7 @@ describe("pactfuse-api P0", () => {
   });
 
   it("blocks verifier and same-log revival after a finalized gate reorg", async () => {
-    const { app } = makeApp();
+    const { app } = makeApp(":memory:", { chain: createFakeGateChainClient() });
     const sessionId = await createSession(app, "sess-gate-reorg", { finalityDepth: 2 });
     const spendId = await registerSpend(app, sessionId);
     const finalized = await finalizeSpendSettlement(app, sessionId, spendId, "gate-reorg");
@@ -818,7 +848,7 @@ describe("pactfuse-api P0", () => {
   });
 
   it("keeps artifact reads bearer-bound and validates path parameters", async () => {
-    const { app, ctx } = makeApp();
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeGateChainClient() });
     const sessionId = await createSession(app, "sess-artifact");
     const spendId = await registerSpend(app, sessionId);
     const artifactHash = hex32("artifact");
@@ -1629,7 +1659,7 @@ describe("pactfuse-api P0", () => {
   });
 
   it("requires a matching bearer-bound artifact token before lease execution", async () => {
-    const { app, ctx } = makeApp();
+    const { app, ctx } = makeApp(":memory:", { chain: createFakeGateChainClient() });
     const sessionId = await createSession(app, "sess-lease-bearer-bound");
     const spendId = await registerSpend(app, sessionId);
     const payer = "0x1234";
@@ -1906,6 +1936,46 @@ async function registerSpend(app: ReturnType<typeof createApp>, sessionId: strin
   });
   expect(res.status).toBe(201);
   return spendId;
+}
+
+function createFakeGateChainClient(currentBlockNumber = 101): ChainClient {
+  return {
+    async status() {
+      return {
+        name: "chain",
+        mode: "fixture",
+        ready: true,
+        reason: "test chain provider",
+        chainId: "84532",
+      };
+    },
+    async getBlockNumber() {
+      return currentBlockNumber;
+    },
+    async getTransactionReceipt(txHash: string) {
+      return {
+        transactionHash: txHash,
+        blockNumber: 100,
+        status: "success",
+      };
+    },
+    async getLogs(input: Record<string, unknown>) {
+      if (input.reorged === true) {
+        return [];
+      }
+      return [
+        {
+          transactionHash: input.txHash,
+          logIndex: input.logIndex,
+          chainId: input.chainId,
+          blockNumber: input.blockNumber,
+          eventName: input.event,
+          args: { spendId: input.spendId },
+          rawLogHash: input.rawLogHash,
+        },
+      ];
+    },
+  };
 }
 
 function gateEventEnvelope(

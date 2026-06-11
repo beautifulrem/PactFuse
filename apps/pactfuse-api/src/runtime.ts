@@ -4,6 +4,7 @@ import {
   createLocalTemplateRegistry,
   createUnconfiguredCawReceiptSource,
   createUnconfiguredChainClient,
+  createViemChainClient,
 } from "./services/providers.js";
 import { createVerifierAdapter } from "./services/verifier.js";
 import type { Clock, Logger, ServiceCtx } from "./types.js";
@@ -16,7 +17,12 @@ export function createServiceCtx(options: {
   return {
     db: openPactFuseDb(options.dbPath),
     verifier: createVerifierAdapter(),
-    chain: createUnconfiguredChainClient(),
+    chain: process.env.PACTFUSE_CHAIN_RPC_URL
+      ? createViemChainClient({
+          rpcUrl: process.env.PACTFUSE_CHAIN_RPC_URL,
+          ...(process.env.PACTFUSE_CHAIN_ID ? { chainId: process.env.PACTFUSE_CHAIN_ID } : {}),
+        })
+      : createUnconfiguredChainClient(),
     caw: createUnconfiguredCawReceiptSource(),
     templates: createLocalTemplateRegistry(),
     mcpAuditSecret: process.env.PACTFUSE_MCP_AUDIT_TOKEN ?? null,

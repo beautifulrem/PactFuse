@@ -430,17 +430,24 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
   return withIdempotency(ctx, scoped("gate:events:ingest", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     const session = requireSessionRow(ctx, envelope.sessionId, requestId);
     assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    const finalityDepth = finalityDepthForSession(session);
+    let certifiedPayload = payload;
+    let confirmations = payload.reorged ? 0 : payload.currentBlockNumber - payload.blockNumber + 1;
+    if (payload.reorged || confirmations >= finalityDepth) {
+      const chainProof = await verifyGateEventWithChain(ctx, payload, requestId);
+      certifiedPayload = { ...payload, currentBlockNumber: chainProof.currentBlockNumber };
+      confirmations = payload.reorged ? 0 : chainProof.confirmations;
+    }
     return withImmediateTransaction(ctx, () => {
-      const finalityDepth = finalityDepthForSession(session);
-      const confirmations = payload.reorged ? 0 : payload.currentBlockNumber - payload.blockNumber + 1;
+      const gatePayload = certifiedPayload;
       const gateEventId = hashJson({
         sessionId: envelope.sessionId,
-        event: payload.event,
-        spendId: payload.spendId,
-        txHash: payload.txHash,
-        logIndex: payload.logIndex,
-        chainId: payload.chainId,
-        rawLogHash: payload.rawLogHash,
+        event: gatePayload.event,
+        spendId: gatePayload.spendId,
+        txHash: gatePayload.txHash,
+        logIndex: gatePayload.logIndex,
+        chainId: gatePayload.chainId,
+        rawLogHash: gatePayload.rawLogHash,
       });
       const existing = ctx.db.sqlite
         .prepare(
@@ -448,15 +455,15 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
            FROM gate_chain_events
            WHERE session_id = ? AND tx_hash = ? AND log_index = ? AND event_kind = ?`,
         )
-        .get(envelope.sessionId, payload.txHash, payload.logIndex, payload.event) as Row | undefined;
+        .get(envelope.sessionId, gatePayload.txHash, gatePayload.logIndex, gatePayload.event) as Row | undefined;
       if (existing) {
-        assertGateEventRowMatches(existing, payload, gateEventId, requestId);
+        assertGateEventRowMatches(existing, gatePayload, gateEventId, requestId);
       }
-      if (payload.reorged) {
+      if (gatePayload.reorged) {
         return recordGateReorg(ctx, {
           requestId,
           sessionId: envelope.sessionId,
-          payload,
+          payload: gatePayload,
           existing,
           gateEventId,
           finalityDepth,
@@ -472,7 +479,7 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
       const observedEventId =
         typeof existing?.observed_event_id === "string"
           ? existing.observed_event_id
-          : appendGateObservedEvent(ctx, envelope.sessionId, payload, gateEventId, finalityDepth, confirmations).eventId;
+          : appendGateObservedEvent(ctx, envelope.sessionId, gatePayload, gateEventId, finalityDepth, confirmations).eventId;
       if (!existing) {
         ctx.db.sqlite
           .prepare(
@@ -484,16 +491,16 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
           .run(
             gateEventId,
             envelope.sessionId,
-            payload.spendId,
-            payload.event,
-            payload.txHash,
-            payload.logIndex,
-            payload.chainId,
-            payload.blockNumber,
-            payload.currentBlockNumber,
+            gatePayload.spendId,
+            gatePayload.event,
+            gatePayload.txHash,
+            gatePayload.logIndex,
+            gatePayload.chainId,
+            gatePayload.blockNumber,
+            gatePayload.currentBlockNumber,
             finalityDepth,
             confirmations,
-            payload.rawLogHash,
+            gatePayload.rawLogHash,
             observedEventId,
             ctx.clock.now().toISOString(),
             ctx.clock.now().toISOString(),
@@ -508,7 +515,7 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
                SET current_block_number = ?, confirmations = ?, updated_at = ?
                WHERE gate_event_id = ?`,
             )
-            .run(payload.currentBlockNumber, confirmations, ctx.clock.now().toISOString(), gateEventId);
+            .run(gatePayload.currentBlockNumber, confirmations, ctx.clock.now().toISOString(), gateEventId);
         }
         return {
           ok: true,
@@ -516,8 +523,8 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
           evidenceEventId: observedEventId,
           data: {
             gateEventId,
-            spendId: payload.spendId,
-            event: payload.event,
+            spendId: gatePayload.spendId,
+            event: gatePayload.event,
             finalityStatus: "observed_finalizing",
             confirmations,
             finalityDepth,
@@ -532,14 +539,14 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
       const finalizedEventId =
         typeof existing?.finalized_event_id === "string"
           ? existing.finalized_event_id
-          : appendGateFinalizedEvent(ctx, envelope.sessionId, payload, gateEventId, observedEventId, finalityDepth, confirmations).eventId;
+          : appendGateFinalizedEvent(ctx, envelope.sessionId, gatePayload, gateEventId, observedEventId, finalityDepth, confirmations).eventId;
       const finalizeResult = ctx.db.sqlite
         .prepare(
           `UPDATE gate_chain_events
            SET current_block_number = ?, confirmations = ?, status = 'finalized', finalized_event_id = ?, updated_at = ?
            WHERE gate_event_id = ?`,
         )
-        .run(payload.currentBlockNumber, confirmations, finalizedEventId, ctx.clock.now().toISOString(), gateEventId);
+        .run(gatePayload.currentBlockNumber, confirmations, finalizedEventId, ctx.clock.now().toISOString(), gateEventId);
       if (finalizeResult.changes !== 1) {
         throw Object.assign(new Error("finalized gate event did not update the observed gate row"), {
           apiError: proofBlockedError(requestId, "finalized gate event did not update the observed gate row"),
@@ -547,15 +554,15 @@ export async function ingestGateEvent(input: SessionScopedEnvelope, ctx: Service
       }
       ctx.db.sqlite
         .prepare("UPDATE spends SET status = ? WHERE session_id = ? AND spend_id = ?")
-        .run(gateSpendStatus(payload.event, "finalized"), envelope.sessionId, payload.spendId);
+        .run(gateSpendStatus(gatePayload.event, "finalized"), envelope.sessionId, gatePayload.spendId);
       return {
         ok: true,
         requestId,
         evidenceEventId: finalizedEventId,
         data: {
           gateEventId,
-          spendId: payload.spendId,
-          event: payload.event,
+          spendId: gatePayload.spendId,
+          event: gatePayload.event,
           finalityStatus: "finalized",
           confirmations,
           finalityDepth,
@@ -1588,6 +1595,233 @@ function requireFinalizedSettlement(ctx: ServiceCtx, sessionId: string, spendId:
       apiError: proofBlockedError(requestId, "finalized SpendSettled gate proof is internally inconsistent"),
     });
   }
+}
+
+async function verifyGateEventWithChain(
+  ctx: ServiceCtx,
+  payload: {
+    event: "SpendTripped" | "SpendSettled";
+    spendId: string;
+    txHash: string;
+    logIndex: number;
+    chainId: string;
+    blockNumber: number;
+    currentBlockNumber: number;
+    rawLogHash: string;
+    reorged: boolean;
+  },
+  requestId: string,
+): Promise<{ currentBlockNumber: number; confirmations: number }> {
+  let status;
+  try {
+    status = await ctx.chain.status();
+  } catch (error) {
+    throw Object.assign(new Error("chain proof provider readiness check failed"), {
+      apiError: proofPendingError(requestId, chainFailureMessage("chain proof provider readiness check failed", error)),
+    });
+  }
+  if (!status.ready) {
+    throw Object.assign(new Error("chain proof provider is not ready"), {
+      apiError: proofPendingError(requestId, `chain proof provider is not ready: ${status.reason}`),
+    });
+  }
+
+  let currentBlockNumber: number;
+  try {
+    currentBlockNumber = await ctx.chain.getBlockNumber();
+  } catch (error) {
+    throw Object.assign(new Error("failed to read current chain head"), {
+      apiError: proofPendingError(requestId, chainFailureMessage("failed to read current chain head", error)),
+    });
+  }
+  if (!Number.isInteger(currentBlockNumber) || currentBlockNumber < 0) {
+    throw Object.assign(new Error("chain provider returned an invalid current block number"), {
+      apiError: proofBlockedError(requestId, "chain provider returned an invalid current block number", { currentBlockNumber }),
+    });
+  }
+  if (currentBlockNumber < payload.blockNumber) {
+    throw Object.assign(new Error("chain head is behind the claimed gate event block"), {
+      apiError: proofPendingError(requestId, "chain head is behind the claimed gate event block"),
+    });
+  }
+
+  let logs: Record<string, unknown>[];
+  try {
+    logs = await ctx.chain.getLogs({
+      chainId: payload.chainId,
+      blockNumber: payload.blockNumber,
+      txHash: payload.txHash,
+      logIndex: payload.logIndex,
+      event: payload.event,
+      spendId: payload.spendId,
+      rawLogHash: payload.rawLogHash,
+      reorged: payload.reorged,
+    });
+  } catch (error) {
+    throw Object.assign(new Error("failed to re-fetch gate event logs"), {
+      apiError: proofPendingError(requestId, chainFailureMessage("failed to re-fetch gate event logs", error)),
+    });
+  }
+  const matchingLog = logs.find((log) => chainLogMatchesGatePayload(log, payload));
+  if (payload.reorged) {
+    if (matchingLog) {
+      throw Object.assign(new Error("cannot invalidate a gate event that is still present on chain"), {
+        apiError: proofBlockedError(requestId, "cannot invalidate a gate event that is still present on chain"),
+      });
+    }
+    return { currentBlockNumber, confirmations: 0 };
+  }
+
+  let receipt: Record<string, unknown>;
+  try {
+    receipt = await ctx.chain.getTransactionReceipt(payload.txHash);
+  } catch (error) {
+    throw Object.assign(new Error("failed to re-fetch gate transaction receipt"), {
+      apiError: proofPendingError(requestId, chainFailureMessage("failed to re-fetch gate transaction receipt", error)),
+    });
+  }
+  assertReceiptMatchesGatePayload(receipt, payload, requestId);
+  if (!matchingLog) {
+    throw Object.assign(new Error("claimed gate event log was not found on chain"), {
+      apiError: proofPendingError(requestId, "claimed gate event log was not found on chain"),
+    });
+  }
+  const chainRawLogHash = rawLogHashForChainLog(matchingLog);
+  if (chainRawLogHash.toLowerCase() !== payload.rawLogHash.toLowerCase()) {
+    throw Object.assign(new Error("claimed gate event rawLogHash does not match chain log"), {
+      apiError: proofBlockedError(requestId, "claimed gate event rawLogHash does not match chain log", {
+        expected: payload.rawLogHash,
+        actual: chainRawLogHash,
+      }),
+    });
+  }
+  return {
+    currentBlockNumber,
+    confirmations: currentBlockNumber - payload.blockNumber + 1,
+  };
+}
+
+function assertReceiptMatchesGatePayload(
+  receipt: Record<string, unknown>,
+  payload: { txHash: string; blockNumber: number },
+  requestId: string,
+): void {
+  const txHash = optionalHex(receipt.transactionHash ?? receipt.txHash ?? receipt.hash);
+  if (txHash && txHash.toLowerCase() !== payload.txHash.toLowerCase()) {
+    throw Object.assign(new Error("gate transaction receipt hash mismatch"), {
+      apiError: proofBlockedError(requestId, "gate transaction receipt hash mismatch", { expected: payload.txHash, actual: txHash }),
+    });
+  }
+  const blockNumber = optionalChainNumber(receipt.blockNumber);
+  if (blockNumber !== null && blockNumber !== payload.blockNumber) {
+    throw Object.assign(new Error("gate transaction receipt block mismatch"), {
+      apiError: proofBlockedError(requestId, "gate transaction receipt block mismatch", {
+        expected: payload.blockNumber,
+        actual: blockNumber,
+      }),
+    });
+  }
+  const status = receipt.status;
+  if (status === "reverted" || status === "0x0" || status === 0 || status === false) {
+    throw Object.assign(new Error("gate transaction receipt is reverted"), {
+      apiError: proofBlockedError(requestId, "gate transaction receipt is reverted"),
+    });
+  }
+}
+
+function chainLogMatchesGatePayload(
+  log: Record<string, unknown>,
+  payload: {
+    event: "SpendTripped" | "SpendSettled";
+    spendId: string;
+    txHash: string;
+    logIndex: number;
+    chainId: string;
+    blockNumber: number;
+  },
+): boolean {
+  const txHash = optionalHex(log.transactionHash ?? log.txHash);
+  if (txHash && txHash.toLowerCase() !== payload.txHash.toLowerCase()) {
+    return false;
+  }
+  const logIndex = optionalChainNumber(log.logIndex ?? log.index);
+  if (logIndex !== null && logIndex !== payload.logIndex) {
+    return false;
+  }
+  const blockNumber = optionalChainNumber(log.blockNumber);
+  if (blockNumber !== null && blockNumber !== payload.blockNumber) {
+    return false;
+  }
+  const chainId = optionalString(log.chainId);
+  if (chainId && chainId !== payload.chainId) {
+    return false;
+  }
+  const eventName = optionalString(log.eventName ?? log.event);
+  if (eventName && eventName !== payload.event) {
+    return false;
+  }
+  const args = log.args && typeof log.args === "object" ? (log.args as Record<string, unknown>) : {};
+  const spendId = optionalHex(log.spendId ?? args.spendId);
+  return !spendId || spendId.toLowerCase() === payload.spendId.toLowerCase();
+}
+
+function rawLogHashForChainLog(log: Record<string, unknown>): `0x${string}` {
+  const explicit = optionalHex(log.rawLogHash ?? log.logHash);
+  if (explicit && /^0x[0-9a-fA-F]{64}$/.test(explicit)) {
+    return explicit as `0x${string}`;
+  }
+  return hashJson(normalizeChainJson(log));
+}
+
+function normalizeChainJson(value: unknown): JsonValue {
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeChainJson(item));
+  }
+  if (value && typeof value === "object") {
+    const result: Record<string, JsonValue> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      const child = (value as Record<string, unknown>)[key];
+      if (child !== undefined) {
+        result[key] = normalizeChainJson(child);
+      }
+    }
+    return result;
+  }
+  return String(value);
+}
+
+function optionalHex(value: unknown): string | null {
+  return typeof value === "string" && /^0x[0-9a-fA-F]+$/.test(value) ? value : null;
+}
+
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function optionalChainNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value)) {
+    return value;
+  }
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  if (typeof value === "string" && /^[0-9]+$/.test(value)) {
+    return Number(value);
+  }
+  if (typeof value === "string" && /^0x[0-9a-fA-F]+$/.test(value)) {
+    return Number.parseInt(value.slice(2), 16);
+  }
+  return null;
+}
+
+function chainFailureMessage(prefix: string, error: unknown): string {
+  return error instanceof Error ? `${prefix}: ${error.message}` : prefix;
 }
 
 function finalityDepthForSession(session: Row): number {
