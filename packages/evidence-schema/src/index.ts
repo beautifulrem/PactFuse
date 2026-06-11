@@ -262,6 +262,17 @@ export const ArtifactPreflightPayloadSchema = z
   })
   .strict();
 
+export const ArtifactPreflightVerifyPayloadSchema = z
+  .object({
+    preflightId: Hex32Schema,
+    artifactPayloadHash: Hex32Schema,
+    artifactCid: ArtifactCidSchema,
+    manifestFetchHash: Hex32Schema,
+    endpointResponseHash: Hex32Schema,
+    leaseDryRunHash: Hex32Schema,
+  })
+  .strict();
+
 export const QuotePayloadSchema = z
   .object({
     spendId: Hex32Schema,
@@ -439,6 +450,7 @@ export const EvidenceEventKindSchema = z.enum([
   "caw.receipt.ingested.fixture",
   "caw.receipt.ingested.raw",
   "artifact.preflight.pending",
+  "artifact.preflight.verified",
   "artifact.access_token.issued",
   "quote.signed.mocked",
   "quote.signed.chain_settleable",
@@ -620,7 +632,13 @@ export const ArtifactPreflightViewSchema = z
     endpointUrl: z.string().min(1).max(500),
     priceDisclosureHash: Hex32Schema,
     sourceStateSnapshotHash: Hex32Schema,
-    status: z.enum(["pending_live_delivery"]),
+    deliveryProofHash: Hex32Schema.nullable().default(null),
+    manifestFetchHash: Hex32Schema.nullable().default(null),
+    endpointResponseHash: Hex32Schema.nullable().default(null),
+    leaseDryRunHash: Hex32Schema.nullable().default(null),
+    verifiedAt: IsoDateStringSchema.nullable().default(null),
+    verifiedEventId: Hex32Schema.nullable().default(null),
+    status: z.enum(["pending_live_delivery", "passed_live_delivery"]),
     createdAt: IsoDateStringSchema,
   })
   .strict();

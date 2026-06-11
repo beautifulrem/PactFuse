@@ -43,7 +43,7 @@ Purpose: keep implementation aligned with the proof gates. This checklist is not
    - Every CAW receipt must be linked to an ingested raw receipt hash; manual rows are fixtures and cannot pass Judge Check.
 
 6. Artifact API and verifier
-   - `/api/artifacts/preflight` must pass before a quote signer can sign; winner mode requires `chain_settleable_after_preflight`, a quote hash bound to chain/payment/preflight fields, and quote chain/expiry matching the verified token settlement.
+   - `/api/v1/artifacts/preflight` plus `/api/v1/artifacts/preflight/verify` must produce `passed_live_delivery` before a quote signer can sign; winner mode requires `chain_settleable_after_preflight`, a quote hash bound to chain/payment/preflight fields, and quote chain/expiry matching the verified token settlement.
    - Generate Source-Bound Code-Scan MCP Lease receipt pack.
    - Hash artifact payload and receipt pack separately.
    - Include `priceDisclosure` and `deliveryPreflight` in the receipt pack and verify their hashes against displayed UI values.

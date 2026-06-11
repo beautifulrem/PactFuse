@@ -371,6 +371,12 @@ CREATE TABLE IF NOT EXISTS judge_check_rows (
   ensureColumn(sqlite, "spends", "session_commitment", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
   ensureColumn(sqlite, "spends", "spend_preimage_json", "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(sqlite, "artifact_preflights", "artifact_cid", `TEXT NOT NULL DEFAULT '${ZERO_ARTIFACT_CID}'`);
+  ensureColumn(sqlite, "artifact_preflights", "delivery_proof_hash", "TEXT");
+  ensureColumn(sqlite, "artifact_preflights", "manifest_fetch_hash", "TEXT");
+  ensureColumn(sqlite, "artifact_preflights", "endpoint_response_hash", "TEXT");
+  ensureColumn(sqlite, "artifact_preflights", "lease_dry_run_hash", "TEXT");
+  ensureColumn(sqlite, "artifact_preflights", "verified_at", "TEXT");
+  ensureColumn(sqlite, "artifact_preflights", "verified_event_id", "TEXT");
   ensureColumn(sqlite, "quotes", "preflight_id", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);
   ensureColumn(sqlite, "quotes", "artifact_cid", `TEXT NOT NULL DEFAULT '${ZERO_ARTIFACT_CID}'`);
   ensureColumn(sqlite, "quotes", "price_disclosure_hash", `TEXT NOT NULL DEFAULT '${ZERO_HASH}'`);

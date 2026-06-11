@@ -2784,6 +2784,9 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
   if (!latestReplayEvent(eventsById, "token.balance_delta.verified", (event) => replayEventHasLiveChainProofAuthority(event, false))) {
     blockers.push("final verifier requires token.balance_delta.verified proof event from a live chain provider");
   }
+  if (!latestReplayEvent(eventsById, "artifact.preflight.verified", (event) => event.authority === "delivery")) {
+    blockers.push("final verifier requires artifact.preflight.verified delivery event");
+  }
   if (!latestReplayEvent(eventsById, "artifact.access_token.issued", (event) => event.authority === "delivery")) {
     blockers.push("final verifier requires artifact.access_token.issued delivery event");
   }
@@ -3026,6 +3029,75 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     } else if (lowerHex(preflight.artifactHashPreview) !== lowerHex(spend.artifactHash)) {
       errors.push(`artifact preflight ${preflight.preflightId ?? "-"} artifactHashPreview does not match registered spend artifactHash`);
     }
+    if (preflight.status !== "pending_live_delivery" && preflight.status !== "passed_live_delivery") {
+      errors.push(`artifact preflight ${preflight.preflightId ?? "-"} has unsupported status ${preflight.status ?? "-"}`);
+    }
+    if (preflight.status === "passed_live_delivery") {
+      for (const field of [
+        "deliveryProofHash",
+        "manifestFetchHash",
+        "endpointResponseHash",
+        "leaseDryRunHash",
+        "verifiedEventId",
+      ]) {
+        if (!isHex32(preflight[field])) {
+          errors.push(`artifact preflight ${preflight.preflightId ?? "-"} ${field} must be a 32-byte hash after delivery verification`);
+        }
+      }
+      if (typeof preflight.verifiedAt !== "string" || preflight.verifiedAt.length === 0) {
+        errors.push(`artifact preflight ${preflight.preflightId ?? "-"} verifiedAt is required after delivery verification`);
+      }
+      const expectedDeliveryProofHash = safeHashJson(
+        {
+          sessionId: bundle.sessionId,
+          preflightId: preflight.preflightId,
+          spendId: preflight.spendId,
+          artifactPayloadHash: lowerHex(preflight.artifactHashPreview),
+          artifactCid: lowerHex(preflight.artifactCid),
+          endpointUrl: asText(preflight.endpointUrl),
+          priceDisclosureHash: asText(preflight.priceDisclosureHash),
+          sourceStateSnapshotHash: asText(preflight.sourceStateSnapshotHash),
+          manifestFetchHash: lowerHex(preflight.manifestFetchHash),
+          endpointResponseHash: lowerHex(preflight.endpointResponseHash),
+          leaseDryRunHash: lowerHex(preflight.leaseDryRunHash),
+        },
+        `artifact preflight ${preflight.preflightId ?? "-"} delivery proof hash body`,
+        errors,
+      );
+      if (expectedDeliveryProofHash && lowerHex(preflight.deliveryProofHash) !== expectedDeliveryProofHash) {
+        errors.push(`artifact preflight ${preflight.preflightId ?? "-"} deliveryProofHash does not recompute`);
+      }
+      const verifiedEvent = [...eventsById.values()].find(
+        (event) => event.kind === "artifact.preflight.verified" && event.payload?.preflightId === preflight.preflightId,
+      );
+      if (!verifiedEvent || verifiedEvent.authority !== "delivery") {
+        errors.push(`artifact preflight ${preflight.preflightId ?? "-"} requires delivery-authority artifact.preflight.verified event`);
+      } else {
+        if (preflight.verifiedEventId && verifiedEvent.eventId !== preflight.verifiedEventId) {
+          errors.push(`artifact preflight ${preflight.preflightId ?? "-"} verifiedEventId does not match verified event`);
+        }
+        for (const [field, expected] of [
+          ["spendId", preflight.spendId],
+          ["artifactPayloadHash", lowerHex(preflight.artifactHashPreview)],
+          ["artifactCid", lowerHex(preflight.artifactCid)],
+          ["endpointUrl", preflight.endpointUrl],
+          ["priceDisclosureHash", preflight.priceDisclosureHash],
+          ["sourceStateSnapshotHash", preflight.sourceStateSnapshotHash],
+          ["manifestFetchHash", lowerHex(preflight.manifestFetchHash)],
+          ["endpointResponseHash", lowerHex(preflight.endpointResponseHash)],
+          ["leaseDryRunHash", lowerHex(preflight.leaseDryRunHash)],
+          ["deliveryProofHash", lowerHex(preflight.deliveryProofHash)],
+          ["status", "passed_live_delivery"],
+        ]) {
+          if (lowerHex(verifiedEvent.payload?.[field]) !== lowerHex(expected)) {
+            errors.push(`artifact preflight ${preflight.preflightId ?? "-"} verified event payload.${field} does not match preflight`);
+          }
+        }
+        if (verifiedEvent.payload?.proofAuthority !== false || verifiedEvent.payload?.winnerClaimAllowed !== false) {
+          errors.push(`artifact preflight ${preflight.preflightId ?? "-"} verified event must be delivery-only and winnerClaimAllowed=false`);
+        }
+      }
+    }
   }
   for (const quote of quotes) {
     if (!isObject(quote)) {
@@ -3039,6 +3111,9 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     }
     if (quote.spendId !== preflight.spendId) {
       errors.push(`quote ${quote.quoteId ?? "-"} spendId does not match preflight`);
+    }
+    if (preflight.status !== "passed_live_delivery") {
+      errors.push(`quote ${quote.quoteId ?? "-"} references preflight that has not passed live delivery`);
     }
     if (
       lowerHex(quote.artifactCommitment) !== lowerHex(preflight.artifactHashPreview) ||
@@ -3118,6 +3193,33 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
         }
         if (quoteEvent.payload?.proofAuthority !== false || quoteEvent.payload?.winnerClaimAllowed !== false) {
           errors.push(`quote ${quote.quoteId ?? "-"} live quote event must be delivery-only and winnerClaimAllowed=false`);
+        }
+      }
+    } else if (quote.status === MOCK_QUOTE_STATUS) {
+      const quoteEvent = [...eventsById.values()].find((event) => event.kind === "quote.signed.mocked" && event.payload?.quoteId === quote.quoteId);
+      if (!quoteEvent || quoteEvent.authority !== "advisory") {
+        errors.push(`quote ${quote.quoteId ?? "-"} requires advisory quote.signed.mocked event`);
+      } else {
+        for (const [field, expected] of [
+          ["quoteHash", quote.quoteHash],
+          ["spendId", quote.spendId],
+          ["preflightId", quote.preflightId],
+          ["artifactCommitment", lowerHex(quote.artifactCommitment)],
+          ["artifactCid", lowerHex(quote.artifactCid)],
+          ["payer", lowerHex(spend?.payer)],
+          ["agentWallet", lowerHex(spend?.agentWallet)],
+          ["paymentToken", lowerHex(spend?.paymentToken)],
+          ["market", lowerHex(spend?.market)],
+          ["priceAtomic", quote.priceAtomic],
+          ["validUntilBlock", quote.validUntilBlock],
+          ["status", MOCK_QUOTE_STATUS],
+        ]) {
+          if (lowerHex(quoteEvent.payload?.[field]) !== lowerHex(expected)) {
+            errors.push(`quote ${quote.quoteId ?? "-"} mocked event payload.${field} does not match quote/payment binding`);
+          }
+        }
+        if (quoteEvent.payload?.proofAuthority !== false || quoteEvent.payload?.winnerClaimAllowed !== false) {
+          errors.push(`quote ${quote.quoteId ?? "-"} mocked quote event must be advisory and winnerClaimAllowed=false`);
         }
       }
     }

@@ -246,6 +246,12 @@ export const artifactPreflights = sqliteTable("artifact_preflights", {
   endpointUrl: text("endpoint_url").notNull(),
   priceDisclosureHash: text("price_disclosure_hash").notNull(),
   sourceStateSnapshotHash: text("source_state_snapshot_hash").notNull(),
+  deliveryProofHash: text("delivery_proof_hash"),
+  manifestFetchHash: text("manifest_fetch_hash"),
+  endpointResponseHash: text("endpoint_response_hash"),
+  leaseDryRunHash: text("lease_dry_run_hash"),
+  verifiedAt: text("verified_at"),
+  verifiedEventId: text("verified_event_id"),
   status: text("status").notNull(),
   createdAt: text("created_at").notNull(),
 });

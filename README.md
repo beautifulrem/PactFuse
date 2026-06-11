@@ -201,8 +201,9 @@ Important `/api/v1` routes:
 | `POST /api/v1/caw/receipts/ingest` | Ingest raw CAW receipt exports |
 | `POST /api/v1/gate/events/ingest` | Ingest gate/indexer events |
 | `POST /api/v1/token/balance-deltas/verify` | Verify finalized settlement against CAW allowance proof, ERC20 balance deltas, and matching `Transfer` log |
-| `POST /api/v1/artifacts/preflight` | Preflight delivery before quote signing |
-| `POST /api/v1/quotes` | Sign mocked or chain-settleable quotes after preflight |
+| `POST /api/v1/artifacts/preflight` | Create pending delivery preflight evidence |
+| `POST /api/v1/artifacts/preflight/verify` | Verify manifest fetch, endpoint response, and lease dry-run before quote signing |
+| `POST /api/v1/quotes` | Sign mocked or chain-settleable quotes after verified preflight |
 | `POST /api/v1/artifacts/access-token` | Issue bearer-bound artifact access tokens |
 | `POST /api/v1/lease/execute` | Execute clean leases through audited MCP JSON-RPC |
 | `POST /api/v1/mcp/audit` | Record audited MCP adapter calls |

@@ -1382,10 +1382,23 @@ describe("pactfuse-api P0", () => {
 	      "artifactHashPreview",
 	      "artifactCid",
 	      "priceDisclosureHash",
+      "status",
 	      "winnerClaimAllowed",
 	    ]);
     expect(json.paths["/api/v1/artifacts/preflight"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/ArtifactPreflightInput",
+    );
+    expect(json.paths["/api/v1/artifacts/preflight/verify"].post["x-pactfuse-proof-fields"]).toEqual([
+      "preflightId",
+      "deliveryProofHash",
+      "manifestFetchHash",
+      "endpointResponseHash",
+      "leaseDryRunHash",
+      "status",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/artifacts/preflight/verify"].post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ArtifactPreflightVerifyInput",
     );
 	    expect(json.paths["/api/v1/quotes"].post["x-pactfuse-proof-fields"]).toEqual([
 	      "preflightId",
@@ -1708,6 +1721,19 @@ describe("pactfuse-api P0", () => {
     expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.artifactPreflights.items.required).toContain(
       "sourceStateSnapshotHash",
     );
+    expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.artifactPreflights.items.required).toEqual(
+      expect.arrayContaining([
+        "deliveryProofHash",
+        "manifestFetchHash",
+        "endpointResponseHash",
+        "leaseDryRunHash",
+        "verifiedAt",
+        "verifiedEventId",
+      ]),
+    );
+    expect(
+      json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.artifactPreflights.items.properties.status.enum,
+    ).toEqual(["pending_live_delivery", "passed_live_delivery"]);
     expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.quotes.items.required).toContain(
       "quoteHash",
     );
@@ -3361,6 +3387,15 @@ describe("pactfuse-api P0", () => {
         sourceStateSnapshotHash: hex32("overpriced-source-state"),
       },
     });
+    expect(overpricedPreflight.status).toBe(202);
+    await verifyArtifactPreflightForTest(
+      app,
+      overpricedSessionId,
+      overpricedPreflight.json.data.preflightId,
+      TEST_ARTIFACT_HASH,
+      artifactCidForTest(TEST_ARTIFACT_HASH),
+      "overpriced",
+    );
     const overpricedQuote = await post(app, "/api/v1/quotes", {
       sessionId: overpricedSessionId,
       idempotencyKey: "overpriced-quote",
@@ -3391,7 +3426,6 @@ describe("pactfuse-api P0", () => {
       },
     });
 
-    expect(overpricedPreflight.status).toBe(202);
     expect(overpricedQuote.status).toBe(422);
     expect(overpricedQuote.json.error.code).toBe("proof_blocked");
     expect(overpricedQuote.json.error.message).toContain("priceAtomic does not match registered ProcurementGate price");
@@ -3523,6 +3557,115 @@ describe("pactfuse-api P0", () => {
     expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("quote.signed.mocked");
   });
 
+  it("blocks quote signing until artifact preflight passes delivery verification", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-quote-preflight-verify-required");
+    const spendId = await registerSpend(app, sessionId);
+    const artifactHashPreview = TEST_ARTIFACT_HASH;
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "preflight-pending-before-quote",
+      payload: {
+        spendId,
+        artifactHashPreview,
+        artifactCid: artifactCidForTest(artifactHashPreview),
+        endpointUrl: "https://example.com/artifact",
+        priceDisclosureHash: hex32("pending-before-quote-price"),
+        sourceStateSnapshotHash: hex32("pending-before-quote-source"),
+      },
+    });
+
+    const quote = await post(app, "/api/v1/quotes", {
+      sessionId,
+      idempotencyKey: "quote-before-preflight-verify",
+      payload: {
+        spendId,
+        preflightId: preflight.json.data.preflightId,
+        artifactCommitment: artifactHashPreview,
+        priceAtomic: "1000",
+        quoteNonce: "quote-before-preflight-verify",
+        validUntilBlock: "123",
+      },
+    });
+
+    expect(preflight.status).toBe(202);
+    expect(quote.status).toBe(422);
+    expect(quote.json.error.code).toBe("proof_blocked");
+    expect(quote.json.error.message).toContain("artifact preflight is not quote-eligible");
+  });
+
+  it("verifies artifact preflight delivery proof before quote signing", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-preflight-verify-proof");
+    const spendId = await registerSpend(app, sessionId);
+    const artifactHashPreview = TEST_ARTIFACT_HASH;
+    const artifactCid = artifactCidForTest(artifactHashPreview);
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "preflight-verify-proof",
+      payload: {
+        spendId,
+        artifactHashPreview,
+        artifactCid,
+        endpointUrl: "https://example.com/artifact",
+        priceDisclosureHash: hex32("preflight-verify-price"),
+        sourceStateSnapshotHash: hex32("preflight-verify-source"),
+      },
+    });
+    const mismatch = await post(app, "/api/v1/artifacts/preflight/verify", {
+      sessionId,
+      idempotencyKey: "preflight-verify-mismatch",
+      payload: {
+        preflightId: preflight.json.data.preflightId,
+        artifactPayloadHash: hex32("wrong-artifact-payload"),
+        artifactCid,
+        manifestFetchHash: hex32("preflight-verify-manifest"),
+        endpointResponseHash: hex32("preflight-verify-endpoint"),
+        leaseDryRunHash: hex32("preflight-verify-lease"),
+      },
+    });
+    const verify = await verifyArtifactPreflightForTest(
+      app,
+      sessionId,
+      preflight.json.data.preflightId,
+      artifactHashPreview,
+      artifactCid,
+      "preflight-verify-proof",
+    );
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const verifiedEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "artifact.preflight.verified");
+    const preflightView = replayJson.data.artifactPreflights.find(
+      (row: { preflightId: string }) => row.preflightId === preflight.json.data.preflightId,
+    );
+
+    expect(mismatch.status).toBe(422);
+    expect(mismatch.json.error.code).toBe("proof_blocked");
+    expect(verify.json.data.deliveryProofHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(preflightView).toEqual(
+      expect.objectContaining({
+        preflightId: preflight.json.data.preflightId,
+        status: "passed_live_delivery",
+        deliveryProofHash: verify.json.data.deliveryProofHash,
+        manifestFetchHash: hex32("preflight-verify-proof-manifest-fetch"),
+        endpointResponseHash: hex32("preflight-verify-proof-endpoint-response"),
+        leaseDryRunHash: hex32("preflight-verify-proof-lease-dry-run"),
+        verifiedEventId: verify.json.evidenceEventId,
+      }),
+    );
+    expect(verifiedEvent).toEqual(
+      expect.objectContaining({
+        authority: "delivery",
+        payload: expect.objectContaining({
+          preflightId: preflight.json.data.preflightId,
+          deliveryProofHash: verify.json.data.deliveryProofHash,
+          status: "passed_live_delivery",
+          winnerClaimAllowed: false,
+        }),
+      }),
+    );
+  });
+
   it("binds mocked quote signing to the matching artifact preflight", async () => {
     const { app, ctx } = makeApp();
     const sessionId = await createSession(app, "sess-quote-preflight-bound");
@@ -3543,6 +3686,14 @@ describe("pactfuse-api P0", () => {
         sourceStateSnapshotHash,
       },
     });
+    await verifyArtifactPreflightForTest(
+      app,
+      sessionId,
+      preflight.json.data.preflightId,
+      artifactHashPreview,
+      artifactCidForTest(artifactHashPreview),
+      "preflight-before-quote",
+    );
     const quote = await post(app, "/api/v1/quotes", {
       sessionId,
       idempotencyKey: "quote-after-preflight",
@@ -3631,6 +3782,14 @@ describe("pactfuse-api P0", () => {
         sourceStateSnapshotHash: hex32("live-quote-provider-source"),
       },
     });
+    await verifyArtifactPreflightForTest(
+      app,
+      sessionId,
+      preflight.json.data.preflightId,
+      artifactHashPreview,
+      artifactCidForTest(artifactHashPreview),
+      "live-quote-provider",
+    );
 
     const quote = await post(app, "/api/v1/quotes", {
       sessionId,
@@ -3672,6 +3831,14 @@ describe("pactfuse-api P0", () => {
         sourceStateSnapshotHash: hex32("live-quote-bound-source"),
       },
     });
+    await verifyArtifactPreflightForTest(
+      app,
+      sessionId,
+      preflight.json.data.preflightId,
+      artifactHashPreview,
+      artifactCidForTest(artifactHashPreview),
+      "live-quote-bound",
+    );
     const quote = await post(app, "/api/v1/quotes", {
       sessionId,
       idempotencyKey: "live-quote-bound",
@@ -3737,6 +3904,14 @@ describe("pactfuse-api P0", () => {
         sourceStateSnapshotHash: hex32("source-state-mismatch"),
       },
     });
+    await verifyArtifactPreflightForTest(
+      app,
+      sessionId,
+      preflight.json.data.preflightId,
+      artifactHashPreview,
+      artifactCidForTest(artifactHashPreview),
+      "preflight-mismatch",
+    );
 
     const quote = await post(app, "/api/v1/quotes", {
       sessionId,
@@ -3794,6 +3969,14 @@ describe("pactfuse-api P0", () => {
         sourceStateSnapshotHash: hex32("refund-source-state"),
       },
     });
+    await verifyArtifactPreflightForTest(
+      app,
+      sessionId,
+      preflight.json.data.preflightId,
+      artifactHashPreview,
+      artifactCidForTest(artifactHashPreview),
+      "refund",
+    );
     const quote = await post(app, "/api/v1/quotes", {
       sessionId,
       idempotencyKey: "refund-quote",
@@ -3876,6 +4059,14 @@ describe("pactfuse-api P0", () => {
         sourceStateSnapshotHash: hex32("exclusive-source-state"),
       },
     });
+    await verifyArtifactPreflightForTest(
+      app,
+      sessionId,
+      preflight.json.data.preflightId,
+      artifactHash,
+      artifactCidForTest(artifactHash),
+      "exclusive",
+    );
     const quote = await post(app, "/api/v1/quotes", {
       sessionId,
       idempotencyKey: "exclusive-quote",
@@ -3927,6 +4118,14 @@ describe("pactfuse-api P0", () => {
         sourceStateSnapshotHash: hex32("exclusive-second-source-state"),
       },
     });
+    await verifyArtifactPreflightForTest(
+      app,
+      secondSessionId,
+      secondPreflight.json.data.preflightId,
+      secondArtifactHash,
+      artifactCidForTest(secondArtifactHash),
+      "exclusive-second",
+    );
     const secondQuote = await post(app, "/api/v1/quotes", {
       sessionId: secondSessionId,
       idempotencyKey: "exclusive-second-quote",
@@ -7777,6 +7976,31 @@ function artifactCidForTest(artifactHash: string): string {
   return `sha256:${artifactHash.toLowerCase()}`;
 }
 
+async function verifyArtifactPreflightForTest(
+  app: ReturnType<typeof createApp>,
+  sessionId: string,
+  preflightId: string,
+  artifactHash: string,
+  artifactCid: string,
+  seed: string,
+) {
+  const verify = await post(app, "/api/v1/artifacts/preflight/verify", {
+    sessionId,
+    idempotencyKey: `${seed}-preflight-verify`,
+    payload: {
+      preflightId,
+      artifactPayloadHash: artifactHash,
+      artifactCid,
+      manifestFetchHash: hex32(`${seed}-manifest-fetch`),
+      endpointResponseHash: hex32(`${seed}-endpoint-response`),
+      leaseDryRunHash: hex32(`${seed}-lease-dry-run`),
+    },
+  });
+  expect(verify.status).toBe(202);
+  expect(verify.json.data.status).toBe("passed_live_delivery");
+  return verify;
+}
+
 function artifactPayloadForTest(seed: string): Record<string, unknown> {
   return seed === "artifact" ? { ...TEST_ARTIFACT_PAYLOAD } : { artifactType: "source-bound-code-scan-mcp-lease", seed, content: `scan:${seed}` };
 }
@@ -7810,6 +8034,7 @@ async function quoteArtifactForTest(
     },
   });
   expect(preflight.status).toBe(202);
+  await verifyArtifactPreflightForTest(app, sessionId, preflight.json.data.preflightId, artifactHash, artifactCid, seed);
   const quote = await post(app, "/api/v1/quotes", {
     sessionId,
     idempotencyKey: `${seed}-quote`,

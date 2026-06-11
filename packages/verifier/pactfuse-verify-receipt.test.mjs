@@ -916,8 +916,25 @@ function replayBundle() {
 	  const artifactPayload = { artifactType: "source-bound-code-scan-mcp-lease", content: "scan-result" };
 	  const artifactHash = hashJson(artifactPayload);
 	  const artifactCid = `sha256:${artifactHash}`;
+  const artifactEndpointUrl = "https://example.com/artifact.json";
 	  const priceDisclosureHash = hex32("price-disclosure");
 	  const sourceStateSnapshotHash = hex32("source-state");
+  const manifestFetchHash = hex32("manifest-fetch");
+  const endpointResponseHash = hex32("endpoint-response");
+  const leaseDryRunHash = hex32("lease-dry-run");
+  const deliveryProofHash = hashJson({
+    sessionId,
+    preflightId,
+    spendId,
+    artifactPayloadHash: artifactHash,
+    artifactCid,
+    endpointUrl: artifactEndpointUrl,
+    priceDisclosureHash,
+    sourceStateSnapshotHash,
+    manifestFetchHash,
+    endpointResponseHash,
+    leaseDryRunHash,
+  });
   const agentWallet = "0x1000000000000000000000000000000000000001";
   const paymentToken = "0x4000000000000000000000000000000000000004";
   const market = "0x5000000000000000000000000000000000000005";
@@ -982,10 +999,16 @@ function replayBundle() {
 	        spendId,
 	        artifactHashPreview: artifactHash,
 	        artifactCid,
-	        endpointUrl: "https://example.com/artifact.json",
+	        endpointUrl: artifactEndpointUrl,
 	        priceDisclosureHash,
 	        sourceStateSnapshotHash,
-	        status: "pending_live_delivery",
+        deliveryProofHash,
+        manifestFetchHash,
+        endpointResponseHash,
+        leaseDryRunHash,
+        verifiedAt: "2026-06-11T00:00:02.050Z",
+        verifiedEventId: ZERO_HASH,
+	        status: "passed_live_delivery",
 	        createdAt,
 	      },
 	    ],
@@ -1078,6 +1101,56 @@ function replayBundle() {
     ...bundle.events,
     {
       eventSeq: bundle.events.length + 1,
+      authority: "delivery",
+      kind: "artifact.preflight.verified",
+      payload: {
+        preflightId,
+        spendId,
+        artifactPayloadHash: artifactHash,
+        artifactCid,
+        endpointUrl: artifactEndpointUrl,
+        priceDisclosureHash,
+        sourceStateSnapshotHash,
+        manifestFetchHash,
+        endpointResponseHash,
+        leaseDryRunHash,
+        deliveryProofHash,
+        status: "passed_live_delivery",
+        proofAuthority: false,
+        winnerClaimAllowed: false,
+      },
+      createdAt,
+    },
+    {
+      eventSeq: bundle.events.length + 2,
+      authority: "advisory",
+      kind: "quote.signed.mocked",
+      payload: {
+        quoteId,
+        quoteHash,
+        spendId,
+        preflightId,
+        artifactCommitment: artifactHash,
+        artifactCid,
+        payer: agentWallet.toLowerCase(),
+        agentWallet: agentWallet.toLowerCase(),
+        paymentToken: paymentToken.toLowerCase(),
+        market: market.toLowerCase(),
+        priceAtomic: "1000",
+        validUntilBlock: "1000000",
+        priceDisclosureHash,
+        sourceStateSnapshotHash,
+        quoteSignedAfterPreflight: true,
+        status: "mocked_after_preflight_not_chain_settleable",
+        modes: lockedRuntimeModes(),
+        chainId: null,
+        proofAuthority: false,
+        winnerClaimAllowed: false,
+      },
+      createdAt,
+    },
+    {
+      eventSeq: bundle.events.length + 3,
       authority: "proof",
       kind: "gate.spend_settled",
       payload: {
@@ -1119,6 +1192,8 @@ function replayBundle() {
     },
   ];
   sealReplayBundleForTest(bundle);
+  bundle.artifactPreflights[0].verifiedEventId = bundle.events.find((event) => event.kind === "artifact.preflight.verified").eventId;
+  refreshReplayPagingForTest(bundle);
   const gateEvent = bundle.events.find((event) => event.kind === "gate.spend_settled");
   const cawCalls = appendCawLiveContractCallsForTest(bundle);
   const auditUsage = appendCawLiveAuditUsageEventsForTest(bundle, cawCalls);

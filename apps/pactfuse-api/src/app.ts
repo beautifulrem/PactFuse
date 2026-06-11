@@ -47,6 +47,7 @@ import {
   submitCawLiveTransfer,
   syncCawLiveAudit,
   syncCawLivePact,
+  verifyArtifactPreflight,
   verifyCawAllowance,
   verifyTokenBalanceDelta,
   verifyEvidenceForSession,
@@ -79,6 +80,7 @@ const ROUTES = [
   { method: "POST", path: "/api/v1/token/balance-deltas/verify", okStatus: 202 },
   { method: "POST", path: "/api/v1/indexer/backfill", okStatus: 202 },
   { method: "POST", path: "/api/v1/artifacts/preflight", okStatus: 202 },
+  { method: "POST", path: "/api/v1/artifacts/preflight/verify", okStatus: 202 },
   { method: "POST", path: "/api/v1/quotes", okStatus: 201 },
   { method: "POST", path: "/api/v1/artifacts/access-token", okStatus: 202 },
   { method: "GET", path: "/api/v1/artifacts/{sessionId}/{spendId}/{payer}/{artifactHash}", okStatus: 200 },
@@ -206,7 +208,16 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "winnerClaimAllowed",
   ],
   "/api/v1/indexer/backfill": ["cursor.status", "cursor.lastIndexedBlock", "insertedLogCount", "proofAuthority", "winnerClaimAllowed"],
-  "/api/v1/artifacts/preflight": ["preflightId", "artifactHashPreview", "artifactCid", "priceDisclosureHash", "winnerClaimAllowed"],
+  "/api/v1/artifacts/preflight": ["preflightId", "artifactHashPreview", "artifactCid", "priceDisclosureHash", "status", "winnerClaimAllowed"],
+  "/api/v1/artifacts/preflight/verify": [
+    "preflightId",
+    "deliveryProofHash",
+    "manifestFetchHash",
+    "endpointResponseHash",
+    "leaseDryRunHash",
+    "status",
+    "winnerClaimAllowed",
+  ],
   "/api/v1/quotes": ["preflightId", "artifactCid", "quoteSignedAfterPreflight", "priceDisclosureHash", "status", "chainId", "winnerClaimAllowed"],
   "/api/v1/artifacts/access-token": [
     "tokenId",
@@ -457,6 +468,11 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.post("/api/v1/artifacts/preflight", async (c) => {
     authorizeApiRole(c, ctx, "operator");
     return send(c, await runArtifactPreflight(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
+  });
+
+  app.post("/api/v1/artifacts/preflight/verify", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    return send(c, await verifyArtifactPreflight(SessionScopedEnvelopeSchema.parse(await readJson(c)), ctx), 202);
   });
 
   app.post("/api/v1/quotes", async (c) => {
@@ -1043,6 +1059,20 @@ function buildOpenApi(): Record<string, unknown> {
             sourceStateSnapshotHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
           },
         },
+        ArtifactPreflightVerifyInput: sessionEnvelopeSchema("#/components/schemas/ArtifactPreflightVerifyPayload"),
+        ArtifactPreflightVerifyPayload: {
+          type: "object",
+          required: ["preflightId", "artifactPayloadHash", "artifactCid", "manifestFetchHash", "endpointResponseHash", "leaseDryRunHash"],
+          additionalProperties: false,
+          properties: {
+            preflightId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            artifactPayloadHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            artifactCid: { type: "string", pattern: "^sha256:0x[0-9a-fA-F]{64}$" },
+            manifestFetchHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            endpointResponseHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            leaseDryRunHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+          },
+        },
         QuoteInput: sessionEnvelopeSchema("#/components/schemas/QuotePayload"),
         QuotePayload: {
           type: "object",
@@ -1534,7 +1564,13 @@ function buildOpenApi(): Record<string, unknown> {
             artifactCid: { type: "string", pattern: "^sha256:0x[0-9a-fA-F]{64}$" },
             priceDisclosureHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             sourceStateSnapshotHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
-            status: { enum: ["pending_live_delivery"] },
+            deliveryProofHash: nullable({ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }),
+            manifestFetchHash: nullable({ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }),
+            endpointResponseHash: nullable({ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }),
+            leaseDryRunHash: nullable({ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }),
+            verifiedAt: nullable({ type: "string", format: "date-time" }),
+            verifiedEventId: nullable({ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }),
+            status: { enum: ["pending_live_delivery", "passed_live_delivery"] },
             winnerClaimAllowed: { const: false },
           },
         }),
@@ -1908,6 +1944,12 @@ function buildOpenApi(): Record<string, unknown> {
                   "endpointUrl",
                   "priceDisclosureHash",
                   "sourceStateSnapshotHash",
+                  "deliveryProofHash",
+                  "manifestFetchHash",
+                  "endpointResponseHash",
+                  "leaseDryRunHash",
+                  "verifiedAt",
+                  "verifiedEventId",
                   "status",
                   "createdAt",
                 ],
@@ -1920,7 +1962,13 @@ function buildOpenApi(): Record<string, unknown> {
                   endpointUrl: { type: "string" },
                   priceDisclosureHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
                   sourceStateSnapshotHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
-                  status: { enum: ["pending_live_delivery"] },
+                  deliveryProofHash: nullable({ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }),
+                  manifestFetchHash: nullable({ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }),
+                  endpointResponseHash: nullable({ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }),
+                  leaseDryRunHash: nullable({ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }),
+                  verifiedAt: nullable({ type: "string", format: "date-time" }),
+                  verifiedEventId: nullable({ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }),
+                  status: { enum: ["pending_live_delivery", "passed_live_delivery"] },
                   createdAt: { type: "string", format: "date-time" },
                 },
               },
@@ -2420,6 +2468,9 @@ function requestBodySchemaFor(method: string, path: string): Record<string, unkn
   if (path === "/api/v1/artifacts/preflight") {
     return jsonRequestBody({ $ref: "#/components/schemas/ArtifactPreflightInput" });
   }
+  if (path === "/api/v1/artifacts/preflight/verify") {
+    return jsonRequestBody({ $ref: "#/components/schemas/ArtifactPreflightVerifyInput" });
+  }
   if (path === "/api/v1/quotes") {
     return jsonRequestBody({ $ref: "#/components/schemas/QuoteInput" });
   }
@@ -2526,6 +2577,7 @@ function apiRoleForPath(path: string): ApiRole | null {
     case "/api/v1/indexer/backfill":
     case "/api/v1/token/balance-deltas/verify":
     case "/api/v1/artifacts/preflight":
+    case "/api/v1/artifacts/preflight/verify":
     case "/api/v1/evidence/verify":
     case "/api/v1/evidence/claim-readiness":
     case "/api/v1/evidence/live-preflight":
@@ -2603,6 +2655,10 @@ function sessionEnvelopeSchema(payloadRef: string): Record<string, unknown> {
   };
 }
 
+function nullable(schema: Record<string, unknown>): Record<string, unknown> {
+  return { oneOf: [schema, { type: "null" }] };
+}
+
 function responseSchemaFor(path: string): Record<string, unknown> {
   switch (path) {
     case "/api/v1/evidence/verify":
@@ -2625,6 +2681,7 @@ function responseSchemaFor(path: string): Record<string, unknown> {
     case "/api/v1/indexer/backfill":
       return { $ref: "#/components/schemas/ChainIndexerBackfillResponse" };
     case "/api/v1/artifacts/preflight":
+    case "/api/v1/artifacts/preflight/verify":
       return { $ref: "#/components/schemas/ArtifactPreflightResponse" };
     case "/api/v1/quotes":
       return { $ref: "#/components/schemas/QuoteResponse" };

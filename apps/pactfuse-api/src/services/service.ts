@@ -4,6 +4,7 @@ import {
   ArtifactPreflightViewSchema,
   ArtifactAccessIssuePayloadSchema,
   ArtifactPreflightPayloadSchema,
+  ArtifactPreflightVerifyPayloadSchema,
   ArtifactRefundPayloadSchema,
   ClaimReadinessViewSchema,
   CawOperationBuildPayloadSchema,
@@ -3385,6 +3386,135 @@ export async function runArtifactPreflight(input: SessionScopedEnvelope, ctx: Se
   });
 }
 
+export async function verifyArtifactPreflight(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
+  const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
+  const payload = parseStrict(ArtifactPreflightVerifyPayloadSchema, envelope.payload);
+  return withIdempotency(ctx, scoped("artifacts:preflight:verify", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
+    assertSession(ctx, envelope.sessionId, requestId);
+    const preflight = ctx.db.sqlite
+      .prepare(
+        `SELECT *
+         FROM artifact_preflights
+         WHERE session_id = ? AND preflight_id = ?`,
+      )
+      .get(envelope.sessionId, payload.preflightId) as Row | undefined;
+    if (!preflight) {
+      throw Object.assign(new Error("artifact preflight not found"), { apiError: notFoundError(requestId, "artifact preflight") });
+    }
+    if (preflight.status !== "pending_live_delivery") {
+      throw Object.assign(new Error("artifact preflight is not pending verification"), {
+        apiError: proofBlockedError(requestId, "artifact preflight is not pending verification", {
+          status: String(preflight.status),
+        }),
+      });
+    }
+    if (String(preflight.artifact_hash_preview).toLowerCase() !== payload.artifactPayloadHash.toLowerCase()) {
+      throw Object.assign(new Error("artifact delivery payload hash does not match preflight preview"), {
+        apiError: proofBlockedError(requestId, "artifact delivery payload hash does not match preflight preview", {
+          expected: String(preflight.artifact_hash_preview).toLowerCase(),
+          actual: payload.artifactPayloadHash.toLowerCase(),
+        }),
+      });
+    }
+    if (String(preflight.artifact_cid).toLowerCase() !== payload.artifactCid.toLowerCase()) {
+      throw Object.assign(new Error("artifact delivery CID does not match preflight CID"), {
+        apiError: proofBlockedError(requestId, "artifact delivery CID does not match preflight CID", {
+          expected: String(preflight.artifact_cid).toLowerCase(),
+          actual: payload.artifactCid.toLowerCase(),
+        }),
+      });
+    }
+    const verifiedAt = ctx.clock.now().toISOString();
+    const manifestFetchHash = payload.manifestFetchHash.toLowerCase();
+    const endpointResponseHash = payload.endpointResponseHash.toLowerCase();
+    const leaseDryRunHash = payload.leaseDryRunHash.toLowerCase();
+    const deliveryProofHash = hashJson({
+      sessionId: envelope.sessionId,
+      preflightId: payload.preflightId,
+      spendId: String(preflight.spend_id),
+      artifactPayloadHash: payload.artifactPayloadHash.toLowerCase(),
+      artifactCid: payload.artifactCid.toLowerCase(),
+      endpointUrl: String(preflight.endpoint_url),
+      priceDisclosureHash: String(preflight.price_disclosure_hash),
+      sourceStateSnapshotHash: String(preflight.source_state_snapshot_hash),
+      manifestFetchHash,
+      endpointResponseHash,
+      leaseDryRunHash,
+    });
+    const event = withImmediateTransaction(ctx, () => {
+      const writtenEvent = appendEvidenceEvent(ctx, {
+        sessionId: envelope.sessionId,
+        authority: "delivery",
+        kind: "artifact.preflight.verified",
+        payload: {
+          preflightId: payload.preflightId,
+          spendId: String(preflight.spend_id),
+          artifactPayloadHash: payload.artifactPayloadHash.toLowerCase(),
+          artifactCid: payload.artifactCid.toLowerCase(),
+          endpointUrl: String(preflight.endpoint_url),
+          priceDisclosureHash: String(preflight.price_disclosure_hash),
+          sourceStateSnapshotHash: String(preflight.source_state_snapshot_hash),
+          manifestFetchHash,
+          endpointResponseHash,
+          leaseDryRunHash,
+          deliveryProofHash,
+          status: "passed_live_delivery",
+          proofAuthority: false,
+          winnerClaimAllowed: false,
+        },
+      });
+      const update = ctx.db.sqlite
+        .prepare(
+          `UPDATE artifact_preflights
+           SET status = 'passed_live_delivery',
+               delivery_proof_hash = ?,
+               manifest_fetch_hash = ?,
+               endpoint_response_hash = ?,
+               lease_dry_run_hash = ?,
+               verified_at = ?,
+               verified_event_id = ?
+           WHERE session_id = ? AND preflight_id = ? AND status = 'pending_live_delivery'`,
+        )
+        .run(
+          deliveryProofHash,
+          manifestFetchHash,
+          endpointResponseHash,
+          leaseDryRunHash,
+          verifiedAt,
+          writtenEvent.eventId,
+          envelope.sessionId,
+          payload.preflightId,
+        );
+      if (update.changes !== 1) {
+        throw Object.assign(new Error("artifact preflight is no longer pending verification"), {
+          apiError: proofBlockedError(requestId, "artifact preflight is no longer pending verification", {
+            preflightId: payload.preflightId,
+          }),
+        });
+      }
+      return writtenEvent;
+    });
+    return {
+      ok: true,
+      requestId,
+      evidenceEventId: event.eventId,
+      data: {
+        preflightId: payload.preflightId,
+        artifactHashPreview: String(preflight.artifact_hash_preview),
+        artifactCid: String(preflight.artifact_cid),
+        priceDisclosureHash: String(preflight.price_disclosure_hash),
+        sourceStateSnapshotHash: String(preflight.source_state_snapshot_hash),
+        deliveryProofHash,
+        manifestFetchHash,
+        endpointResponseHash,
+        leaseDryRunHash,
+        status: "passed_live_delivery",
+        winnerClaimAllowed: false,
+      },
+    };
+  });
+}
+
 export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: ServiceCtx): Promise<ServiceResult<unknown>> {
   const envelope = parseStrict(SessionScopedEnvelopeSchema, input);
   const payload = parseStrict(QuotePayloadSchema, envelope.payload);
@@ -5647,6 +5777,7 @@ export function appendEvidenceEvent(
       | "caw.receipt.ingested.fixture"
       | "caw.receipt.ingested.raw"
       | "artifact.preflight.pending"
+      | "artifact.preflight.verified"
       | "artifact.access_token.issued"
       | "quote.signed.mocked"
       | "quote.signed.chain_settleable"
@@ -9589,7 +9720,8 @@ function requireQuotePreflight(
 ): Row {
   const preflight = ctx.db.sqlite
     .prepare(
-      `SELECT preflight_id, spend_id, artifact_hash_preview, artifact_cid, price_disclosure_hash, source_state_snapshot_hash, status
+      `SELECT preflight_id, spend_id, artifact_hash_preview, artifact_cid, price_disclosure_hash, source_state_snapshot_hash,
+              delivery_proof_hash, manifest_fetch_hash, endpoint_response_hash, lease_dry_run_hash, verified_at, verified_event_id, status
        FROM artifact_preflights
        WHERE session_id = ? AND preflight_id = ? AND spend_id = ?`,
     )
@@ -9599,7 +9731,7 @@ function requireQuotePreflight(
       apiError: proofPendingError(requestId, "artifact preflight is required before quote signing"),
     });
   }
-  if (preflight.status !== "pending_live_delivery") {
+  if (preflight.status !== "passed_live_delivery") {
     throw Object.assign(new Error("artifact preflight is not quote-eligible"), {
       apiError: proofBlockedError(requestId, "artifact preflight is not quote-eligible", {
         status: String(preflight.status),
@@ -9796,7 +9928,7 @@ function requireArtifactQuoteBinding(
     .get(sessionId, input.spendId, String(quote.preflight_id)) as Row | undefined;
   if (
     !preflight ||
-    preflight.status !== "pending_live_delivery" ||
+    preflight.status !== "passed_live_delivery" ||
     String(preflight.artifact_hash_preview).toLowerCase() !== input.artifactHash.toLowerCase() ||
     String(preflight.artifact_cid).toLowerCase() !== artifactCid.toLowerCase()
   ) {
@@ -10024,6 +10156,12 @@ function listArtifactPreflights(ctx: ServiceCtx, sessionId: string, limit: numbe
       endpointUrl: row.endpoint_url,
       priceDisclosureHash: row.price_disclosure_hash,
       sourceStateSnapshotHash: row.source_state_snapshot_hash,
+      deliveryProofHash: row.delivery_proof_hash ?? null,
+      manifestFetchHash: row.manifest_fetch_hash ?? null,
+      endpointResponseHash: row.endpoint_response_hash ?? null,
+      leaseDryRunHash: row.lease_dry_run_hash ?? null,
+      verifiedAt: row.verified_at ?? null,
+      verifiedEventId: row.verified_event_id ?? null,
       status: row.status,
       createdAt: row.created_at,
     }),

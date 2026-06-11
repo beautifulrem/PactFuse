@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { ArtifactAccessIssuePayloadSchema, ArtifactCidSchema, ArtifactPreflightPayloadSchema } from "./index.js";
+import {
+  ArtifactAccessIssuePayloadSchema,
+  ArtifactCidSchema,
+  ArtifactPreflightPayloadSchema,
+  ArtifactPreflightVerifyPayloadSchema,
+} from "./index.js";
 
 const HEX_A = `0x${"a".repeat(64)}`;
 const HEX_B = `0x${"B".repeat(64)}`;
@@ -27,6 +32,20 @@ describe("artifact evidence schemas", () => {
 
     expect(ArtifactPreflightPayloadSchema.parse(payload)).toEqual(payload);
     expect(() => ArtifactPreflightPayloadSchema.parse({ ...payload, artifactCid: undefined })).toThrow();
+  });
+
+  it("requires delivery proof hashes on artifact preflight verify payloads", () => {
+    const payload = {
+      preflightId: HEX_A,
+      artifactPayloadHash: HEX_A,
+      artifactCid: `sha256:${HEX_A}`,
+      manifestFetchHash: HEX_A,
+      endpointResponseHash: HEX_A,
+      leaseDryRunHash: HEX_A,
+    };
+
+    expect(ArtifactPreflightVerifyPayloadSchema.parse(payload)).toEqual(payload);
+    expect(() => ArtifactPreflightVerifyPayloadSchema.parse({ ...payload, manifestFetchHash: undefined })).toThrow();
   });
 
   it("requires quote binding and payload bytes for artifact access issuance", () => {
