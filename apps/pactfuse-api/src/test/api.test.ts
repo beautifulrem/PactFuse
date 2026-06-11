@@ -795,6 +795,8 @@ describe("pactfuse-api P0", () => {
       "artifactHash",
       "transcriptHash",
       "leaseRunHash",
+      "boundedToPinnedManifest",
+      "manifestBindingHash",
       "winnerClaimAllowed",
     ]);
     expect(json.paths["/api/v1/lease/execute"].post.parameters).toEqual([
@@ -975,9 +977,7 @@ describe("pactfuse-api P0", () => {
     expect(json.components.schemas.AgentTranscriptResponse.oneOf[0].properties.data.properties.format.const).toBe(
       "mcp-json-rpc",
     );
-    expect(
-      json.components.schemas.AgentTranscriptResponse.oneOf[0].properties.data.properties.boundedToPinnedManifest.const,
-    ).toBe(false);
+    expect(json.components.schemas.AgentTranscriptResponse.oneOf[0].properties.data.properties.boundedToPinnedManifest.type).toBe("boolean");
     expect(json.components.schemas.FailClosedProofState.properties.proofChipAllowed.const).toBe(false);
     expect(json.components.schemas.FailClosedProofState.properties.winnerClaimAllowed.const).toBe(false);
     expect(json.components.schemas.FailClosedProofState.properties.finalVerifierComplete.const).toBe(false);
@@ -1149,7 +1149,7 @@ describe("pactfuse-api P0", () => {
         sourceHash: upperSourceHash,
         manifestUrl: "https://example.com/manifest.json",
         manifestHash: hex32("manifest"),
-        capabilityVector: { has_write_file: false },
+        capabilityVector: defaultSourceCapabilityForTest(),
       },
     });
     const spendId = await computeSpendIdForTest(app, sessionId, [upperSourceHash]);
@@ -4528,6 +4528,8 @@ describe("pactfuse-api P0", () => {
         toolsCallHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
         outputHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
         leaseRunHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        boundedToPinnedManifest: true,
+        manifestBindingHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
         settlementEventId: issued.json.data.settlementEventId,
         status: "succeeded_live_mcp_transcript",
         winnerClaimAllowed: false,
@@ -4535,6 +4537,7 @@ describe("pactfuse-api P0", () => {
     );
     expect(transcriptJson.data.status).toBe("summarized");
     expect(transcriptJson.data.callCount).toBe(2);
+    expect(transcriptJson.data.boundedToPinnedManifest).toBe(true);
     expect(transcriptJson.data.calls.map((call: { toolName: string }) => call.toolName)).toEqual(["tools/list", "tools/call"]);
     expect(heartbeatJson.data).toEqual(
       expect.objectContaining({
@@ -4551,7 +4554,7 @@ describe("pactfuse-api P0", () => {
         sourceId: "clean-source",
         sourceHash: hex32("source"),
         manifestHash: hex32("manifest"),
-        capabilityVector: { has_write_file: false },
+        capabilityVector: defaultSourceCapabilityForTest(),
         proofStatus: "pending",
       }),
     ]);
@@ -4588,6 +4591,8 @@ describe("pactfuse-api P0", () => {
         leaseRunId: lease.json.data.leaseRunId,
         transcriptHash: lease.json.data.transcriptHash,
         leaseRunHash: lease.json.data.leaseRunHash,
+        boundedToPinnedManifest: true,
+        manifestBindingHash: lease.json.data.manifestBindingHash,
         status: "succeeded_live_mcp_transcript",
         winnerClaimAllowed: false,
       }),
@@ -4675,6 +4680,77 @@ describe("pactfuse-api P0", () => {
       expect(lease.json.data.status).toBe("succeeded_live_mcp_transcript");
       expect(tokenRow.status).toBe("consumed");
       expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/call"]);
+    } finally {
+      await mcp.close();
+    }
+  });
+
+  it("blocks live MCP lease execution before tools/call when tools/list diverges from the pinned source manifest", async () => {
+    const mcp = await startMcpJsonRpcServer((request) => {
+      if (request.method === "tools/list") {
+        return {
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { tools: [leaseToolDefinitionForTest("pactfuse_code_scan")] },
+        };
+      }
+      return {
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { content: [{ type: "text", text: "should-not-run" }] },
+      };
+    });
+    try {
+      const logs: Array<Record<string, unknown>> = [];
+      const { app, ctx } = makeApp(":memory:", {
+        chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }),
+        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
+      });
+      const sessionId = await createSession(app, "sess-lease-pinned-manifest-mismatch");
+      const spendId = await registerSpend(app, sessionId, defaultSourceCapabilityForTest("pactfuse_other_scan"));
+      const payer = "0x1234";
+      const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-pinned-manifest-mismatch");
+      await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-pinned-manifest-mismatch");
+      const issued = await post(app, "/api/v1/artifacts/access-token", {
+        sessionId,
+        idempotencyKey: "issue-pinned-manifest-mismatch-token",
+        payload: {
+          spendId,
+          payer,
+          quoteId: quoted.quoteId,
+          artifactHash: quoted.artifactHash,
+          artifactPayload: quoted.artifactPayload,
+        },
+      });
+      const lease = await post(
+        app,
+        "/api/v1/lease/execute",
+        {
+          sessionId,
+          idempotencyKey: "lease-pinned-manifest-mismatch",
+          payload: {
+            spendId,
+            payer,
+            artifactHash: quoted.artifactHash,
+            targetRepo: "https://github.com/example/independent-target",
+            targetCommit: "abcdef123456",
+          },
+        },
+        { authorization: `Bearer ${issued.json.data.accessToken}` },
+      );
+      const tokenRow = ctx.db.sqlite
+        .prepare("SELECT status FROM artifact_access_tokens WHERE session_id = ? AND token_id = ?")
+        .get(sessionId, issued.json.data.tokenId) as { status: string };
+      const succeededLeaseCount = ctx.db.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM lease_runs WHERE session_id = ? AND status = 'succeeded_live_mcp_transcript'")
+        .get(sessionId) as { count: number };
+
+      expect(issued.status).toBe(202);
+      expect(lease.status).toBe(202);
+      expect(lease.json.data.status).toBe("blocked_mcp_execution_failed");
+      expect(tokenRow.status).toBe("active");
+      expect(succeededLeaseCount.count).toBe(0);
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list"]);
     } finally {
       await mcp.close();
     }
@@ -5236,7 +5312,11 @@ async function createSession(app: ReturnType<typeof createApp>, key: string, pay
   return res.json.data.sessionId;
 }
 
-async function registerSource(app: ReturnType<typeof createApp>, sessionId: string) {
+async function registerSource(
+  app: ReturnType<typeof createApp>,
+  sessionId: string,
+  capabilityVector: Record<string, unknown> = defaultSourceCapabilityForTest(),
+) {
   const res = await post(app, "/api/v1/sources/register", {
     sessionId,
     idempotencyKey: "src-register",
@@ -5245,7 +5325,7 @@ async function registerSource(app: ReturnType<typeof createApp>, sessionId: stri
       sourceHash: hex32("source"),
       manifestUrl: "https://example.com/manifest.json",
       manifestHash: hex32("manifest"),
-      capabilityVector: { has_write_file: false },
+      capabilityVector,
     },
   });
   expect(res.status).toBe(201);
@@ -5257,7 +5337,7 @@ async function signedSourcePayloadForTest(seed: string) {
     sourceId: seed,
     manifestUrl: `https://example.com/${seed}.json`,
     manifestHash: hex32(`manifest:${seed}`),
-    capabilityVector: { has_write_file: false, seed },
+      capabilityVector: { ...defaultSourceCapabilityForTest(), seed },
   };
   const sourceHash = hashForTestJson({
     version: "pactfuse-source-identity-v1",
@@ -5281,10 +5361,21 @@ function sourceIdentityMessageForTest(sourceIdentityHash: `0x${string}`): string
   return `PactFuse source identity v1:${sourceIdentityHash}`;
 }
 
-async function registerSpend(app: ReturnType<typeof createApp>, sessionId: string): Promise<string> {
-  await registerSource(app, sessionId);
+function defaultSourceCapabilityForTest(toolName = "pactfuse_code_scan"): Record<string, unknown> {
+  return {
+    has_write_file: false,
+    mcpTools: [leaseToolDefinitionForTest(toolName)],
+  };
+}
+
+async function registerSpend(
+  app: ReturnType<typeof createApp>,
+  sessionId: string,
+  capabilityVector: Record<string, unknown> = defaultSourceCapabilityForTest(),
+): Promise<string> {
+  await registerSource(app, sessionId, capabilityVector);
   const sourceHashes = [hex32("source")];
-  const spendId = await computeSpendIdForTest(app, sessionId, sourceHashes);
+  const spendId = await computeSpendIdForTest(app, sessionId, sourceHashes, capabilityVector);
   const res = await post(app, "/api/v1/spends/register-batch", {
     sessionId,
     idempotencyKey: "spend-register",
@@ -5695,6 +5786,7 @@ async function computeSpendIdForTest(
   app: ReturnType<typeof createApp>,
   sessionId: string,
   sourceHashes: string[],
+  capabilityVector: Record<string, unknown> = defaultSourceCapabilityForTest(),
 ): Promise<`0x${string}`> {
   const session = await app.request(`/api/v1/sessions/${sessionId}`);
   const sessionJson = await session.json();
@@ -5706,7 +5798,7 @@ async function computeSpendIdForTest(
     {
       sourceHash: hex32("source"),
       manifestHash: hex32("manifest"),
-      capabilityVector: { has_write_file: false },
+      capabilityVector,
     },
   ]);
   const sessionCommitment = keccakJsonForTest({ sessionId: sessionId.toLowerCase(), runConfigHash });
@@ -5863,10 +5955,7 @@ function createFakeMcpLeaseClient(toolName = "pactfuse_code_scan"): McpLeaseClie
         id: "lease-tools-list",
         result: {
           tools: [
-            {
-              name: toolName,
-              description: "Deterministic code scan",
-            },
+            leaseToolDefinitionForTest(toolName),
           ],
         },
       };

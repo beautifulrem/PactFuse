@@ -622,7 +622,7 @@ const JUDGE_ROW_EVENT_KINDS = {
   lease_execution: new Set(["lease.execution.succeeded", "lease.execution.blocked"]),
 };
 
-function buildAgentTranscriptSnapshot(sessionId, calls) {
+function buildAgentTranscriptSnapshot(bundle, calls) {
   const callSummaries = calls.map((call) => ({
     callId: call.callId,
     auditNonce: call.auditNonce,
@@ -634,28 +634,47 @@ function buildAgentTranscriptSnapshot(sessionId, calls) {
   }));
   const toolsListHash = calls.length > 0 ? hashJson([...new Set(calls.map((call) => call.toolName))].sort()) : null;
   const toolsCallHash = calls.length > 0 ? hashJson(callSummaries) : null;
+  const boundedToPinnedManifest = agentTranscriptBoundedToPinnedManifest(bundle, calls);
   const transcriptHash =
     calls.length > 0
       ? hashJson({
           format: "mcp-json-rpc",
-          sessionId,
+          sessionId: bundle.sessionId,
           toolsListHash,
           toolsCallHash,
+          boundedToPinnedManifest,
           callCount: calls.length,
         })
       : null;
   return {
-    sessionId,
+    sessionId: bundle.sessionId,
     status: calls.length > 0 ? "summarized" : "pending",
     format: "mcp-json-rpc",
     toolsListHash,
     toolsCallHash,
     transcriptHash,
-    boundedToPinnedManifest: false,
+    boundedToPinnedManifest,
     callCount: calls.length,
     calls: callSummaries,
     winnerClaimAllowed: false,
   };
+}
+
+function agentTranscriptBoundedToPinnedManifest(bundle, calls) {
+  const successfulLeases = (Array.isArray(bundle.leaseRuns) ? bundle.leaseRuns : []).filter(
+    (lease) => isObject(lease) && lease.status === "succeeded_live_mcp_transcript",
+  );
+  if (successfulLeases.length === 0) {
+    return false;
+  }
+  const callsByAuditNonce = new Map(calls.filter(isObject).map((call) => [call.auditNonce, call]));
+  return successfulLeases.every((lease) => {
+    const prefix = typeof lease.leaseRunId === "string" ? lease.leaseRunId.slice(2, 22) : "";
+    const listCall = callsByAuditNonce.get(`lease_${prefix}_tools_list`);
+    const toolCall = callsByAuditNonce.get(`lease_${prefix}_tools_call`);
+    const binding = pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall);
+    return binding.ok;
+  });
 }
 
 function verifyMcpAdapterCalls(bundle, calls, errors) {
@@ -683,7 +702,7 @@ function verifyMcpAdapterCalls(bundle, calls, errors) {
       callsByAuditNonce.set(call.auditNonce, call);
     }
   }
-  const transcript = buildAgentTranscriptSnapshot(bundle.sessionId, calls.filter(isObject));
+  const transcript = buildAgentTranscriptSnapshot(bundle, calls.filter(isObject));
   const transcriptHash = safeHashJson(transcript, "agent transcript snapshot", errors);
   if (transcriptHash && lowerHex(bundle.agentTranscriptHash) !== transcriptHash) {
     errors.push("agentTranscriptHash must equal the hash of the replay MCP transcript snapshot");
@@ -703,6 +722,73 @@ function jsonPath(root, path) {
   return path.reduce((value, key) => (value == null ? undefined : value[key]), root);
 }
 
+function pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall, errors = null) {
+  const fail = (message) => {
+    if (errors) {
+      errors.push(message);
+    }
+    return { ok: false };
+  };
+  if (!isObject(listCall) || !isObject(toolCall)) {
+    return fail(`succeeded lease run ${lease?.leaseRunId ?? "-"} is missing bound MCP tools/list or tools/call transcript frames`);
+  }
+  const spend = (Array.isArray(bundle.spends) ? bundle.spends : []).find((candidate) => isObject(candidate) && candidate.spendId === lease.spendId);
+  if (!spend) {
+    return fail(`succeeded lease run ${lease.leaseRunId} references a spend without pinned source manifest data`);
+  }
+  if (!Array.isArray(spend.sourceHashes) || spend.sourceHashes.length === 0) {
+    return fail(`succeeded lease run ${lease.leaseRunId} spend is missing source hashes`);
+  }
+  const sourcesByHash = new Map(
+    (Array.isArray(bundle.sources) ? bundle.sources : [])
+      .filter((source) => isObject(source) && typeof source.sourceHash === "string")
+      .map((source) => [lowerHex(source.sourceHash), source]),
+  );
+  const expectedTools = [];
+  for (const sourceHash of spend.sourceHashes) {
+    if (typeof sourceHash !== "string") {
+      return fail(`succeeded lease run ${lease.leaseRunId} spend contains a non-string source hash`);
+    }
+    const source = sourcesByHash.get(lowerHex(sourceHash));
+    if (!source) {
+      return fail(`succeeded lease run ${lease.leaseRunId} source ${sourceHash} is missing from replay sources`);
+    }
+    const capabilityVector = source.capabilityVector;
+    if (!isObject(capabilityVector)) {
+      return fail(`succeeded lease run ${lease.leaseRunId} source ${sourceHash} has invalid capabilityVector`);
+    }
+    if (capabilityVector.has_write_file === true) {
+      return fail(`succeeded lease run ${lease.leaseRunId} source ${sourceHash} advertises write-file capability`);
+    }
+    if (!Array.isArray(capabilityVector.mcpTools) || capabilityVector.mcpTools.length === 0) {
+      return fail(`succeeded lease run ${lease.leaseRunId} source ${sourceHash} is missing pinned MCP tools`);
+    }
+    for (const tool of capabilityVector.mcpTools) {
+      if (!isObject(tool) || typeof tool.name !== "string") {
+        return fail(`succeeded lease run ${lease.leaseRunId} source ${sourceHash} has invalid pinned MCP tool`);
+      }
+      expectedTools.push(tool);
+    }
+  }
+  if (expectedTools.length !== 1) {
+    return fail(`succeeded lease run ${lease.leaseRunId} pinned manifest must expose exactly one MCP tool`);
+  }
+  const actualTools = jsonPath(listCall, ["response", "result", "tools"]);
+  if (!Array.isArray(actualTools) || actualTools.some((tool) => !isObject(tool))) {
+    return fail(`succeeded lease run ${lease.leaseRunId} tools/list response is missing tool definitions`);
+  }
+  const expectedToolsHash = safeHashJson(expectedTools, `lease run ${lease.leaseRunId} pinned MCP tools`, errors ?? []);
+  const actualToolsHash = safeHashJson(actualTools, `lease run ${lease.leaseRunId} actual MCP tools`, errors ?? []);
+  if (expectedToolsHash && actualToolsHash && expectedToolsHash !== actualToolsHash) {
+    return fail(`succeeded lease run ${lease.leaseRunId} tools/list is not bounded to pinned source manifest`);
+  }
+  const requestedToolName = jsonPath(toolCall, ["request", "params", "name"]);
+  if (requestedToolName !== expectedTools[0].name) {
+    return fail(`succeeded lease run ${lease.leaseRunId} tools/call name does not match pinned source manifest`);
+  }
+  return { ok: true, expectedToolsHash, actualToolsHash };
+}
+
 function verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors) {
   if (listCall.sessionId !== bundle.sessionId || toolCall.sessionId !== bundle.sessionId) {
     errors.push(`succeeded lease run ${lease.leaseRunId} MCP transcript frames must be bound to replay bundle session`);
@@ -718,6 +804,7 @@ function verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors) {
     errors.push(`succeeded lease run ${lease.leaseRunId} tools/call request is missing arguments`);
     return;
   }
+  pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall, errors);
   const expectedArguments = {
     sessionId: bundle.sessionId,
     leaseRunId: lease.leaseRunId,

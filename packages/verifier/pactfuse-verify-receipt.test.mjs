@@ -290,6 +290,13 @@ describe("pactfuse receipt verifier contract", () => {
 	      },
 	      "tools/call argument targetCommit does not match lease run",
 	    ],
+	    [
+	      "pinned source manifest tools",
+	      (bundle) => {
+	        bundle.sources[0].capabilityVector.mcpTools = [leaseToolDefinitionForTest("pactfuse_other_scan")];
+	      },
+	      "tools/list is not bounded to pinned source manifest",
+	    ],
 	  ])("rejects replay bundles with tampered %s", (_label, mutate, expected) => {
 	    const bundle = replayBundleWithLease();
 	    mutate(bundle);
@@ -524,11 +531,13 @@ function replayBundleWithLease() {
   const listCallId = hex32("lease-list-call");
   const toolCallId = hex32("lease-tool-call");
   const auditPrefix = leaseRunId.slice(2, 22);
+  const pinnedTool = leaseToolDefinitionForTest();
+  const sourceHash = hex32("source");
   const listRequest = { jsonrpc: "2.0", id: "lease-tools-list", method: "tools/list", params: {} };
   const listResponse = {
     jsonrpc: "2.0",
     id: "lease-tools-list",
-    result: { tools: [{ name: "pactfuse_code_scan", description: "Deterministic code scan" }] },
+    result: { tools: [pinnedTool] },
   };
   const callRequest = {
     jsonrpc: "2.0",
@@ -559,6 +568,38 @@ function replayBundleWithLease() {
       },
     },
   };
+  bundle.sources = [
+    {
+      sourceId: "clean-source",
+      sessionId: bundle.sessionId,
+      sourceHash,
+      manifestUrl: "https://example.com/manifest.json",
+      manifestHash: hex32("manifest"),
+      issuer: null,
+      signature: null,
+      capabilityVector: defaultSourceCapabilityForTest(),
+      proofStatus: "pending",
+      createdAt,
+    },
+  ];
+  bundle.spends = [
+    {
+      spendId: bundle.artifactAccessTokens[0].spendId,
+      sessionId: bundle.sessionId,
+      pactId: "pact-c",
+      toolId: "code-scan",
+      payer: bundle.artifactAccessTokens[0].payer,
+      agentWallet: "0xabcd",
+      sourceHashes: [sourceHash],
+      sourceSetHash: hex32("source-set"),
+      sessionCommitment: hex32("session-commitment"),
+      spendPreimage: {},
+      maxPriceAtomic: "1000",
+      nonce: "nonce-1",
+      status: "settled_finalized",
+      createdAt,
+    },
+  ];
   const mcpAdapterCalls = [
     mcpCallForTest({
       callId: listCallId,
@@ -652,7 +693,7 @@ function replayBundleWithLease() {
   bundle.mcpAdapterCalls = mcpAdapterCalls;
   bundle.asOfMcpAdapterCallCount = mcpAdapterCalls.length;
   bundle.leaseRuns = [leaseRun];
-  bundle.agentTranscriptHash = hashJson(agentTranscriptForTest(bundle.sessionId, mcpAdapterCalls));
+  bundle.agentTranscriptHash = hashJson(agentTranscriptForTest(bundle.sessionId, mcpAdapterCalls, true));
   bundle.events = [...bundle.events, leaseEvent];
   bundle.asOfEventSeq = bundle.events.length;
   bundle.eventRoot = hashJson(bundle.events.map((event) => event.eventHash));
@@ -739,7 +780,7 @@ function appendSignedSourceForTest(bundle) {
     sourceId: "signed-source",
     manifestUrl: "https://example.com/signed-source.json",
     manifestHash: hex32("signed-source-manifest"),
-    capabilityVector: { has_write_file: false },
+    capabilityVector: defaultSourceCapabilityForTest(),
   };
   const sourceHash = hashJson({
     version: "pactfuse-source-identity-v1",
@@ -759,6 +800,33 @@ function appendSignedSourceForTest(bundle) {
   };
   bundle.sources = [...bundle.sources, source];
   return source;
+}
+
+function defaultSourceCapabilityForTest(toolName = "pactfuse_code_scan") {
+  return {
+    has_write_file: false,
+    mcpTools: [leaseToolDefinitionForTest(toolName)],
+  };
+}
+
+function leaseToolDefinitionForTest(name = "pactfuse_code_scan") {
+  const properties = Object.fromEntries(
+    ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "targetRepo", "targetCommit"].map((field) => [
+      field,
+      { type: "string" },
+    ]),
+  );
+  return {
+    name,
+    description: "Deterministic read-only code scan",
+    inputSchema: {
+      type: "object",
+      properties,
+      required: Object.keys(properties),
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true },
+  };
 }
 
 function mcpCallForTest({ callId, sessionId, auditNonce, toolName, request, response, createdAt }) {
@@ -817,10 +885,10 @@ function rehashLeaseTranscriptForTest(bundle) {
   event.payload.toolsCallHash = leaseRun.toolsCallHash;
   event.payload.outputHash = leaseRun.outputHash;
   event.payload.leaseRunHash = leaseRun.leaseRunHash;
-  bundle.agentTranscriptHash = hashJson(agentTranscriptForTest(bundle.sessionId, bundle.mcpAdapterCalls));
+  bundle.agentTranscriptHash = hashJson(agentTranscriptForTest(bundle.sessionId, bundle.mcpAdapterCalls, true));
 }
 
-function agentTranscriptForTest(sessionId, calls) {
+function agentTranscriptForTest(sessionId, calls, boundedToPinnedManifest = false) {
   const callSummaries = calls.map((call) => ({
     callId: call.callId,
     auditNonce: call.auditNonce,
@@ -839,6 +907,7 @@ function agentTranscriptForTest(sessionId, calls) {
           sessionId,
           toolsListHash,
           toolsCallHash,
+          boundedToPinnedManifest,
           callCount: calls.length,
         })
       : null;
@@ -849,7 +918,7 @@ function agentTranscriptForTest(sessionId, calls) {
     toolsListHash,
     toolsCallHash,
     transcriptHash,
-    boundedToPinnedManifest: false,
+    boundedToPinnedManifest,
     callCount: calls.length,
     calls: callSummaries,
     winnerClaimAllowed: false,

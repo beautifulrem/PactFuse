@@ -336,7 +336,8 @@ export function createHttpJsonRpcMcpLeaseClient(input: {
       const toolsListRequest = jsonRpcRequest("tools/list", {});
       const toolsListResponse = await withMcpStage("tools/list", async () => {
         const response = await postJsonRpc(input.endpointUrl, toolsListRequest, timeoutMs);
-        assertToolListed(response, toolName);
+        const tools = assertToolListed(response, toolName);
+        assertPinnedManifestTools(tools, leaseInput.pinnedManifestTools);
         return response;
       });
       const toolsCallRequest = jsonRpcRequest("tools/call", {
@@ -456,7 +457,7 @@ function assertJsonRpcSuccess(response: Record<string, unknown>, method: string)
   }
 }
 
-function assertToolListed(response: Record<string, unknown>, toolName: string): void {
+function assertToolListed(response: Record<string, unknown>, toolName: string): Array<Record<string, unknown>> {
   assertJsonRpcSuccess(response, "tools/list");
   const result = response.result;
   if (!result || typeof result !== "object" || Array.isArray(result)) {
@@ -478,6 +479,16 @@ function assertToolListed(response: Record<string, unknown>, toolName: string): 
     throw new Error(`tools/list did not expose the required unique tool ${toolName}`);
   }
   assertLeaseToolDefinition(toolRecord);
+  return [toolRecord];
+}
+
+function assertPinnedManifestTools(actualTools: Array<Record<string, unknown>>, pinnedTools: Array<Record<string, unknown>>): void {
+  if (pinnedTools.length !== 1) {
+    throw new Error("pinned source manifest must expose exactly one PactFuse lease tool");
+  }
+  if (hashJson(actualTools) !== hashJson(pinnedTools)) {
+    throw new Error("tools/list is not bounded to the pinned source manifest");
+  }
 }
 
 function normalizeLeaseToolName(toolName: string): string {

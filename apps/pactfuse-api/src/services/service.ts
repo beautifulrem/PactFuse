@@ -71,6 +71,12 @@ import {
 } from "../util.js";
 
 type Row = Record<string, unknown>;
+type PinnedMcpManifest = {
+  sourceHashes: string[];
+  manifestHashes: string[];
+  tools: Array<Record<string, unknown>>;
+  toolsHash: string;
+};
 const REPLAY_SUMMARY_LIMIT = 200;
 const ARTIFACT_PAYLOAD_REPLAY_MAX_BYTES = 256 * 1024;
 const ARTIFACT_TOKEN_LEASE_CLAIM_TTL_MS = 5 * 60 * 1000;
@@ -1620,6 +1626,7 @@ export async function executeLease(
         const artifactTokenId = String(activeToken.token_id);
         assertArtifactTokenUnusedForLease(ctx, envelope.sessionId, artifactTokenId, requestId);
         const leaseRunId = hashJson({ sessionId: envelope.sessionId, payload: { ...payload, artifactHash }, requestId });
+        const pinnedManifest = requirePinnedMcpManifestForSpend(ctx, envelope.sessionId, payload.spendId, requestId);
         claimArtifactTokenForLease(
           ctx,
           envelope.sessionId,
@@ -1646,6 +1653,7 @@ export async function executeLease(
             artifactHash,
             targetRepo: payload.targetRepo,
             targetCommit: payload.targetCommit,
+            pinnedManifestTools: pinnedManifest.tools,
           });
         } catch (error) {
           const failedStage = mcpLeaseFailureStage(error);
@@ -1705,6 +1713,16 @@ export async function executeLease(
         const toolsListHash = hashJson({ requestHash: listCall.requestHash, responseHash: listCall.responseHash });
         const toolsCallHash = hashJson({ requestHash: toolCall.requestHash, responseHash: toolCall.responseHash });
         const outputHash = hashJson(leaseExecution.output);
+        const manifestBindingHash = hashJson({
+          sessionId: envelope.sessionId,
+          leaseRunId,
+          spendId: payload.spendId,
+          sourceHashes: pinnedManifest.sourceHashes,
+          manifestHashes: pinnedManifest.manifestHashes,
+          pinnedManifestToolsHash: pinnedManifest.toolsHash,
+          toolsListHash,
+          toolsCallHash,
+        });
         const leaseRunHash = hashJson({
           sessionId: envelope.sessionId,
           leaseRunId,
@@ -1765,6 +1783,10 @@ export async function executeLease(
               outputHash,
               leaseRunHash,
               mcpToolName: leaseExecution.toolName,
+              boundedToPinnedManifest: true,
+              pinnedManifestToolsHash: pinnedManifest.toolsHash,
+              pinnedManifestHashes: pinnedManifest.manifestHashes,
+              manifestBindingHash,
               bearerBound: true,
               status: "succeeded_live_mcp_transcript",
               proofAuthority: false,
@@ -1807,6 +1829,8 @@ export async function executeLease(
             toolsCallHash,
             outputHash,
             leaseRunHash,
+            boundedToPinnedManifest: true,
+            manifestBindingHash,
             settlementEventId: settlement.finalizedEventId,
             status: "succeeded_live_mcp_transcript",
             winnerClaimAllowed: false,
@@ -1895,6 +1919,8 @@ function recordBlockedLeaseExecution(
       toolsCallHash: null,
       outputHash: null,
       leaseRunHash: null,
+      boundedToPinnedManifest: false,
+      manifestBindingHash: null,
       settlementEventId: input.settlementEventId,
       status: input.status,
       winnerClaimAllowed: false,
@@ -2137,6 +2163,7 @@ function buildAgentTranscriptData(sessionId: string, ctx: ServiceCtx, callLimit 
   }));
   const toolsListHash = calls.length > 0 ? hashJson([...new Set(calls.map((call) => call.toolName))].sort()) : null;
   const toolsCallHash = calls.length > 0 ? hashJson(callSummaries) : null;
+  const boundedToPinnedManifest = agentTranscriptBoundedToPinnedManifest(ctx, sessionId, calls);
   const transcriptHash =
     calls.length > 0
       ? hashJson({
@@ -2144,6 +2171,7 @@ function buildAgentTranscriptData(sessionId: string, ctx: ServiceCtx, callLimit 
           sessionId,
           toolsListHash,
           toolsCallHash,
+          boundedToPinnedManifest,
           callCount: calls.length,
         })
       : null;
@@ -2154,11 +2182,60 @@ function buildAgentTranscriptData(sessionId: string, ctx: ServiceCtx, callLimit 
     toolsListHash,
     toolsCallHash,
     transcriptHash,
-    boundedToPinnedManifest: false,
+    boundedToPinnedManifest,
     callCount: calls.length,
     calls: callSummaries,
     winnerClaimAllowed: false,
   });
+}
+
+function agentTranscriptBoundedToPinnedManifest(
+  ctx: ServiceCtx,
+  sessionId: string,
+  calls: ReturnType<typeof listMcpAdapterCalls>,
+): boolean {
+  const successfulLeases = listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT).filter((lease) => lease.status === "succeeded_live_mcp_transcript");
+  if (successfulLeases.length === 0) {
+    return false;
+  }
+  const callsByAuditNonce = new Map(calls.map((call) => [call.auditNonce, call]));
+  return successfulLeases.every((lease) => {
+    const prefix = lease.leaseRunId.slice(2, 22);
+    const listCall = callsByAuditNonce.get(`lease_${prefix}_tools_list`);
+    const toolCall = callsByAuditNonce.get(`lease_${prefix}_tools_call`);
+    if (!listCall || !toolCall || typeof lease.spendId !== "string") {
+      return false;
+    }
+    let pinnedManifest: PinnedMcpManifest;
+    try {
+      pinnedManifest = requirePinnedMcpManifestForSpend(ctx, sessionId, lease.spendId, newRequestId("agent_manifest_bound"));
+    } catch {
+      return false;
+    }
+    const actualTools = mcpToolsFromToolsListResponse(listCall.response);
+    const requestedToolName =
+      toolCall.request.params && typeof toolCall.request.params === "object" && !Array.isArray(toolCall.request.params)
+        ? (toolCall.request.params as Record<string, JsonValue>).name
+        : null;
+    return (
+      Array.isArray(actualTools) &&
+      hashJson(actualTools) === pinnedManifest.toolsHash &&
+      pinnedManifest.tools.length === 1 &&
+      requestedToolName === pinnedManifest.tools[0]?.name
+    );
+  });
+}
+
+function mcpToolsFromToolsListResponse(response: Record<string, JsonValue>): Array<Record<string, unknown>> | null {
+  const result = response.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return null;
+  }
+  const tools = (result as Record<string, unknown>).tools;
+  if (!Array.isArray(tools) || tools.some((tool) => !tool || typeof tool !== "object" || Array.isArray(tool))) {
+    return null;
+  }
+  return tools as Array<Record<string, unknown>>;
 }
 
 export async function readArtifactAccess(
@@ -4721,6 +4798,73 @@ function sourceCapabilitySnapshotFor(ctx: ServiceCtx, sessionId: string, sourceH
     };
   });
   return { hash: hashJson(entries), entries };
+}
+
+function requirePinnedMcpManifestForSpend(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string): PinnedMcpManifest {
+  const spend = ctx.db.sqlite
+    .prepare("SELECT source_hashes_json FROM spends WHERE session_id = ? AND spend_id = ?")
+    .get(sessionId, spendId) as Row | undefined;
+  if (!spend) {
+    throw Object.assign(new Error("lease execution requires a registered spend"), {
+      apiError: proofPendingError(requestId, "lease execution requires a registered spend"),
+    });
+  }
+  const sourceHashes = normalizedSourceHashes(JSON.parse(String(spend.source_hashes_json)) as string[]);
+  const manifestHashes: string[] = [];
+  const tools: Array<Record<string, unknown>> = [];
+  for (const sourceHash of sourceHashes) {
+    const source = ctx.db.sqlite
+      .prepare(
+        `SELECT source_hash, manifest_hash, capability_vector_json
+         FROM sources
+         WHERE session_id = ? AND LOWER(source_hash) = ?`,
+      )
+      .get(sessionId, sourceHash) as Row | undefined;
+    if (!source) {
+      throw Object.assign(new Error("lease execution requires registered source manifests"), {
+        apiError: proofPendingError(requestId, `lease execution requires registered source manifests: ${sourceHash}`),
+      });
+    }
+    const capabilityVector = JSON.parse(String(source.capability_vector_json));
+    if (!capabilityVector || typeof capabilityVector !== "object" || Array.isArray(capabilityVector)) {
+      throw Object.assign(new Error("source capability vector must be an object"), {
+        apiError: proofBlockedError(requestId, "source capability vector must be an object", { sourceHash }),
+      });
+    }
+    if ((capabilityVector as Record<string, unknown>).has_write_file === true) {
+      throw Object.assign(new Error("pinned source manifest advertises write-file capability"), {
+        apiError: proofBlockedError(requestId, "pinned source manifest advertises write-file capability", { sourceHash }),
+      });
+    }
+    const mcpTools = (capabilityVector as Record<string, unknown>).mcpTools;
+    if (!Array.isArray(mcpTools) || mcpTools.length === 0) {
+      throw Object.assign(new Error("source capability vector must pin MCP tools"), {
+        apiError: proofBlockedError(requestId, "source capability vector must pin MCP tools", { sourceHash }),
+      });
+    }
+    for (const tool of mcpTools) {
+      if (!tool || typeof tool !== "object" || Array.isArray(tool) || typeof (tool as Record<string, unknown>).name !== "string") {
+        throw Object.assign(new Error("source capability vector contains an invalid MCP tool definition"), {
+          apiError: proofBlockedError(requestId, "source capability vector contains an invalid MCP tool definition", { sourceHash }),
+        });
+      }
+      tools.push(tool as Record<string, unknown>);
+    }
+    manifestHashes.push(String(source.manifest_hash).toLowerCase());
+  }
+  if (tools.length !== 1) {
+    throw Object.assign(new Error("pinned source manifest must expose exactly one PactFuse lease tool"), {
+      apiError: proofBlockedError(requestId, "pinned source manifest must expose exactly one PactFuse lease tool", {
+        toolCount: tools.length,
+      }),
+    });
+  }
+  return {
+    sourceHashes,
+    manifestHashes,
+    tools,
+    toolsHash: hashJson(tools),
+  };
 }
 
 function assertExistingSpendMatches(

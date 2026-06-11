@@ -73,6 +73,7 @@ export type McpLeaseExecutionInput = {
   artifactHash: string;
   targetRepo: string;
   targetCommit: string;
+  pinnedManifestTools: Array<Record<string, unknown>>;
 };
 
 export type McpJsonRpcFrame = {

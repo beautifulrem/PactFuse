@@ -639,7 +639,7 @@ export const AgentTranscriptViewSchema = z
     toolsListHash: Hex32Schema.nullable(),
     toolsCallHash: Hex32Schema.nullable(),
     transcriptHash: Hex32Schema.nullable(),
-    boundedToPinnedManifest: z.literal(false),
+    boundedToPinnedManifest: z.boolean(),
     callCount: z.number().int().min(0).max(200),
     calls: z.array(AgentTranscriptCallSummarySchema).max(200),
     winnerClaimAllowed: z.literal(false),
