@@ -896,6 +896,25 @@ describe("pactfuse-api P0", () => {
       "createdAt",
       "proofAuthority",
     ]);
+    expect(
+      json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.properties.cawLiveInteractions.items.required,
+    ).toEqual([
+      "interactionId",
+      "sessionId",
+      "kind",
+      "walletId",
+      "pactId",
+      "cawRequestId",
+      "requestHash",
+      "request",
+      "responseHash",
+      "response",
+      "status",
+      "authKeyHash",
+      "proofAuthority",
+      "winnerClaimAllowed",
+      "createdAt",
+    ]);
     expect(json.components.schemas.ReplayBundleResponse.oneOf[0].properties.data.required).toEqual([
       "bundleType",
       "sessionId",
@@ -5540,6 +5559,7 @@ describe("pactfuse-api P0", () => {
     const pactKeyHash = "0xe731d15044e2dac2b1cee3ea70e39cccc583c28ad1f42510b6a6dbc0b70b4adb";
     const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
     const sessionId = await createSession(app, "sess-caw-live");
+    const spendId = await registerSpend(app, sessionId);
 
     const status = await app.request("/api/v1/caw/live/status");
     const statusJson = await status.json();
@@ -5582,11 +5602,14 @@ describe("pactfuse-api P0", () => {
         sessionId,
         idempotencyKey: "caw-live-transfer-submit",
         payload: {
+          spendId,
           pactId: "pact-live-1",
           walletId: "wallet-live-1",
-          destinationAddress: "0x1111111111111111111111111111111111111111",
-          amount: "0.001",
-          tokenId: "SETH",
+          destinationAddress: TEST_MARKET_ADDRESS,
+          amount: "1000",
+          paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+          tokenId: TEST_PAYMENT_TOKEN_ADDRESS,
+          sourceAddress: TEST_PAYER_ADDRESS,
           requestId: "pf-live-transfer-1",
           description: "PactFuse live transfer proof",
         },
@@ -5594,7 +5617,17 @@ describe("pactfuse-api P0", () => {
       { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
     );
     expect(transfer.status).toBe(202);
-    expect(transfer.json.data).toEqual(expect.objectContaining({ cawRequestId: "pf-live-transfer-1", status: "live_pending" }));
+    expect(transfer.json.data).toEqual(
+      expect.objectContaining({
+        spendId,
+        cawRequestId: "pf-live-transfer-1",
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        tokenId: TEST_PAYMENT_TOKEN_ADDRESS,
+        amount: "1000",
+        destinationAddress: TEST_MARKET_ADDRESS,
+        status: "live_pending",
+      }),
+    );
     expect(transfer.json.data.pactScopedApiKeyHash).toBe(pactKeyHash);
 
     const audit = await post(app, "/api/v1/caw/live/audit/sync", {
@@ -5609,7 +5642,118 @@ describe("pactfuse-api P0", () => {
     const replayJson = await replay.json();
     expect(replayJson.data.cawLiveInteractions).toHaveLength(4);
     expect(JSON.stringify(replayJson.data.cawLiveInteractions)).not.toContain("pact-scoped-secret");
+    expect(replayJson.data.cawLiveInteractions.find((row: { kind: string }) => row.kind === "transfer_submit")).toEqual(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          spend_id: spendId,
+          payment_token: TEST_PAYMENT_TOKEN_ADDRESS,
+          dst_addr: TEST_MARKET_ADDRESS,
+          amount: "1000",
+        }),
+      }),
+    );
     expect(replayJson.data.replayPageIndex.collections.cawLiveInteractions.totalRows).toBe(4);
+  });
+
+  it("blocks CAW live transfers that are not bound to an active Pact and registered spend", async () => {
+    const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
+    const sessionId = await createSession(app, "sess-caw-live-transfer-binding");
+    const spendId = await registerSpend(app, sessionId);
+    const basePayload = {
+      spendId,
+      pactId: "pact-live-1",
+      walletId: "wallet-live-1",
+      destinationAddress: TEST_MARKET_ADDRESS,
+      amount: "1000",
+      paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+      tokenId: TEST_PAYMENT_TOKEN_ADDRESS,
+      requestId: "pf-live-transfer-binding",
+    };
+
+    const beforePact = await post(
+      app,
+      "/api/v1/caw/live/transfers/submit",
+      {
+        sessionId,
+        idempotencyKey: "caw-transfer-before-active-pact",
+        payload: basePayload,
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    await post(app, "/api/v1/caw/live/pacts/submit", {
+      sessionId,
+      idempotencyKey: "binding-pact-submit",
+      payload: { walletId: "wallet-live-1", intent: "bind transfer", spec: { policies: [] } },
+    });
+    await post(app, "/api/v1/caw/live/pacts/sync", {
+      sessionId,
+      idempotencyKey: "binding-pact-sync",
+      payload: { pactId: "pact-live-1" },
+    });
+    const badPactKey = await post(
+      app,
+      "/api/v1/caw/live/transfers/submit",
+      {
+        sessionId,
+        idempotencyKey: "caw-transfer-bad-pact-key",
+        payload: basePayload,
+      },
+      { "x-pactfuse-caw-pact-api-key": "wrong-pact-scoped-secret" },
+    );
+    const badToken = await post(
+      app,
+      "/api/v1/caw/live/transfers/submit",
+      {
+        sessionId,
+        idempotencyKey: "caw-transfer-bad-token",
+        payload: { ...basePayload, paymentToken: "0x9999999999999999999999999999999999999999" },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const badTokenId = await post(
+      app,
+      "/api/v1/caw/live/transfers/submit",
+      {
+        sessionId,
+        idempotencyKey: "caw-transfer-bad-token-id",
+        payload: { ...basePayload, tokenId: "0x9999999999999999999999999999999999999999" },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const badAmount = await post(
+      app,
+      "/api/v1/caw/live/transfers/submit",
+      {
+        sessionId,
+        idempotencyKey: "caw-transfer-bad-amount",
+        payload: { ...basePayload, amount: "999" },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const badMarket = await post(
+      app,
+      "/api/v1/caw/live/transfers/submit",
+      {
+        sessionId,
+        idempotencyKey: "caw-transfer-bad-market",
+        payload: { ...basePayload, destinationAddress: "0x9999999999999999999999999999999999999999" },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+
+    expect(beforePact.status).toBe(422);
+    expect(beforePact.json.error.code).toBe("proof_blocked");
+    expect(beforePact.json.error.message).toContain("active synced Pact");
+    expect(badPactKey.status).toBe(422);
+    expect(badPactKey.json.error.message).toContain("pact API key does not match");
+    expect(badToken.status).toBe(422);
+    expect(badToken.json.error.message).toContain("paymentToken does not match");
+    expect(badTokenId.status).toBe(422);
+    expect(badTokenId.json.error.message).toContain("tokenId must match");
+    expect(badAmount.status).toBe(422);
+    expect(badAmount.json.error.message).toContain("priceAtomic does not match");
+    expect(badMarket.status).toBe(422);
+    expect(badMarket.json.error.message).toContain("destinationAddress does not match");
   });
 
   it("passes pinned Pact template hashes into the verifier", async () => {

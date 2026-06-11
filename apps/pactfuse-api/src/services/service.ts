@@ -1091,6 +1091,25 @@ export async function submitCawLiveTransfer(
       });
     }
     await requireCawLiveReady(ctx, requestId);
+    const spend = assertSpend(ctx, envelope.sessionId, payload.spendId, requestId);
+    const pactKeyHash = sha256Hex(pactApiKey);
+    requireActiveCawLivePact(ctx, envelope.sessionId, payload.pactId, payload.walletId, pactKeyHash, requestId);
+    assertSpendPaymentToken(spend, payload.paymentToken, "CAW live transfer", requestId);
+    assertSpendPrice(spend, payload.amount, "CAW live transfer", requestId);
+    assertSpendMarket(spend, payload.destinationAddress, "CAW live transfer", requestId);
+    if (payload.tokenId && payload.tokenId.toLowerCase() !== payload.paymentToken.toLowerCase()) {
+      throw Object.assign(new Error("CAW live transfer tokenId must match registered ProcurementGate paymentToken"), {
+        apiError: proofBlockedError(requestId, "CAW live transfer tokenId must match registered ProcurementGate paymentToken", {
+          spendId: payload.spendId,
+          paymentToken: payload.paymentToken.toLowerCase(),
+          tokenId: payload.tokenId,
+        }),
+      });
+    }
+    if (payload.sourceAddress) {
+      requireSpendPayer(spend, payload.sourceAddress, requestId);
+    }
+    const cawTokenId = payload.tokenId ?? payload.paymentToken;
     const request = cawLiveTransferRequest(payload);
     const transferInput: {
       walletId: string;
@@ -1109,7 +1128,7 @@ export async function submitCawLiveTransfer(
       walletId: payload.walletId,
       destinationAddress: payload.destinationAddress,
       amount: payload.amount,
-      tokenId: payload.tokenId,
+      tokenId: cawTokenId,
       pactApiKey,
     };
     if (payload.chainId) {
@@ -1145,7 +1164,7 @@ export async function submitCawLiveTransfer(
       request,
       response,
       status,
-      authKeyHash: sha256Hex(pactApiKey),
+      authKeyHash: pactKeyHash,
     });
     const event = appendEvidenceEvent(ctx, {
       sessionId: envelope.sessionId,
@@ -1155,8 +1174,10 @@ export async function submitCawLiveTransfer(
         interactionId: saved.interactionId,
         walletId: payload.walletId,
         pactId: payload.pactId,
+        spendId: payload.spendId,
         cawRequestId,
-        tokenId: payload.tokenId,
+        tokenId: cawTokenId,
+        paymentToken: payload.paymentToken.toLowerCase(),
         amount: payload.amount,
         destinationAddress: payload.destinationAddress,
         requestHash: saved.requestHash,
@@ -1167,13 +1188,15 @@ export async function submitCawLiveTransfer(
         winnerClaimAllowed: false,
       },
     });
-    updateJudgeCheckRow(ctx, envelope.sessionId, {
-      rowId: "caw_boundary",
-      status: status === "live_denied" || status === "live_failed" ? "blocked" : "pass",
-      authority: "proof",
-      reason: status === "live_denied" ? "CAW live policy denied the transfer" : "CAW live transfer response is recorded",
-      evidenceEventId: event.eventId,
-    });
+    if (status === "live_denied" || status === "live_failed") {
+      updateJudgeCheckRow(ctx, envelope.sessionId, {
+        rowId: "caw_boundary",
+        status: "blocked",
+        authority: "proof",
+        reason: status === "live_denied" ? "CAW live policy denied the transfer" : "CAW live transfer failed",
+        evidenceEventId: event.eventId,
+      });
+    }
     return {
       ok: true,
       requestId,
@@ -1182,8 +1205,10 @@ export async function submitCawLiveTransfer(
         interactionId: saved.interactionId,
         walletId: payload.walletId,
         pactId: payload.pactId,
+        spendId: payload.spendId,
         cawRequestId,
-        tokenId: payload.tokenId,
+        tokenId: cawTokenId,
+        paymentToken: payload.paymentToken.toLowerCase(),
         amount: payload.amount,
         destinationAddress: payload.destinationAddress,
         requestHash: saved.requestHash,
@@ -1302,11 +1327,13 @@ function cawLivePactSubmitRequest(payload: CawLivePactSubmitPayload): Record<str
 
 function cawLiveTransferRequest(payload: CawLiveTransferSubmitPayload): Record<string, JsonValue> {
   return jsonRecord({
+    spend_id: payload.spendId,
     pact_id: payload.pactId,
     wallet_id: payload.walletId,
     dst_addr: payload.destinationAddress,
     amount: payload.amount,
-    token_id: payload.tokenId,
+    payment_token: payload.paymentToken.toLowerCase(),
+    token_id: payload.tokenId ?? payload.paymentToken,
     chain_id: payload.chainId,
     request_id: payload.requestId,
     src_addr: payload.sourceAddress,
@@ -1396,6 +1423,46 @@ function requireCawResponseId(response: Record<string, unknown>, keys: string[],
     });
   }
   return value;
+}
+
+function requireActiveCawLivePact(
+  ctx: ServiceCtx,
+  sessionId: string,
+  pactId: string,
+  walletId: string,
+  authKeyHash: string,
+  requestId: string,
+): Row {
+  const row = ctx.db.sqlite
+    .prepare(
+      `SELECT interaction_id, wallet_id, pact_id, auth_key_hash, status
+       FROM caw_live_interactions
+       WHERE session_id = ?
+         AND kind = 'pact_sync'
+         AND pact_id = ?
+         AND wallet_id = ?
+         AND status = 'live_active'
+       ORDER BY created_at DESC, interaction_id DESC
+       LIMIT 1`,
+    )
+    .get(sessionId, pactId, walletId) as Row | undefined;
+  if (!row) {
+    throw Object.assign(new Error("CAW live transfer requires an active synced Pact for this wallet"), {
+      apiError: proofBlockedError(requestId, "CAW live transfer requires an active synced Pact for this wallet", {
+        pactId,
+        walletId,
+      }),
+    });
+  }
+  if (String(row.auth_key_hash).toLowerCase() !== authKeyHash.toLowerCase()) {
+    throw Object.assign(new Error("CAW live transfer pact API key does not match the active synced Pact"), {
+      apiError: proofBlockedError(requestId, "CAW live transfer pact API key does not match the active synced Pact", {
+        pactId,
+        walletId,
+      }),
+    });
+  }
+  return row;
 }
 
 function optionalStringFromCaw(response: Record<string, unknown>, keys: string[]): string | null {
@@ -2627,6 +2694,7 @@ async function buildVerifierRunView(
     ...verifyEventLogIntegrity(ctx, sessionId),
     ...verifySpendBindingIntegrity(ctx, sessionId),
     ...verifyMcpAdapterCallIntegrity(ctx, sessionId),
+    ...verifyCawLiveInteractionIntegrity(ctx, sessionId),
     ...verifyGateFinalityIntegrity(ctx, sessionId),
     ...verifyArtifactAccessTokenIntegrity(ctx, sessionId),
     ...verifyLeaseRunIntegrity(ctx, sessionId),
@@ -3943,6 +4011,34 @@ function assertSpendPrice(spend: Row, priceAtomic: string, scope: string, reques
         spendId: String(spend.spend_id),
         expectedPriceAtomic: expected,
         actualPriceAtomic: actual,
+      }),
+    });
+  }
+}
+
+function assertSpendPaymentToken(spend: Row, paymentToken: string, scope: string, requestId: string): void {
+  const expected = String(spend.payment_token).toLowerCase();
+  const actual = paymentToken.toLowerCase();
+  if (actual !== expected) {
+    throw Object.assign(new Error(`${scope} paymentToken does not match registered ProcurementGate paymentToken`), {
+      apiError: proofBlockedError(requestId, `${scope} paymentToken does not match registered ProcurementGate paymentToken`, {
+        spendId: String(spend.spend_id),
+        expectedPaymentToken: expected,
+        actualPaymentToken: actual,
+      }),
+    });
+  }
+}
+
+function assertSpendMarket(spend: Row, market: string, scope: string, requestId: string): void {
+  const expected = String(spend.market).toLowerCase();
+  const actual = market.toLowerCase();
+  if (actual !== expected) {
+    throw Object.assign(new Error(`${scope} destinationAddress does not match registered ProcurementGate market`), {
+      apiError: proofBlockedError(requestId, `${scope} destinationAddress does not match registered ProcurementGate market`, {
+        spendId: String(spend.spend_id),
+        expectedMarket: expected,
+        actualDestinationAddress: actual,
       }),
     });
   }
@@ -6746,6 +6842,7 @@ function listCawLiveInteractions(ctx: ServiceCtx, sessionId: string, limit: numb
       pactId: row.pact_id ?? null,
       cawRequestId: row.caw_request_id ?? null,
       requestHash: row.request_hash,
+      request: JSON.parse(String(row.request_json)),
       responseHash: row.response_hash,
       response: JSON.parse(String(row.response_json)),
       status: row.status,
@@ -7005,6 +7102,142 @@ function verifyMcpAdapterCallIntegrity(ctx: ServiceCtx, sessionId: string): stri
     }
   }
   return errors;
+}
+
+function verifyCawLiveInteractionIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  const errors: string[] = [];
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT interaction_id, kind, wallet_id, pact_id, caw_request_id, request_hash, request_json,
+              response_hash, response_json, status, auth_key_hash
+       FROM caw_live_interactions
+       WHERE session_id = ?
+       ORDER BY created_at ASC, interaction_id ASC`,
+    )
+    .all(sessionId) as Row[];
+  const events = listEvents(ctx, sessionId, 0, 200).filter((event) => event.kind.startsWith("caw.live."));
+  const eventsByInteractionId = new Map(
+    events
+      .map((event) => {
+        const interactionId = typeof event.payload.interactionId === "string" ? event.payload.interactionId : null;
+        return interactionId ? [interactionId, event] : null;
+      })
+      .filter((entry): entry is [string, EvidenceEvent] => Boolean(entry)),
+  );
+  const activePacts = new Set<string>();
+  for (const row of rows) {
+    if (row.kind === "pact_sync" && row.status === "live_active" && row.wallet_id && row.pact_id && row.auth_key_hash) {
+      activePacts.add(`${String(row.wallet_id)}:${String(row.pact_id)}:${String(row.auth_key_hash).toLowerCase()}`);
+    }
+  }
+  for (const row of rows) {
+    const interactionId = String(row.interaction_id);
+    let request: Record<string, JsonValue> | null = null;
+    let response: Record<string, JsonValue> | null = null;
+    try {
+      request = JSON.parse(String(row.request_json)) as Record<string, JsonValue>;
+    } catch {
+      errors.push(`CAW live interaction ${interactionId} has invalid request_json`);
+    }
+    try {
+      response = JSON.parse(String(row.response_json)) as Record<string, JsonValue>;
+    } catch {
+      errors.push(`CAW live interaction ${interactionId} has invalid response_json`);
+    }
+    if (request && hashJson(request) !== String(row.request_hash).toLowerCase()) {
+      errors.push(`CAW live interaction ${interactionId} requestHash does not match request_json`);
+    }
+    if (response && hashJson(response) !== String(row.response_hash).toLowerCase()) {
+      errors.push(`CAW live interaction ${interactionId} responseHash does not match response_json`);
+    }
+    const event = eventsByInteractionId.get(interactionId);
+    if (!event) {
+      errors.push(`CAW live interaction ${interactionId} has no matching evidence event`);
+      continue;
+    }
+    const expectedKind =
+      row.kind === "pact_submit"
+        ? "caw.live.pact.submitted"
+        : row.kind === "pact_sync"
+          ? "caw.live.pact.synced"
+          : row.kind === "transfer_submit"
+            ? "caw.live.transfer.submitted"
+            : "caw.live.audit.synced";
+    if (event.kind !== expectedKind) {
+      errors.push(`CAW live interaction ${interactionId} event kind does not match row kind`);
+    }
+    for (const [field, expected] of [
+      ["walletId", row.wallet_id ?? null],
+      ["pactId", row.pact_id ?? null],
+      ["requestHash", row.request_hash],
+      ["responseHash", row.response_hash],
+      ["status", row.status],
+    ] as const) {
+      if ((event.payload[field] ?? null) !== expected) {
+        errors.push(`CAW live event ${event.eventId} payload.${field} does not match interaction row`);
+      }
+    }
+    if (event.authority !== "proof" || event.payload.proofAuthority !== true || event.payload.winnerClaimAllowed !== false) {
+      errors.push(`CAW live event ${event.eventId} does not carry fail-closed proof payload`);
+    }
+    if (row.kind !== "transfer_submit" || !request) {
+      continue;
+    }
+    const spendId = typeof request.spend_id === "string" ? request.spend_id : null;
+    if (!spendId) {
+      errors.push(`CAW live transfer ${interactionId} is missing spend_id`);
+      continue;
+    }
+    const spend = ctx.db.sqlite
+      .prepare(
+        `SELECT spend_id, payer, payment_token, market, max_price_atomic
+         FROM spends
+         WHERE session_id = ? AND spend_id = ?`,
+      )
+      .get(sessionId, spendId) as Row | undefined;
+    if (!spend) {
+      errors.push(`CAW live transfer ${interactionId} references missing registered spend`);
+      continue;
+    }
+    const checks = [
+      ["payment_token", String(spend.payment_token).toLowerCase()],
+      ["dst_addr", String(spend.market).toLowerCase()],
+      ["amount", BigInt(String(spend.max_price_atomic)).toString()],
+    ] as const;
+    for (const [field, expected] of checks) {
+      const actual = field === "amount" ? safeDecimalString(request[field]) : String(request[field] ?? "").toLowerCase();
+      if (actual !== expected) {
+        errors.push(`CAW live transfer ${interactionId} request.${field} does not match registered spend`);
+      }
+    }
+    if (typeof request.token_id === "string" && request.token_id.toLowerCase() !== String(spend.payment_token).toLowerCase()) {
+      errors.push(`CAW live transfer ${interactionId} request.token_id does not match registered spend payment token`);
+    }
+    if (typeof request.src_addr === "string" && request.src_addr.toLowerCase() !== String(spend.payer).toLowerCase()) {
+      errors.push(`CAW live transfer ${interactionId} request.src_addr does not match registered spend payer`);
+    }
+    if (!activePacts.has(`${String(row.wallet_id)}:${String(row.pact_id)}:${String(row.auth_key_hash).toLowerCase()}`)) {
+      errors.push(`CAW live transfer ${interactionId} is not bound to an active synced CAW Pact and key hash`);
+    }
+    for (const [field, expected] of [
+      ["spendId", spendId],
+      ["paymentToken", String(spend.payment_token).toLowerCase()],
+      ["amount", BigInt(String(spend.max_price_atomic)).toString()],
+      ["destinationAddress", String(spend.market)],
+    ] as const) {
+      if (String(event.payload[field] ?? "").toLowerCase() !== String(expected).toLowerCase()) {
+        errors.push(`CAW live event ${event.eventId} payload.${field} does not match registered spend transfer`);
+      }
+    }
+  }
+  return errors;
+}
+
+function safeDecimalString(value: unknown): string {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) {
+    return "";
+  }
+  return BigInt(value).toString();
 }
 
 function verifyGateFinalityIntegrity(ctx: ServiceCtx, sessionId: string): string[] {

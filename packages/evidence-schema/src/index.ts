@@ -176,11 +176,13 @@ export const CawLivePactSyncPayloadSchema = z
 
 export const CawLiveTransferSubmitPayloadSchema = z
   .object({
+    spendId: Hex32Schema,
     pactId: z.string().min(1).max(160),
     walletId: z.string().min(1).max(160),
     destinationAddress: z.string().min(1).max(160),
     amount: CawAmountStringSchema,
-    tokenId: z.string().min(1).max(80).default("SETH"),
+    paymentToken: AddressSchema,
+    tokenId: z.string().min(1).max(80).optional(),
     chainId: z.string().min(1).max(80).optional(),
     requestId: z.string().min(1).max(160).optional(),
     sourceAddress: z.string().min(1).max(160).optional(),
@@ -503,6 +505,7 @@ export const CawLiveInteractionViewSchema = z
     pactId: z.string().min(1).max(160).nullable(),
     cawRequestId: z.string().min(1).max(160).nullable(),
     requestHash: Hex32Schema,
+    request: JsonObjectSchema,
     responseHash: Hex32Schema,
     response: JsonObjectSchema,
     status: z.enum(["live_submitted", "live_active", "live_pending", "live_denied", "live_failed", "live_synced"]),

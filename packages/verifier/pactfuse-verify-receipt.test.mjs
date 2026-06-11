@@ -137,6 +137,23 @@ describe("pactfuse receipt verifier contract", () => {
 	      "requires structurally verified CAW authority status",
 	    ],
     [
+      "CAW operation spend split from finalized settlement",
+      (bundle) => {
+        bundle.cawReceiptOperations[0].spendId = hex32("split-caw-spend");
+        bundle.cawReceiptOperations[0].request.spendId = hex32("split-caw-spend");
+      },
+      "does not match a finalized SpendSettled proof event by spendId and txHash",
+    ],
+    [
+      "CAW receipt tx split from finalized settlement",
+      (bundle) => {
+        const gateEvent = bundle.events.find((candidate) => candidate.kind === "gate.spend_settled");
+        gateEvent.payload.txHash = hex32("split-gate-tx");
+        sealReplayBundleForTest(bundle);
+      },
+      "does not match a finalized SpendSettled proof event by spendId and txHash",
+    ],
+    [
       "missing raw bundle body",
       (bundle) => {
         delete bundle.rawCawReceiptBundles[0].rawBundle;
@@ -193,6 +210,31 @@ describe("pactfuse receipt verifier contract", () => {
         bundle.replayPageIndex = replayPageIndexForTest(bundle);
       },
       "references missing registered spend",
+    ],
+    [
+      "self-consistent CAW live transfer amount drift from registered spend",
+      (bundle) => {
+        const { transfer } = appendCawLiveTransferForTest(bundle);
+        transfer.request.amount = "999";
+        transfer.requestHash = hashJson(transfer.request);
+        const event = bundle.events.find((candidate) => candidate.kind === "caw.live.transfer.submitted");
+        event.payload.requestHash = transfer.requestHash;
+        event.payload.amount = "999";
+        sealReplayBundleForTest(bundle);
+      },
+      "request.amount does not match registered spend",
+    ],
+    [
+      "self-consistent CAW live transfer token id drift from registered spend",
+      (bundle) => {
+        const { transfer } = appendCawLiveTransferForTest(bundle);
+        transfer.request.token_id = "0x9999999999999999999999999999999999999999";
+        transfer.requestHash = hashJson(transfer.request);
+        const event = bundle.events.find((candidate) => candidate.kind === "caw.live.transfer.submitted");
+        event.payload.requestHash = transfer.requestHash;
+        sealReplayBundleForTest(bundle);
+      },
+      "request.token_id does not match registered spend payment token",
     ],
 	    [
 	      "agent transcript hash",
@@ -603,13 +645,13 @@ function replayBundle() {
       {
         operationId,
         sessionId,
-        spendId: hex32("caw-spend"),
+        spendId,
         operationKind: "activate_tool",
         target: rawReceipt.target,
         selector: rawReceipt.selector,
         valueAtomic: "0",
         request: {
-          spendId: hex32("caw-spend"),
+          spendId,
           operationKind: "activate_tool",
           target: rawReceipt.target,
           selector: rawReceipt.selector,
@@ -644,6 +686,50 @@ function replayBundle() {
       })),
     },
 	  };
+  bundle.events = [
+    ...bundle.events,
+    {
+      eventSeq: bundle.events.length + 1,
+      authority: "proof",
+      kind: "gate.spend_settled",
+      payload: {
+        gateEventId: hex32("base-contract-gate-event-id"),
+        event: "SpendSettled",
+        spendId,
+        txHash: rawReceipt.txHash,
+        logIndex: 0,
+        chainId: "84532",
+        blockNumber: 100,
+        currentBlockNumber: 102,
+        rawLogHash: hex32("base-contract-gate-log"),
+        confirmations: 3,
+        finalityDepth: 2,
+        finalityStatus: "finalized",
+        observedEventId: hex32("base-contract-gate-observed"),
+        indexedLogId: hex32("base-contract-gate-indexed-log"),
+        cursorId: "gate:indexer",
+        indexedRawLogHash: hex32("base-contract-gate-indexed-raw"),
+        finalizedHeadBlock: 102,
+        latestHeadBlock: 102,
+        contractStateVerified: true,
+        contractAddress: "0x1111111111111111111111111111111111111111",
+        contractFunction: "registeredSpend",
+        contractSessionId: sessionId,
+        contractPactId: bundle.spends[0].pactId,
+        contractToolId: bundle.spends[0].toolId,
+        contractSourceSetHash: bundle.spends[0].sourceSetHash,
+        contractAgentWallet: bundle.spends[0].agentWallet,
+        contractPaymentToken: bundle.spends[0].paymentToken,
+        contractPrice: bundle.spends[0].maxPriceAtomic,
+        contractArtifactHash: bundle.spends[0].artifactHash,
+        contractMarket: bundle.spends[0].market,
+        contractSpendState: "Settled",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+      createdAt,
+    },
+  ];
   sealReplayBundleForTest(bundle);
   return bundle;
 		}
@@ -679,6 +765,120 @@ function retargetArtifactForTest(bundle, artifactPayload) {
   bundle.artifactAccessTokens[0].artifactPayloadHash = artifactHash;
   bundle.artifactAccessTokens[0].artifactPayload = artifactPayload;
   rehashFirstQuoteForTest(bundle);
+}
+
+function appendCawLiveTransferForTest(bundle) {
+  const createdAt = "2026-06-11T00:00:02.000Z";
+  const walletId = "wallet-live-1";
+  const pactId = "pact-live-1";
+  const authKeyHash = hashJson("pact-scoped-secret");
+  const spend = bundle.spends[0];
+  const pactRequest = { pact_id: pactId };
+  const pactResponse = {
+    result: {
+      pact_id: pactId,
+      wallet_id: walletId,
+      status: "ACTIVE",
+    },
+  };
+  const pactSync = {
+    interactionId: hex32("caw-live-pact-sync"),
+    sessionId: bundle.sessionId,
+    kind: "pact_sync",
+    walletId,
+    pactId,
+    cawRequestId: null,
+    requestHash: hashJson(pactRequest),
+    request: pactRequest,
+    responseHash: hashJson(pactResponse),
+    response: pactResponse,
+    status: "live_active",
+    authKeyHash,
+    proofAuthority: true,
+    winnerClaimAllowed: false,
+    createdAt,
+  };
+  const transferRequest = {
+    spend_id: spend.spendId,
+    pact_id: pactId,
+    wallet_id: walletId,
+    dst_addr: spend.market.toLowerCase(),
+    amount: spend.maxPriceAtomic,
+    payment_token: spend.paymentToken.toLowerCase(),
+    token_id: spend.paymentToken.toLowerCase(),
+    request_id: "pf-live-transfer-test",
+  };
+  const transferResponse = {
+    result: {
+      id: "tx-live-1",
+      wallet_id: walletId,
+      request_id: "pf-live-transfer-test",
+      status: "submitted",
+    },
+  };
+  const transfer = {
+    interactionId: hex32("caw-live-transfer"),
+    sessionId: bundle.sessionId,
+    kind: "transfer_submit",
+    walletId,
+    pactId,
+    cawRequestId: "pf-live-transfer-test",
+    requestHash: hashJson(transferRequest),
+    request: transferRequest,
+    responseHash: hashJson(transferResponse),
+    response: transferResponse,
+    status: "live_pending",
+    authKeyHash,
+    proofAuthority: true,
+    winnerClaimAllowed: false,
+    createdAt,
+  };
+  bundle.cawLiveInteractions = [pactSync, transfer];
+  bundle.events = [
+    ...bundle.events,
+    {
+      eventSeq: bundle.events.length + 1,
+      authority: "proof",
+      kind: "caw.live.pact.synced",
+      payload: {
+        interactionId: pactSync.interactionId,
+        walletId,
+        pactId,
+        pactScopedApiKeyHash: authKeyHash,
+        requestHash: pactSync.requestHash,
+        responseHash: pactSync.responseHash,
+        status: "live_active",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+      createdAt,
+    },
+    {
+      eventSeq: bundle.events.length + 2,
+      authority: "proof",
+      kind: "caw.live.transfer.submitted",
+      payload: {
+        interactionId: transfer.interactionId,
+        walletId,
+        pactId,
+        spendId: spend.spendId,
+        cawRequestId: transfer.cawRequestId,
+        tokenId: spend.paymentToken.toLowerCase(),
+        paymentToken: spend.paymentToken.toLowerCase(),
+        amount: spend.maxPriceAtomic,
+        destinationAddress: spend.market,
+        requestHash: transfer.requestHash,
+        responseHash: transfer.responseHash,
+        pactScopedApiKeyHash: authKeyHash,
+        status: "live_pending",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+      createdAt,
+    },
+  ];
+  sealReplayBundleForTest(bundle);
+  return { pactSync, transfer };
 }
 
 function replayBundleWithLease() {

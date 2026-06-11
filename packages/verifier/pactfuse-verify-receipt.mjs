@@ -1222,6 +1222,116 @@ function verifySourceIdentityBindings(bundle, errors) {
   }
 }
 
+function verifyCawLiveInteractions(interactions, spendsById, eventsById, errors) {
+  const activePacts = new Set();
+  for (const interaction of interactions) {
+    if (
+      isObject(interaction) &&
+      interaction.kind === "pact_sync" &&
+      interaction.status === "live_active" &&
+      interaction.walletId &&
+      interaction.pactId &&
+      interaction.authKeyHash
+    ) {
+      activePacts.add(`${interaction.walletId}:${interaction.pactId}:${lowerHex(interaction.authKeyHash)}`);
+    }
+  }
+  for (const interaction of interactions) {
+    if (!isObject(interaction)) {
+      errors.push("cawLiveInteractions entries must be objects");
+      continue;
+    }
+    if (!isObject(interaction.request)) {
+      errors.push(`CAW live interaction ${interaction.interactionId ?? "-"} requires request`);
+      continue;
+    }
+    if (!isObject(interaction.response)) {
+      errors.push(`CAW live interaction ${interaction.interactionId ?? "-"} requires response`);
+      continue;
+    }
+    const requestHash = safeHashJson(interaction.request, `CAW live interaction ${interaction.interactionId ?? "-"} request`, errors);
+    const responseHash = safeHashJson(interaction.response, `CAW live interaction ${interaction.interactionId ?? "-"} response`, errors);
+    if (requestHash && requestHash !== lowerHex(interaction.requestHash)) {
+      errors.push(`CAW live interaction ${interaction.interactionId ?? "-"} requestHash does not match request`);
+    }
+    if (responseHash && responseHash !== lowerHex(interaction.responseHash)) {
+      errors.push(`CAW live interaction ${interaction.interactionId ?? "-"} responseHash does not match response`);
+    }
+    const event = [...eventsById.values()].find(
+      (candidate) =>
+        isObject(candidate) &&
+        typeof candidate.kind === "string" &&
+        candidate.kind.startsWith("caw.live.") &&
+        candidate.payload?.interactionId === interaction.interactionId,
+    );
+    if (!event) {
+      errors.push(`CAW live interaction ${interaction.interactionId ?? "-"} has no matching evidence event`);
+    } else {
+      for (const [field, expected] of [
+        ["walletId", interaction.walletId ?? null],
+        ["pactId", interaction.pactId ?? null],
+        ["requestHash", interaction.requestHash],
+        ["responseHash", interaction.responseHash],
+        ["status", interaction.status],
+      ]) {
+        if ((event.payload?.[field] ?? null) !== expected) {
+          errors.push(`CAW live event ${event.eventId ?? "-"} payload.${field} does not match interaction`);
+        }
+      }
+      if (event.authority !== "proof" || event.payload?.proofAuthority !== true || event.payload?.winnerClaimAllowed !== false) {
+        errors.push(`CAW live event ${event.eventId ?? "-"} must carry fail-closed proof payload`);
+      }
+    }
+    if (interaction.kind !== "transfer_submit") {
+      continue;
+    }
+    const spendId = typeof interaction.request.spend_id === "string" ? interaction.request.spend_id : null;
+    if (!spendId) {
+      errors.push(`CAW live transfer ${interaction.interactionId ?? "-"} is missing spend_id`);
+      continue;
+    }
+    const spend = spendsById.get(lowerHex(spendId));
+    if (!spend) {
+      errors.push(`CAW live transfer ${interaction.interactionId ?? "-"} references missing registered spend`);
+      continue;
+    }
+    for (const [field, expected] of [
+      ["payment_token", lowerHex(spend.paymentToken)],
+      ["dst_addr", lowerHex(spend.market)],
+      ["amount", asText(spend.maxPriceAtomic)],
+    ]) {
+      const actual =
+        field === "amount"
+          ? (decimal(interaction.request[field]) ?? -1n).toString()
+          : asText(interaction.request[field]).toLowerCase();
+      if (actual !== asText(expected).toLowerCase()) {
+        errors.push(`CAW live transfer ${interaction.interactionId ?? "-"} request.${field} does not match registered spend`);
+      }
+    }
+    if (typeof interaction.request.token_id === "string" && lowerHex(interaction.request.token_id) !== lowerHex(spend.paymentToken)) {
+      errors.push(`CAW live transfer ${interaction.interactionId ?? "-"} request.token_id does not match registered spend payment token`);
+    }
+    if (typeof interaction.request.src_addr === "string" && lowerHex(interaction.request.src_addr) !== lowerHex(spend.payer)) {
+      errors.push(`CAW live transfer ${interaction.interactionId ?? "-"} request.src_addr does not match registered spend payer`);
+    }
+    if (!activePacts.has(`${interaction.walletId}:${interaction.pactId}:${lowerHex(interaction.authKeyHash)}`)) {
+      errors.push(`CAW live transfer ${interaction.interactionId ?? "-"} is not bound to an active synced CAW Pact and key hash`);
+    }
+    if (event) {
+      for (const [field, expected] of [
+        ["spendId", spendId],
+        ["paymentToken", lowerHex(spend.paymentToken)],
+        ["amount", asText(spend.maxPriceAtomic)],
+        ["destinationAddress", lowerHex(spend.market)],
+      ]) {
+        if (asText(event.payload?.[field]).toLowerCase() !== asText(expected).toLowerCase()) {
+          errors.push(`CAW live event ${event.eventId ?? "-"} payload.${field} does not match registered spend transfer`);
+        }
+      }
+    }
+  }
+}
+
 function verifyGateContractStateProofEvent(bundle, event, errors) {
   const payload = isObject(event.payload) ? event.payload : null;
   const label = `gate proof event ${event.eventId ?? "-"}`;
@@ -1361,6 +1471,35 @@ function verifyCawOperationBinding(canonical, operation, rawBundle, errors) {
   }
   if (operation.spendId && request.spendId !== operation.spendId) {
     errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} request.spendId does not match CAW operation`);
+  }
+}
+
+function verifyCawReceiptSettlementBinding(canonical, operation, bundle, errors) {
+  if (canonical.operationKind !== "activate_tool" || canonical.effect !== "allow") {
+    return;
+  }
+  const label = `canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"}`;
+  if (!operation.spendId) {
+    errors.push(`${label} activate_tool allow receipt requires CAW operation spendId`);
+    return;
+  }
+  if (!canonical.txHash) {
+    errors.push(`${label} activate_tool allow receipt requires txHash`);
+    return;
+  }
+  const settled = (Array.isArray(bundle.events) ? bundle.events : []).find((event) => {
+    const payload = isObject(event?.payload) ? event.payload : {};
+    return (
+      isObject(event) &&
+      event.kind === "gate.spend_settled" &&
+      lowerHex(payload.spendId) === lowerHex(operation.spendId) &&
+      lowerHex(payload.txHash) === lowerHex(canonical.txHash) &&
+      payload.finalityStatus === "finalized" &&
+      payload.proofAuthority === true
+    );
+  });
+  if (!settled) {
+    errors.push(`${label} activate_tool allow receipt does not match a finalized SpendSettled proof event by spendId and txHash`);
   }
 }
 
@@ -1542,6 +1681,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   const rawBundles = Array.isArray(bundle.rawCawReceiptBundles) ? bundle.rawCawReceiptBundles : [];
   const canonicalReceipts = Array.isArray(bundle.canonicalCawReceipts) ? bundle.canonicalCawReceipts : [];
   const cawReceiptOperations = Array.isArray(bundle.cawReceiptOperations) ? bundle.cawReceiptOperations : [];
+  const cawLiveInteractions = Array.isArray(bundle.cawLiveInteractions) ? bundle.cawLiveInteractions : [];
   const preflights = Array.isArray(bundle.artifactPreflights) ? bundle.artifactPreflights : [];
   const quotes = Array.isArray(bundle.quotes) ? bundle.quotes : [];
   const accessTokens = Array.isArray(bundle.artifactAccessTokens) ? bundle.artifactAccessTokens : [];
@@ -1560,6 +1700,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   verifyContractStateProofEvents(bundle, Array.isArray(bundle.events) ? bundle.events : [], errors);
   verifySourceIdentityBindings(bundle, errors);
   const spendsById = new Map(spends.filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]));
+  verifyCawLiveInteractions(cawLiveInteractions, spendsById, eventsById, errors);
   const preflightsById = new Map(preflights.filter(isObject).map((preflight) => [preflight.preflightId, preflight]));
   const quotesById = new Map(quotes.filter(isObject).map((quote) => [quote.quoteId, quote]));
   for (const preflight of preflights) {
@@ -1719,6 +1860,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
       errors.push(`canonical CAW receipt ${canonicalReceiptHash ?? "-"} references missing CAW operation`);
     } else {
       verifyCawOperationBinding(canonical, operation, rawMatch.rawBundle, errors);
+      verifyCawReceiptSettlementBinding(canonical, operation, bundle, errors);
     }
     if (canonical.effect === "allow" && !canonical.txHash) {
       errors.push(`canonical CAW allow receipt ${canonicalReceiptHash ?? "-"} requires txHash`);
