@@ -50,8 +50,8 @@ function createRuntimeMcpLeaseClient() {
 }
 
 function createRuntimeCawLiveClient() {
-  const baseUrl = process.env.AGENT_WALLET_API_URL ?? process.env.PACTFUSE_CAW_LIVE_API_URL;
-  const apiKey = process.env.AGENT_WALLET_API_KEY ?? process.env.PACTFUSE_CAW_LIVE_API_KEY;
+  const baseUrl = process.env.PACTFUSE_CAW_LIVE_API_URL ?? process.env.AGENT_WALLET_API_URL;
+  const apiKey = process.env.PACTFUSE_CAW_LIVE_API_KEY ?? process.env.AGENT_WALLET_API_KEY;
   if (!baseUrl || !apiKey) {
     return createUnconfiguredCawLiveClient();
   }
@@ -60,7 +60,7 @@ function createRuntimeCawLiveClient() {
     apiKey,
     timeoutMs: numberEnv("PACTFUSE_CAW_LIVE_TIMEOUT_MS", 10_000),
   };
-  const walletId = process.env.AGENT_WALLET_WALLET_ID ?? process.env.PACTFUSE_CAW_LIVE_WALLET_ID;
+  const walletId = process.env.PACTFUSE_CAW_LIVE_WALLET_ID ?? process.env.AGENT_WALLET_WALLET_ID;
   if (walletId) {
     clientInput.walletId = walletId;
   }
@@ -70,6 +70,9 @@ function createRuntimeCawLiveClient() {
 function createRuntimeDeploymentRegistry(): DeploymentRegistry | undefined {
   const rawJson = process.env.PACTFUSE_DEPLOYMENT_REGISTRY_JSON;
   const registryPath = process.env.PACTFUSE_DEPLOYMENT_REGISTRY_PATH;
+  if (rawJson && registryPath) {
+    throw new Error("set either PACTFUSE_DEPLOYMENT_REGISTRY_JSON or PACTFUSE_DEPLOYMENT_REGISTRY_PATH, not both");
+  }
   if (!rawJson && !registryPath) {
     return undefined;
   }
@@ -107,7 +110,14 @@ function booleanEnv(name: string, fallback: boolean): boolean {
   if (!raw) {
     return fallback;
   }
-  return !["0", "false", "no", "off"].includes(raw.trim().toLowerCase());
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  throw new Error(`${name} must be one of true,false,1,0,yes,no,on,off`);
 }
 
 function hexEnv(name: string): `0x${string}` | undefined {

@@ -6,6 +6,10 @@
   "scripts": {
     "test": "vitest run"
   },
+  "dependencies": {
+    "@noble/curves": "^1.9.1",
+    "viem": "^2.41.2"
+  },
   "devDependencies": {
     "vitest": "^4.0.15"
   }

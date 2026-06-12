@@ -276,6 +276,15 @@ export function createHttpsCawReceiptSource(input: {
             endpoint: input.exportUrl,
           } satisfies ProofProviderStatus;
         }
+        if (!input.apiKey) {
+          return {
+            name: "caw",
+            mode: "live",
+            ready: false,
+            reason: "CAW export API key is missing",
+            endpoint: input.exportUrl,
+          } satisfies ProofProviderStatus;
+        }
         const url = cawExportUrl(input.exportUrl, input.walletId, { limit: 1 });
         const response = await fetch(url, {
           method: "GET",
@@ -314,6 +323,9 @@ export function createHttpsCawReceiptSource(input: {
         allowInsecureTestEndpoint: input.allowInsecureTestEndpoint,
         label: "CAW export endpoint",
       });
+      if (!input.apiKey) {
+        throw new Error("CAW export API key is missing");
+      }
       const url = cawExportUrl(input.exportUrl, input.walletId, {
         limit,
         session_id: optionalString(request.sessionId),
@@ -680,13 +692,14 @@ export function createHttpJsonRpcMcpLeaseClient(input: {
   endpointUrl: string;
   toolName?: string;
   timeoutMs?: number;
+  allowInsecureTestEndpoint?: boolean;
 }): McpLeaseClient {
   const toolName = normalizeLeaseToolName(input.toolName ?? "pactfuse_code_scan");
   const timeoutMs = input.timeoutMs ?? 10_000;
   return {
     async status() {
       try {
-        new URL(input.endpointUrl);
+        assertTrustedMcpEndpoint(input.endpointUrl, input.allowInsecureTestEndpoint);
         const response = await postJsonRpc(input.endpointUrl, jsonRpcRequest("tools/list", {}), Math.min(timeoutMs, 2_000));
         assertToolListed(response, toolName);
         return {
@@ -707,6 +720,7 @@ export function createHttpJsonRpcMcpLeaseClient(input: {
       }
     },
     async executeCleanLease(leaseInput) {
+      assertTrustedMcpEndpoint(input.endpointUrl, input.allowInsecureTestEndpoint);
       const toolsListRequest = jsonRpcRequest("tools/list", {});
       const toolsListResponse = await withMcpStage("tools/list", async () => {
         const response = await postJsonRpc(input.endpointUrl, toolsListRequest, timeoutMs);
@@ -962,6 +976,85 @@ function cawEndpointTrust(input: {
     return { ok: false, reason: `${input.label} host ${url.hostname} is not an official Cobo API host` };
   }
   return { ok: true };
+}
+
+function assertTrustedMcpEndpoint(endpointUrl: string, allowInsecureTestEndpoint?: boolean): void {
+  const trust = mcpEndpointTrust(endpointUrl, allowInsecureTestEndpoint);
+  if (!trust.ok) {
+    throw new Error(trust.reason);
+  }
+}
+
+function mcpEndpointTrust(endpointUrl: string, allowInsecureTestEndpoint?: boolean): { ok: true } | { ok: false; reason: string } {
+  let url: URL;
+  try {
+    url = new URL(endpointUrl);
+  } catch {
+    return { ok: false, reason: "lease MCP endpoint must be a valid URL" };
+  }
+  if (allowInsecureTestEndpoint) {
+    return { ok: true };
+  }
+  if (url.protocol !== "https:") {
+    return { ok: false, reason: "lease MCP endpoint must use HTTPS" };
+  }
+  if (!isPublicHostname(url.hostname)) {
+    return { ok: false, reason: "lease MCP endpoint must use a public hostname" };
+  }
+  return { ok: true };
+}
+
+function isPublicHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host === "example.com" ||
+    host.endsWith(".example.com") ||
+    host.endsWith(".example") ||
+    host.endsWith(".test") ||
+    host.endsWith(".local") ||
+    host.endsWith(".lan") ||
+    host.endsWith(".internal")
+  ) {
+    return false;
+  }
+  if (isPrivateIpv4(host)) {
+    return false;
+  }
+  if (isPrivateIpv6(host)) {
+    return false;
+  }
+  return host.includes(".");
+}
+
+function isPrivateIpv4(host: string): boolean {
+  const parts = host.split(".");
+  if (parts.length !== 4) {
+    return false;
+  }
+  const octets = parts.map((part) => Number(part));
+  if (octets.some((octet, index) => !Number.isInteger(octet) || octet < 0 || octet > 255 || String(octet) !== parts[index])) {
+    return false;
+  }
+  const a = octets[0] ?? -1;
+  const b = octets[1] ?? -1;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    a >= 224
+  );
+}
+
+function isPrivateIpv6(host: string): boolean {
+  const normalized = host.toLowerCase();
+  return normalized === "::1" || normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("fe80:");
 }
 
 function cawExportUrl(base: string, walletId: string | undefined, params: Record<string, string | number | undefined>): URL {

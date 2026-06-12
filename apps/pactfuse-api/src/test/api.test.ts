@@ -273,6 +273,84 @@ describe("pactfuse-api P0", () => {
     }
   });
 
+  it("rejects malformed boolean runtime environment flags instead of enabling unsafe modes", () => {
+    const previousAllowInsecure = process.env.PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS;
+    try {
+      process.env.PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS = "flase";
+
+      expect(() =>
+        createServiceCtx({
+          dbPath: ":memory:",
+          logger: {
+            info: () => undefined,
+            warn: () => undefined,
+            error: () => undefined,
+          },
+          clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
+        }),
+      ).toThrow("PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS must be one of");
+    } finally {
+      restoreEnv("PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS", previousAllowInsecure);
+    }
+  });
+
+  it("prefers PactFuse-scoped CAW live env over generic Agent Wallet env", async () => {
+    const previousPactfuseUrl = process.env.PACTFUSE_CAW_LIVE_API_URL;
+    const previousPactfuseKey = process.env.PACTFUSE_CAW_LIVE_API_KEY;
+    const previousAgentUrl = process.env.AGENT_WALLET_API_URL;
+    const previousAgentKey = process.env.AGENT_WALLET_API_KEY;
+    try {
+      process.env.PACTFUSE_CAW_LIVE_API_URL = "http://127.0.0.1:1/v2";
+      process.env.PACTFUSE_CAW_LIVE_API_KEY = "pactfuse-live-key";
+      process.env.AGENT_WALLET_API_URL = "https://api.dev.cobo.com/v2";
+      process.env.AGENT_WALLET_API_KEY = "stale-agent-wallet-key";
+      const ctx = createServiceCtx({
+        dbPath: ":memory:",
+        logger: {
+          info: () => undefined,
+          warn: () => undefined,
+          error: () => undefined,
+        },
+        clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
+      });
+
+      const status = await ctx.cawLive.status();
+
+      expect(status.endpoint).toBe("http://127.0.0.1:1/v2");
+      expect(status.ready).toBe(false);
+      expect(status.reason).toContain("must use HTTPS");
+    } finally {
+      restoreEnv("PACTFUSE_CAW_LIVE_API_URL", previousPactfuseUrl);
+      restoreEnv("PACTFUSE_CAW_LIVE_API_KEY", previousPactfuseKey);
+      restoreEnv("AGENT_WALLET_API_URL", previousAgentUrl);
+      restoreEnv("AGENT_WALLET_API_KEY", previousAgentKey);
+    }
+  });
+
+  it("rejects ambiguous deployment registry env sources", () => {
+    const previousJson = process.env.PACTFUSE_DEPLOYMENT_REGISTRY_JSON;
+    const previousPath = process.env.PACTFUSE_DEPLOYMENT_REGISTRY_PATH;
+    try {
+      process.env.PACTFUSE_DEPLOYMENT_REGISTRY_JSON = JSON.stringify(testDeploymentRegistry());
+      process.env.PACTFUSE_DEPLOYMENT_REGISTRY_PATH = "deployments/base-sepolia.json";
+
+      expect(() =>
+        createServiceCtx({
+          dbPath: ":memory:",
+          logger: {
+            info: () => undefined,
+            warn: () => undefined,
+            error: () => undefined,
+          },
+          clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
+        }),
+      ).toThrow("set either PACTFUSE_DEPLOYMENT_REGISTRY_JSON or PACTFUSE_DEPLOYMENT_REGISTRY_PATH, not both");
+    } finally {
+      restoreEnv("PACTFUSE_DEPLOYMENT_REGISTRY_JSON", previousJson);
+      restoreEnv("PACTFUSE_DEPLOYMENT_REGISTRY_PATH", previousPath);
+    }
+  });
+
   it("exports a live deployment registry from RPC receipt, code, and ERC20 metadata", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pactfuse-registry-"));
     const outputPath = join(dir, "deployments", "base-sepolia.json");
@@ -615,6 +693,28 @@ describe("pactfuse-api P0", () => {
       const registry = proofBundle.deploymentRegistry as { entries: Array<Record<string, unknown>> };
       const replayBundle = proofBundle.replayBundle as Record<string, unknown>;
       registry.entries[0].explorerUrl = `https://sepolia.basescan.org/tx/${hex32("live-smoke-different-deploy")}`;
+      const deploymentRegistryHash = hashForTestJson(registry);
+      proofBundle.deploymentRegistryHash = deploymentRegistryHash;
+      replayBundle.deploymentRegistry = registry;
+      replayBundle.deploymentRegistryHash = deploymentRegistryHash;
+      const replayBundleHash = hashForTestJson(replayBundle);
+      proofBundle.replayBundleHash = replayBundleHash;
+      proofBundle.claimInputReplayBundleHash = replayBundleHash;
+      claim.replayBundleHash = replayBundleHash;
+      resealLiveSmokeProofBundleForTest(proofBundle);
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("PaymentToken deployment registry entry is not live-proof complete");
+  });
+
+  it("live-smoke rejects a self-consistent deployment registry with a non-explorer tx URL", async () => {
+    const result = await runLiveSmokeAgainstStub(undefined, (fixture) => {
+      const proofBundle = fixture.proofBundle as Record<string, unknown>;
+      const claim = fixture.claim as Record<string, unknown>;
+      const registry = proofBundle.deploymentRegistry as { entries: Array<Record<string, unknown>> };
+      const replayBundle = proofBundle.replayBundle as Record<string, unknown>;
+      registry.entries[0].explorerUrl = `https://pactfuse.dev/tx/${registry.entries[0].deploymentTxHash}`;
       const deploymentRegistryHash = hashForTestJson(registry);
       proofBundle.deploymentRegistryHash = deploymentRegistryHash;
       replayBundle.deploymentRegistry = registry;
@@ -1712,6 +1812,53 @@ describe("pactfuse-api P0", () => {
         spendId: hex32("registry-localhost-explorer-spend"),
         settlementEventId: hex32("registry-localhost-explorer-settlement"),
         txHash: hex32("registry-localhost-explorer-tx"),
+        chainProviderMode: "live",
+        chainId: "84532",
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const registryGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry");
+
+    expect(res.status).toBe(200);
+    expect(registryGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        evidenceEventId: null,
+        reason: "missing live deployment registry entry for the mock payment token",
+      }),
+    );
+  });
+
+  it("does not pass the mock token deployment registry gate with a non-explorer HTTPS URL", async () => {
+    const registry = testDeploymentRegistry();
+    const { app, ctx } = makeApp(":memory:", {
+      deploymentRegistry: {
+        ...registry,
+        entries: registry.entries.map((entry) => ({
+          ...entry,
+          explorerUrl: `https://pactfuse.dev/tx/${entry.deploymentTxHash}`,
+        })),
+      },
+    });
+    const sessionId = await createSession(app, "sess-registry-non-explorer-url");
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "token.balance_delta.verified",
+      payload: {
+        spendId: hex32("registry-non-explorer-url-spend"),
+        settlementEventId: hex32("registry-non-explorer-url-settlement"),
+        txHash: hex32("registry-non-explorer-url-tx"),
         chainProviderMode: "live",
         chainId: "84532",
         paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
@@ -3518,6 +3665,25 @@ describe("pactfuse-api P0", () => {
     await expect(source.fetchReceiptBundle({ sessionId: hex32("fake-session") })).rejects.toThrow(
       "not an official Cobo API host",
     );
+  });
+
+  it("does not mark CAW receipt export sources ready without an API key", async () => {
+    const source = createHttpsCawReceiptSource({
+      exportUrl: "https://api.dev.cobo.com/v2/audit",
+    });
+
+    const status = await source.status();
+
+    expect(status).toEqual(
+      expect.objectContaining({
+        name: "caw",
+        mode: "live",
+        ready: false,
+        endpoint: "https://api.dev.cobo.com/v2/audit",
+        reason: "CAW export API key is missing",
+      }),
+    );
+    await expect(source.fetchReceiptBundle({ sessionId: hex32("fake-session") })).rejects.toThrow("CAW export API key is missing");
   });
 
   it("links non-manual CAW receipt ingest to a built operation", async () => {
@@ -6501,6 +6667,25 @@ describe("pactfuse-api P0", () => {
     );
   });
 
+  it("rejects supplied replay bundles whose asOfEventSeq is ahead of the server session", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-replay-future-as-of");
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const replayBundle = deepClone(replayJson.data);
+    replayBundle.asOfEventSeq = 999_999;
+
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-replay-future-as-of",
+      payload: { replayBundle },
+    });
+
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.schemaOk).toBe(false);
+    expect(verify.json.data.errors).toContain("replayBundle.asOfEventSeq is ahead of the server latest event sequence");
+  });
+
   it("records MCP adapter calls with request and response hashes", async () => {
     const { app, ctx } = makeApp();
     const sessionId = await createSession(app, "sess-mcp-audit");
@@ -7606,7 +7791,7 @@ describe("pactfuse-api P0", () => {
       const { app, ctx } = makeApp(":memory:", {
       cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
-        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
+        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000, allowInsecureTestEndpoint: true }),
       });
       const sessionId = await createSession(app, "sess-lease-http-mcp-success");
       const spendId = await registerSpend(app, sessionId);
@@ -7667,8 +7852,8 @@ describe("pactfuse-api P0", () => {
       result: { tools: [leaseToolDefinitionForTest("pactfuse_other_scan")] },
     }));
     try {
-      const goodStatus = await createHttpJsonRpcMcpLeaseClient({ endpointUrl: goodMcp.url, timeoutMs: 1_000 }).status();
-      const badStatus = await createHttpJsonRpcMcpLeaseClient({ endpointUrl: badMcp.url, timeoutMs: 1_000 }).status();
+      const goodStatus = await createHttpJsonRpcMcpLeaseClient({ endpointUrl: goodMcp.url, timeoutMs: 1_000, allowInsecureTestEndpoint: true }).status();
+      const badStatus = await createHttpJsonRpcMcpLeaseClient({ endpointUrl: badMcp.url, timeoutMs: 1_000, allowInsecureTestEndpoint: true }).status();
 
       expect(goodStatus).toEqual(
         expect.objectContaining({
@@ -7693,6 +7878,29 @@ describe("pactfuse-api P0", () => {
     }
   });
 
+  it("does not mark local HTTP MCP lease endpoints as live without test opt-in", async () => {
+    const mcp = await startMcpJsonRpcServer((request) => ({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { tools: [leaseToolDefinitionForTest()] },
+    }));
+    try {
+      const status = await createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }).status();
+
+      expect(status).toEqual(
+        expect.objectContaining({
+          name: "mcp_lease",
+          mode: "live",
+          ready: false,
+          reason: "lease MCP endpoint must use HTTPS",
+        }),
+      );
+      expect(mcp.calls).toEqual([]);
+    } finally {
+      await mcp.close();
+    }
+  });
+
   it("blocks live MCP lease execution before tools/call when tools/list diverges from the pinned source manifest", async () => {
     const mcp = await startMcpJsonRpcServer((request) => {
       if (request.method === "tools/list") {
@@ -7714,7 +7922,7 @@ describe("pactfuse-api P0", () => {
       const { app, ctx } = makeApp(":memory:", {
       cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
-        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
+        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000, allowInsecureTestEndpoint: true }),
       });
       const sessionId = await createSession(app, "sess-lease-pinned-manifest-mismatch");
       const spendId = await registerSpend(app, sessionId, defaultSourceCapabilityForTest("pactfuse_other_scan"));
@@ -7788,7 +7996,7 @@ describe("pactfuse-api P0", () => {
       const { app, ctx } = makeApp(":memory:", {
       cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
-        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
+        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000, allowInsecureTestEndpoint: true }),
       });
       const sessionId = await createSession(app, "sess-lease-call-failure-blocks-token");
       const spendId = await registerSpend(app, sessionId);
@@ -7962,7 +8170,7 @@ describe("pactfuse-api P0", () => {
       const { app, ctx } = makeApp(":memory:", {
       cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
-        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
+        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000, allowInsecureTestEndpoint: true }),
       });
       const sessionId = await createSession(app, "sess-lease-dangerous-tools");
       const spendId = await registerSpend(app, sessionId);
@@ -8035,7 +8243,7 @@ describe("pactfuse-api P0", () => {
       const { app, ctx } = makeApp(":memory:", {
       cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
-        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000 }),
+        mcpLease: createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000, allowInsecureTestEndpoint: true }),
       });
       const sessionId = await createSession(app, "sess-lease-missing-tool-metadata");
       const spendId = await registerSpend(app, sessionId);

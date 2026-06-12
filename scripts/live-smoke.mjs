@@ -7,6 +7,16 @@ import { join, resolve } from "node:path";
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 const ZERO_HASH = `0x${"0".repeat(64)}`;
 const BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
+const PUBLIC_EXPLORER_HOST_PATTERNS = [
+  /(^|\.)basescan\.org$/,
+  /(^|\.)etherscan\.io$/,
+  /(^|\.)etherscan\.org$/,
+  /(^|\.)arbiscan\.io$/,
+  /(^|\.)optimistic\.etherscan\.io$/,
+  /(^|\.)polygonscan\.com$/,
+  /(^|\.)blockscout\.com$/,
+  /(^|\.)routescan\.io$/,
+];
 
 const baseUrl = stripTrailingSlash(process.env.PACTFUSE_API_BASE_URL ?? "http://127.0.0.1:8787");
 const operatorToken = process.env.PACTFUSE_OPERATOR_TOKEN;
@@ -701,7 +711,17 @@ function sameHex(left, right) {
 }
 
 function explorerUrlContainsTxHash(explorerUrl, txHash) {
-  return typeof explorerUrl === "string" && typeof txHash === "string" && explorerUrl.toLowerCase().includes(txHash.toLowerCase());
+  if (typeof explorerUrl !== "string" || typeof txHash !== "string") {
+    return false;
+  }
+  try {
+    const url = new URL(explorerUrl);
+    const segments = url.pathname.toLowerCase().split("/").filter(Boolean);
+    const txIndex = segments.indexOf("tx");
+    return txIndex >= 0 && segments[txIndex + 1] === txHash.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 function isPublicExplorerUrl(value) {
@@ -714,7 +734,7 @@ function isPublicExplorerUrl(value) {
       return false;
     }
     const host = url.hostname.toLowerCase();
-    return host !== "example.com" && !host.endsWith(".example.com") && host !== "localhost" && !host.endsWith(".localhost");
+    return PUBLIC_EXPLORER_HOST_PATTERNS.some((pattern) => pattern.test(host));
   } catch {
     return false;
   }

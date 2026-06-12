@@ -332,6 +332,16 @@ const CAW_STRUCTURAL_AUTHORITY_STATUS = "verified_policy_authority_structural";
 const MOCK_QUOTE_STATUS = "mocked_after_preflight_not_chain_settleable";
 const CHAIN_SETTLEABLE_QUOTE_STATUS = "chain_settleable_after_preflight";
 const BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
+const PUBLIC_EXPLORER_HOST_PATTERNS = [
+  /(^|\.)basescan\.org$/,
+  /(^|\.)etherscan\.io$/,
+  /(^|\.)etherscan\.org$/,
+  /(^|\.)arbiscan\.io$/,
+  /(^|\.)optimistic\.etherscan\.io$/,
+  /(^|\.)polygonscan\.com$/,
+  /(^|\.)blockscout\.com$/,
+  /(^|\.)routescan\.io$/,
+] as const;
 const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 
@@ -5437,7 +5447,14 @@ function isLiveDeploymentRegistryEntry(entry: {
 }
 
 function explorerUrlContainsTxHash(explorerUrl: string, txHash: string): boolean {
-  return explorerUrl.toLowerCase().includes(txHash.toLowerCase());
+  try {
+    const url = new URL(explorerUrl);
+    const segments = url.pathname.toLowerCase().split("/").filter(Boolean);
+    const txIndex = segments.indexOf("tx");
+    return txIndex >= 0 && segments[txIndex + 1] === txHash.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 function isNonZeroHex32(value: string): boolean {
@@ -5451,7 +5468,7 @@ function isPublicExplorerUrl(value: string): boolean {
       return false;
     }
     const host = url.hostname.toLowerCase();
-    return host !== "example.com" && !host.endsWith(".example.com") && host !== "localhost" && !host.endsWith(".localhost");
+    return PUBLIC_EXPLORER_HOST_PATTERNS.some((pattern) => pattern.test(host));
   } catch {
     return false;
   }
@@ -12505,10 +12522,22 @@ function verifyReplayBundleBindings(
     typeof bundle.asOfMcpAdapterCallCount === "number" && Number.isInteger(bundle.asOfMcpAdapterCallCount)
       ? Math.max(0, Math.min(bundle.asOfMcpAdapterCallCount, REPLAY_SUMMARY_LIMIT))
       : REPLAY_SUMMARY_LIMIT;
-  const asOfEventSeq =
-    typeof bundle.asOfEventSeq === "number" && Number.isInteger(bundle.asOfEventSeq)
-      ? Math.max(0, Math.min(bundle.asOfEventSeq, REPLAY_SUMMARY_LIMIT))
-      : REPLAY_SUMMARY_LIMIT;
+  const session = ctx.db.sqlite
+    .prepare("SELECT latest_event_seq FROM sessions WHERE session_id = ?")
+    .get(sessionId) as Row | undefined;
+  const latestEventSeq = session ? Number(session.latest_event_seq) : 0;
+  const suppliedAsOfEventSeq = bundle.asOfEventSeq;
+  const hasSuppliedAsOfEventSeq = typeof suppliedAsOfEventSeq === "number" && Number.isInteger(suppliedAsOfEventSeq);
+  if (suppliedAsOfEventSeq !== undefined && (!hasSuppliedAsOfEventSeq || suppliedAsOfEventSeq < 0)) {
+    errors.push("replayBundle.asOfEventSeq must be a non-negative integer");
+  }
+  if (hasSuppliedAsOfEventSeq && suppliedAsOfEventSeq > latestEventSeq) {
+    errors.push("replayBundle.asOfEventSeq is ahead of the server latest event sequence");
+  }
+  if (hasSuppliedAsOfEventSeq && suppliedAsOfEventSeq > REPLAY_SUMMARY_LIMIT) {
+    errors.push(`replayBundle.asOfEventSeq is above final verifier cap ${REPLAY_SUMMARY_LIMIT}`);
+  }
+  const asOfEventSeq = hasSuppliedAsOfEventSeq ? suppliedAsOfEventSeq : Math.min(latestEventSeq, REPLAY_SUMMARY_LIMIT);
   const expectedEvents = listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT).filter((event) => event.eventSeq <= asOfEventSeq);
   const expectedEventRoot = hashJson(expectedEvents.map((event) => event.eventHash));
   if (bundle.eventRoot !== expectedEventRoot) {

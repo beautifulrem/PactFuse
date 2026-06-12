@@ -61,6 +61,7 @@ PACTFUSE_CAW_WALLET_ID=replace-with-wallet-id
 PACTFUSE_CAW_EXPORT_LIMIT=50
 
 # MCP lease executor
+# Must be a public HTTPS JSON-RPC endpoint; localhost, private networks, and example hosts are rejected in production mode.
 PACTFUSE_LEASE_MCP_URL=https://mcp-lease.example.com/jsonrpc
 PACTFUSE_LEASE_MCP_TOOL_NAME=pactfuse_code_scan
 PACTFUSE_LEASE_MCP_TIMEOUT_MS=10000

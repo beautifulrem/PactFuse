@@ -638,6 +638,14 @@ describe("pactfuse receipt verifier contract", () => {
       },
       "issuer and signature must be provided together",
     ],
+    [
+      "source identity issuer",
+      (bundle) => {
+        const source = appendSignedSourceForTest(bundle);
+        source.issuer = "0x2222222222222222222222222222222222222222";
+      },
+      "signature does not recover issuer",
+    ],
 	  ])("rejects replay bundles with tampered %s", (_label, mutate, expected) => {
     const bundle = replayBundle();
     mutate(bundle);
@@ -2728,8 +2736,9 @@ function appendSignedSourceForTest(bundle) {
     ...sourceBase,
     sessionId: bundle.sessionId,
     sourceHash,
-    issuer: "0x1111111111111111111111111111111111111111",
-    signature: hex32("signed-source-signature"),
+    issuer: "0x1Be31A94361a391bBaFB2a4CCd704F57dc04d4bb",
+    signature:
+      "0x3c3715f92bec68099740feaf73b63dc802cf22358c423d0dc750cfd5a14c88206a2332c51a72c6298d520eff957bc6b8020126efefe10fb686e34a3677dc74b41c",
     proofStatus: "pending",
     createdAt: "2026-06-11T00:00:03.000Z",
   };

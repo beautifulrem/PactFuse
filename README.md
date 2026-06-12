@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  PactFuse trips unsafe source-bound spends before payment, settles clean leases through a gate contract, and preserves a replayable evidence bundle for every claim.
+  PactFuse is a fail-closed backend for tripping unsafe source-bound spends before payment, settling clean leases through a gate contract, and preserving replayable evidence for every authorized claim.
 </p>
 
 <p align="center">

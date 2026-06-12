@@ -112,6 +112,13 @@ importers:
         version: 4.1.8(@types/node@24.13.1)(vite@8.0.16(@types/node@24.13.1)(esbuild@0.28.0)(tsx@4.22.4))
 
   packages/verifier:
+    dependencies:
+      '@noble/curves':
+        specifier: ^1.9.1
+        version: 1.9.1
+      viem:
+        specifier: ^2.41.2
+        version: 2.52.2(typescript@5.9.3)(zod@4.4.3)
     devDependencies:
       vitest:
         specifier: ^4.0.15

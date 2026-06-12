@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 
+import { secp256k1 } from "@noble/curves/secp256k1";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { hashMessage } from "viem";
+import { publicKeyToAddress } from "viem/accounts";
 
 const BAD_EVIDENCE_VALUES = new Set(["pending", "fixture", "manual", "blocked"]);
 const INACTIVE_BRANCH_NULL_PATHS = new Set(["paymentProof.permit", "paymentProof.gatePaid"]);
@@ -1731,8 +1734,52 @@ function verifySourceIdentityBindings(bundle, errors) {
     });
     if (lowerHex(source.sourceHash) !== expectedSourceHash) {
       errors.push(`source ${source.sourceHash ?? "-"} sourceHash does not match signed source identity preimage`);
+      continue;
+    }
+    if (!isEvmAddress(source.issuer)) {
+      errors.push(`source ${source.sourceHash ?? "-"} issuer must be an EVM address`);
+      continue;
+    }
+    try {
+      const recovered = recoverSourceIssuerAddress(sourceIdentityMessage(expectedSourceHash), source.signature);
+      if (lowerHex(recovered) !== lowerHex(source.issuer)) {
+        errors.push(`source ${source.sourceHash ?? "-"} signature does not recover issuer`);
+      }
+    } catch (error) {
+      errors.push(`source ${source.sourceHash ?? "-"} signature cannot be recovered: ${error instanceof Error ? error.message : "unknown error"}`);
     }
   }
+}
+
+function sourceIdentityMessage(sourceIdentityHash) {
+  return `PactFuse source identity: ${sourceIdentityHash}`;
+}
+
+function recoverSourceIssuerAddress(message, signature) {
+  if (typeof signature !== "string" || !/^0x[0-9a-fA-F]{130}$/.test(signature)) {
+    throw new Error("signature must be 65-byte hex");
+  }
+  const recoveryBit = signatureRecoveryBit(Number.parseInt(signature.slice(130, 132), 16));
+  const compactSignature = signature.slice(2, 130);
+  const messageHash = hashMessage(message);
+  const publicKey = secp256k1.Signature.fromCompact(compactSignature)
+    .addRecoveryBit(recoveryBit)
+    .recoverPublicKey(messageHash.slice(2))
+    .toHex(false);
+  return publicKeyToAddress(`0x${publicKey}`);
+}
+
+function signatureRecoveryBit(yParityOrV) {
+  if (yParityOrV === 0 || yParityOrV === 1) {
+    return yParityOrV;
+  }
+  if (yParityOrV === 27) {
+    return 0;
+  }
+  if (yParityOrV === 28) {
+    return 1;
+  }
+  throw new Error("invalid recovery bit");
 }
 
 function verifyCawLiveInteractions(interactions, spendsById, eventsById, errors) {
