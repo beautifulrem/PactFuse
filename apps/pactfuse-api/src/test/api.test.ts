@@ -313,6 +313,13 @@ describe("pactfuse-api P0", () => {
         "proof-bundle providerStatusHash does not recompute",
       ],
       [
+        "public claim event hash",
+        (proofBundle) => {
+          proofBundle.publicClaimEventHash = hex32("live-smoke-bad-public-claim-event");
+        },
+        "proof-bundle public claim event hash does not recompute",
+      ],
+      [
         "proof bundle hash",
         (proofBundle) => {
           proofBundle.proofBundleHash = hex32("live-smoke-bad-bundle");
@@ -9946,11 +9953,38 @@ function liveSmokeFixture(): {
     { name: "caw", mode: "live", ready: true, reason: "stub caw receipts", endpoint: null },
     { name: "mcp_lease", mode: "live", ready: true, reason: "stub mcp lease", endpoint: null },
   ];
+  const priorProofPayload = { proofAuthority: true, winnerClaimAllowed: false, stub: "final verifier passed" };
+  const priorProofPayloadHash = hashForTestJson(priorProofPayload);
+  const priorProofEventHash = hashForTestJson({
+    sessionId,
+    eventSeq: 49,
+    authority: "proof",
+    kind: "verifier.final_replay_claim",
+    payloadHash: priorProofPayloadHash,
+    prevProofEventHash: ZERO_HASH,
+  });
+  const events = [
+    {
+      sessionId,
+      eventId: priorProofEventHash,
+      eventSeq: 49,
+      eventHash: priorProofEventHash,
+      prevProofEventHash: ZERO_HASH,
+      authority: "proof",
+      kind: "verifier.final_replay_claim",
+      payloadHash: priorProofPayloadHash,
+      payload: priorProofPayload,
+      createdAt: "2026-06-11T00:00:00.000Z",
+    },
+  ];
   const replayBundle = {
     bundleType: "PACTFUSE_EVIDENCE_V1",
     sessionId,
+    summaryMode: true,
+    asOfEventSeq: 49,
     winnerClaimAllowed: true,
-    eventRoot: hashForTestJson(["stub-event"]),
+    eventRoot: hashForTestJson(events.map((event) => event.eventHash)),
+    events,
     replayPageIndex: { pageSize: 200, pageRoot: hashForTestJson([]), collections: {} },
     replayPages: {},
   };
@@ -10009,8 +10043,6 @@ function liveSmokeFixture(): {
     bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
     sessionId,
     publicClaimHash,
-    publicClaimEventId: hex32("live-smoke-public-claim-event"),
-    publicClaimEventHash: hex32("live-smoke-public-claim-event-hash"),
     publicClaimEventSeq: 50,
     claimInputReplayBundleHash: replayBundleHash,
     replayBundleHash,
@@ -10024,6 +10056,34 @@ function liveSmokeFixture(): {
     deploymentRegistry: null,
     server,
     winnerClaimAllowed: true,
+  };
+  const publicClaimPayloadHash = hashForTestJson({
+    claim,
+    publicClaimHash,
+    replayBundleHash,
+    verifierRunHash: proofBundleBase.verifierRunHash,
+    asOfEventSeq: 49,
+    providerStatuses,
+    providerStatusHash: proofBundleBase.providerStatusHash,
+    deploymentRegistry: null,
+    deploymentRegistryHash: null,
+    server,
+    serverHash: proofBundleBase.serverHash,
+    proofAuthority: true,
+    winnerClaimAllowed: true,
+  });
+  const publicClaimEventHash = hashForTestJson({
+    sessionId,
+    eventSeq: 50,
+    authority: "proof",
+    kind: "public.claim.authorized",
+    payloadHash: publicClaimPayloadHash,
+    prevProofEventHash: priorProofEventHash,
+  });
+  const proofBundleWithEvent = {
+    ...proofBundleBase,
+    publicClaimEventId: publicClaimEventHash,
+    publicClaimEventHash,
   };
   return {
     sessionId,
@@ -10051,8 +10111,8 @@ function liveSmokeFixture(): {
     },
     claim,
     proofBundle: {
-      ...proofBundleBase,
-      proofBundleHash: hashForTestJson(proofBundleBase),
+      ...proofBundleWithEvent,
+      proofBundleHash: hashForTestJson(proofBundleWithEvent),
     },
   };
 }

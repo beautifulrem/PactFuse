@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
+const ZERO_HASH = `0x${"0".repeat(64)}`;
 
 const baseUrl = stripTrailingSlash(process.env.PACTFUSE_API_BASE_URL ?? "http://127.0.0.1:8787");
 const operatorToken = process.env.PACTFUSE_OPERATOR_TOKEN;
@@ -89,6 +90,11 @@ try {
     assert(HEX32.test(proofBundleData.proofBundleHash), "proof-bundle hash is missing or invalid", proofBundleData);
     assert(HEX32.test(proofBundleData.publicClaimEventId), "proof-bundle public claim event id is missing or invalid", proofBundleData);
     assert(HEX32.test(proofBundleData.publicClaimEventHash), "proof-bundle public claim event hash is missing or invalid", proofBundleData);
+    assert(
+      Number.isInteger(proofBundleData.publicClaimEventSeq) && proofBundleData.publicClaimEventSeq > 1,
+      "proof-bundle public claim event seq is missing or invalid",
+      proofBundleData,
+    );
     assert(HEX32.test(proofBundleData.providerStatusHash), "proof-bundle provider status hash is missing or invalid", proofBundleData);
     assert(HEX32.test(proofBundleData.serverHash), "proof-bundle server hash is missing or invalid", proofBundleData);
     verifyProofBundleHashes(proofBundleData, claimData);
@@ -208,11 +214,107 @@ function verifyProofBundleHashes(proofBundle, claim) {
     expected: proofBundle.serverHash,
     actual: hashJson(proofBundle.server),
   });
+  const previousProofEventHash = verifyReplayBundleEvents(proofBundle.replayBundle, proofBundle.publicClaimEventSeq - 1);
+  verifyPublicClaimEventHash(proofBundle, previousProofEventHash);
   const bundleBase = { ...proofBundle };
   delete bundleBase.proofBundleHash;
   assert(hashJson(bundleBase) === proofBundle.proofBundleHash, "proof-bundle hash does not recompute", {
     expected: proofBundle.proofBundleHash,
     actual: hashJson(bundleBase),
+  });
+}
+
+function verifyReplayBundleEvents(replayBundle, expectedAsOfEventSeq) {
+  const events = replayBundle?.events;
+  assert(Array.isArray(events) && events.length > 0, "proof-bundle replayBundle.events is missing or empty", replayBundle);
+  assert(replayBundle.asOfEventSeq === expectedAsOfEventSeq, "proof-bundle replay asOfEventSeq does not precede public claim event", {
+    expected: expectedAsOfEventSeq,
+    actual: replayBundle.asOfEventSeq,
+  });
+  let previousEventSeq = 0;
+  let previousProofEventHash = ZERO_HASH;
+  for (const event of events) {
+    assert(isObject(event), "proof-bundle replayBundle.events entries must be objects", event);
+    for (const field of ["eventId", "sessionId", "eventSeq", "eventHash", "authority", "kind", "payloadHash", "payload"]) {
+      assert(event[field] !== undefined, `proof-bundle replay event is missing ${field}`, event);
+    }
+    assert(event.sessionId === replayBundle.sessionId, "proof-bundle replay event sessionId does not match replay bundle", event);
+    assert(Number.isInteger(event.eventSeq) && event.eventSeq > previousEventSeq, "proof-bundle replay eventSeq is not strictly increasing", event);
+    previousEventSeq = event.eventSeq;
+    const expectedPayloadHash = hashJson(event.payload);
+    assert(sameHex(event.payloadHash, expectedPayloadHash), "proof-bundle replay event payloadHash does not recompute", {
+      eventId: event.eventId,
+      expected: event.payloadHash,
+      actual: expectedPayloadHash,
+    });
+    const expectedPrevProofEventHash = event.authority === "proof" ? previousProofEventHash : null;
+    assert(
+      (event.prevProofEventHash ?? null) === expectedPrevProofEventHash,
+      "proof-bundle replay event prevProofEventHash does not match proof chain",
+      { eventId: event.eventId, expected: expectedPrevProofEventHash, actual: event.prevProofEventHash ?? null },
+    );
+    const expectedEventHash = hashJson({
+      sessionId: event.sessionId,
+      eventSeq: event.eventSeq,
+      authority: event.authority,
+      kind: event.kind,
+      payloadHash: event.payloadHash,
+      prevProofEventHash: event.prevProofEventHash ?? null,
+    });
+    assert(sameHex(event.eventHash, expectedEventHash), "proof-bundle replay eventHash does not recompute", {
+      eventId: event.eventId,
+      expected: event.eventHash,
+      actual: expectedEventHash,
+    });
+    assert(sameHex(event.eventId, expectedEventHash), "proof-bundle replay eventId does not equal eventHash", {
+      eventId: event.eventId,
+      expected: expectedEventHash,
+    });
+    if (event.authority === "proof") {
+      previousProofEventHash = event.eventHash.toLowerCase();
+    }
+  }
+  const expectedEventRoot = hashJson(events.map((event) => event.eventHash));
+  assert(sameHex(replayBundle.eventRoot, expectedEventRoot), "proof-bundle replay eventRoot does not recompute", {
+    expected: replayBundle.eventRoot,
+    actual: expectedEventRoot,
+  });
+  return previousProofEventHash;
+}
+
+function verifyPublicClaimEventHash(proofBundle, previousProofEventHash) {
+  const asOfEventSeq = proofBundle.publicClaimEventSeq - 1;
+  const payload = {
+    claim: proofBundle.publicClaim,
+    publicClaimHash: proofBundle.publicClaimHash,
+    replayBundleHash: proofBundle.claimInputReplayBundleHash,
+    verifierRunHash: proofBundle.verifierRunHash,
+    asOfEventSeq,
+    providerStatuses: proofBundle.providerStatuses,
+    providerStatusHash: proofBundle.providerStatusHash,
+    deploymentRegistry: proofBundle.deploymentRegistry,
+    deploymentRegistryHash: proofBundle.deploymentRegistryHash,
+    server: proofBundle.server,
+    serverHash: proofBundle.serverHash,
+    proofAuthority: true,
+    winnerClaimAllowed: true,
+  };
+  const payloadHash = hashJson(payload);
+  const eventHash = hashJson({
+    sessionId: proofBundle.sessionId,
+    eventSeq: proofBundle.publicClaimEventSeq,
+    authority: "proof",
+    kind: "public.claim.authorized",
+    payloadHash,
+    prevProofEventHash: previousProofEventHash,
+  });
+  assert(sameHex(proofBundle.publicClaimEventHash, eventHash), "proof-bundle public claim event hash does not recompute", {
+    expected: proofBundle.publicClaimEventHash,
+    actual: eventHash,
+  });
+  assert(sameHex(proofBundle.publicClaimEventId, eventHash), "proof-bundle public claim event id does not equal event hash", {
+    expected: proofBundle.publicClaimEventId,
+    actual: eventHash,
   });
 }
 
@@ -265,6 +367,14 @@ function sortForJcs(value) {
     return sorted;
   }
   return value;
+}
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function sameHex(left, right) {
+  return typeof left === "string" && typeof right === "string" && left.toLowerCase() === right.toLowerCase();
 }
 
 function assert(condition, message, details) {
