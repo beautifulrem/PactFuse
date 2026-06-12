@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { createHash } from "node:crypto";
+
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 
 const baseUrl = stripTrailingSlash(process.env.PACTFUSE_API_BASE_URL ?? "http://127.0.0.1:8787");
@@ -49,6 +51,10 @@ try {
     assert(claimData.proofChipAllowed === true, "public-claim proofChipAllowed is not true", claimData);
     assert(claimData.finalVerifierComplete === true, "public-claim finalVerifierComplete is not true", claimData);
     assert(claimData.winnerClaimAllowed === true, "public-claim winnerClaimAllowed is not true", claimData);
+    assert(claimData.sessionId === sessionId, "public-claim sessionId does not match PACTFUSE_LIVE_SMOKE_SESSION_ID", {
+      expected: sessionId,
+      actual: claimData.sessionId,
+    });
     assert(HEX32.test(claimData.publicClaimHash), "public-claim hash is missing or invalid", claimData);
 
     const proofBundle = await requestJson(`/api/v1/evidence/proof-bundle?sessionId=${encodeURIComponent(sessionId)}`);
@@ -56,6 +62,18 @@ try {
     assert(proofBundle.ok === true && proofBundleData, "proof-bundle did not return data", proofBundle);
     assert(proofBundleData.bundleType === "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1", "proof-bundle has the wrong bundle type", proofBundleData);
     assert(proofBundleData.winnerClaimAllowed === true, "proof-bundle winnerClaimAllowed is not true", proofBundleData);
+    assert(proofBundleData.sessionId === sessionId, "proof-bundle sessionId does not match PACTFUSE_LIVE_SMOKE_SESSION_ID", {
+      expected: sessionId,
+      actual: proofBundleData.sessionId,
+    });
+    assert(proofBundleData.publicClaim?.sessionId === sessionId, "proof-bundle embedded publicClaim sessionId does not match", {
+      expected: sessionId,
+      actual: proofBundleData.publicClaim?.sessionId,
+    });
+    assert(proofBundleData.replayBundle?.sessionId === sessionId, "proof-bundle embedded replayBundle sessionId does not match", {
+      expected: sessionId,
+      actual: proofBundleData.replayBundle?.sessionId,
+    });
     assert(proofBundleData.publicClaimHash === claimData.publicClaimHash, "proof-bundle public claim hash does not match public-claim", {
       proofBundlePublicClaimHash: proofBundleData.publicClaimHash,
       publicClaimHash: claimData.publicClaimHash,
@@ -70,8 +88,10 @@ try {
     });
     assert(HEX32.test(proofBundleData.proofBundleHash), "proof-bundle hash is missing or invalid", proofBundleData);
     assert(HEX32.test(proofBundleData.publicClaimEventId), "proof-bundle public claim event id is missing or invalid", proofBundleData);
+    assert(HEX32.test(proofBundleData.publicClaimEventHash), "proof-bundle public claim event hash is missing or invalid", proofBundleData);
     assert(HEX32.test(proofBundleData.providerStatusHash), "proof-bundle provider status hash is missing or invalid", proofBundleData);
     assert(HEX32.test(proofBundleData.serverHash), "proof-bundle server hash is missing or invalid", proofBundleData);
+    verifyProofBundleHashes(proofBundleData, claimData);
   }
 
   console.log(
@@ -148,6 +168,103 @@ function listEnv(name, fallback) {
     .map((part) => part.trim())
     .filter(Boolean);
   return values.length > 0 ? values : fallback;
+}
+
+function verifyProofBundleHashes(proofBundle, claim) {
+  assert(canonicalizeJson(proofBundle.publicClaim) === canonicalizeJson(claim), "proof-bundle publicClaim does not match public-claim response", {
+    proofBundlePublicClaimHash: proofBundle.publicClaim?.publicClaimHash,
+    publicClaimHash: claim?.publicClaimHash,
+  });
+  assert(proofBundle.publicClaim?.publicClaimHash === proofBundle.publicClaimHash, "proof-bundle publicClaimHash does not match embedded publicClaim", {
+    proofBundlePublicClaimHash: proofBundle.publicClaimHash,
+    embeddedPublicClaimHash: proofBundle.publicClaim?.publicClaimHash,
+  });
+  assert(
+    hashJson(publicClaimHashInput(proofBundle.publicClaim)) === proofBundle.publicClaimHash,
+    "proof-bundle publicClaimHash does not recompute from embedded publicClaim",
+    {
+      expected: proofBundle.publicClaimHash,
+      actual: hashJson(publicClaimHashInput(proofBundle.publicClaim)),
+    },
+  );
+  assert(hashJson(proofBundle.replayBundle) === proofBundle.replayBundleHash, "proof-bundle replayBundleHash does not recompute", {
+    expected: proofBundle.replayBundleHash,
+    actual: hashJson(proofBundle.replayBundle),
+  });
+  assert(hashJson(proofBundle.publicClaim.verifierRun) === proofBundle.verifierRunHash, "proof-bundle verifierRunHash does not recompute", {
+    expected: proofBundle.verifierRunHash,
+    actual: hashJson(proofBundle.publicClaim.verifierRun),
+  });
+  assert(hashJson(proofBundle.providerStatuses) === proofBundle.providerStatusHash, "proof-bundle providerStatusHash does not recompute", {
+    expected: proofBundle.providerStatusHash,
+    actual: hashJson(proofBundle.providerStatuses),
+  });
+  const deploymentRegistryHash = proofBundle.deploymentRegistry === null ? null : hashJson(proofBundle.deploymentRegistry);
+  assert(deploymentRegistryHash === proofBundle.deploymentRegistryHash, "proof-bundle deploymentRegistryHash does not recompute", {
+    expected: proofBundle.deploymentRegistryHash,
+    actual: deploymentRegistryHash,
+  });
+  assert(hashJson(proofBundle.server) === proofBundle.serverHash, "proof-bundle serverHash does not recompute", {
+    expected: proofBundle.serverHash,
+    actual: hashJson(proofBundle.server),
+  });
+  const bundleBase = { ...proofBundle };
+  delete bundleBase.proofBundleHash;
+  assert(hashJson(bundleBase) === proofBundle.proofBundleHash, "proof-bundle hash does not recompute", {
+    expected: proofBundle.proofBundleHash,
+    actual: hashJson(bundleBase),
+  });
+}
+
+function publicClaimHashInput(claim) {
+  return {
+    sessionId: claim.sessionId,
+    claimMode: claim.claimMode,
+    paymentMode: claim.paymentMode,
+    tokenMode: claim.tokenMode,
+    identityMode: claim.identityMode,
+    replayBundleHash: claim.replayBundleHash,
+    verifierRun: {
+      proofLevel: claim.verifierRun.proofLevel,
+      proofChipAllowed: claim.verifierRun.proofChipAllowed,
+      finalVerifierComplete: claim.verifierRun.finalVerifierComplete,
+      winnerClaimAllowed: claim.verifierRun.winnerClaimAllowed,
+    },
+  };
+}
+
+function hashJson(value) {
+  return `0x${createHash("sha256").update(canonicalizeJson(value)).digest("hex")}`;
+}
+
+function canonicalizeJson(value) {
+  return JSON.stringify(sortForJcs(value));
+}
+
+function sortForJcs(value) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("JCS canonicalization rejects non-finite numbers");
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sortForJcs(item));
+  }
+  if (typeof value === "object") {
+    const sorted = {};
+    for (const key of Object.keys(value).sort()) {
+      const child = value[key];
+      if (child !== undefined) {
+        sorted[key] = sortForJcs(child);
+      }
+    }
+    return sorted;
+  }
+  return value;
 }
 
 function assert(condition, message, details) {

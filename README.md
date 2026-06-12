@@ -305,7 +305,7 @@ Required result:
 - chain, CAW live, CAW receipt export, and MCP lease providers are ready
 - `/api/v1/evidence/live-preflight` returns `readyForPublicClaim=true` with no blockers
 - `/api/v1/evidence/public-claim` returns `authorized_public_claim`, `finalVerifierComplete=true`, and `winnerClaimAllowed=true`
-- `/api/v1/evidence/proof-bundle` returns `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1`, and its replay, provider, deployment-registry, server, and bundle hashes recompute from the response body
+- `/api/v1/evidence/proof-bundle` returns `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1`, and its public claim, public-claim event hash, replay, verifier run, provider, deployment-registry, server, and bundle hashes recompute from the response body
 
 For `mock-test-token`, claim readiness also requires a live deployment registry entry for the payment token address, non-zero deployment transaction hash, public HTTPS explorer URL, decimals, and non-zero bytecode hash. Official Base Sepolia USDC is accepted only on chain id `84532` with a passed official-USDC probe and a matching live registry entry.
 
@@ -359,7 +359,7 @@ Before publishing a branch or demo:
 3. Run `pnpm turbo run test --force`.
 4. Run `pnpm test:contracts`.
 5. For live demos, run `pnpm live-smoke` against the real evidence session.
-6. Confirm the proof bundle hash, replay hash, provider status hash, deployment registry hash, and server hash recompute locally.
+6. Confirm the proof bundle hash, public claim hash, public-claim event hash, replay hash, verifier run hash, provider status hash, deployment registry hash, and server hash recompute locally.
 7. Confirm fixture, pending, manual, and blocked rows do not appear as public proof.
 8. Confirm secrets are not committed.
 

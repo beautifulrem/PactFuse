@@ -1,4 +1,5 @@
 import { createHash, createHmac } from "node:crypto";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import { join } from "node:path";
@@ -269,6 +270,62 @@ describe("pactfuse-api P0", () => {
       restoreEnv("PACTFUSE_INDEXER_ENABLED", previousIndexerEnabled);
       restoreEnv("PACTFUSE_CHAIN_RPC_URL", previousChainRpc);
       restoreEnv("PACTFUSE_CHAIN_ID", previousChainId);
+    }
+  });
+
+  it("live-smoke recomputes public proof bundle hashes against a live endpoint", async () => {
+    const result = await runLiveSmokeAgainstStub();
+    const stdout = JSON.parse(result.stdout) as Record<string, unknown>;
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(stdout.ok).toBe(true);
+    expect(stdout.proofBundleHash).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  it("live-smoke rejects session and proof hash drift from the live endpoint", async () => {
+    const cases: Array<[string, (proofBundle: Record<string, unknown>) => void, string]> = [
+      [
+        "wrong session",
+        (proofBundle) => {
+          proofBundle.sessionId = hex32("live-smoke-wrong-session");
+        },
+        "proof-bundle sessionId does not match",
+      ],
+      [
+        "public claim hash",
+        (proofBundle) => {
+          proofBundle.publicClaimHash = hex32("live-smoke-bad-public-claim");
+        },
+        "proof-bundle public claim hash does not match public-claim",
+      ],
+      [
+        "replay bundle hash",
+        (proofBundle) => {
+          proofBundle.replayBundleHash = hex32("live-smoke-bad-replay");
+        },
+        "proof-bundle final replay hash does not match public-claim",
+      ],
+      [
+        "provider status hash",
+        (proofBundle) => {
+          proofBundle.providerStatusHash = hex32("live-smoke-bad-provider");
+        },
+        "proof-bundle providerStatusHash does not recompute",
+      ],
+      [
+        "proof bundle hash",
+        (proofBundle) => {
+          proofBundle.proofBundleHash = hex32("live-smoke-bad-bundle");
+        },
+        "proof-bundle hash does not recompute",
+      ],
+    ];
+
+    for (const [, mutateProofBundle, expectedError] of cases) {
+      const result = await runLiveSmokeAgainstStub(mutateProofBundle);
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(expectedError);
     }
   });
 
@@ -757,12 +814,12 @@ describe("pactfuse-api P0", () => {
     const proofBundleJson = await proofBundle.json();
     const claimEvents = ctx.db.sqlite
       .prepare(
-        `SELECT event_seq, authority, kind, payload_json
+        `SELECT event_id, event_seq, event_hash, authority, kind, payload_json
          FROM evidence_events
          WHERE session_id = ? AND kind = 'public.claim.authorized'
          ORDER BY event_seq ASC`,
       )
-      .all(sessionId) as Array<{ event_seq: number; authority: string; kind: string; payload_json: string }>;
+      .all(sessionId) as Array<{ event_id: string; event_seq: number; event_hash: string; authority: string; kind: string; payload_json: string }>;
     const claimEventPayload = JSON.parse(claimEvents[0]?.payload_json ?? "{}") as Record<string, unknown>;
 
     expect(identity.status).toBe(202);
@@ -818,6 +875,8 @@ describe("pactfuse-api P0", () => {
         bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
         sessionId,
         publicClaimHash: claimJson.data.publicClaimHash,
+        publicClaimEventId: claimEvents[0].event_id,
+        publicClaimEventHash: claimEvents[0].event_hash,
         publicClaimEventSeq: claimEvents[0].event_seq,
         claimInputReplayBundleHash: claimJson.data.replayBundleHash,
         replayBundleHash: claimJson.data.replayBundleHash,
@@ -1432,7 +1491,9 @@ describe("pactfuse-api P0", () => {
       "proofBundleHash",
       "publicClaimHash",
       "publicClaimEventId",
+      "publicClaimEventHash",
       "replayBundleHash",
+      "verifierRunHash",
       "providerStatusHash",
       "deploymentRegistryHash",
       "serverHash",
@@ -9716,6 +9777,232 @@ async function startMcpJsonRpcServer(respond: (request: Record<string, unknown>)
         });
       }),
   };
+}
+
+async function runLiveSmokeAgainstStub(mutateProofBundle?: (proofBundle: Record<string, unknown>) => void): Promise<{
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}> {
+  const fixture = liveSmokeFixture();
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const proofBundle = deepClone(fixture.proofBundle);
+    if (mutateProofBundle) {
+      mutateProofBundle(proofBundle);
+    }
+    const responses: Record<string, unknown> = {
+      "/readyz": fixture.ready,
+      "/api/v1/evidence/live-preflight": fixture.preflight,
+      "/api/v1/evidence/public-claim": { ok: true, requestId: "stub_public_claim", data: fixture.claim },
+      "/api/v1/evidence/proof-bundle": { ok: true, requestId: "stub_proof_bundle", data: proofBundle },
+    };
+    const body = responses[url.pathname];
+    if (!body) {
+      res.statusCode = 404;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ ok: false, error: { code: "not_found" } }));
+      return;
+    }
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify(body));
+  });
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("live-smoke stub server did not bind to a TCP port");
+  }
+  try {
+    const result = await runNodeScript([join(process.cwd(), "../../scripts/live-smoke.mjs")], {
+      cwd: join(process.cwd(), "../.."),
+      env: {
+        ...process.env,
+        PACTFUSE_API_BASE_URL: `http://127.0.0.1:${address.port}`,
+        PACTFUSE_OPERATOR_TOKEN: "operator-test-token",
+        PACTFUSE_LIVE_SMOKE_SESSION_ID: fixture.sessionId,
+        PACTFUSE_LIVE_SMOKE_REQUIRED_PROVIDERS: "chain,caw_live,caw,mcp_lease",
+      },
+    });
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+}
+
+function runNodeScript(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }): Promise<{
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, args, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`node ${args.join(" ")} timed out`));
+    }, 10_000);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on("close", (status) => {
+      clearTimeout(timeout);
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
+
+function liveSmokeFixture(): {
+  sessionId: string;
+  ready: Record<string, unknown>;
+  preflight: Record<string, unknown>;
+  claim: Record<string, unknown>;
+  proofBundle: Record<string, unknown>;
+} {
+  const sessionId = hex32("live-smoke-stub-session");
+  const providerStatuses = [
+    { name: "chain", mode: "live", ready: true, reason: "stub chain", chainId: "84532", endpoint: null },
+    { name: "caw_live", mode: "live", ready: true, reason: "stub caw live", endpoint: "https://api.agenticwallet.cobo.test/" },
+    { name: "caw", mode: "live", ready: true, reason: "stub caw receipts", endpoint: null },
+    { name: "mcp_lease", mode: "live", ready: true, reason: "stub mcp lease", endpoint: null },
+  ];
+  const replayBundle = {
+    bundleType: "PACTFUSE_EVIDENCE_V1",
+    sessionId,
+    winnerClaimAllowed: true,
+    eventRoot: hashForTestJson(["stub-event"]),
+    replayPageIndex: { pageSize: 200, pageRoot: hashForTestJson([]), collections: {} },
+    replayPages: {},
+  };
+  const replayBundleHash = hashForTestJson(replayBundle);
+  const verifierRun = {
+    sessionId,
+    proofLevel: "final_replay_claim",
+    claimMode: "caw-target-real",
+    paymentMode: "gate-paid-artifact-real",
+    tokenMode: "mock-test-token",
+    identityMode: "p0-floor-one-wallet",
+    schemaOk: true,
+    proofChipAllowed: true,
+    winnerClaimAllowed: true,
+    requestedWinnerClaimAllowed: true,
+    finalVerifierComplete: true,
+    errors: [],
+    warnings: [],
+    raw: {},
+  };
+  const publicClaimHash = hashForTestJson({
+    sessionId,
+    claimMode: "caw-target-real",
+    paymentMode: "gate-paid-artifact-real",
+    tokenMode: "mock-test-token",
+    identityMode: "p0-floor-one-wallet",
+    replayBundleHash,
+    verifierRun: {
+      proofLevel: verifierRun.proofLevel,
+      proofChipAllowed: verifierRun.proofChipAllowed,
+      finalVerifierComplete: verifierRun.finalVerifierComplete,
+      winnerClaimAllowed: verifierRun.winnerClaimAllowed,
+    },
+  });
+  const claim = {
+    sessionId,
+    claimStatus: "authorized_public_claim",
+    claimMode: "caw-target-real",
+    paymentMode: "gate-paid-artifact-real",
+    tokenMode: "mock-test-token",
+    identityMode: "p0-floor-one-wallet",
+    replayBundleHash,
+    publicClaimHash,
+    verifierRun,
+    proofChipAllowed: true,
+    finalVerifierComplete: true,
+    winnerClaimAllowed: true,
+  };
+  const server = {
+    proofBundleVersion: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+    commit: "stub-commit",
+    buildTime: "2026-06-11T00:00:00.000Z",
+    generatedAt: "2026-06-11T00:00:00.000Z",
+  };
+  const proofBundleBase = {
+    bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+    sessionId,
+    publicClaimHash,
+    publicClaimEventId: hex32("live-smoke-public-claim-event"),
+    publicClaimEventHash: hex32("live-smoke-public-claim-event-hash"),
+    publicClaimEventSeq: 50,
+    claimInputReplayBundleHash: replayBundleHash,
+    replayBundleHash,
+    verifierRunHash: hashForTestJson(verifierRun),
+    providerStatusHash: hashForTestJson(providerStatuses),
+    deploymentRegistryHash: null,
+    serverHash: hashForTestJson(server),
+    publicClaim: claim,
+    replayBundle,
+    providerStatuses,
+    deploymentRegistry: null,
+    server,
+    winnerClaimAllowed: true,
+  };
+  return {
+    sessionId,
+    ready: {
+      ok: true,
+      proofProviderCheck: { checked: true },
+      apiSecurity: { operatorTokenConfigured: true, allowInsecureMissingRoleTokens: false },
+      mcpAudit: { configured: true },
+      gateIngest: { configured: true },
+      proofProviders: providerStatuses,
+    },
+    preflight: {
+      ok: true,
+      requestId: "stub_preflight",
+      data: {
+        sessionId,
+        status: "ready",
+        readyForPublicClaim: true,
+        winnerClaimAllowed: true,
+        blockingReasons: [],
+        requiredExternalInputs: [],
+        checks: [{ checkId: "stub", status: "pass" }],
+        security: { cawIngestTokenConfigured: true },
+      },
+    },
+    claim,
+    proofBundle: {
+      ...proofBundleBase,
+      proofBundleHash: hashForTestJson(proofBundleBase),
+    },
+  };
+}
+
+function deepClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function signAuditPayload(secret: string, payload: unknown): `0x${string}` {
