@@ -39,7 +39,7 @@
 - [Evidence And Verification](#evidence-and-verification)
 - [Configuration](#configuration)
 - [Smart Contracts](#smart-contracts)
-- [Frontend Preview](#frontend-preview)
+- [Frontend Console](#frontend-console)
 - [Security Model And Risk Boundary](#security-model-and-risk-boundary)
 - [Third-Party APIs, SDKs, And AI Tools](#third-party-apis-sdks-and-ai-tools)
 - [Development](#development)
@@ -318,15 +318,18 @@ Contracts live in [contracts/src](contracts/src) (Foundry; `pnpm test:contracts`
 
 Deployed Base Sepolia instances are listed in [Verified Live Evidence](#verified-live-evidence).
 
-## Frontend Preview
+## Frontend Console
 
-Fusebox is the intended product surface: a procurement breaker panel where challenged source leases trip cold and clean leases settle hot. Current files are **fixtures, not proof authority**:
+The PactFuse Console is an interactive, evidence-backed demo (zero-build vanilla ES modules, no dependencies):
 
-- [Fusebox v2 preview](apps/fusebox/preview/fusebox-v2/index.html) · [legacy preview](apps/fusebox/preview/fusebox/index.html) · [rendered screenshot](docs/evidence/screenshots/fusebox-v2-prototype.fixture.png)
+```sh
+pnpm demo:console
+# → http://127.0.0.1:8123/apps/fusebox/live/
+```
 
-Production Fusebox must derive state from `/api/v1/evidence/stream` or polling fallback endpoints.
+Pick one of three risk scenarios — unsafe source → auto-interrupt, fresh source → settle & deliver, wrong target → CAW policy denial — and run it. A demo state machine (`idle → pending → detected → executing → success | failed → reset`) drives an abstract system map (agent wallet → Pact policy → procurement gate → artifact market), an event inspector, and an appending evidence log. Every step binds to verified evidence rows from the checked-in signed proof bundle (real tx hashes, blocks, CAW audit evidence); if the artifacts are unreachable the app degrades to a clearly stamped fixture. `?fail=1` demonstrates the failure/retry path. See [apps/fusebox/README.md](apps/fusebox/README.md).
 
-![Fusebox preview (fixture)](docs/evidence/screenshots/fusebox-v2-prototype.fixture.png)
+The earlier design fixtures ([W9 motion prototype](apps/fusebox/preview/fusebox-v2/index.html), [W8 wireframe](apps/fusebox/preview/fusebox/index.html)) remain as design history with no proof authority.
 
 ## Security Model And Risk Boundary
 

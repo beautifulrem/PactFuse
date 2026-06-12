@@ -1,0 +1,65 @@
+/* PactFuse Console — design tokens. Single source of truth; components must
+ * reference tokens, never raw values. */
+:root {
+  color-scheme: dark;
+  /* color */
+  --bg: #0b0d11;
+  --surface: #11141b;
+  --surface-muted: #151a23;
+  --surface-raised: #1a2029;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --text-primary: #e9edf4;
+  --text-secondary: #9aa6b7;
+  --text-muted: #67738a;
+
+  --accent: #5b8af6;
+  --accent-bg: rgba(91, 138, 246, 0.09);
+  --danger: #ef5350;
+  --danger-bg: rgba(239, 83, 80, 0.09);
+  --warning: #e8a13d;
+  --warning-bg: rgba(232, 161, 61, 0.1);
+  --success: #34d399;
+  --success-bg: rgba(52, 211, 153, 0.09);
+  --pending: #8b97ad;
+  --pending-bg: rgba(139, 151, 173, 0.08);
+  --provenance: #c9a86a;
+  --provenance-bg: rgba(201, 168, 106, 0.08);
+
+  /* type */
+  --font-display: "Big Shoulders Display", "Arial Narrow", system-ui, sans-serif;
+  --font-ui: "IBM Plex Sans", "Helvetica Neue", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --fs-hero: clamp(26px, 3vw, 34px);
+  --fs-h2: 17px;
+  --fs-body: 14px;
+  --fs-meta: 12px;
+  --fs-micro: 10.5px;
+
+  /* space (4pt scale) */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --s7: 48px;
+
+  /* radius */
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-lg: 12px;
+
+  /* stroke + motion */
+  --icon-stroke: 1.5;
+  --dur-fast: 150ms;
+  --dur-med: 260ms;
+  --dur-slow: 420ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-snap: cubic-bezier(0.5, 0, 0.2, 1);
+
+  /* layout */
+  --shell-max: 1480px;
+  --console-left: 360px;
+  --rail-w: 56px;
+}

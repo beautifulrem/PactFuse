@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>PactFuse Console — evidence-backed agent procurement demo</title>
+<meta name="description" content="Interactive demo of PactFuse: an on-chain procurement gate that watches source freshness and interrupts agent spending before payment. Every scenario replays verified Base Sepolia + Cobo Agentic Wallet evidence." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="./styles/tokens.css" />
+<link rel="stylesheet" href="./styles/app.css" />
+</head>
+<body data-source="loading" data-motion="full">
+
+<div id="appLoading" class="app-loading" role="status">
+  <i class="spinner" aria-hidden="true"></i>
+  <p>loading signed proof artifacts…</p>
+</div>
+
+<header id="appHeader" class="shell app-header" role="banner"></header>
+
+<div id="metricStrip" class="shell metric-strip" role="group" aria-label="Session metrics"></div>
+
+<main class="shell console" role="main">
+  <aside id="scenarioPanel" class="console-aside" aria-label="Scenario controls"></aside>
+  <section class="console-stage" aria-label="Live system state">
+    <div id="flowMap" class="flowmap"></div>
+    <div class="insight-row">
+      <section id="inspectorPanel" class="inspector" aria-label="Event inspector"></section>
+      <section id="logPanel" class="logpanel" aria-label="Evidence log"></section>
+    </div>
+  </section>
+</main>
+
+<footer id="appFooter" class="shell provenance mono" role="contentinfo"></footer>
+
+<div id="drawerRoot"></div>
+<div id="toast" class="toast mono" role="status" aria-live="polite" hidden></div>
+
+<script type="module" src="./src/main.mjs"></script>
+</body>
+</html>
