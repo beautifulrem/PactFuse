@@ -321,6 +321,17 @@ describe("pactfuse-api P0", () => {
         "proof-bundle replay deploymentRegistryHash does not recompute",
       ],
       [
+        "missing token registry",
+        (proofBundle) => {
+          const replayBundle = proofBundle.replayBundle as Record<string, unknown>;
+          proofBundle.deploymentRegistry = null;
+          proofBundle.deploymentRegistryHash = null;
+          replayBundle.deploymentRegistry = null;
+          replayBundle.deploymentRegistryHash = null;
+        },
+        "public claim tokenMode requires live deployment registry",
+      ],
+      [
         "public claim event hash",
         (proofBundle) => {
           proofBundle.publicClaimEventHash = hex32("live-smoke-bad-public-claim-event");
@@ -10080,6 +10091,30 @@ function liveSmokeFixture(): {
       createdAt: "2026-06-11T00:00:00.000Z",
     },
   ];
+  const spendId = hex32("live-smoke-spend");
+  const quoteId = hex32("live-smoke-quote");
+  const paymentToken = "0x4000000000000000000000000000000000000004";
+  const deploymentRegistry = {
+    mode: "live",
+    chainId: "84532",
+    officialUsdcProbe: {
+      status: "failed",
+      reason: "stub official USDC probe failed before mock-token fallback",
+    },
+    entries: [
+      {
+        contractName: "PaymentToken",
+        chainId: "84532",
+        address: paymentToken,
+        deploymentTxHash: hex32("live-smoke-payment-token-deploy"),
+        explorerUrl: "https://sepolia.basescan.org/tx/0x0000000000000000000000000000000000000000000000000000000000000000",
+        codeHash: hex32("live-smoke-payment-token-code"),
+        tokenMode: "mock-test-token",
+        symbol: "MOCK",
+        decimals: 18,
+      },
+    ],
+  };
   const replayBundle = {
     bundleType: "PACTFUSE_EVIDENCE_V1",
     sessionId,
@@ -10087,9 +10122,23 @@ function liveSmokeFixture(): {
     asOfEventSeq: 49,
     winnerClaimAllowed: true,
     eventRoot: hashForTestJson(events.map((event) => event.eventHash)),
-    deploymentRegistry: null,
-    deploymentRegistryHash: null,
+    deploymentRegistry,
+    deploymentRegistryHash: hashForTestJson(deploymentRegistry),
     events,
+    spends: [
+      {
+        spendId,
+        paymentToken,
+      },
+    ],
+    quotes: [
+      {
+        quoteId,
+        spendId,
+        status: "chain_settleable_after_preflight",
+        chainId: "84532",
+      },
+    ],
     replayPageIndex: { pageSize: 200, pageRoot: hashForTestJson([]), collections: {} },
     replayPages: {},
   };
@@ -10153,12 +10202,12 @@ function liveSmokeFixture(): {
     replayBundleHash,
     verifierRunHash: hashForTestJson(verifierRun),
     providerStatusHash: hashForTestJson(providerStatuses),
-    deploymentRegistryHash: null,
+    deploymentRegistryHash: hashForTestJson(deploymentRegistry),
     serverHash: hashForTestJson(server),
     publicClaim: claim,
     replayBundle,
     providerStatuses,
-    deploymentRegistry: null,
+    deploymentRegistry,
     server,
     winnerClaimAllowed: true,
   };
@@ -10170,8 +10219,8 @@ function liveSmokeFixture(): {
     asOfEventSeq: 49,
     providerStatuses,
     providerStatusHash: proofBundleBase.providerStatusHash,
-    deploymentRegistry: null,
-    deploymentRegistryHash: null,
+    deploymentRegistry,
+    deploymentRegistryHash: proofBundleBase.deploymentRegistryHash,
     server,
     serverHash: proofBundleBase.serverHash,
     proofAuthority: true,

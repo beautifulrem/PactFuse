@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 const ZERO_HASH = `0x${"0".repeat(64)}`;
+const BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
 
 const baseUrl = stripTrailingSlash(process.env.PACTFUSE_API_BASE_URL ?? "http://127.0.0.1:8787");
 const operatorToken = process.env.PACTFUSE_OPERATOR_TOKEN;
@@ -194,6 +195,7 @@ function verifyProofBundleHashes(proofBundle, claim) {
     },
   );
   verifyReplayDeploymentRegistryBinding(proofBundle);
+  verifyPublicClaimDeploymentRegistry(proofBundle);
   assert(hashJson(proofBundle.replayBundle) === proofBundle.replayBundleHash, "proof-bundle replayBundleHash does not recompute", {
     expected: proofBundle.replayBundleHash,
     actual: hashJson(proofBundle.replayBundle),
@@ -262,6 +264,66 @@ function verifyReplayDeploymentRegistryBinding(proofBundle) {
       replayDeploymentRegistryHash: replayBundle.deploymentRegistryHash,
       proofBundleDeploymentRegistryHash: proofBundle.deploymentRegistryHash,
     },
+  );
+}
+
+function verifyPublicClaimDeploymentRegistry(proofBundle) {
+  const tokenMode = proofBundle.publicClaim?.tokenMode;
+  if (tokenMode !== "mock-test-token" && tokenMode !== "official-testnet-usdc") {
+    return;
+  }
+  const registry = proofBundle.deploymentRegistry;
+  assert(isObject(registry) && registry.mode === "live", "public claim tokenMode requires live deployment registry", {
+    tokenMode,
+    deploymentRegistryHash: proofBundle.deploymentRegistryHash,
+  });
+  const quote = (proofBundle.replayBundle?.quotes ?? []).find((candidate) => candidate?.status === "chain_settleable_after_preflight");
+  assert(isObject(quote), "public claim tokenMode requires a chain-settleable quote in the replay bundle", proofBundle.replayBundle?.quotes);
+  const spend = (proofBundle.replayBundle?.spends ?? []).find((candidate) => candidate?.spendId === quote.spendId);
+  assert(isObject(spend), "public claim tokenMode requires the chain-settleable quote spend in the replay bundle", {
+    quoteId: quote.quoteId,
+    spendId: quote.spendId,
+  });
+  assert(String(registry.chainId) === String(quote.chainId), "deployment registry chainId must match the chain-settleable quote", {
+    registryChainId: registry.chainId,
+    quoteChainId: quote.chainId,
+  });
+  const entry = (registry.entries ?? []).find(
+    (candidate) =>
+      candidate?.contractName === "PaymentToken" &&
+      String(candidate.chainId) === String(quote.chainId) &&
+      sameHex(candidate.address, spend.paymentToken) &&
+      candidate.tokenMode === tokenMode,
+  );
+  assert(isObject(entry), "public claim tokenMode requires a matching PaymentToken deployment registry entry", {
+    tokenMode,
+    chainId: quote.chainId,
+    paymentToken: spend.paymentToken,
+  });
+  assert(
+    HEX32.test(entry.deploymentTxHash) &&
+      entry.deploymentTxHash !== ZERO_HASH &&
+      typeof entry.explorerUrl === "string" &&
+      entry.explorerUrl.startsWith("https://") &&
+      HEX32.test(entry.codeHash) &&
+      entry.codeHash !== ZERO_HASH &&
+      Number.isInteger(entry.decimals),
+    "PaymentToken deployment registry entry is not live-proof complete",
+    entry,
+  );
+  const probe = registry.officialUsdcProbe;
+  if (tokenMode === "official-testnet-usdc") {
+    assert(sameHex(spend.paymentToken, BASE_SEPOLIA_USDC) && String(quote.chainId) === "84532", "official USDC claim must use Base Sepolia USDC", {
+      paymentToken: spend.paymentToken,
+      chainId: quote.chainId,
+    });
+    assert(probe?.status === "passed", "official USDC claim requires a passed official-USDC probe", probe);
+    return;
+  }
+  assert(
+    probe?.status === "failed" && typeof probe.reason === "string" && probe.reason.length > 0,
+    "mock token claim requires a failed official-USDC probe reason",
+    probe,
   );
 }
 
