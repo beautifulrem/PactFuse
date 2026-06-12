@@ -1,0 +1,40 @@
+{
+  "manifestType": "PACTFUSE_LIVE_SMOKE_ARTIFACTS_V1",
+  "generatedAt": "2026-06-12T17:55:05.206Z",
+  "sessionId": "0x4686a9d093cce9159d3b38085b7dab31fcf394488d956850bbc533b478c1965c",
+  "requiredProviders": [
+    "chain",
+    "caw_live",
+    "caw",
+    "mcp_lease"
+  ],
+  "livePreflightStatus": "ready",
+  "publicClaimHash": "0xd62483e22eea023b2cc29d9ca75913975f2bf1ac9b67e16e563c9898912287c7",
+  "proofBundleHash": "0x01e0cfb66ae8a738edaafcaa53e8b1c3e00738ad7526aec513bf7a09edd89668",
+  "replayBundleHash": "0x6dca414eac3cf4133674bdc443108fba3b3b526313fe33c4c6eaef0627bea1dc",
+  "publicClaimEventHash": "0x3c11d0f3d3fc205ed79e3433c406557b41d1bb1402a2474786a36abb3db57d23",
+  "providerStatusHash": "0xcf3f572c72441b8613c2f9dee3af9148c54be452db051f6718bb1edb53466e94",
+  "deploymentRegistryHash": "0x9e976d9db4b5cdbf6dc0a15ac28a5d3f51267360b6d55dca7ddb731391240b6b",
+  "serverHash": "0x04e7a5211caf8f23709d909b465c92c5b3aee0631a2980dcafbdb325fde623bb",
+  "artifacts": [
+    {
+      "name": "live-preflight.json",
+      "canonicalHash": "0x2c784dfa5e6d85da5d597f5a6215bb179fd8826163cc2c2d935142eabf0cb7a4",
+      "byteSha256": "0x99b12c1af7e8bd8a76085a7555708f9f086a98fbc2db88665afc79080862b163",
+      "bytes": 24371
+    },
+    {
+      "name": "public-claim.json",
+      "canonicalHash": "0x58c69add1668e3d36a8687ab712925a77d8690e10bf97d9ee9378fd5a2555f11",
+      "byteSha256": "0x224c1c1d4b2c4a1c48145edc23062d43e03be5f2407a26cef92c87f2c07f9cd0",
+      "bytes": 3567
+    },
+    {
+      "name": "proof-bundle.json",
+      "canonicalHash": "0xa8b7166a04738a5825e103ca00bd73deddf5b2f3a45479fd1ab65a7bf35ad0f2",
+      "byteSha256": "0xfeec57fdadf10191412508e8456826d1fbd98bea07ebd6a191018338d41c16ac",
+      "bytes": 9647190
+    }
+  ],
+  "manifestHash": "0x32b1724d8ddc38146ef3b12bcbadbb22f11a276833838ac02b2f8e32f384256e"
+}

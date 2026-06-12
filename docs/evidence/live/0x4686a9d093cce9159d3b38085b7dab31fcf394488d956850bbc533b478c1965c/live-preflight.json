@@ -1,0 +1,716 @@
+{
+  "sessionId": "0x4686a9d093cce9159d3b38085b7dab31fcf394488d956850bbc533b478c1965c",
+  "status": "ready",
+  "readyForPublicClaim": true,
+  "providerStatuses": [
+    {
+      "name": "chain",
+      "mode": "live",
+      "ready": true,
+      "reason": "chain RPC endpoint is configured",
+      "chainId": "84532",
+      "endpoint": "https://base-sepolia-rpc.publicnode.com/"
+    },
+    {
+      "name": "caw",
+      "mode": "live",
+      "ready": true,
+      "reason": "CAW raw audit/export endpoint is configured",
+      "endpoint": "https://api.agenticwallet.cobo.com/"
+    },
+    {
+      "name": "caw_live",
+      "mode": "live",
+      "ready": true,
+      "reason": "CAW live wallet endpoint is configured",
+      "endpoint": "https://api.agenticwallet.cobo.com/"
+    },
+    {
+      "name": "mcp_lease",
+      "mode": "live",
+      "ready": true,
+      "reason": "lease MCP JSON-RPC endpoint lists the required read-only tool",
+      "endpoint": "https://coordination-handhelds-thinks-deaf.trycloudflare.com/"
+    }
+  ],
+  "security": {
+    "operatorTokenConfigured": true,
+    "challengeSubmitterTokenConfigured": false,
+    "artifactSignerTokenConfigured": false,
+    "roleTokenFallbackToOperator": true,
+    "allowInsecureMissingRoleTokens": false,
+    "allowInsecurePublicEvidenceUrls": false,
+    "cawIngestTokenConfigured": true,
+    "mcpAuditSecretConfigured": true,
+    "gateIngestSecretConfigured": true
+  },
+  "indexer": {
+    "requiredCursorCount": 0,
+    "status": "pass",
+    "reasons": [
+      "no required indexer cursor configured; claim readiness relies on direct chain-verified evidence"
+    ]
+  },
+  "checks": [
+    {
+      "checkId": "provider_chain",
+      "label": "chain provider",
+      "status": "pass",
+      "reason": "chain provider is live and reachable",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "provider_caw",
+      "label": "caw provider",
+      "status": "pass",
+      "reason": "caw provider is live and reachable",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "provider_caw_live",
+      "label": "caw_live provider",
+      "status": "pass",
+      "reason": "caw_live provider is live and reachable",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "provider_mcp_lease",
+      "label": "mcp_lease provider",
+      "status": "pass",
+      "reason": "mcp_lease provider is live and reachable",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "security_role_tokens",
+      "label": "Role bearer tokens",
+      "status": "pass",
+      "reason": "operator, challenge, and artifact signer roles are protected",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "security_public_evidence_urls",
+      "label": "Public evidence URLs",
+      "status": "pass",
+      "reason": "public replay URLs must use public hostnames",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "security_caw_receipt_ingest_token",
+      "label": "CAW receipt ingest token",
+      "status": "pass",
+      "reason": "CAW receipt ingest endpoint is bearer-protected",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "security_evidence_hmac",
+      "label": "Evidence ingest HMAC secrets",
+      "status": "pass",
+      "reason": "MCP audit and Gate event ingest endpoints are HMAC-protected",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "indexer_cursors",
+      "label": "Chain indexer cursors",
+      "status": "pass",
+      "reason": "no required indexer cursor configured; claim readiness relies on direct chain-verified evidence",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "claim_provider_chain",
+      "label": "chain provider",
+      "status": "pass",
+      "reason": "chain provider is live",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "claim_provider_caw_live",
+      "label": "caw_live provider",
+      "status": "pass",
+      "reason": "caw_live provider is live",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "claim_provider_caw",
+      "label": "caw provider",
+      "status": "pass",
+      "reason": "caw provider is live",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "claim_provider_mcp_lease",
+      "label": "mcp_lease provider",
+      "status": "pass",
+      "reason": "mcp_lease provider is live",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "claim_production_security",
+      "label": "Production proof-surface security",
+      "status": "pass",
+      "reason": "role tokens, evidence ingest secrets, and proof bundle signing key are production-configured",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "claim_replay_paged_integrity",
+      "label": "Paged replay integrity",
+      "status": "pass",
+      "reason": "replay page index covers all replay collections",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "claim_caw_identity_probe",
+      "label": "CAW identity probe",
+      "status": "pass",
+      "reason": "live CAW wallet identity probe proves real same-wallet semantics",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0x7af976c0f0b832803b203aed811098872781e04ac662102b38664cc8222a1344"
+    },
+    {
+      "checkId": "claim_caw_identity_live_recheck",
+      "label": "CAW identity live recheck",
+      "status": "pass",
+      "reason": "CAW live wallet identity still matches the stored wallet proof",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0x7af976c0f0b832803b203aed811098872781e04ac662102b38664cc8222a1344"
+    },
+    {
+      "checkId": "claim_judge_caw_boundary",
+      "label": "CAW boundary",
+      "status": "pass",
+      "reason": "caw_boundary Judge Check row passes with proof authority",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0xce5ef6ad4786e6283c5b2d667115b58434c6df6550c0a0ba4191e8a861edd9b7"
+    },
+    {
+      "checkId": "claim_caw_wrong_target_deny",
+      "label": "CAW wrong-target deny",
+      "status": "pass",
+      "reason": "live CAW audit contains a denied bypass attempt",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0x889b17459114a2926dd7a289bd5dd67e03e6bc3ddf59573b6f4210f5b6ab0223"
+    },
+    {
+      "checkId": "claim_caw_raw_receipts",
+      "label": "CAW raw receipts",
+      "status": "pass",
+      "reason": "raw and canonical CAW receipts cover deny_probe, approve, and activate_tool",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0xba13c1bb4acf7737c4e036d281c44cdaa13b3cd6f01d320dc83e6dc9733e7384"
+    },
+    {
+      "checkId": "claim_caw_raw_receipts_live_recheck",
+      "label": "CAW raw receipts live recheck",
+      "status": "pass",
+      "reason": "current CAW export still contains the stored deny_probe, approve, and activate_tool raw receipts",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0xba13c1bb4acf7737c4e036d281c44cdaa13b3cd6f01d320dc83e6dc9733e7384"
+    },
+    {
+      "checkId": "claim_caw_allowance_proof",
+      "label": "CAW approve allowance proof",
+      "status": "pass",
+      "reason": "approve tx, ERC20 Approval log, allowance state, and active Pact policy are bound",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0xce5ef6ad4786e6283c5b2d667115b58434c6df6550c0a0ba4191e8a861edd9b7"
+    },
+    {
+      "checkId": "claim_caw_activation_proof",
+      "label": "CAW activation proof",
+      "status": "pass",
+      "reason": "activateTool call is bound to CAW audit usage and the finalized Gate settlement",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0x9bd8d6f562eea04bc21d79cb5c44bb8020e6a1ddc5053428962464989414e5e5"
+    },
+    {
+      "checkId": "claim_judge_source_challenge",
+      "label": "Source challenge",
+      "status": "pass",
+      "reason": "source_challenge Judge Check row passes with proof authority",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0x7071a17cf6577b3f5e5b67dc7062b9640ef994920a09ed01298860869bf0230c"
+    },
+    {
+      "checkId": "claim_judge_ab_trip",
+      "label": "A/B trip",
+      "status": "pass",
+      "reason": "ab_trip Judge Check row passes with proof authority",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0x2991a61e4d586b7dc9476205535e814e3174b0f71382bbea27907cbb9c8fcf80"
+    },
+    {
+      "checkId": "claim_judge_c_settlement",
+      "label": "C settlement",
+      "status": "pass",
+      "reason": "c_settlement Judge Check row passes with proof authority",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0x8eeef22c15fc680a330b9fc01ee739c01a079b8076ad567b997c134712a0dcfd"
+    },
+    {
+      "checkId": "claim_artifact_quote_live",
+      "label": "Live artifact quote",
+      "status": "pass",
+      "reason": "artifact quote is chain-settleable",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "claim_token_balance_delta",
+      "label": "Token balance delta",
+      "status": "pass",
+      "reason": "ERC20 Transfer and block-level balance delta are bound to the finalized settlement",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0x8eeef22c15fc680a330b9fc01ee739c01a079b8076ad567b997c134712a0dcfd"
+    },
+    {
+      "checkId": "claim_token_deployment_registry",
+      "label": "Token deployment registry",
+      "status": "pass",
+      "reason": "mock token deployment registry binds mUSD on chain 84532",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0x8eeef22c15fc680a330b9fc01ee739c01a079b8076ad567b997c134712a0dcfd"
+    },
+    {
+      "checkId": "claim_judge_artifact_access",
+      "label": "Artifact access",
+      "status": "pass",
+      "reason": "artifact_access Judge Check row passes with delivery authority",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0x745b46d8e30137c385dbb16f2a9d7f4181f97a4231816efc616030720908705b"
+    },
+    {
+      "checkId": "claim_judge_lease_execution",
+      "label": "Lease execution",
+      "status": "pass",
+      "reason": "lease_execution Judge Check row passes with delivery authority",
+      "requiredExternalInputs": [],
+      "evidenceEventId": "0xb9785edfa6c8e9f095fdb70fa1b51a0dfa7a44c2418529b3663b7a2e63f0ea06"
+    },
+    {
+      "checkId": "claim_replay_verifier",
+      "label": "Replay bundle verifier",
+      "status": "pass",
+      "reason": "replay bundle and event log checks pass",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "claim_final_verifier_complete",
+      "label": "Final verifier complete",
+      "status": "pass",
+      "reason": "full chain/signature/hash verifier is complete",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "claim_proof_chip_allowed",
+      "label": "Proof chip allowed",
+      "status": "pass",
+      "reason": "proof-chip verifier accepts the evidence pack",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    },
+    {
+      "checkId": "claim_verifier_winner_claim",
+      "label": "Verifier winner claim",
+      "status": "pass",
+      "reason": "final replay verifier authorizes the requested public claim",
+      "requiredExternalInputs": [],
+      "evidenceEventId": null
+    }
+  ],
+  "blockingReasons": [],
+  "requiredExternalInputs": [],
+  "claimReadiness": {
+    "sessionId": "0x4686a9d093cce9159d3b38085b7dab31fcf394488d956850bbc533b478c1965c",
+    "claimMode": "caw-target-real",
+    "paymentMode": "gate-paid-artifact-real",
+    "tokenMode": "mock-test-token",
+    "identityMode": "p0-floor-one-wallet",
+    "targetClaimMode": "caw-target-real",
+    "targetPaymentMode": "gate-paid-artifact-real",
+    "targetTokenMode": "mock-test-token",
+    "targetIdentityMode": "p0-floor-one-wallet",
+    "proofChipAllowed": true,
+    "finalVerifierComplete": true,
+    "winnerClaimAllowed": true,
+    "gates": [
+      {
+        "gateId": "provider_chain",
+        "label": "chain provider",
+        "status": "pass",
+        "blocks": [
+          "paymentMode",
+          "tokenMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "chain provider is live",
+        "evidenceEventId": null
+      },
+      {
+        "gateId": "provider_caw_live",
+        "label": "caw_live provider",
+        "status": "pass",
+        "blocks": [
+          "claimMode",
+          "paymentMode",
+          "identityMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "caw_live provider is live",
+        "evidenceEventId": null
+      },
+      {
+        "gateId": "provider_caw",
+        "label": "caw provider",
+        "status": "pass",
+        "blocks": [
+          "claimMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "caw provider is live",
+        "evidenceEventId": null
+      },
+      {
+        "gateId": "provider_mcp_lease",
+        "label": "mcp_lease provider",
+        "status": "pass",
+        "blocks": [
+          "winnerClaimAllowed"
+        ],
+        "reason": "mcp_lease provider is live",
+        "evidenceEventId": null
+      },
+      {
+        "gateId": "production_security",
+        "label": "Production proof-surface security",
+        "status": "pass",
+        "blocks": [
+          "winnerClaimAllowed"
+        ],
+        "reason": "role tokens, evidence ingest secrets, and proof bundle signing key are production-configured",
+        "evidenceEventId": null
+      },
+      {
+        "gateId": "replay_paged_integrity",
+        "label": "Paged replay integrity",
+        "status": "pass",
+        "blocks": [
+          "winnerClaimAllowed"
+        ],
+        "reason": "replay page index covers all replay collections",
+        "evidenceEventId": null
+      },
+      {
+        "gateId": "caw_identity_probe",
+        "label": "CAW identity probe",
+        "status": "pass",
+        "blocks": [
+          "identityMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "live CAW wallet identity probe proves real same-wallet semantics",
+        "evidenceEventId": "0x7af976c0f0b832803b203aed811098872781e04ac662102b38664cc8222a1344"
+      },
+      {
+        "gateId": "caw_identity_live_recheck",
+        "label": "CAW identity live recheck",
+        "status": "pass",
+        "blocks": [
+          "identityMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "CAW live wallet identity still matches the stored wallet proof",
+        "evidenceEventId": "0x7af976c0f0b832803b203aed811098872781e04ac662102b38664cc8222a1344"
+      },
+      {
+        "gateId": "judge_caw_boundary",
+        "label": "CAW boundary",
+        "status": "pass",
+        "blocks": [
+          "claimMode",
+          "paymentMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "caw_boundary Judge Check row passes with proof authority",
+        "evidenceEventId": "0xce5ef6ad4786e6283c5b2d667115b58434c6df6550c0a0ba4191e8a861edd9b7"
+      },
+      {
+        "gateId": "caw_wrong_target_deny",
+        "label": "CAW wrong-target deny",
+        "status": "pass",
+        "blocks": [
+          "claimMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "live CAW audit contains a denied bypass attempt",
+        "evidenceEventId": "0x889b17459114a2926dd7a289bd5dd67e03e6bc3ddf59573b6f4210f5b6ab0223"
+      },
+      {
+        "gateId": "caw_raw_receipts",
+        "label": "CAW raw receipts",
+        "status": "pass",
+        "blocks": [
+          "claimMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "raw and canonical CAW receipts cover deny_probe, approve, and activate_tool",
+        "evidenceEventId": "0xba13c1bb4acf7737c4e036d281c44cdaa13b3cd6f01d320dc83e6dc9733e7384"
+      },
+      {
+        "gateId": "caw_raw_receipts_live_recheck",
+        "label": "CAW raw receipts live recheck",
+        "status": "pass",
+        "blocks": [
+          "claimMode",
+          "paymentMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "current CAW export still contains the stored deny_probe, approve, and activate_tool raw receipts",
+        "evidenceEventId": "0xba13c1bb4acf7737c4e036d281c44cdaa13b3cd6f01d320dc83e6dc9733e7384"
+      },
+      {
+        "gateId": "caw_allowance_proof",
+        "label": "CAW approve allowance proof",
+        "status": "pass",
+        "blocks": [
+          "paymentMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "approve tx, ERC20 Approval log, allowance state, and active Pact policy are bound",
+        "evidenceEventId": "0xce5ef6ad4786e6283c5b2d667115b58434c6df6550c0a0ba4191e8a861edd9b7"
+      },
+      {
+        "gateId": "caw_activation_proof",
+        "label": "CAW activation proof",
+        "status": "pass",
+        "blocks": [
+          "paymentMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "activateTool call is bound to CAW audit usage and the finalized Gate settlement",
+        "evidenceEventId": "0x9bd8d6f562eea04bc21d79cb5c44bb8020e6a1ddc5053428962464989414e5e5"
+      },
+      {
+        "gateId": "judge_source_challenge",
+        "label": "Source challenge",
+        "status": "pass",
+        "blocks": [
+          "claimMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "source_challenge Judge Check row passes with proof authority",
+        "evidenceEventId": "0x7071a17cf6577b3f5e5b67dc7062b9640ef994920a09ed01298860869bf0230c"
+      },
+      {
+        "gateId": "judge_ab_trip",
+        "label": "A/B trip",
+        "status": "pass",
+        "blocks": [
+          "claimMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "ab_trip Judge Check row passes with proof authority",
+        "evidenceEventId": "0x2991a61e4d586b7dc9476205535e814e3174b0f71382bbea27907cbb9c8fcf80"
+      },
+      {
+        "gateId": "judge_c_settlement",
+        "label": "C settlement",
+        "status": "pass",
+        "blocks": [
+          "paymentMode",
+          "tokenMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "c_settlement Judge Check row passes with proof authority",
+        "evidenceEventId": "0x8eeef22c15fc680a330b9fc01ee739c01a079b8076ad567b997c134712a0dcfd"
+      },
+      {
+        "gateId": "artifact_quote_live",
+        "label": "Live artifact quote",
+        "status": "pass",
+        "blocks": [
+          "paymentMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "artifact quote is chain-settleable",
+        "evidenceEventId": null
+      },
+      {
+        "gateId": "token_balance_delta",
+        "label": "Token balance delta",
+        "status": "pass",
+        "blocks": [
+          "paymentMode",
+          "tokenMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "ERC20 Transfer and block-level balance delta are bound to the finalized settlement",
+        "evidenceEventId": "0x8eeef22c15fc680a330b9fc01ee739c01a079b8076ad567b997c134712a0dcfd"
+      },
+      {
+        "gateId": "token_deployment_registry",
+        "label": "Token deployment registry",
+        "status": "pass",
+        "blocks": [
+          "tokenMode",
+          "winnerClaimAllowed"
+        ],
+        "reason": "mock token deployment registry binds mUSD on chain 84532",
+        "evidenceEventId": "0x8eeef22c15fc680a330b9fc01ee739c01a079b8076ad567b997c134712a0dcfd"
+      },
+      {
+        "gateId": "judge_artifact_access",
+        "label": "Artifact access",
+        "status": "pass",
+        "blocks": [
+          "winnerClaimAllowed"
+        ],
+        "reason": "artifact_access Judge Check row passes with delivery authority",
+        "evidenceEventId": "0x745b46d8e30137c385dbb16f2a9d7f4181f97a4231816efc616030720908705b"
+      },
+      {
+        "gateId": "judge_lease_execution",
+        "label": "Lease execution",
+        "status": "pass",
+        "blocks": [
+          "winnerClaimAllowed"
+        ],
+        "reason": "lease_execution Judge Check row passes with delivery authority",
+        "evidenceEventId": "0xb9785edfa6c8e9f095fdb70fa1b51a0dfa7a44c2418529b3663b7a2e63f0ea06"
+      },
+      {
+        "gateId": "replay_verifier",
+        "label": "Replay bundle verifier",
+        "status": "pass",
+        "blocks": [
+          "winnerClaimAllowed"
+        ],
+        "reason": "replay bundle and event log checks pass",
+        "evidenceEventId": null
+      },
+      {
+        "gateId": "final_verifier_complete",
+        "label": "Final verifier complete",
+        "status": "pass",
+        "blocks": [
+          "winnerClaimAllowed"
+        ],
+        "reason": "full chain/signature/hash verifier is complete",
+        "evidenceEventId": null
+      },
+      {
+        "gateId": "proof_chip_allowed",
+        "label": "Proof chip allowed",
+        "status": "pass",
+        "blocks": [
+          "winnerClaimAllowed"
+        ],
+        "reason": "proof-chip verifier accepts the evidence pack",
+        "evidenceEventId": null
+      },
+      {
+        "gateId": "verifier_winner_claim",
+        "label": "Verifier winner claim",
+        "status": "pass",
+        "blocks": [
+          "winnerClaimAllowed"
+        ],
+        "reason": "final replay verifier authorizes the requested public claim",
+        "evidenceEventId": null
+      }
+    ],
+    "blockers": [],
+    "requiredExternalInputs": [],
+    "replayBundleHash": "0x6dca414eac3cf4133674bdc443108fba3b3b526313fe33c4c6eaef0627bea1dc",
+    "verifierRun": {
+      "sessionId": "0x4686a9d093cce9159d3b38085b7dab31fcf394488d956850bbc533b478c1965c",
+      "proofLevel": "final_replay_claim",
+      "claimMode": "simulated",
+      "paymentMode": "mocked",
+      "tokenMode": "local-mocked",
+      "identityMode": "pending",
+      "schemaOk": true,
+      "proofChipAllowed": true,
+      "winnerClaimAllowed": true,
+      "requestedWinnerClaimAllowed": true,
+      "finalVerifierComplete": true,
+      "errors": [],
+      "warnings": [],
+      "raw": {
+        "schemaOk": true,
+        "proofChipAllowed": true,
+        "winnerClaimAllowed": true,
+        "requestedWinnerClaimAllowed": true,
+        "finalVerifierComplete": true,
+        "file": null,
+        "cliMode": "proof-chip",
+        "paymentProofMode": null,
+        "warnings": [],
+        "schemaErrors": [],
+        "proofCompletenessErrors": [],
+        "proofChipErrors": [],
+        "winnerClaimErrors": [],
+        "errors": [],
+        "proofProviders": [
+          {
+            "name": "chain",
+            "mode": "live",
+            "ready": true,
+            "reason": "chain RPC endpoint is configured",
+            "endpoint": "https://base-sepolia-rpc.publicnode.com/",
+            "chainId": "84532"
+          },
+          {
+            "name": "caw",
+            "mode": "live",
+            "ready": true,
+            "reason": "CAW raw audit/export endpoint is configured",
+            "endpoint": "https://api.agenticwallet.cobo.com/"
+          },
+          {
+            "name": "caw_live",
+            "mode": "live",
+            "ready": true,
+            "reason": "CAW live wallet endpoint is configured",
+            "endpoint": "https://api.agenticwallet.cobo.com/"
+          },
+          {
+            "name": "mcp_lease",
+            "mode": "live",
+            "ready": true,
+            "reason": "lease MCP JSON-RPC endpoint lists the required read-only tool",
+            "endpoint": "https://coordination-handhelds-thinks-deaf.trycloudflare.com/"
+          }
+        ],
+        "pactTemplates": [
+          {
+            "mode": "gate-paid-artifact-real",
+            "sourcePath": "/Volumes/Remi/仓库/Casual/pact-template/gate-paid-artifact-real.json",
+            "templateHash": "0x0fd49cf2ea65dfb2f8d4b11203b2a38cca686bf8cfde2f38ee9ea5a26fe299f6"
+          },
+          {
+            "mode": "permit-payment-real",
+            "sourcePath": "/Volumes/Remi/仓库/Casual/pact-template/permit-payment-real.appendix.json",
+            "templateHash": "0x695fa1a2ad1aaa33496c4d35665cf0d7b887c59f52c3b318fd07e811f60fa6c6"
+          }
+        ]
+      }
+    }
+  },
+  "winnerClaimAllowed": true
+}

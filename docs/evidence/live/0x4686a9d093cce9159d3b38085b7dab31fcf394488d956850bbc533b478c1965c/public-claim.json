@@ -1,0 +1,96 @@
+{
+  "sessionId": "0x4686a9d093cce9159d3b38085b7dab31fcf394488d956850bbc533b478c1965c",
+  "claimStatus": "authorized_public_claim",
+  "snapshotScope": "authorization_event",
+  "providerSnapshotOnly": true,
+  "authorizedAt": "2026-06-12T17:55:03.366Z",
+  "authorizedEventSeq": 335,
+  "asOfEventSeq": 334,
+  "claimMode": "caw-target-real",
+  "paymentMode": "gate-paid-artifact-real",
+  "tokenMode": "mock-test-token",
+  "tokenSettlementClaim": "live-mock-erc20-fallback",
+  "identityMode": "p0-floor-one-wallet",
+  "replayBundleHash": "0x6dca414eac3cf4133674bdc443108fba3b3b526313fe33c4c6eaef0627bea1dc",
+  "providerStatusHash": "0xcf3f572c72441b8613c2f9dee3af9148c54be452db051f6718bb1edb53466e94",
+  "deploymentRegistryHash": "0x9e976d9db4b5cdbf6dc0a15ac28a5d3f51267360b6d55dca7ddb731391240b6b",
+  "serverHash": "0x04e7a5211caf8f23709d909b465c92c5b3aee0631a2980dcafbdb325fde623bb",
+  "verifierRun": {
+    "sessionId": "0x4686a9d093cce9159d3b38085b7dab31fcf394488d956850bbc533b478c1965c",
+    "proofLevel": "final_replay_claim",
+    "claimMode": "caw-target-real",
+    "paymentMode": "gate-paid-artifact-real",
+    "tokenMode": "mock-test-token",
+    "identityMode": "p0-floor-one-wallet",
+    "schemaOk": true,
+    "proofChipAllowed": true,
+    "winnerClaimAllowed": true,
+    "requestedWinnerClaimAllowed": true,
+    "finalVerifierComplete": true,
+    "errors": [],
+    "warnings": [],
+    "raw": {
+      "schemaOk": true,
+      "proofChipAllowed": true,
+      "winnerClaimAllowed": true,
+      "requestedWinnerClaimAllowed": true,
+      "finalVerifierComplete": true,
+      "file": null,
+      "cliMode": "proof-chip",
+      "paymentProofMode": null,
+      "warnings": [],
+      "schemaErrors": [],
+      "proofCompletenessErrors": [],
+      "proofChipErrors": [],
+      "winnerClaimErrors": [],
+      "errors": [],
+      "proofProviders": [
+        {
+          "name": "chain",
+          "mode": "live",
+          "ready": true,
+          "reason": "chain RPC endpoint is configured",
+          "endpoint": "https://base-sepolia-rpc.publicnode.com/",
+          "chainId": "84532"
+        },
+        {
+          "name": "caw",
+          "mode": "live",
+          "ready": true,
+          "reason": "CAW raw audit/export endpoint is configured",
+          "endpoint": "https://api.agenticwallet.cobo.com/"
+        },
+        {
+          "name": "caw_live",
+          "mode": "live",
+          "ready": true,
+          "reason": "CAW live wallet endpoint is configured",
+          "endpoint": "https://api.agenticwallet.cobo.com/"
+        },
+        {
+          "name": "mcp_lease",
+          "mode": "live",
+          "ready": true,
+          "reason": "lease MCP JSON-RPC endpoint lists the required read-only tool",
+          "endpoint": "https://coordination-handhelds-thinks-deaf.trycloudflare.com/"
+        }
+      ],
+      "pactTemplates": [
+        {
+          "mode": "gate-paid-artifact-real",
+          "sourcePath": "/Volumes/Remi/仓库/Casual/pact-template/gate-paid-artifact-real.json",
+          "templateHash": "0x0fd49cf2ea65dfb2f8d4b11203b2a38cca686bf8cfde2f38ee9ea5a26fe299f6"
+        },
+        {
+          "mode": "permit-payment-real",
+          "sourcePath": "/Volumes/Remi/仓库/Casual/pact-template/permit-payment-real.appendix.json",
+          "templateHash": "0x695fa1a2ad1aaa33496c4d35665cf0d7b887c59f52c3b318fd07e811f60fa6c6"
+        }
+      ]
+    }
+  },
+  "proofChipAllowed": true,
+  "finalVerifierComplete": true,
+  "winnerClaimAllowed": true,
+  "publicClaimHash": "0xd62483e22eea023b2cc29d9ca75913975f2bf1ac9b67e16e563c9898912287c7"
+}
