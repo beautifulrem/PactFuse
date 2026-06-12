@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, keccak256, toBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { canonicalizeJson } from "@pactfuse/evidence-schema";
+import { canonicalizeJson, DeploymentRegistrySchema } from "@pactfuse/evidence-schema";
 import { createApp } from "../app.js";
 import { openPactFuseDb } from "../db/index.js";
 import { completeJob, enqueueJob, leaseNextJob, requeueExpiredLeases } from "../services/jobs.js";
@@ -270,6 +270,161 @@ describe("pactfuse-api P0", () => {
       restoreEnv("PACTFUSE_INDEXER_ENABLED", previousIndexerEnabled);
       restoreEnv("PACTFUSE_CHAIN_RPC_URL", previousChainRpc);
       restoreEnv("PACTFUSE_CHAIN_ID", previousChainId);
+    }
+  });
+
+  it("exports a live deployment registry from RPC receipt, code, and ERC20 metadata", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-registry-"));
+    const outputPath = join(dir, "deployments", "base-sepolia.json");
+    const requests: string[] = [];
+    const encodedSymbol = encodeAbiParameters([{ type: "string" }], ["MOCK"]);
+    const encodedDecimals = encodeAbiParameters([{ type: "uint8" }], [18]);
+    const server = createServer(async (req, res) => {
+      const body = await readNodeRequestJson(req);
+      const request = Array.isArray(body) ? body[0] as Record<string, unknown> : body;
+      const method = String(request.method ?? "");
+      requests.push(method);
+      let result: unknown;
+      if (method === "eth_chainId") {
+        result = "0x14a34";
+      } else if (method === "eth_getTransactionReceipt") {
+        result = {
+          transactionHash: TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH,
+          status: "0x1",
+          contractAddress: TEST_PAYMENT_TOKEN_ADDRESS,
+          blockNumber: "0x63",
+        };
+      } else if (method === "eth_getCode") {
+        result = TEST_PAYMENT_TOKEN_CODE;
+      } else if (method === "eth_call") {
+        const [call] = Array.isArray(request.params) ? request.params : [];
+        const data = call && typeof call === "object" && "data" in call ? String((call as Record<string, unknown>).data) : "";
+        result = data.startsWith("0x95d89b41") ? encodedSymbol : encodedDecimals;
+      } else {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: request.id ?? null, error: { code: -32601, message: method } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: request.id ?? null, result }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("registry RPC server did not expose a TCP address");
+    }
+    try {
+      const result = await runNodeScript(["scripts/export-deployment-registry.mjs"], {
+        cwd: join(process.cwd()),
+        env: {
+          ...process.env,
+          PACTFUSE_REGISTRY_RPC_URL: `http://127.0.0.1:${address.port}`,
+          PACTFUSE_REGISTRY_CHAIN_ID: "84532",
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_ADDRESS: TEST_PAYMENT_TOKEN_ADDRESS,
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_DEPLOY_TX: TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH,
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_EXPLORER_URL: `https://sepolia.basescan.org/tx/${TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH}`,
+          PACTFUSE_REGISTRY_TOKEN_MODE: "mock-test-token",
+          PACTFUSE_REGISTRY_OFFICIAL_USDC_PROBE_STATUS: "failed",
+          PACTFUSE_REGISTRY_OFFICIAL_USDC_PROBE_REASON: "Base Sepolia official USDC unavailable for this live smoke wallet",
+          PACTFUSE_REGISTRY_OUTPUT_PATH: outputPath,
+        },
+      });
+      const registry = DeploymentRegistrySchema.parse(readJsonFile(outputPath));
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(requests).toEqual(expect.arrayContaining(["eth_chainId", "eth_getTransactionReceipt", "eth_getCode", "eth_call"]));
+      expect(registry).toEqual(
+        expect.objectContaining({
+          mode: "live",
+          chainId: "84532",
+          officialUsdcProbe: expect.objectContaining({ status: "failed" }),
+        }),
+      );
+      expect(registry.entries[0]).toEqual(
+        expect.objectContaining({
+          contractName: "PaymentToken",
+          chainId: "84532",
+          address: TEST_PAYMENT_TOKEN_ADDRESS.toLowerCase(),
+          deploymentTxHash: TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH.toLowerCase(),
+          explorerUrl: `https://sepolia.basescan.org/tx/${TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH}`,
+          codeHash: TEST_PAYMENT_TOKEN_CODE_HASH,
+          tokenMode: "mock-test-token",
+          symbol: "MOCK",
+          decimals: 18,
+        }),
+      );
+      const duplicate = await runNodeScript(["scripts/export-deployment-registry.mjs"], {
+        cwd: join(process.cwd()),
+        env: {
+          ...process.env,
+          PACTFUSE_REGISTRY_RPC_URL: `http://127.0.0.1:${address.port}`,
+          PACTFUSE_REGISTRY_CHAIN_ID: "84532",
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_ADDRESS: TEST_PAYMENT_TOKEN_ADDRESS,
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_DEPLOY_TX: TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH,
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_EXPLORER_URL: `https://sepolia.basescan.org/tx/${TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH}`,
+          PACTFUSE_REGISTRY_TOKEN_MODE: "mock-test-token",
+          PACTFUSE_REGISTRY_OFFICIAL_USDC_PROBE_STATUS: "failed",
+          PACTFUSE_REGISTRY_OFFICIAL_USDC_PROBE_REASON: "Base Sepolia official USDC unavailable for this live smoke wallet",
+          PACTFUSE_REGISTRY_OUTPUT_PATH: outputPath,
+        },
+      });
+      expect(duplicate.status).not.toBe(0);
+      expect(duplicate.stderr).toContain("EEXIST");
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects inconsistent deployment registry token mode before RPC", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-registry-invalid-"));
+    try {
+      const result = await runNodeScript(["scripts/export-deployment-registry.mjs"], {
+        cwd: join(process.cwd()),
+        env: {
+          ...process.env,
+          PACTFUSE_REGISTRY_RPC_URL: "https://rpc.example.invalid",
+          PACTFUSE_REGISTRY_CHAIN_ID: "84532",
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_ADDRESS: BASE_SEPOLIA_USDC,
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_DEPLOY_TX: TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH,
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_EXPLORER_URL: `https://sepolia.basescan.org/tx/${TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH}`,
+          PACTFUSE_REGISTRY_TOKEN_MODE: "mock-test-token",
+          PACTFUSE_REGISTRY_OFFICIAL_USDC_PROBE_STATUS: "failed",
+          PACTFUSE_REGISTRY_OFFICIAL_USDC_PROBE_REASON: "Base Sepolia official USDC unavailable for this live smoke wallet",
+          PACTFUSE_REGISTRY_OUTPUT_PATH: join(dir, "registry.json"),
+        },
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("mock-test-token cannot be used with the official Base Sepolia USDC address");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects deployment registry explorer URLs that do not point to the transaction", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-registry-invalid-"));
+    try {
+      const result = await runNodeScript(["scripts/export-deployment-registry.mjs"], {
+        cwd: join(process.cwd()),
+        env: {
+          ...process.env,
+          PACTFUSE_REGISTRY_RPC_URL: "https://rpc.example.invalid",
+          PACTFUSE_REGISTRY_CHAIN_ID: "84532",
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_ADDRESS: TEST_PAYMENT_TOKEN_ADDRESS,
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_DEPLOY_TX: TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH,
+          PACTFUSE_REGISTRY_PAYMENT_TOKEN_EXPLORER_URL: `https://sepolia.basescan.org/search?tx=${TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH}`,
+          PACTFUSE_REGISTRY_TOKEN_MODE: "mock-test-token",
+          PACTFUSE_REGISTRY_OFFICIAL_USDC_PROBE_STATUS: "failed",
+          PACTFUSE_REGISTRY_OFFICIAL_USDC_PROBE_REASON: "Base Sepolia official USDC unavailable for this live smoke wallet",
+          PACTFUSE_REGISTRY_OUTPUT_PATH: join(dir, "registry.json"),
+        },
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("explorer URL must point to the deployment transaction");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

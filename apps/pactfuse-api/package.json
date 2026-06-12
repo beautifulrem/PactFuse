@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
+    "export-deployment-registry": "node scripts/export-deployment-registry.mjs",
     "test": "pnpm --filter @pactfuse/evidence-schema build && vitest run"
   },
   "dependencies": {

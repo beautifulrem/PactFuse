@@ -312,6 +312,23 @@ Required result:
 
 For `mock-test-token`, claim readiness and final replay verification require a recorded failed official-USDC probe reason plus a live deployment registry entry for the payment token address, non-zero deployment transaction hash, a public HTTPS explorer URL that points to that transaction, deployment receipt `contractAddress` matching the token address, `codeHash = keccak256(eth_getCode(address))`, and matching ERC20 `decimals()`/`symbol()` metadata. Official Base Sepolia USDC is accepted only on chain id `84532` with a passed official-USDC probe and a matching live registry entry.
 
+Generate that registry from the live RPC before starting the API:
+
+```sh
+PACTFUSE_REGISTRY_RPC_URL=https://... \
+PACTFUSE_REGISTRY_CHAIN_ID=84532 \
+PACTFUSE_REGISTRY_PAYMENT_TOKEN_ADDRESS=0x... \
+PACTFUSE_REGISTRY_PAYMENT_TOKEN_DEPLOY_TX=0x... \
+PACTFUSE_REGISTRY_PAYMENT_TOKEN_EXPLORER_URL=https://sepolia.basescan.org/tx/0x... \
+PACTFUSE_REGISTRY_TOKEN_MODE=mock-test-token \
+PACTFUSE_REGISTRY_OFFICIAL_USDC_PROBE_STATUS=failed \
+PACTFUSE_REGISTRY_OFFICIAL_USDC_PROBE_REASON="recorded official-USDC fallback reason" \
+PACTFUSE_REGISTRY_OUTPUT_PATH=deployments/base-sepolia.json \
+pnpm export-deployment-registry
+```
+
+The exporter creates the output directory when needed and refuses to overwrite an existing registry unless `PACTFUSE_REGISTRY_OUTPUT_FORCE=true` is set.
+
 Use [docs/evidence/production-live-env.example](docs/evidence/production-live-env.example) as the non-secret manifest for the real Cobo/RPC/MCP environment.
 
 ## Smart Contracts
