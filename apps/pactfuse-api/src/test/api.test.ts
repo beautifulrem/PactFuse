@@ -1,6 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -556,6 +556,73 @@ describe("pactfuse-api P0", () => {
       const manifestBase = { ...manifest };
       delete manifestBase.manifestHash;
       expect(manifest.manifestHash).toBe(hashForTestJson(manifestBase));
+
+      const verifyResult = await runNodeScript([join(process.cwd(), "../../scripts/verify-live-artifacts.mjs"), dir], {
+        cwd: join(process.cwd(), "../.."),
+        env: process.env,
+      });
+      const verifyStdout = JSON.parse(verifyResult.stdout) as Record<string, unknown>;
+      expect(verifyResult.status, verifyResult.stderr).toBe(0);
+      expect(verifyStdout).toEqual(
+        expect.objectContaining({
+          ok: true,
+          artifactDir: dir,
+          sessionId: proofBundle.sessionId,
+          artifactManifestHash: manifest.manifestHash,
+          publicClaimHash: publicClaim.publicClaimHash,
+          proofBundleHash: proofBundle.proofBundleHash,
+          artifactCount: 3,
+        }),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("verify-live-artifacts rejects manifest drift", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-smoke-manifest-drift-"));
+    try {
+      const result = await runLiveSmokeAgainstStub(undefined, undefined, {
+        PACTFUSE_LIVE_SMOKE_OUTPUT_DIR: dir,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      const manifestPath = join(dir, "manifest.json");
+      const manifest = readJsonFile(manifestPath);
+      manifest.proofBundleHash = hex32("tampered-manifest-proof-bundle");
+      writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+
+      const verifyResult = await runNodeScript([join(process.cwd(), "../../scripts/verify-live-artifacts.mjs"), dir], {
+        cwd: join(process.cwd(), "../.."),
+        env: process.env,
+      });
+
+      expect(verifyResult.status).not.toBe(0);
+      expect(verifyResult.stderr).toContain("manifestHash does not recompute");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("verify-live-artifacts rejects artifact byte drift", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-smoke-artifact-drift-"));
+    try {
+      const result = await runLiveSmokeAgainstStub(undefined, undefined, {
+        PACTFUSE_LIVE_SMOKE_OUTPUT_DIR: dir,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      const proofBundlePath = join(dir, "proof-bundle.json");
+      const proofBundle = readJsonFile(proofBundlePath);
+      proofBundle.server = { ...(proofBundle.server as Record<string, unknown>), commit: "tampered-after-export" };
+      writeFileSync(proofBundlePath, `${JSON.stringify(proofBundle, null, 2)}\n`, "utf8");
+
+      const verifyResult = await runNodeScript([join(process.cwd(), "../../scripts/verify-live-artifacts.mjs"), dir], {
+        cwd: join(process.cwd(), "../.."),
+        env: process.env,
+      });
+
+      expect(verifyResult.status).not.toBe(0);
+      expect(verifyResult.stderr).toContain("artifact proof-bundle.json");
+      expect(verifyResult.stderr).toContain("bytes does not match manifest");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -573,6 +640,44 @@ describe("pactfuse-api P0", () => {
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain("PACTFUSE_LIVE_SMOKE_OUTPUT_DIR must be empty");
       expect(readFileSync(existingManifest, "utf8")).toBe('{"existing":true}\n');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("live-smoke refuses artifact export when the output path is a symlink", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-smoke-symlink-"));
+    const targetDir = join(dir, "target");
+    const linkPath = join(dir, "artifact-link");
+    try {
+      mkdirSync(targetDir);
+      symlinkSync(targetDir, linkPath);
+
+      const result = await runLiveSmokeAgainstStub(undefined, undefined, {
+        PACTFUSE_LIVE_SMOKE_OUTPUT_DIR: linkPath,
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("real directory, not a symlink or file");
+      expect(readdirSync(targetDir)).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("live-smoke refuses artifact export when the output path is a regular file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-smoke-file-"));
+    const filePath = join(dir, "artifact-output");
+    writeFileSync(filePath, "existing-file\n", "utf8");
+    try {
+      const result = await runLiveSmokeAgainstStub(undefined, undefined, {
+        PACTFUSE_LIVE_SMOKE_OUTPUT_DIR: filePath,
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("real directory, not a symlink or file");
+      expect(readFileSync(filePath, "utf8")).toBe("existing-file\n");
+      expect(readdirSync(dir).sort()).toEqual(["artifact-output"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1020,6 +1125,74 @@ describe("pactfuse-api P0", () => {
     );
   });
 
+  it("keeps verifier results fail-closed when a verifier success also carries errors", async () => {
+    const { app, ctx } = makeApp(":memory:", {
+      verifier: {
+        verify: async () => ({
+          schemaOk: true,
+          proofChipAllowed: true,
+          winnerClaimAllowed: true,
+          requestedWinnerClaimAllowed: true,
+          finalVerifierComplete: true,
+          warnings: [],
+          errors: ["dirty verifier success must not authorize claims"],
+          schemaErrors: ["schema side-channel error"],
+          proofCompletenessErrors: ["proof side-channel error"],
+        }),
+      },
+    });
+    const sessionId = await createSession(app, "sess-verify-dirty-success");
+
+    const res = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-dirty-success",
+      payload: { receipt: { receiptId: "dirty-success" } },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const failClosedEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "verifier.fail_closed");
+    const claim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`);
+    const run = ctx.db.sqlite
+      .prepare(
+        "SELECT schema_ok, proof_chip_allowed, winner_claim_allowed, final_verifier_complete FROM verifier_runs WHERE session_id = ?",
+      )
+      .get(sessionId) as
+      | { schema_ok: number; proof_chip_allowed: number; winner_claim_allowed: number; final_verifier_complete: number }
+      | undefined;
+
+    expect(res.status).toBe(200);
+    expect(res.json.data.proofLevel).toBe("fail_closed_no_claim");
+    expect(res.json.data.schemaOk).toBe(false);
+    expect(res.json.data.proofChipAllowed).toBe(false);
+    expect(res.json.data.finalVerifierComplete).toBe(false);
+    expect(res.json.data.winnerClaimAllowed).toBe(false);
+    expect(res.json.data.errors).toEqual(
+      expect.arrayContaining([
+        "dirty verifier success must not authorize claims",
+        "schema side-channel error",
+        "proof side-channel error",
+      ]),
+    );
+    expect(run).toEqual({
+      schema_ok: 0,
+      proof_chip_allowed: 0,
+      winner_claim_allowed: 0,
+      final_verifier_complete: 0,
+    });
+    expect(failClosedEvent).toEqual(
+      expect.objectContaining({
+        authority: "operator",
+        payload: expect.objectContaining({
+          schemaOk: false,
+          proofChipAllowed: false,
+          winnerClaimAllowed: false,
+          finalVerifierComplete: false,
+        }),
+      }),
+    );
+    expect(claim.status).toBe(423);
+  });
+
   it("keeps public claim authorization closed until readiness and verifier gates all pass", async () => {
     const { app } = makeApp(":memory:", {
       verifier: {
@@ -1118,30 +1291,50 @@ describe("pactfuse-api P0", () => {
       idempotencyKey: "public-claim-deny-audit",
       payload: { walletId: "wallet-live-1", action: "wrong_target.deny_probe", result: "denied", limit: 20 },
     });
+    const cawProofReplay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const cawProofReplayJson = await cawProofReplay.json();
+    const cawProofEvents = cawProofReplayJson.data.events as Array<{ kind: string; payload: Record<string, unknown> }>;
+    const allowanceProof = cawProofEvents.find((event) => event.kind === "caw.allowance.verified")?.payload;
+    const activationProof = cawProofEvents.find((event) => event.kind === "caw.activation.verified")?.payload;
+    const denyProof = cawProofEvents.find(
+      (event) =>
+        event.kind === "caw.live.audit.usage.verified" &&
+        event.payload.operationKind === "deny_probe" &&
+        event.payload.result === "denied",
+    )?.payload;
+    expect(allowanceProof).toBeDefined();
+    expect(activationProof).toBeDefined();
+    expect(denyProof).toBeDefined();
     cawReceipts.push(
       cawReceiptFields("public-claim-deny", {
+        walletAddress: TEST_PAYER_ADDRESS,
         operationKind: "deny_probe",
         target: TEST_MARKET_ADDRESS,
         selector: ERC20_APPROVE_SELECTOR,
-        requestId: "public-claim-deny-probe",
+        requestId: denyProof?.cawRequestId,
+        policyDigest: denyProof?.policyDigest,
         effect: "deny",
         status: "denied",
         txHash: null,
         txCount: "0",
       }),
       cawReceiptFields("public-claim-approve", {
+        walletAddress: TEST_PAYER_ADDRESS,
         operationKind: "approve",
         target: TEST_PAYMENT_TOKEN_ADDRESS,
         selector: ERC20_APPROVE_SELECTOR,
-        requestId: "public-claim-settle-approve",
-        txHash: hex32("caw-live-contract:public-claim-settle-approve"),
+        requestId: allowanceProof?.cawRequestId,
+        policyDigest: allowanceProof?.auditPolicyDigest,
+        txHash: allowanceProof?.approveTxHash,
       }),
       cawReceiptFields("public-claim-activate", {
+        walletAddress: TEST_PAYER_ADDRESS,
         operationKind: "activate_tool",
         target: INDEXER_ADDRESS,
         selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
-        requestId: String(finalized.txHash),
-        txHash: finalized.txHash,
+        requestId: activationProof?.cawRequestId,
+        policyDigest: activationProof?.auditPolicyDigest,
+        txHash: activationProof?.activateTxHash,
       }),
     );
     await buildAndIngestCawReceiptForTest(app, sessionId, spendId, "public-claim-deny-receipt", {
@@ -3133,6 +3326,16 @@ describe("pactfuse-api P0", () => {
         signature: signed.payload.signature,
       }),
     );
+
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-signed-source-replay",
+      payload: { replayBundle: replayJson.data },
+    });
+
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.errors.some((error: string) => error.includes("signature does not recover issuer"))).toBe(false);
+    expect(verify.json.data.raw.schemaErrors.some((error: string) => error.includes("signature does not recover issuer"))).toBe(false);
   });
 
   it("blocks source identity registrations with partial or invalid signatures", async () => {

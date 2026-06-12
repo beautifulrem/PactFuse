@@ -4381,9 +4381,12 @@ async function buildVerifierRunView(
     ...(await verifyIndexerCursorIntegrity(ctx, proofProviders)),
     ...verifyReplayBundleBindings(ctx, sessionId, payload),
   ];
-  const rawErrors = toStringArray(raw.errors);
-  const schemaOk = Boolean(raw.schemaOk) && eventLogErrors.length === 0;
-  const finalVerifierComplete = schemaOk && Boolean(raw.finalVerifierComplete);
+  const rawErrors = verifierErrorStrings(raw);
+  const rawSchemaErrors = toStringArray((raw as Record<string, unknown>).schemaErrors);
+  const hasDirtyVerifierSuccess =
+    (Boolean(raw.finalVerifierComplete) || Boolean(raw.proofChipAllowed) || Boolean(raw.winnerClaimAllowed)) && rawErrors.length > 0;
+  const schemaOk = Boolean(raw.schemaOk) && rawSchemaErrors.length === 0 && eventLogErrors.length === 0;
+  const finalVerifierComplete = schemaOk && !hasDirtyVerifierSuccess && Boolean(raw.finalVerifierComplete);
   const proofChipAllowed = finalVerifierComplete && Boolean(raw.proofChipAllowed);
   const winnerClaimAllowed = proofChipAllowed && Boolean(raw.winnerClaimAllowed);
   const view = VerifierRunViewSchema.parse({
@@ -12601,6 +12604,18 @@ function scoped(scope: string, sessionId: string): string {
 
 function toStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map((item) => String(item)) : [];
+}
+
+function verifierErrorStrings(raw: unknown): string[] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return [];
+  }
+  const record = raw as Record<string, unknown>;
+  return [
+    ...toStringArray(record.errors),
+    ...toStringArray(record.schemaErrors),
+    ...toStringArray(record.proofCompletenessErrors),
+  ].filter((value, index, values) => values.indexOf(value) === index);
 }
 
 function proofProviderWarnings(statuses: ProofProviderStatus[]): string[] {

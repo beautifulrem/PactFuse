@@ -14,6 +14,7 @@
     "test:contracts": "forge test",
     "export-deployment-registry": "pnpm --filter @pactfuse/evidence-schema build && pnpm --filter @pactfuse/api export-deployment-registry",
     "live-smoke": "node scripts/live-smoke.mjs",
+    "verify-live-artifacts": "node scripts/verify-live-artifacts.mjs",
     "dev:api": "pnpm --filter @pactfuse/api dev",
     "start:api": "pnpm --filter @pactfuse/api start"
   },

@@ -129,6 +129,36 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.winnerClaimAllowed).toBe(true);
   });
 
+  it("keeps final authority closed when canonical CAW receipts do not match live CAW proof events", () => {
+    const bundle = replayBundleWithLease();
+    promoteFirstQuoteToChainSettleableForTest(bundle);
+    appendCawIdentityProbeForTest(bundle);
+    const denyProbe = appendCawDenyProbeForTest(bundle);
+    appendFinalCawReceiptCoverageForTest(bundle, denyProbe, {
+      approvePolicyDigest: hex32("wrong-caw-approve-policy"),
+    });
+    appendFinalTripProofsForTest(bundle);
+    const sourceEvent = appendFinalSourceChallengeForTest(bundle);
+    appendArtifactAccessEventForTest(bundle);
+    passJudgeRowForTest(bundle, "source_challenge", "proof", sourceEvent.eventId, "finalized source challenge proof");
+    passJudgeRowForTest(bundle, "c_settlement", "proof", latestEventForTest(bundle, "token.balance_delta.verified").eventId, "token balance delta settled");
+    bundle.winnerClaimAllowed = true;
+    refreshReplayPagingForTest(bundle);
+
+    const result = verifyEvidence(
+      bundle,
+      createServerRuntimeVerifierOptions({
+        cliMode: "proof-chip",
+        proofProviders: liveProofProvidersForTest(),
+      }),
+    );
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofCompletenessErrors).toContain("final verifier requires canonical CAW approve receipt to match the live allowance proof");
+    expect(result.proofCompletenessErrors).toContain("replay bundle requested winnerClaimAllowed=true before every final verifier gate passed");
+  });
+
   it("keeps final authority closed when token deployment registry evidence is missing", () => {
     const bundle = replayBundleWithLease();
     promoteFirstQuoteToChainSettleableForTest(bundle);
@@ -655,6 +685,15 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.proofChipAllowed).toBe(false);
 	    expect(result.errors.some((error) => error.includes(expected))).toBe(true);
 	  });
+
+  it("accepts signed source identity produced with the API v1 message domain", () => {
+    const bundle = replayBundle();
+    appendSignedSourceForTest(bundle);
+
+    const result = verifyEvidence(bundle, { cliMode: "schema-only" });
+
+    expect(result.schemaErrors.some((error) => error.includes("signature does not recover issuer"))).toBe(false);
+  });
 
   it("accepts uppercase artifact hex variants after canonical comparison", () => {
 	    const bundle = replayBundle();
@@ -1880,9 +1919,10 @@ function appendCawDenyProbeAuditUsageForTest(bundle, interaction, contractEvent)
   );
 }
 
-function appendFinalCawReceiptCoverageForTest(bundle, denyProbe) {
+function appendFinalCawReceiptCoverageForTest(bundle, denyProbe, options = {}) {
   bundle.rawCawReceiptBundles[0].receiptCount = 1;
   const approve = bundle.cawLiveInteractions.find((interaction) => interaction.kind === "contract_call" && interaction.request.operation_kind === "approve");
+  const activate = bundle.cawLiveInteractions.find((interaction) => interaction.kind === "contract_call" && interaction.request.operation_kind === "activate_tool");
   appendCanonicalCawReceiptForTest(bundle, {
     seed: "deny-probe",
     operationKind: "deny_probe",
@@ -1893,6 +1933,7 @@ function appendFinalCawReceiptCoverageForTest(bundle, denyProbe) {
     status: "denied",
     txHash: null,
     spendId: bundle.spends[0].spendId,
+    policyDigest: options.denyPolicyDigest,
   });
   appendCanonicalCawReceiptForTest(bundle, {
     seed: "approve",
@@ -1904,11 +1945,24 @@ function appendFinalCawReceiptCoverageForTest(bundle, denyProbe) {
     status: "succeeded",
     txHash: approve.response.result.transaction_hash,
     spendId: bundle.spends[0].spendId,
+    policyDigest: options.approvePolicyDigest,
+  });
+  appendCanonicalCawReceiptForTest(bundle, {
+    seed: "activate",
+    operationKind: "activate_tool",
+    target: activate.request.contract_addr,
+    selector: activate.request.selector,
+    requestId: activate.cawRequestId,
+    effect: "allow",
+    status: "succeeded",
+    txHash: activate.response.result.transaction_hash,
+    spendId: bundle.spends[0].spendId,
+    policyDigest: options.activatePolicyDigest,
   });
   sealReplayBundleForTest(bundle);
 }
 
-function appendCanonicalCawReceiptForTest(bundle, { seed, operationKind, target, selector, requestId, effect, status, txHash, spendId }) {
+function appendCanonicalCawReceiptForTest(bundle, { seed, operationKind, target, selector, requestId, effect, status, txHash, spendId, policyDigest }) {
   const createdAt = "2026-06-11T00:00:03.400Z";
   const fetchedAt = "2026-06-11T00:00:03.350Z";
   const operationId = hex32(`caw-receipt-operation-${seed}`);
@@ -1917,7 +1971,7 @@ function appendCanonicalCawReceiptForTest(bundle, { seed, operationKind, target,
     operationId,
     operationKind,
     walletAddress: bundle.spends[0].agentWallet,
-    policyDigest: hex32("pact-live-policy"),
+    policyDigest: policyDigest ?? hex32("pact-live-policy"),
     paramsDigest: hex32(`caw-receipt-params-${seed}`),
     requestId,
     effect,
@@ -2736,9 +2790,9 @@ function appendSignedSourceForTest(bundle) {
     ...sourceBase,
     sessionId: bundle.sessionId,
     sourceHash,
-    issuer: "0x1Be31A94361a391bBaFB2a4CCd704F57dc04d4bb",
+    issuer: "0x8670914d722FA578f6b2c5F7062413fE7Aa9815e",
     signature:
-      "0x3c3715f92bec68099740feaf73b63dc802cf22358c423d0dc750cfd5a14c88206a2332c51a72c6298d520eff957bc6b8020126efefe10fb686e34a3677dc74b41c",
+      "0x5936cab3d0dedac996d847cd845afd56373c280bcbecf0179c9832e179fa728b78298eceb29e1492f11d94ce05226e889bfc2c7309d64fef2d7b47655ebced291c",
     proofStatus: "pending",
     createdAt: "2026-06-11T00:00:03.000Z",
   };

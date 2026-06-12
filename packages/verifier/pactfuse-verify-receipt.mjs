@@ -1752,7 +1752,7 @@ function verifySourceIdentityBindings(bundle, errors) {
 }
 
 function sourceIdentityMessage(sourceIdentityHash) {
-  return `PactFuse source identity: ${sourceIdentityHash}`;
+  return `PactFuse source identity v1:${sourceIdentityHash}`;
 }
 
 function recoverSourceIssuerAddress(message, signature) {
@@ -3072,7 +3072,98 @@ function finalCawReceiptCoverageBlockers(bundle) {
   if (!hasReceipt("activate_tool", "allow")) {
     blockers.push("final verifier requires canonical CAW activate_tool allow receipt with txHash");
   }
+  blockers.push(...finalCawReceiptLiveBindingBlockers(bundle, canonicalReceipts));
   return blockers;
+}
+
+function finalCawReceiptLiveBindingBlockers(bundle, canonicalReceipts) {
+  const blockers = [];
+  const events = Array.isArray(bundle.events) ? bundle.events.filter(isObject) : [];
+  const eventsById = new Map(events.filter((event) => typeof event.eventId === "string").map((event) => [event.eventId, event]));
+  const spendsById = new Map((Array.isArray(bundle.spends) ? bundle.spends : []).filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]));
+  const receipts = canonicalReceipts.filter((receipt) => ["caw-api", "caw-export"].includes(asText(receipt.sourceLabel)));
+
+  const receiptMatchesDeny = receipts.some((receipt) =>
+    events.some((event) => finalCawDenyReceiptMatchesEvent(receipt, event, eventsById)),
+  );
+  if (!receiptMatchesDeny) {
+    blockers.push("final verifier requires canonical CAW deny_probe receipt to match denied live CAW audit usage");
+  }
+
+  const receiptMatchesApprove = receipts.some((receipt) =>
+    events.some((event) => finalCawApproveReceiptMatchesEvent(receipt, event)),
+  );
+  if (!receiptMatchesApprove) {
+    blockers.push("final verifier requires canonical CAW approve receipt to match the live allowance proof");
+  }
+
+  const receiptMatchesActivate = receipts.some((receipt) =>
+    events.some((event) => finalCawActivateReceiptMatchesEvent(receipt, event, spendsById)),
+  );
+  if (!receiptMatchesActivate) {
+    blockers.push("final verifier requires canonical CAW activate_tool receipt to match the live activation proof");
+  }
+  return blockers;
+}
+
+function finalCawDenyReceiptMatchesEvent(receipt, event, eventsById) {
+  if (receipt.operationKind !== "deny_probe" || receipt.effect !== "deny" || receipt.status !== "denied") {
+    return false;
+  }
+  const payload = isObject(event?.payload) ? event.payload : {};
+  if (
+    event.kind !== "caw.live.audit.usage.verified" ||
+    !replayEventHasProofAuthority(event, false) ||
+    payload.operationKind !== "deny_probe" ||
+    payload.result !== "denied" ||
+    asText(receipt.requestId) !== asText(payload.cawRequestId) ||
+    lowerHex(receipt.policyDigest) !== lowerHex(payload.policyDigest)
+  ) {
+    return false;
+  }
+  const contractEvent = eventsById.get(payload.cawContractCallEventId);
+  const contractPayload = isObject(contractEvent?.payload) ? contractEvent.payload : {};
+  return (
+    contractEvent?.kind === "caw.live.contract_call.submitted" &&
+    lowerHex(receipt.target) === lowerHex(contractPayload.contractAddress) &&
+    lowerHex(receipt.selector) === lowerHex(contractPayload.selector)
+  );
+}
+
+function finalCawApproveReceiptMatchesEvent(receipt, event) {
+  if (receipt.operationKind !== "approve" || receipt.effect !== "allow" || receipt.status !== "succeeded") {
+    return false;
+  }
+  const payload = isObject(event?.payload) ? event.payload : {};
+  return (
+    event.kind === "caw.allowance.verified" &&
+    replayEventHasProofAuthority(event, false) &&
+    asText(receipt.requestId) === asText(payload.cawRequestId) &&
+    lowerHex(receipt.policyDigest) === lowerHex(payload.auditPolicyDigest) &&
+    lowerHex(receipt.txHash) === lowerHex(payload.approveTxHash) &&
+    lowerHex(receipt.target) === lowerHex(payload.paymentToken) &&
+    lowerHex(receipt.selector) === ERC20_APPROVE_SELECTOR &&
+    lowerHex(receipt.walletAddress) === lowerHex(payload.agentWallet)
+  );
+}
+
+function finalCawActivateReceiptMatchesEvent(receipt, event, spendsById) {
+  if (receipt.operationKind !== "activate_tool" || receipt.effect !== "allow" || receipt.status !== "succeeded") {
+    return false;
+  }
+  const payload = isObject(event?.payload) ? event.payload : {};
+  const spend = spendsById.get(lowerHex(payload.spendId));
+  return (
+    event.kind === "caw.activation.verified" &&
+    replayEventHasLiveChainProofAuthority(event, false) &&
+    asText(receipt.requestId) === asText(payload.cawRequestId) &&
+    lowerHex(receipt.policyDigest) === lowerHex(payload.auditPolicyDigest) &&
+    lowerHex(receipt.txHash) === lowerHex(payload.activateTxHash) &&
+    lowerHex(receipt.target) === lowerHex(payload.procurementGateAddress) &&
+    lowerHex(receipt.selector) === PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR &&
+    isObject(spend) &&
+    lowerHex(receipt.walletAddress) === lowerHex(spend.agentWallet)
+  );
 }
 
 function verifyReplayBundleEvidence(bundle, options = {}) {
