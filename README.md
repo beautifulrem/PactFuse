@@ -291,12 +291,13 @@ The replay verifier checks:
 
 ### Live Release Gate
 
-The production claim path has a separate smoke gate. It does not create evidence and it does not accept fixture data; it only validates an already-built live session:
+The production claim path has a separate smoke gate. It does not create server-side evidence and it does not accept fixture data; it validates an already-built live session and can export the verified public proof artifacts:
 
 ```sh
 PACTFUSE_API_BASE_URL=http://127.0.0.1:8787 \
 PACTFUSE_OPERATOR_TOKEN=... \
 PACTFUSE_LIVE_SMOKE_SESSION_ID=0x... \
+PACTFUSE_LIVE_SMOKE_OUTPUT_DIR=artifacts/live/0x... \
 pnpm live-smoke
 ```
 
@@ -307,6 +308,7 @@ Required result:
 - `/api/v1/evidence/live-preflight` returns `readyForPublicClaim=true` with no blockers
 - `/api/v1/evidence/public-claim` returns `authorized_public_claim`, `finalVerifierComplete=true`, and `winnerClaimAllowed=true`
 - `/api/v1/evidence/proof-bundle` returns `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1`, and its public claim, public-claim event hash, replay, verifier run, provider, deployment-registry, server, and bundle hashes recompute from the response body
+- when `PACTFUSE_LIVE_SMOKE_OUTPUT_DIR` is set, the smoke gate writes `live-preflight.json`, `public-claim.json`, `proof-bundle.json`, and `manifest.json`; the output directory must be empty, and the manifest records SHA-256 hashes over sorted-key canonical JSON for each artifact plus the recomputed public-claim, proof-bundle, replay, provider, deployment-registry, and server hashes
 
 For `mock-test-token`, claim readiness and final replay verification require a recorded failed official-USDC probe reason plus a live deployment registry entry for the payment token address, non-zero deployment transaction hash, a public HTTPS explorer URL that points to that transaction, deployment receipt `contractAddress` matching the token address, `codeHash = keccak256(eth_getCode(address))`, and matching ERC20 `decimals()`/`symbol()` metadata. Official Base Sepolia USDC is accepted only on chain id `84532` with a passed official-USDC probe and a matching live registry entry.
 

@@ -1,6 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -280,6 +280,69 @@ describe("pactfuse-api P0", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(stdout.ok).toBe(true);
     expect(stdout.proofBundleHash).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  it("live-smoke exports public proof artifacts with a recomputable manifest", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-smoke-"));
+    try {
+      const result = await runLiveSmokeAgainstStub(undefined, undefined, {
+        PACTFUSE_LIVE_SMOKE_OUTPUT_DIR: dir,
+      });
+      const stdout = JSON.parse(result.stdout) as Record<string, unknown>;
+      const publicClaim = readJsonFile(join(dir, "public-claim.json"));
+      const proofBundle = readJsonFile(join(dir, "proof-bundle.json"));
+      const preflight = readJsonFile(join(dir, "live-preflight.json"));
+      const manifest = readJsonFile(join(dir, "manifest.json"));
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(stdout.artifactDir).toBe(dir);
+      expect(stdout.artifactManifestHash).toBe(manifest.manifestHash);
+      expect(preflight.status).toBe("ready");
+      expect(publicClaim.publicClaimHash).toBe(stdout.publicClaimHash);
+      expect(proofBundle.proofBundleHash).toBe(stdout.proofBundleHash);
+      expect(manifest).toEqual(
+        expect.objectContaining({
+          manifestType: "PACTFUSE_LIVE_SMOKE_ARTIFACTS_V1",
+          sessionId: proofBundle.sessionId,
+          publicClaimHash: publicClaim.publicClaimHash,
+          proofBundleHash: proofBundle.proofBundleHash,
+          replayBundleHash: proofBundle.replayBundleHash,
+          publicClaimEventHash: proofBundle.publicClaimEventHash,
+          providerStatusHash: proofBundle.providerStatusHash,
+          deploymentRegistryHash: proofBundle.deploymentRegistryHash,
+          serverHash: proofBundle.serverHash,
+        }),
+      );
+      expect(manifest.artifacts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: "live-preflight.json", canonicalHash: hashForTestJson(preflight) }),
+          expect.objectContaining({ name: "public-claim.json", canonicalHash: hashForTestJson(publicClaim) }),
+          expect.objectContaining({ name: "proof-bundle.json", canonicalHash: hashForTestJson(proofBundle) }),
+        ]),
+      );
+      const manifestBase = { ...manifest };
+      delete manifestBase.manifestHash;
+      expect(manifest.manifestHash).toBe(hashForTestJson(manifestBase));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("live-smoke refuses to overwrite an existing artifact export directory", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-smoke-existing-"));
+    const existingManifest = join(dir, "manifest.json");
+    writeFileSync(existingManifest, '{"existing":true}\n', "utf8");
+    try {
+      const result = await runLiveSmokeAgainstStub(undefined, undefined, {
+        PACTFUSE_LIVE_SMOKE_OUTPUT_DIR: dir,
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("PACTFUSE_LIVE_SMOKE_OUTPUT_DIR must be empty");
+      expect(readFileSync(existingManifest, "utf8")).toBe('{"existing":true}\n');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("live-smoke rejects session and proof hash drift from the live endpoint", async () => {
@@ -10543,6 +10606,7 @@ async function startMcpJsonRpcServer(respond: (request: Record<string, unknown>)
 async function runLiveSmokeAgainstStub(
   mutateProofBundle?: (proofBundle: Record<string, unknown>) => void,
   mutateFixture?: (fixture: ReturnType<typeof liveSmokeFixture>) => void,
+  extraEnv: Record<string, string> = {},
 ): Promise<{
   status: number | null;
   stdout: string;
@@ -10591,6 +10655,7 @@ async function runLiveSmokeAgainstStub(
         PACTFUSE_OPERATOR_TOKEN: "operator-test-token",
         PACTFUSE_LIVE_SMOKE_SESSION_ID: fixture.sessionId,
         PACTFUSE_LIVE_SMOKE_REQUIRED_PROVIDERS: "chain,caw_live,caw,mcp_lease",
+        ...extraEnv,
       },
     });
     return { status: result.status, stdout: result.stdout, stderr: result.stderr };
@@ -10605,6 +10670,10 @@ async function runLiveSmokeAgainstStub(
       });
     });
   }
+}
+
+function readJsonFile(path: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
 }
 
 function resealLiveSmokeProofBundleForTest(proofBundle: Record<string, unknown>): void {

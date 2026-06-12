@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
+import { link, lstat, mkdir, readdir, unlink, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 const ZERO_HASH = `0x${"0".repeat(64)}`;
@@ -11,6 +13,7 @@ const operatorToken = process.env.PACTFUSE_OPERATOR_TOKEN;
 const sessionId = process.env.PACTFUSE_LIVE_SMOKE_SESSION_ID;
 const requirePublicClaim = booleanEnv("PACTFUSE_LIVE_SMOKE_REQUIRE_PUBLIC_CLAIM", true);
 const requiredProviders = listEnv("PACTFUSE_LIVE_SMOKE_REQUIRED_PROVIDERS", ["chain", "caw_live", "caw", "mcp_lease"]);
+const artifactOutputDir = process.env.PACTFUSE_LIVE_SMOKE_OUTPUT_DIR ? resolve(process.env.PACTFUSE_LIVE_SMOKE_OUTPUT_DIR) : null;
 
 try {
   assert(operatorToken, "PACTFUSE_OPERATOR_TOKEN is required");
@@ -131,6 +134,15 @@ try {
     verifyProofBundleHashes(proofBundleData, claimData);
   }
 
+  const artifactManifest = artifactOutputDir
+    ? await exportLiveSmokeArtifacts({
+        outputDir: artifactOutputDir,
+        preflight: preflightData,
+        publicClaim: claimData,
+        proofBundle: proofBundleData,
+      })
+    : null;
+
   console.log(
     JSON.stringify(
       {
@@ -141,6 +153,8 @@ try {
         livePreflightStatus: preflightData.status,
         publicClaimHash: claimData?.publicClaimHash ?? null,
         proofBundleHash: proofBundleData?.proofBundleHash ?? null,
+        artifactDir: artifactManifest?.artifactDir ?? null,
+        artifactManifestHash: artifactManifest?.manifestHash ?? null,
       },
       null,
       2,
@@ -181,6 +195,90 @@ async function requestJson(path) {
     throw withDetails(new Error(`${path} returned HTTP ${response.status}`), json);
   }
   return json;
+}
+
+async function exportLiveSmokeArtifacts(input) {
+  await prepareArtifactOutputDir(input.outputDir);
+  const artifacts = [];
+  artifacts.push(await writeJsonArtifact(input.outputDir, "live-preflight.json", input.preflight));
+  if (input.publicClaim) {
+    artifacts.push(await writeJsonArtifact(input.outputDir, "public-claim.json", input.publicClaim));
+  }
+  if (input.proofBundle) {
+    artifacts.push(await writeJsonArtifact(input.outputDir, "proof-bundle.json", input.proofBundle));
+  }
+  const manifestBase = {
+    manifestType: "PACTFUSE_LIVE_SMOKE_ARTIFACTS_V1",
+    generatedAt: new Date().toISOString(),
+    sessionId,
+    requiredProviders,
+    livePreflightStatus: input.preflight.status,
+    publicClaimHash: input.publicClaim?.publicClaimHash ?? null,
+    proofBundleHash: input.proofBundle?.proofBundleHash ?? null,
+    replayBundleHash: input.proofBundle?.replayBundleHash ?? input.publicClaim?.replayBundleHash ?? null,
+    publicClaimEventHash: input.proofBundle?.publicClaimEventHash ?? null,
+    providerStatusHash: input.proofBundle?.providerStatusHash ?? input.publicClaim?.providerStatusHash ?? null,
+    deploymentRegistryHash: input.proofBundle?.deploymentRegistryHash ?? input.publicClaim?.deploymentRegistryHash ?? null,
+    serverHash: input.proofBundle?.serverHash ?? input.publicClaim?.serverHash ?? null,
+    artifacts,
+  };
+  const manifestHash = hashJson(manifestBase);
+  const manifest = { ...manifestBase, manifestHash };
+  await writeJsonArtifact(input.outputDir, "manifest.json", manifest);
+  return { artifactDir: input.outputDir, manifestHash };
+}
+
+async function writeJsonArtifact(outputDir, name, value) {
+  const body = `${JSON.stringify(value, null, 2)}\n`;
+  await writeNoOverwrite(join(outputDir, name), body);
+  return {
+    name,
+    canonicalHash: hashJson(value),
+    byteSha256: `0x${createHash("sha256").update(body).digest("hex")}`,
+    bytes: Buffer.byteLength(body, "utf8"),
+  };
+}
+
+async function prepareArtifactOutputDir(outputDir) {
+  let stat = null;
+  try {
+    stat = await lstat(outputDir);
+  } catch (error) {
+    if (!isNodeErrorCode(error, "ENOENT")) {
+      throw error;
+    }
+  }
+  if (!stat) {
+    await mkdir(outputDir, { recursive: true, mode: 0o755 });
+    stat = await lstat(outputDir);
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error("PACTFUSE_LIVE_SMOKE_OUTPUT_DIR must be a real directory, not a symlink or file");
+  }
+  const existing = await readdir(outputDir);
+  if (existing.length > 0) {
+    throw new Error("PACTFUSE_LIVE_SMOKE_OUTPUT_DIR must be empty to avoid overwriting prior proof artifacts");
+  }
+}
+
+async function writeNoOverwrite(path, body) {
+  const tempPath = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  try {
+    await writeFile(tempPath, body, { encoding: "utf8", mode: 0o644, flag: "wx" });
+    await link(tempPath, path);
+  } finally {
+    try {
+      await unlink(tempPath);
+    } catch (error) {
+      if (!isNodeErrorCode(error, "ENOENT")) {
+        throw error;
+      }
+    }
+  }
+}
+
+function isNodeErrorCode(error, code) {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === code);
 }
 
 function stripTrailingSlash(value) {
