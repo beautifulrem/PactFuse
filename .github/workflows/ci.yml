@@ -40,8 +40,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Check live-smoke syntax
-        run: node --check scripts/live-smoke.mjs
+      - name: Check script syntax
+        run: pnpm check:scripts
 
       - name: Build
         run: pnpm build
@@ -55,6 +55,27 @@ jobs:
   live-smoke:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.live_smoke }}
     runs-on: ubuntu-latest
+    env:
+      PACTFUSE_API_BASE_URL: ${{ secrets.PACTFUSE_API_BASE_URL }}
+      PACTFUSE_OPERATOR_TOKEN: ${{ secrets.PACTFUSE_OPERATOR_TOKEN }}
+      PACTFUSE_LIVE_SMOKE_SESSION_ID: ${{ secrets.PACTFUSE_LIVE_SMOKE_SESSION_ID }}
+      PACTFUSE_LIVE_SMOKE_REQUIRE_PUBLIC_CLAIM: "true"
+      PACTFUSE_LIVE_SMOKE_OUTPUT_DIR: live-smoke-artifacts
+      PACTFUSE_MCP_AUDIT_TOKEN: ${{ secrets.PACTFUSE_MCP_AUDIT_TOKEN }}
+      PACTFUSE_GATE_INGEST_TOKEN: ${{ secrets.PACTFUSE_GATE_INGEST_TOKEN }}
+      PACTFUSE_CAW_INGEST_TOKEN: ${{ secrets.PACTFUSE_CAW_INGEST_TOKEN }}
+      PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM }}
+      PACTFUSE_TRUSTED_PROOF_KEY_HASHES: ${{ secrets.PACTFUSE_TRUSTED_PROOF_KEY_HASHES }}
+      PACTFUSE_CHAIN_RPC_URL: ${{ secrets.PACTFUSE_CHAIN_RPC_URL }}
+      PACTFUSE_CHAIN_ID: ${{ secrets.PACTFUSE_CHAIN_ID }}
+      PACTFUSE_DEPLOYMENT_REGISTRY_JSON: ${{ secrets.PACTFUSE_DEPLOYMENT_REGISTRY_JSON }}
+      PACTFUSE_CAW_LIVE_API_URL: ${{ secrets.PACTFUSE_CAW_LIVE_API_URL }}
+      PACTFUSE_CAW_LIVE_API_KEY: ${{ secrets.PACTFUSE_CAW_LIVE_API_KEY }}
+      PACTFUSE_CAW_LIVE_WALLET_ID: ${{ secrets.PACTFUSE_CAW_LIVE_WALLET_ID }}
+      PACTFUSE_CAW_EXPORT_URL: ${{ secrets.PACTFUSE_CAW_EXPORT_URL }}
+      PACTFUSE_CAW_API_KEY: ${{ secrets.PACTFUSE_CAW_API_KEY }}
+      PACTFUSE_CAW_WALLET_ID: ${{ secrets.PACTFUSE_CAW_WALLET_ID }}
+      PACTFUSE_LEASE_MCP_URL: ${{ secrets.PACTFUSE_LEASE_MCP_URL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,10 +85,18 @@ jobs:
         with:
           node-version: 22
 
+      - name: Check live environment
+        run: node scripts/live-env-report.mjs
+
       - name: Run live public-claim smoke gate
         run: node scripts/live-smoke.mjs
-        env:
-          PACTFUSE_API_BASE_URL: ${{ secrets.PACTFUSE_API_BASE_URL }}
-          PACTFUSE_OPERATOR_TOKEN: ${{ secrets.PACTFUSE_OPERATOR_TOKEN }}
-          PACTFUSE_LIVE_SMOKE_SESSION_ID: ${{ secrets.PACTFUSE_LIVE_SMOKE_SESSION_ID }}
-          PACTFUSE_LIVE_SMOKE_REQUIRE_PUBLIC_CLAIM: "true"
+
+      - name: Verify exported live artifacts
+        run: node scripts/verify-live-artifacts.mjs "$PACTFUSE_LIVE_SMOKE_OUTPUT_DIR"
+
+      - name: Upload live proof artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pactfuse-live-smoke-artifacts
+          path: live-smoke-artifacts
+          if-no-files-found: error

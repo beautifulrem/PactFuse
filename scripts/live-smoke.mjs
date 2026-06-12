@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { link, lstat, mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
@@ -23,6 +23,7 @@ const operatorToken = process.env.PACTFUSE_OPERATOR_TOKEN;
 const sessionId = process.env.PACTFUSE_LIVE_SMOKE_SESSION_ID;
 const requirePublicClaim = booleanEnv("PACTFUSE_LIVE_SMOKE_REQUIRE_PUBLIC_CLAIM", true);
 const requiredProviders = listEnv("PACTFUSE_LIVE_SMOKE_REQUIRED_PROVIDERS", ["chain", "caw_live", "caw", "mcp_lease"]);
+const trustedProofKeyHashes = new Set(listEnv("PACTFUSE_TRUSTED_PROOF_KEY_HASHES", []).map((value) => value.toLowerCase()));
 const artifactOutputDir = process.env.PACTFUSE_LIVE_SMOKE_OUTPUT_DIR ? resolve(process.env.PACTFUSE_LIVE_SMOKE_OUTPUT_DIR) : null;
 
 try {
@@ -36,6 +37,12 @@ try {
   assert(ready.apiSecurity?.allowInsecureMissingRoleTokens === false, "insecure missing-role-token bypass is enabled", ready.apiSecurity);
   assert(ready.mcpAudit?.configured === true, "PACTFUSE_MCP_AUDIT_TOKEN is not configured", ready.mcpAudit);
   assert(ready.gateIngest?.configured === true, "PACTFUSE_GATE_INGEST_TOKEN is not configured", ready.gateIngest);
+  assert(ready.proofBundleSigning?.configured === true, "proof bundle signing key is not configured", ready.proofBundleSigning);
+  assert(
+    trustedProofKeyHashes.has(String(ready.proofBundleSigning?.publicKeyHash ?? "").toLowerCase()),
+    "readyz proof bundle signing publicKeyHash is not trusted",
+    ready.proofBundleSigning,
+  );
 
   const providers = new Map((ready.proofProviders ?? []).map((provider) => [provider.name, provider]));
   for (const providerName of requiredProviders) {
@@ -337,6 +344,8 @@ function verifyProofBundleHashes(proofBundle, claim) {
   verifyPublicClaimSnapshotBinding(proofBundle);
   verifyReplayDeploymentRegistryBinding(proofBundle);
   verifyPublicClaimDeploymentRegistry(proofBundle);
+  verifyPublicReplayUrls(proofBundle.replayBundle);
+  verifyProofBundleAttestation(proofBundle);
   assert(hashJson(proofBundle.replayBundle) === proofBundle.replayBundleHash, "proof-bundle replayBundleHash does not recompute", {
     expected: proofBundle.replayBundleHash,
     actual: hashJson(proofBundle.replayBundle),
@@ -367,6 +376,63 @@ function verifyProofBundleHashes(proofBundle, claim) {
     expected: proofBundle.proofBundleHash,
     actual: hashJson(bundleBase),
   });
+}
+
+function verifyProofBundleAttestation(proofBundle) {
+  const attestation = proofBundle.verifierAttestation;
+  assert(isObject(attestation), "proof-bundle verifierAttestation is missing", proofBundle);
+  assert(attestation.scheme === "ed25519", "proof-bundle verifierAttestation scheme is not ed25519", attestation);
+  assert(typeof attestation.publicKeyPem === "string" && attestation.publicKeyPem.length > 0, "proof-bundle verifierAttestation publicKeyPem is missing", attestation);
+  assert(HEX32.test(attestation.publicKeyHash), "proof-bundle verifierAttestation publicKeyHash is missing or invalid", attestation);
+  assert(HEX32.test(attestation.signedPayloadHash), "proof-bundle verifierAttestation signedPayloadHash is missing or invalid", attestation);
+  assert(typeof attestation.signature === "string" && attestation.signature.length > 0, "proof-bundle verifierAttestation signature is missing", attestation);
+  const publicKeyHash = hashText(attestation.publicKeyPem);
+  assert(sameHex(publicKeyHash, attestation.publicKeyHash), "proof-bundle verifierAttestation publicKeyHash does not match publicKeyPem", {
+    expected: attestation.publicKeyHash,
+    actual: publicKeyHash,
+  });
+  assert(trustedProofKeyHashes.size > 0, "PACTFUSE_TRUSTED_PROOF_KEY_HASHES is required for public proof bundle verification");
+  assert(
+    trustedProofKeyHashes.has(String(attestation.publicKeyHash).toLowerCase()),
+    "proof-bundle verifierAttestation publicKeyHash is not trusted",
+    attestation,
+  );
+  const signedPayloadHash = hashJson(publicProofBundleVerifierAttestationInput(proofBundle, attestation));
+  assert(sameHex(signedPayloadHash, attestation.signedPayloadHash), "proof-bundle verifierAttestation signedPayloadHash does not recompute", {
+    expected: attestation.signedPayloadHash,
+    actual: signedPayloadHash,
+  });
+  const signatureOk = cryptoVerify(
+    null,
+    Buffer.from(String(attestation.signedPayloadHash).slice(2), "hex"),
+    createPublicKey(attestation.publicKeyPem),
+    Buffer.from(attestation.signature, "base64"),
+  );
+  assert(signatureOk, "proof-bundle verifierAttestation signature is invalid", attestation);
+}
+
+function publicProofBundleVerifierAttestationInput(proofBundle, attestation) {
+  return {
+    attestationType: "PACTFUSE_PUBLIC_PROOF_VERIFIER_ATTESTATION_V1",
+    scheme: attestation.scheme,
+    keyId: attestation.keyId,
+    publicKeyHash: attestation.publicKeyHash,
+    bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+    sessionId: proofBundle.sessionId,
+    publicClaimHash: proofBundle.publicClaimHash,
+    publicClaimEventSeq: proofBundle.publicClaimEventSeq,
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt: proofBundle.authorizedAt,
+    asOfEventSeq: proofBundle.asOfEventSeq,
+    claimInputReplayBundleHash: proofBundle.claimInputReplayBundleHash,
+    replayBundleHash: proofBundle.replayBundleHash,
+    verifierRunHash: proofBundle.verifierRunHash,
+    providerStatusHash: proofBundle.providerStatusHash,
+    deploymentRegistryHash: proofBundle.deploymentRegistryHash,
+    serverHash: proofBundle.serverHash,
+    winnerClaimAllowed: true,
+  };
 }
 
 function verifyPublicClaimSnapshotBinding(proofBundle) {
@@ -427,6 +493,16 @@ function verifyPublicClaimModeAlignment(proofBundle) {
       verifierRun: verifierRun[field],
     });
   }
+  const expectedTokenSettlementClaim = tokenSettlementClaimForTokenMode(claim.tokenMode);
+  assert(
+    expectedTokenSettlementClaim && claim.tokenSettlementClaim === expectedTokenSettlementClaim,
+    "proof-bundle publicClaim.tokenSettlementClaim does not match tokenMode",
+    {
+      tokenMode: claim.tokenMode,
+      tokenSettlementClaim: claim.tokenSettlementClaim,
+      expectedTokenSettlementClaim,
+    },
+  );
   for (const field of ["proofChipAllowed", "finalVerifierComplete", "winnerClaimAllowed"]) {
     assert(claim[field] === verifierRun[field], `proof-bundle publicClaim.${field} does not match verifierRun.${field}`, {
       publicClaim: claim[field],
@@ -437,6 +513,16 @@ function verifyPublicClaimModeAlignment(proofBundle) {
     proofBundle: proofBundle.winnerClaimAllowed,
     publicClaim: claim.winnerClaimAllowed,
   });
+}
+
+function tokenSettlementClaimForTokenMode(tokenMode) {
+  if (tokenMode === "official-testnet-usdc") {
+    return "official-testnet-usdc";
+  }
+  if (tokenMode === "mock-test-token") {
+    return "live-mock-erc20-fallback";
+  }
+  return null;
 }
 
 function verifyProofBundleProviderStatuses(proofBundle) {
@@ -499,9 +585,11 @@ function verifyPublicClaimDeploymentRegistry(proofBundle) {
     tokenMode,
     deploymentRegistryHash: proofBundle.deploymentRegistryHash,
   });
-  const quote = (proofBundle.replayBundle?.quotes ?? []).find((candidate) => candidate?.status === "chain_settleable_after_preflight");
+  const quote = replayRowsForCollection(proofBundle.replayBundle, "quotes").find(
+    (candidate) => candidate?.status === "chain_settleable_after_preflight",
+  );
   assert(isObject(quote), "public claim tokenMode requires a chain-settleable quote in the replay bundle", proofBundle.replayBundle?.quotes);
-  const spend = (proofBundle.replayBundle?.spends ?? []).find((candidate) => candidate?.spendId === quote.spendId);
+  const spend = replayRowsForCollection(proofBundle.replayBundle, "spends").find((candidate) => candidate?.spendId === quote.spendId);
   assert(isObject(spend), "public claim tokenMode requires the chain-settleable quote spend in the replay bundle", {
     quoteId: quote.quoteId,
     spendId: quote.spendId,
@@ -533,6 +621,7 @@ function verifyPublicClaimDeploymentRegistry(proofBundle) {
     "PaymentToken deployment registry entry is not live-proof complete",
     entry,
   );
+  verifyLiveContractDeploymentRegistryEntries(proofBundle, registry, quote, spend);
   const probe = registry.officialUsdcProbe;
   if (tokenMode === "official-testnet-usdc") {
     assert(sameHex(spend.paymentToken, BASE_SEPOLIA_USDC) && String(quote.chainId) === "84532", "official USDC claim must use Base Sepolia USDC", {
@@ -549,9 +638,96 @@ function verifyPublicClaimDeploymentRegistry(proofBundle) {
   );
 }
 
+function verifyPublicReplayUrls(replayBundle) {
+  for (const source of Array.isArray(replayBundle?.sources) ? replayBundle.sources : []) {
+    if (source?.manifestUrl !== undefined) {
+      assertPublicReplayUrl(`source ${source.sourceHash ?? "-"} manifestUrl`, source.manifestUrl);
+    }
+  }
+  for (const preflight of Array.isArray(replayBundle?.artifactPreflights) ? replayBundle.artifactPreflights : []) {
+    if (preflight?.endpointUrl !== undefined) {
+      assertPublicReplayUrl(`artifact preflight ${preflight.preflightId ?? "-"} endpointUrl`, preflight.endpointUrl);
+    }
+  }
+}
+
+function assertPublicReplayUrl(label, value) {
+  assert(typeof value === "string" && value.length > 0, `${label} must be a URL string`, value);
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw withDetails(new Error(`${label} must be a valid URL`), value);
+  }
+  assert(url.protocol === "https:" || url.protocol === "http:", `${label} must use HTTP or HTTPS`, value);
+  assert(!url.username && !url.password && !url.search && !url.hash, `${label} must not contain credentials, query strings, or fragments`, value);
+  assert(isPublicReplayHostname(url.hostname), `${label} must use a public hostname`, value);
+}
+
+function verifyLiveContractDeploymentRegistryEntries(proofBundle, registry, quote, spend) {
+  const requirements = new Map();
+  const addRequirement = (contractName, address, chainId) => {
+    if (!isEvmAddress(address) || String(chainId ?? "").length === 0) {
+      return;
+    }
+    const key = `${contractName}:${String(chainId)}:${address.toLowerCase()}`;
+    requirements.set(key, { contractName, address: address.toLowerCase(), chainId: String(chainId) });
+  };
+
+  const events = replayRowsForCollection(proofBundle.replayBundle, "events");
+  for (const event of events) {
+    const payload = isObject(event?.payload) ? event.payload : {};
+    if ((event?.kind === "gate.spend_tripped" || event?.kind === "gate.spend_settled") && liveContractProofFinalized(payload)) {
+      addRequirement("ProcurementGate", payload.contractAddress, payload.chainId);
+    }
+    if (event?.kind === "source.challenge.confirmed" && liveContractProofFinalized(payload)) {
+      addRequirement("SourceStateRegistry", payload.sourceRegistryAddress, payload.chainId);
+    }
+  }
+  if (quote.status === "chain_settleable_after_preflight") {
+    addRequirement("PaidArtifactMarket", spend.market, quote.chainId);
+  }
+
+  for (const requirement of requirements.values()) {
+    assert(String(registry.chainId) === requirement.chainId, `deployment registry chainId must match ${requirement.contractName} chain proof`, {
+      registryChainId: registry.chainId,
+      proofChainId: requirement.chainId,
+    });
+    const entry = (registry.entries ?? []).find(
+      (candidate) =>
+        candidate?.contractName === requirement.contractName &&
+        String(candidate.chainId) === requirement.chainId &&
+        sameHex(candidate.address, requirement.address),
+    );
+    assert(
+      liveDeploymentRegistryEntryComplete(entry),
+      `public claim requires a live ${requirement.contractName} deployment registry entry for ${requirement.address} on chain ${requirement.chainId}`,
+      entry ?? requirement,
+    );
+  }
+}
+
+function liveContractProofFinalized(payload) {
+  return payload?.finalityStatus === "finalized" && payload?.contractStateVerified === true;
+}
+
+function liveDeploymentRegistryEntryComplete(entry) {
+  return (
+    isObject(entry) &&
+    HEX32.test(entry.deploymentTxHash) &&
+    entry.deploymentTxHash !== ZERO_HASH &&
+    isPublicExplorerUrl(entry.explorerUrl) &&
+    explorerUrlContainsTxHash(entry.explorerUrl, entry.deploymentTxHash) &&
+    HEX32.test(entry.codeHash) &&
+    entry.codeHash !== ZERO_HASH
+  );
+}
+
 function verifyReplayBundleEvents(replayBundle, expectedAsOfEventSeq) {
-  const events = replayBundle?.events;
-  assert(Array.isArray(events) && events.length > 0, "proof-bundle replayBundle.events is missing or empty", replayBundle);
+  const summaryEvents = replayBundle?.events;
+  const events = replayRowsForCollection(replayBundle, "events");
+  assert(Array.isArray(summaryEvents) && summaryEvents.length > 0, "proof-bundle replayBundle.events is missing or empty", replayBundle);
+  assert(events.length > 0, "proof-bundle replay pages are missing events", replayBundle);
   assert(replayBundle.asOfEventSeq === expectedAsOfEventSeq, "proof-bundle replay asOfEventSeq does not precede public claim event", {
     expected: expectedAsOfEventSeq,
     actual: replayBundle.asOfEventSeq,
@@ -599,7 +775,11 @@ function verifyReplayBundleEvents(replayBundle, expectedAsOfEventSeq) {
       previousProofEventHash = event.eventHash.toLowerCase();
     }
   }
-  const expectedEventRoot = hashJson(events.map((event) => event.eventHash));
+  assert(previousEventSeq === expectedAsOfEventSeq, "proof-bundle replay pages do not end at asOfEventSeq", {
+    expected: expectedAsOfEventSeq,
+    actual: previousEventSeq,
+  });
+  const expectedEventRoot = hashJson(summaryEvents.map((event) => event.eventHash));
   assert(sameHex(replayBundle.eventRoot, expectedEventRoot), "proof-bundle replay eventRoot does not recompute", {
     expected: replayBundle.eventRoot,
     actual: expectedEventRoot,
@@ -607,13 +787,24 @@ function verifyReplayBundleEvents(replayBundle, expectedAsOfEventSeq) {
   return previousProofEventHash;
 }
 
+function replayRowsForCollection(replayBundle, collection) {
+  const pages = replayBundle?.replayPages?.[collection];
+  if (Array.isArray(pages)) {
+    return pages.flatMap((page) => (Array.isArray(page?.rows) ? page.rows : []));
+  }
+  const summaryRows = replayBundle?.[collection];
+  return Array.isArray(summaryRows) ? summaryRows : [];
+}
+
 function verifyPublicClaimEventHash(proofBundle, previousProofEventHash) {
   const asOfEventSeq = proofBundle.publicClaimEventSeq - 1;
   const payload = {
     claim: proofBundle.publicClaim,
     publicClaimHash: proofBundle.publicClaimHash,
+    replayBundle: proofBundle.replayBundle,
     replayBundleHash: proofBundle.claimInputReplayBundleHash,
     verifierRunHash: proofBundle.verifierRunHash,
+    verifierAttestation: proofBundle.verifierAttestation,
     asOfEventSeq,
     providerStatuses: proofBundle.providerStatuses,
     providerStatusHash: proofBundle.providerStatusHash,
@@ -654,12 +845,17 @@ function publicClaimHashInput(claim) {
     claimMode: claim.claimMode,
     paymentMode: claim.paymentMode,
     tokenMode: claim.tokenMode,
+    tokenSettlementClaim: claim.tokenSettlementClaim,
     identityMode: claim.identityMode,
     replayBundleHash: claim.replayBundleHash,
     providerStatusHash: claim.providerStatusHash,
     deploymentRegistryHash: claim.deploymentRegistryHash,
     serverHash: claim.serverHash,
     verifierRun: {
+      claimMode: claim.verifierRun.claimMode,
+      paymentMode: claim.verifierRun.paymentMode,
+      tokenMode: claim.verifierRun.tokenMode,
+      identityMode: claim.verifierRun.identityMode,
       proofLevel: claim.verifierRun.proofLevel,
       proofChipAllowed: claim.verifierRun.proofChipAllowed,
       finalVerifierComplete: claim.verifierRun.finalVerifierComplete,
@@ -670,6 +866,10 @@ function publicClaimHashInput(claim) {
 
 function hashJson(value) {
   return `0x${createHash("sha256").update(canonicalizeJson(value)).digest("hex")}`;
+}
+
+function hashText(value) {
+  return `0x${createHash("sha256").update(value).digest("hex")}`;
 }
 
 function canonicalizeJson(value) {
@@ -704,6 +904,58 @@ function sortForJcs(value) {
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isEvmAddress(value) {
+  return typeof value === "string" && /^0x[0-9a-fA-F]{40}$/.test(value);
+}
+
+function isPublicReplayHostname(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".test") ||
+    host.endsWith(".local") ||
+    host.endsWith(".lan") ||
+    host.endsWith(".internal")
+  ) {
+    return false;
+  }
+  if (host.includes(":")) {
+    return false;
+  }
+  if (isPrivateOrReservedIpv4(host)) {
+    return false;
+  }
+  return host.includes(".");
+}
+
+function isPrivateOrReservedIpv4(host) {
+  const parts = host.split(".");
+  if (parts.length !== 4) {
+    return false;
+  }
+  const octets = parts.map((part) => Number(part));
+  if (octets.some((octet, index) => !Number.isInteger(octet) || octet < 0 || octet > 255 || String(octet) !== parts[index])) {
+    return false;
+  }
+  const a = octets[0] ?? -1;
+  const b = octets[1] ?? -1;
+  const c = octets[2] ?? -1;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && c === 2) ||
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113) ||
+    a >= 224
+  );
 }
 
 function sameHex(left, right) {
