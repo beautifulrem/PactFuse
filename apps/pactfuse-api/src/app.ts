@@ -291,6 +291,8 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "publicClaimHash",
     "publicClaimEventId",
     "publicClaimEventHash",
+    "publicClaimEventSeq",
+    "claimInputReplayBundleHash",
     "replayBundleHash",
     "verifierRunHash",
     "providerStatusHash",
@@ -1512,7 +1514,21 @@ function buildOpenApi(): Record<string, unknown> {
             serverHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             publicClaim: { type: "object", additionalProperties: true },
             replayBundle: { type: "object", additionalProperties: true },
-            providerStatuses: { type: "array", items: { type: "object", additionalProperties: true } },
+            providerStatuses: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["name", "mode", "ready", "reason", "endpoint"],
+                properties: {
+                  name: { enum: ["chain", "caw", "caw_live", "mcp_lease"] },
+                  mode: { enum: ["unconfigured", "fixture", "live"] },
+                  ready: { type: "boolean" },
+                  reason: { type: "string" },
+                  chainId: { type: "string" },
+                  endpoint: { anyOf: [{ type: "string" }, { type: "null" }] },
+                },
+              },
+            },
             deploymentRegistry: { anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }] },
             server: {
               type: "object",

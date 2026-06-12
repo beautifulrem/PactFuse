@@ -1578,6 +1578,8 @@ describe("pactfuse-api P0", () => {
       "publicClaimHash",
       "publicClaimEventId",
       "publicClaimEventHash",
+      "publicClaimEventSeq",
+      "claimInputReplayBundleHash",
       "replayBundleHash",
       "verifierRunHash",
       "providerStatusHash",
@@ -1588,6 +1590,10 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/evidence/proof-bundle"].get.responses["200"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/ProofBundleResponse",
     );
+    const proofBundleProviderStatus =
+      json.components.schemas.ProofBundleResponse.oneOf[0].properties.data.properties.providerStatuses.items;
+    expect(proofBundleProviderStatus.required).toEqual(["name", "mode", "ready", "reason", "endpoint"]);
+    expect(proofBundleProviderStatus.properties.endpoint.anyOf).toEqual([{ type: "string" }, { type: "null" }]);
     expect(json.paths["/api/v1/evidence/public-claim"].get.responses["200"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/PublicClaimResponse",
     );
