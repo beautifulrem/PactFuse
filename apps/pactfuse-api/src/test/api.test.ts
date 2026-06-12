@@ -386,6 +386,28 @@ describe("pactfuse-api P0", () => {
     expect(result.stderr).toContain("proof-bundle publicClaim.tokenMode does not match verifierRun.tokenMode");
   });
 
+  it("live-smoke rejects a self-consistent deployment registry with a mismatched explorer tx URL", async () => {
+    const result = await runLiveSmokeAgainstStub(undefined, (fixture) => {
+      const proofBundle = fixture.proofBundle as Record<string, unknown>;
+      const claim = fixture.claim as Record<string, unknown>;
+      const registry = proofBundle.deploymentRegistry as { entries: Array<Record<string, unknown>> };
+      const replayBundle = proofBundle.replayBundle as Record<string, unknown>;
+      registry.entries[0].explorerUrl = `https://sepolia.basescan.org/tx/${hex32("live-smoke-different-deploy")}`;
+      const deploymentRegistryHash = hashForTestJson(registry);
+      proofBundle.deploymentRegistryHash = deploymentRegistryHash;
+      replayBundle.deploymentRegistry = registry;
+      replayBundle.deploymentRegistryHash = deploymentRegistryHash;
+      const replayBundleHash = hashForTestJson(replayBundle);
+      proofBundle.replayBundleHash = replayBundleHash;
+      proofBundle.claimInputReplayBundleHash = replayBundleHash;
+      claim.replayBundleHash = replayBundleHash;
+      resealLiveSmokeProofBundleForTest(proofBundle);
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("PaymentToken deployment registry entry is not live-proof complete");
+  });
+
   it("fails closed when protected mutation role tokens are missing unless test/dev mode explicitly opts in", async () => {
     const secure = makeApp(":memory:", {
       apiSecurity: {
@@ -1381,6 +1403,53 @@ describe("pactfuse-api P0", () => {
     );
     expect(json.data.requiredExternalInputs).toContain(
       "live deployment registry for the payment token address, deployment tx, explorer URL, decimals, and code hash",
+    );
+  });
+
+  it("does not pass the mock token deployment registry gate when explorer URL does not match the deployment tx", async () => {
+    const registry = testDeploymentRegistry();
+    const { app, ctx } = makeApp(":memory:", {
+      deploymentRegistry: {
+        ...registry,
+        entries: registry.entries.map((entry) => ({
+          ...entry,
+          explorerUrl: `https://sepolia.basescan.org/tx/${hex32("different-payment-token-deploy")}`,
+        })),
+      },
+    });
+    const sessionId = await createSession(app, "sess-registry-explorer-mismatch");
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "token.balance_delta.verified",
+      payload: {
+        spendId: hex32("registry-explorer-mismatch-spend"),
+        settlementEventId: hex32("registry-explorer-mismatch-settlement"),
+        txHash: hex32("registry-explorer-mismatch-tx"),
+        chainProviderMode: "live",
+        chainId: "84532",
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const registryGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry");
+
+    expect(res.status).toBe(200);
+    expect(registryGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        evidenceEventId: null,
+        reason: "missing live deployment registry entry for the mock payment token",
+      }),
     );
   });
 
@@ -8617,6 +8686,7 @@ const TEST_ARTIFACT_PAYLOAD = Object.freeze({ artifactType: "source-bound-code-s
 const TEST_ARTIFACT_HASH = hashForTestJson(TEST_ARTIFACT_PAYLOAD);
 
 function testDeploymentRegistry(): NonNullable<ServiceCtx["deploymentRegistry"]> {
+  const deploymentTxHash = hex32("test-payment-token-deploy");
   return {
     mode: "live",
     chainId: "84532",
@@ -8629,8 +8699,8 @@ function testDeploymentRegistry(): NonNullable<ServiceCtx["deploymentRegistry"]>
         contractName: "PaymentToken",
         chainId: "84532",
         address: TEST_PAYMENT_TOKEN_ADDRESS,
-        deploymentTxHash: hex32("test-payment-token-deploy"),
-        explorerUrl: "https://sepolia.basescan.org/tx/0x0000000000000000000000000000000000000000000000000000000000000000",
+        deploymentTxHash,
+        explorerUrl: `https://sepolia.basescan.org/tx/${deploymentTxHash}`,
         codeHash: hex32("test-payment-token-code"),
         tokenMode: "mock-test-token",
         symbol: "MOCK",
@@ -10186,6 +10256,7 @@ function liveSmokeFixture(): {
   const spendId = hex32("live-smoke-spend");
   const quoteId = hex32("live-smoke-quote");
   const paymentToken = "0x4000000000000000000000000000000000000004";
+  const deploymentTxHash = hex32("live-smoke-payment-token-deploy");
   const deploymentRegistry = {
     mode: "live",
     chainId: "84532",
@@ -10198,8 +10269,8 @@ function liveSmokeFixture(): {
         contractName: "PaymentToken",
         chainId: "84532",
         address: paymentToken,
-        deploymentTxHash: hex32("live-smoke-payment-token-deploy"),
-        explorerUrl: "https://sepolia.basescan.org/tx/0x0000000000000000000000000000000000000000000000000000000000000000",
+        deploymentTxHash,
+        explorerUrl: `https://sepolia.basescan.org/tx/${deploymentTxHash}`,
         codeHash: hex32("live-smoke-payment-token-code"),
         tokenMode: "mock-test-token",
         symbol: "MOCK",

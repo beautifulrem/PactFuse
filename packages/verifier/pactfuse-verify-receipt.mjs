@@ -2659,12 +2659,32 @@ function deploymentRegistryEntryHasLiveFields(entry) {
     isObject(entry) &&
     isHex32(entry.deploymentTxHash) &&
     entry.deploymentTxHash !== ZERO_HASH &&
-    typeof entry.explorerUrl === "string" &&
-    entry.explorerUrl.startsWith("https://") &&
+    isPublicExplorerUrl(entry.explorerUrl) &&
+    explorerUrlContainsTxHash(entry.explorerUrl, entry.deploymentTxHash) &&
     isHex32(entry.codeHash) &&
     entry.codeHash !== ZERO_HASH &&
     Number.isInteger(entry.decimals)
   );
+}
+
+function explorerUrlContainsTxHash(explorerUrl, txHash) {
+  return typeof explorerUrl === "string" && typeof txHash === "string" && explorerUrl.toLowerCase().includes(txHash.toLowerCase());
+}
+
+function isPublicExplorerUrl(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:") {
+      return false;
+    }
+    const host = url.hostname.toLowerCase();
+    return host !== "example.com" && !host.endsWith(".example.com") && host !== "localhost" && !host.endsWith(".localhost");
+  } catch {
+    return false;
+  }
 }
 
 function deploymentRegistryBlockersForPaymentToken(registry, paymentToken, chainId) {

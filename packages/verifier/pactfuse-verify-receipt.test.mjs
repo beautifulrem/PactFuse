@@ -160,6 +160,39 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.proofCompletenessErrors).toContain("final verifier requires live deployment registry evidence for the payment token");
   });
 
+  it("keeps final authority closed when the token deployment registry explorer URL does not match the deployment tx", () => {
+    const bundle = replayBundleWithLease();
+    promoteFirstQuoteToChainSettleableForTest(bundle);
+    appendCawIdentityProbeForTest(bundle);
+    const denyProbe = appendCawDenyProbeForTest(bundle);
+    appendFinalCawReceiptCoverageForTest(bundle, denyProbe);
+    appendFinalTripProofsForTest(bundle);
+    const sourceEvent = appendFinalSourceChallengeForTest(bundle);
+    appendArtifactAccessEventForTest(bundle);
+    passJudgeRowForTest(bundle, "source_challenge", "proof", sourceEvent.eventId, "finalized source challenge proof");
+    passJudgeRowForTest(bundle, "c_settlement", "proof", latestEventForTest(bundle, "token.balance_delta.verified").eventId, "token balance delta settled");
+    bundle.deploymentRegistry.entries[0].explorerUrl = `https://sepolia.basescan.org/tx/${hex32("different-payment-token-deploy")}`;
+    bundle.deploymentRegistryHash = hashJson(bundle.deploymentRegistry);
+    bundle.winnerClaimAllowed = true;
+    refreshReplayPagingForTest(bundle);
+
+    const result = verifyEvidence(
+      bundle,
+      createServerRuntimeVerifierOptions({
+        cliMode: "proof-chip",
+        proofProviders: liveProofProvidersForTest(),
+      }),
+    );
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.winnerClaimAllowed).toBe(false);
+    expect(result.proofCompletenessErrors).toContain(
+      "final verifier requires a live PaymentToken deployment registry entry for the chain-settleable payment token",
+    );
+  });
+
   it("rejects caller-supplied live provider flags without server runtime authority", () => {
     const bundle = replayBundle();
     const result = verifyEvidence(bundle, {
@@ -3071,6 +3104,7 @@ function lockedRuntimeModes() {
 }
 
 function deploymentRegistryForTest(paymentToken) {
+  const deploymentTxHash = hex32("test-payment-token-deploy");
   return {
     mode: "live",
     chainId: "84532",
@@ -3083,8 +3117,8 @@ function deploymentRegistryForTest(paymentToken) {
         contractName: "PaymentToken",
         chainId: "84532",
         address: paymentToken,
-        deploymentTxHash: hex32("test-payment-token-deploy"),
-        explorerUrl: "https://sepolia.basescan.org/tx/0x0000000000000000000000000000000000000000000000000000000000000000",
+        deploymentTxHash,
+        explorerUrl: `https://sepolia.basescan.org/tx/${deploymentTxHash}`,
         codeHash: hex32("test-payment-token-code"),
         tokenMode: "mock-test-token",
         symbol: "MOCK",

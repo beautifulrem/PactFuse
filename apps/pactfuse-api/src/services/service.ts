@@ -5301,8 +5301,13 @@ function isLiveDeploymentRegistryEntry(entry: {
     typeof entry.decimals === "number" &&
     Number.isInteger(entry.decimals) &&
     entry.decimals >= 0 &&
-    isPublicExplorerUrl(entry.explorerUrl)
+    isPublicExplorerUrl(entry.explorerUrl) &&
+    explorerUrlContainsTxHash(entry.explorerUrl, entry.deploymentTxHash)
   );
+}
+
+function explorerUrlContainsTxHash(explorerUrl: string, txHash: string): boolean {
+  return explorerUrl.toLowerCase().includes(txHash.toLowerCase());
 }
 
 function isNonZeroHex32(value: string): boolean {
