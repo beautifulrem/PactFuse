@@ -204,6 +204,7 @@ function verifyProofBundleHashes(proofBundle, claim) {
     expected: proofBundle.verifierRunHash,
     actual: hashJson(proofBundle.publicClaim.verifierRun),
   });
+  verifyProofBundleProviderStatuses(proofBundle);
   assert(hashJson(proofBundle.providerStatuses) === proofBundle.providerStatusHash, "proof-bundle providerStatusHash does not recompute", {
     expected: proofBundle.providerStatusHash,
     actual: hashJson(proofBundle.providerStatuses),
@@ -225,6 +226,16 @@ function verifyProofBundleHashes(proofBundle, claim) {
     expected: proofBundle.proofBundleHash,
     actual: hashJson(bundleBase),
   });
+}
+
+function verifyProofBundleProviderStatuses(proofBundle) {
+  const providers = Array.isArray(proofBundle.providerStatuses) ? proofBundle.providerStatuses : [];
+  assert(providers.length > 0, "proof-bundle providerStatuses is missing or empty", proofBundle.providerStatuses);
+  const providersByName = new Map(providers.filter(isObject).map((provider) => [provider.name, provider]));
+  for (const providerName of requiredProviders) {
+    const provider = providersByName.get(providerName);
+    assert(provider?.mode === "live" && provider.ready === true, `proof-bundle provider ${providerName} is not live and ready`, provider ?? null);
+  }
 }
 
 function verifyReplayDeploymentRegistryBinding(proofBundle) {

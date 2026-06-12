@@ -313,6 +313,15 @@ describe("pactfuse-api P0", () => {
         "proof-bundle providerStatusHash does not recompute",
       ],
       [
+        "self-consistent fixture provider snapshot",
+        (proofBundle) => {
+          const providerStatuses = proofBundle.providerStatuses as Array<Record<string, unknown>>;
+          providerStatuses[0] = { ...providerStatuses[0], mode: "fixture" };
+          resealLiveSmokeProofBundleForTest(proofBundle);
+        },
+        "proof-bundle provider chain is not live and ready",
+      ],
+      [
         "replay deployment registry hash",
         (proofBundle) => {
           const replayBundle = proofBundle.replayBundle as Record<string, unknown>;
@@ -10015,6 +10024,43 @@ async function runLiveSmokeAgainstStub(mutateProofBundle?: (proofBundle: Record<
       });
     });
   }
+}
+
+function resealLiveSmokeProofBundleForTest(proofBundle: Record<string, unknown>): void {
+  proofBundle.providerStatusHash = hashForTestJson(proofBundle.providerStatuses);
+  const replayBundle = proofBundle.replayBundle as { events?: Array<Record<string, unknown>> };
+  const previousProofEventHash =
+    replayBundle.events
+      ?.filter((event) => event.authority === "proof" && typeof event.eventHash === "string")
+      .at(-1)?.eventHash ?? null;
+  const payloadHash = hashForTestJson({
+    claim: proofBundle.publicClaim,
+    publicClaimHash: proofBundle.publicClaimHash,
+    replayBundleHash: proofBundle.claimInputReplayBundleHash,
+    verifierRunHash: proofBundle.verifierRunHash,
+    asOfEventSeq: Number(proofBundle.publicClaimEventSeq) - 1,
+    providerStatuses: proofBundle.providerStatuses,
+    providerStatusHash: proofBundle.providerStatusHash,
+    deploymentRegistry: proofBundle.deploymentRegistry,
+    deploymentRegistryHash: proofBundle.deploymentRegistryHash,
+    server: proofBundle.server,
+    serverHash: proofBundle.serverHash,
+    proofAuthority: true,
+    winnerClaimAllowed: true,
+  });
+  const eventHash = hashForTestJson({
+    sessionId: proofBundle.sessionId,
+    eventSeq: proofBundle.publicClaimEventSeq,
+    authority: "proof",
+    kind: "public.claim.authorized",
+    payloadHash,
+    prevProofEventHash: previousProofEventHash,
+  });
+  proofBundle.publicClaimEventId = eventHash;
+  proofBundle.publicClaimEventHash = eventHash;
+  const bundleBase = { ...proofBundle };
+  delete (bundleBase as { proofBundleHash?: unknown }).proofBundleHash;
+  proofBundle.proofBundleHash = hashForTestJson(bundleBase);
 }
 
 function runNodeScript(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }): Promise<{
