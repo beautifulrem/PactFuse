@@ -77,6 +77,13 @@ function createRuntimeDeploymentRegistry(): DeploymentRegistry | undefined {
   return DeploymentRegistrySchema.parse(JSON.parse(raw));
 }
 
+function createRuntimeServerMetadata() {
+  return {
+    commit: process.env.PACTFUSE_SERVER_COMMIT ?? process.env.VERCEL_GIT_COMMIT_SHA ?? null,
+    buildTime: process.env.PACTFUSE_BUILD_TIME ?? null,
+  };
+}
+
 function numberEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) {
@@ -100,7 +107,7 @@ function booleanEnv(name: string, fallback: boolean): boolean {
   if (!raw) {
     return fallback;
   }
-  return !["0", "false", "no", "off"].includes(raw.toLowerCase());
+  return !["0", "false", "no", "off"].includes(raw.trim().toLowerCase());
 }
 
 function hexEnv(name: string): `0x${string}` | undefined {
@@ -178,6 +185,7 @@ export function createServiceCtx(options: {
     gateIngestSecret: process.env.PACTFUSE_GATE_INGEST_TOKEN ?? null,
     cawIngestToken: process.env.PACTFUSE_CAW_INGEST_TOKEN ?? null,
     deploymentRegistry: createRuntimeDeploymentRegistry(),
+    server: createRuntimeServerMetadata(),
     requiredIndexerCursors: options.requiredIndexerCursors ?? runtimeIndexerOptions?.cursors ?? [],
     apiSecurity: {
       operatorToken: process.env.PACTFUSE_OPERATOR_TOKEN ?? null,

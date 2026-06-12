@@ -23,6 +23,7 @@ import {
   normalizePactFuseChainLog,
   PACTFUSE_CHAIN_EVENT_ABI,
 } from "../services/providers.js";
+import { createRuntimeIndexerWorkerOptions, createServiceCtx } from "../runtime.js";
 import { appendEvidenceEvent, recordMcpAdapterCall } from "../services/service.js";
 import { createVerifierAdapter } from "../services/verifier.js";
 import type { ApiSecurityConfig, CawLiveClient, CawReceiptSource, ChainClient, McpLeaseClient, ServiceCtx } from "../types.js";
@@ -112,6 +113,10 @@ function makeApp(
     gateIngestSecret,
     cawIngestToken: options.cawIngestToken === undefined ? CAW_INGEST_TOKEN : options.cawIngestToken,
     deploymentRegistry: options.deploymentRegistry,
+    server: {
+      commit: "test-server-commit",
+      buildTime: "2026-06-11T00:00:00.000Z",
+    },
     requiredIndexerCursors: options.requiredIndexerCursors ?? [],
     apiSecurity,
     clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
@@ -203,6 +208,18 @@ describe("pactfuse-api P0", () => {
     const allowedArtifactAuth = await post(app, "/api/v1/quotes", {}, { authorization: "Bearer artifact-test-token" });
     const missingIndexer = await post(app, "/api/v1/indexer/backfill", {});
     const allowedIndexerAuth = await post(app, "/api/v1/indexer/backfill", {}, { authorization: "Bearer operator-test-token" });
+    const missingClaimReadiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${hex32("auth-claim-readiness")}`);
+    const wrongClaimReadiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${hex32("auth-claim-readiness")}`, {
+      headers: { authorization: "Bearer wrong" },
+    });
+    const missingPublicClaim = await app.request(`/api/v1/evidence/public-claim?sessionId=${hex32("auth-public-claim")}`);
+    const wrongPublicClaim = await app.request(`/api/v1/evidence/public-claim?sessionId=${hex32("auth-public-claim")}`, {
+      headers: { authorization: "Bearer wrong" },
+    });
+    const missingProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${hex32("auth-proof-bundle")}`);
+    const wrongProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${hex32("auth-proof-bundle")}`, {
+      headers: { authorization: "Bearer wrong" },
+    });
     const invalidJsonWithoutAuth = await rawPost(app, "/api/v1/sources/challenge", "{", {});
     const invalidJsonWithAuth = await rawPost(app, "/api/v1/sources/challenge", "{", { authorization: "Bearer challenge-test-token" });
 
@@ -215,8 +232,44 @@ describe("pactfuse-api P0", () => {
     expect(allowedArtifactAuth.status).toBe(400);
     expect(missingIndexer.status).toBe(401);
     expect(allowedIndexerAuth.status).toBe(400);
+    expect(missingClaimReadiness.status).toBe(401);
+    expect(wrongClaimReadiness.status).toBe(403);
+    expect(missingPublicClaim.status).toBe(401);
+    expect(wrongPublicClaim.status).toBe(403);
+    expect(missingProofBundle.status).toBe(401);
+    expect(wrongProofBundle.status).toBe(403);
     expect(invalidJsonWithoutAuth.status).toBe(401);
     expect(invalidJsonWithAuth.status).toBe(400);
+  });
+
+  it("trims boolean runtime environment flags before applying production security switches", () => {
+    const previousAllowInsecure = process.env.PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS;
+    const previousIndexerEnabled = process.env.PACTFUSE_INDEXER_ENABLED;
+    const previousChainRpc = process.env.PACTFUSE_CHAIN_RPC_URL;
+    const previousChainId = process.env.PACTFUSE_CHAIN_ID;
+    try {
+      process.env.PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS = " false ";
+      const ctx = createServiceCtx({
+        dbPath: ":memory:",
+        logger: {
+          info: () => undefined,
+          warn: () => undefined,
+          error: () => undefined,
+        },
+        clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
+      });
+      expect(ctx.apiSecurity.allowInsecureMissingRoleTokens).toBe(false);
+
+      process.env.PACTFUSE_CHAIN_RPC_URL = "https://rpc.example";
+      process.env.PACTFUSE_CHAIN_ID = "84532";
+      process.env.PACTFUSE_INDEXER_ENABLED = " off ";
+      expect(createRuntimeIndexerWorkerOptions()).toBeNull();
+    } finally {
+      restoreEnv("PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS", previousAllowInsecure);
+      restoreEnv("PACTFUSE_INDEXER_ENABLED", previousIndexerEnabled);
+      restoreEnv("PACTFUSE_CHAIN_RPC_URL", previousChainRpc);
+      restoreEnv("PACTFUSE_CHAIN_ID", previousChainId);
+    }
   });
 
   it("fails closed when protected mutation role tokens are missing unless test/dev mode explicitly opts in", async () => {
@@ -694,6 +747,14 @@ describe("pactfuse-api P0", () => {
       headers: { authorization: "Bearer operator-test-token" },
     });
     const repeatedClaimJson = await repeatedClaim.json();
+    const missingProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`);
+    const wrongProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer wrong" },
+    });
+    const proofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const proofBundleJson = await proofBundle.json();
     const claimEvents = ctx.db.sqlite
       .prepare(
         `SELECT event_seq, authority, kind, payload_json
@@ -737,6 +798,8 @@ describe("pactfuse-api P0", () => {
     expect(claimJson.data.publicClaimHash).toMatch(/^0x[0-9a-f]{64}$/);
     expect(repeatedClaim.status).toBe(200);
     expect(repeatedClaimJson.data.publicClaimHash).toBe(claimJson.data.publicClaimHash);
+    expect(missingProofBundle.status).toBe(401);
+    expect(wrongProofBundle.status).toBe(403);
     expect(claimEvents).toHaveLength(1);
     expect(claimEvents[0]).toEqual(expect.objectContaining({ authority: "proof", kind: "public.claim.authorized" }));
     expect(claimEventPayload).toEqual(
@@ -749,6 +812,74 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(claimEventPayload.claim).toEqual(expect.objectContaining({ publicClaimHash: claimJson.data.publicClaimHash }));
+    expect(proofBundle.status).toBe(200);
+    expect(proofBundleJson.data).toEqual(
+      expect.objectContaining({
+        bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+        sessionId,
+        publicClaimHash: claimJson.data.publicClaimHash,
+        publicClaimEventSeq: claimEvents[0].event_seq,
+        claimInputReplayBundleHash: claimJson.data.replayBundleHash,
+        replayBundleHash: claimJson.data.replayBundleHash,
+        verifierRunHash: hashForTestJson(claimJson.data.verifierRun),
+        deploymentRegistryHash: hashForTestJson(testDeploymentRegistry()),
+        serverHash: hashForTestJson({
+          proofBundleVersion: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+          commit: "test-server-commit",
+          buildTime: "2026-06-11T00:00:00.000Z",
+          generatedAt: "2026-06-11T00:00:00.000Z",
+        }),
+        winnerClaimAllowed: true,
+      }),
+    );
+    expect(proofBundleJson.data.publicClaim).toEqual(claimJson.data);
+    expect(proofBundleJson.data.replayBundle.winnerClaimAllowed).toBe(true);
+    expect(hashForTestJson(proofBundleJson.data.replayBundle)).toBe(claimJson.data.replayBundleHash);
+    expect(hashForTestJson(proofBundleJson.data.providerStatuses)).toBe(proofBundleJson.data.providerStatusHash);
+    const proofBundleBase = { ...proofBundleJson.data };
+    delete (proofBundleBase as { proofBundleHash?: string }).proofBundleHash;
+    expect(hashForTestJson(proofBundleBase)).toBe(proofBundleJson.data.proofBundleHash);
+
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "advisory",
+      kind: "public.claim.authorized",
+      payload: {
+        claim: claimJson.data,
+        publicClaimHash: claimJson.data.publicClaimHash,
+        replayBundleHash: claimJson.data.replayBundleHash,
+        verifierRunHash: hashForTestJson(claimJson.data.verifierRun),
+        asOfEventSeq: claimEvents[0].event_seq,
+        proofAuthority: true,
+        winnerClaimAllowed: true,
+      },
+    });
+    const advisoryProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const advisoryProofBundleJson = await advisoryProofBundle.json();
+
+    expect(advisoryProofBundle.status).toBe(423);
+    expect(advisoryProofBundleJson.error.code).toBe("proof_pending");
+
+    const refreshedClaim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const refreshedClaimJson = await refreshedClaim.json();
+    const refreshedClaimEvents = ctx.db.sqlite
+      .prepare(
+        `SELECT event_seq, authority, kind
+         FROM evidence_events
+         WHERE session_id = ? AND kind = 'public.claim.authorized'
+         ORDER BY event_seq ASC`,
+      )
+      .all(sessionId) as Array<{ event_seq: number; authority: string; kind: string }>;
+
+    expect(refreshedClaim.status, JSON.stringify(refreshedClaimJson)).toBe(200);
+    expect(refreshedClaimJson.data.publicClaimHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(refreshedClaimEvents).toHaveLength(3);
+    expect(refreshedClaimEvents[1]).toEqual(expect.objectContaining({ authority: "advisory" }));
+    expect(refreshedClaimEvents[2]).toEqual(expect.objectContaining({ authority: "proof" }));
   });
 
   it("fails verifier closed when a required indexer cursor is missing", async () => {
@@ -1007,6 +1138,109 @@ describe("pactfuse-api P0", () => {
     expect(json.data.replayBundleHash).toMatch(/^0x[0-9a-f]{64}$/);
   });
 
+  it("does not pass the mock token deployment registry gate with placeholder deployment hashes", async () => {
+    const registry = testDeploymentRegistry();
+    const { app, ctx } = makeApp(":memory:", {
+      deploymentRegistry: {
+        ...registry,
+        entries: registry.entries.map((entry) => ({
+          ...entry,
+          deploymentTxHash: ZERO_HASH,
+          codeHash: ZERO_HASH,
+        })),
+      },
+    });
+    const sessionId = await createSession(app, "sess-registry-placeholder-hash");
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "token.balance_delta.verified",
+      payload: {
+        spendId: hex32("registry-placeholder-spend"),
+        settlementEventId: hex32("registry-placeholder-settlement"),
+        txHash: hex32("registry-placeholder-tx"),
+        chainProviderMode: "live",
+        chainId: "84532",
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const registryGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry");
+
+    expect(res.status).toBe(200);
+    expect(registryGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        evidenceEventId: null,
+        reason: "missing live deployment registry entry for the mock payment token",
+      }),
+    );
+    expect(json.data.requiredExternalInputs).toContain(
+      "live deployment registry for the payment token address, deployment tx, explorer URL, decimals, and code hash",
+    );
+  });
+
+  it("does not pass the official USDC registry gate without a passed probe and live registry entry", async () => {
+    const { app, ctx } = makeApp(":memory:", {
+      deploymentRegistry: {
+        mode: "live",
+        chainId: "84532",
+        officialUsdcProbe: {
+          status: "failed",
+          reason: "probe not captured",
+        },
+        entries: [],
+      },
+    });
+    const sessionId = await createSession(app, "sess-official-usdc-probe-required");
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "token.balance_delta.verified",
+      payload: {
+        spendId: hex32("official-usdc-spend"),
+        settlementEventId: hex32("official-usdc-settlement"),
+        txHash: hex32("official-usdc-tx"),
+        chainProviderMode: "live",
+        chainId: "84532",
+        paymentToken: BASE_SEPOLIA_USDC,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const registryGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry");
+
+    expect(res.status).toBe(200);
+    expect(json.data.targetTokenMode).toBe("official-testnet-usdc");
+    expect(registryGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        evidenceEventId: null,
+        reason: "official USDC token mode requires Base Sepolia chainId 84532, passed USDC probe evidence, and a live registry entry",
+      }),
+    );
+    expect(json.data.requiredExternalInputs).toContain(
+      "live deployment registry for the payment token address, deployment tx, explorer URL, decimals, and code hash",
+    );
+  });
+
   it("blocks live proof preflight when production auth or live providers are not configured", async () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-live-preflight-blocked");
@@ -1193,6 +1427,20 @@ describe("pactfuse-api P0", () => {
       "publicClaimHash",
       "winnerClaimAllowed",
     ]);
+    expect(json.paths["/api/v1/evidence/proof-bundle"].get["x-pactfuse-proof-fields"]).toEqual([
+      "bundleType",
+      "proofBundleHash",
+      "publicClaimHash",
+      "publicClaimEventId",
+      "replayBundleHash",
+      "providerStatusHash",
+      "deploymentRegistryHash",
+      "serverHash",
+      "winnerClaimAllowed",
+    ]);
+    expect(json.paths["/api/v1/evidence/proof-bundle"].get.responses["200"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/ProofBundleResponse",
+    );
     expect(json.paths["/api/v1/evidence/public-claim"].get.responses["200"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/PublicClaimResponse",
     );
@@ -5224,23 +5472,23 @@ describe("pactfuse-api P0", () => {
     expect(statusJson.data.cursors[0].reason).toContain("chain log backfill failed");
     expect(verify.status).toBe(200);
     expect(verify.json.data.schemaOk).toBe(false);
-	    expect(verify.json.data.errors.some((error: string) => error.includes("chain indexer cursor gate:indexer"))).toBe(true);
-	    expect(verify.json.data.winnerClaimAllowed).toBe(false);
-	  });
+    expect(verify.json.data.errors.some((error: string) => error.includes("chain indexer cursor gate:indexer"))).toBe(true);
+    expect(verify.json.data.winnerClaimAllowed).toBe(false);
+  });
 
-		  it("indexes replay pages when summary snapshots exceed the first page", async () => {
-		    const { app, ctx } = makeApp();
-		    const sessionId = await createSession(app, "sess-replay-summary-cap");
-	    for (let i = 0; i < 200; i += 1) {
-	      appendEvidenceEvent(ctx, {
-	        sessionId,
-	        authority: "operator",
-	        kind: "runner.heartbeat",
-	        payload: { i, winnerClaimAllowed: false },
-	      });
-	    }
-		    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
-		    const replayJson = await replay.json();
+  it("indexes replay pages when summary snapshots exceed the first page", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-replay-summary-cap");
+    for (let i = 0; i < 200; i += 1) {
+      appendEvidenceEvent(ctx, {
+        sessionId,
+        authority: "operator",
+        kind: "runner.heartbeat",
+        payload: { i, winnerClaimAllowed: false },
+      });
+    }
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
     const eventPage0 = await app.request(`/api/v1/evidence/replay-page?sessionId=${sessionId}&collection=events&page=0`);
     const eventPage0Json = await eventPage0.json();
     const eventPage1 = await app.request(`/api/v1/evidence/replay-page?sessionId=${sessionId}&collection=events&page=1`);
@@ -5249,17 +5497,17 @@ describe("pactfuse-api P0", () => {
     const emptyPageJson = await emptyPage.json();
     const outOfRange = await app.request(`/api/v1/evidence/replay-page?sessionId=${sessionId}&collection=events&page=99`);
     const outOfRangeJson = await outOfRange.json();
-		    const verify = await post(app, "/api/v1/evidence/verify", {
-		      sessionId,
-		      idempotencyKey: "verify-replay-summary-cap",
-		      payload: { replayBundle: replayJson.data },
-		    });
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-replay-summary-cap",
+      payload: { replayBundle: replayJson.data },
+    });
 
-		    expect(replay.status).toBe(200);
-		    expect(replayJson.data.events).toHaveLength(200);
-		    expect(replayJson.data.fullReplayRoot).toBe(replayJson.data.replayPageIndex.pageRoot);
-		    expect(replayJson.data.replayPageIndex.collections.events.totalRows).toBeGreaterThan(200);
-		    expect(replayJson.data.replayPageIndex.collections.events.pageHashes.length).toBeGreaterThan(1);
+    expect(replay.status).toBe(200);
+    expect(replayJson.data.events).toHaveLength(200);
+    expect(replayJson.data.fullReplayRoot).toBe(replayJson.data.replayPageIndex.pageRoot);
+    expect(replayJson.data.replayPageIndex.collections.events.totalRows).toBeGreaterThan(200);
+    expect(replayJson.data.replayPageIndex.collections.events.pageHashes.length).toBeGreaterThan(1);
     expect(replayJson.data.replayPages.events).toHaveLength(replayJson.data.replayPageIndex.collections.events.pageCount);
     expect(eventPage0.status).toBe(200);
     expect(eventPage0Json.data.bundleType).toBe("PACTFUSE_REPLAY_PAGE_V1");
@@ -5278,11 +5526,14 @@ describe("pactfuse-api P0", () => {
     expect(emptyPageJson.error.code).toBe("bad_request");
     expect(outOfRange.status).toBe(400);
     expect(outOfRangeJson.error.code).toBe("bad_request");
-		    expect(verify.status).toBe(200);
-		    expect(verify.json.data.schemaOk).toBe(true);
-		  });
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.schemaOk).toBe(false);
+    expect(verify.json.data.errors).toContain(
+      `replayBundle.events has ${replayJson.data.replayPageIndex.collections.events.totalRows} rows, above final verifier cap 200`,
+    );
+  });
 
-	  it("records MCP adapter calls with request and response hashes", async () => {
+  it("records MCP adapter calls with request and response hashes", async () => {
     const { app, ctx } = makeApp();
     const sessionId = await createSession(app, "sess-mcp-audit");
 
@@ -8090,6 +8341,7 @@ const INDEXER_ADDRESS = "0x1111111111111111111111111111111111111111";
 const TEST_PAYER_ADDRESS = "0x1000000000000000000000000000000000000001";
 const TEST_PAYMENT_TOKEN_ADDRESS = "0x4000000000000000000000000000000000000004";
 const TEST_MARKET_ADDRESS = "0x5000000000000000000000000000000000000005";
+const BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
 const TEST_PACT_ID = hex32("pact-c");
 const TEST_TOOL_ID = hex32("code-scan");
 const TEST_ARTIFACT_PAYLOAD = Object.freeze({ artifactType: "source-bound-code-scan-mcp-lease", seed: "artifact", content: "scan:artifact" });
@@ -9316,6 +9568,14 @@ function createFakeCawLiveClient(
 
 function hashForTestJson(value: unknown): `0x${string}` {
   return `0x${createHash("sha256").update(canonicalizeJson(value)).digest("hex")}`;
+}
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+    return;
+  }
+  process.env[name] = value;
 }
 
 function keccakJsonForTest(value: unknown): `0x${string}` {

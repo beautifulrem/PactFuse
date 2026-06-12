@@ -32,6 +32,7 @@ import {
   readJudgeCheck,
   readProofProviderStatus,
   readLiveProofPreflight,
+  readProofBundle,
   readReplayPage,
   readRunnerHeartbeat,
   recordMcpAdapterAudit,
@@ -93,6 +94,7 @@ const ROUTES = [
   { method: "GET", path: "/api/v1/evidence/claim-readiness", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/live-preflight", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/public-claim", okStatus: 200 },
+  { method: "GET", path: "/api/v1/evidence/proof-bundle", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/replay-bundle", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/replay-page", okStatus: 200 },
   { method: "GET", path: "/api/v1/evidence/indexer-status", okStatus: 200 },
@@ -281,6 +283,17 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "identityMode",
     "replayBundleHash",
     "publicClaimHash",
+    "winnerClaimAllowed",
+  ],
+  "/api/v1/evidence/proof-bundle": [
+    "bundleType",
+    "proofBundleHash",
+    "publicClaimHash",
+    "publicClaimEventId",
+    "replayBundleHash",
+    "providerStatusHash",
+    "deploymentRegistryHash",
+    "serverHash",
     "winnerClaimAllowed",
   ],
   "/api/v1/evidence/replay-bundle": [
@@ -535,6 +548,12 @@ export function createApp(ctx: ServiceCtx): Hono {
     authorizeApiRole(c, ctx, "operator");
     const sessionId = requiredQuery(c, "sessionId");
     return send(c, await authorizePublicClaim(sessionId, ctx));
+  });
+
+  app.get("/api/v1/evidence/proof-bundle", async (c) => {
+    authorizeApiRole(c, ctx, "operator");
+    const sessionId = requiredQuery(c, "sessionId");
+    return send(c, await readProofBundle(sessionId, ctx));
   });
 
   app.get("/api/v1/evidence/replay-bundle", async (c) => {
@@ -1450,6 +1469,60 @@ function buildOpenApi(): Record<string, unknown> {
             finalVerifierComplete: { const: true },
             winnerClaimAllowed: { const: true },
             publicClaimHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+          },
+        }),
+        ProofBundleResponse: serviceResponseSchema({
+          type: "object",
+          required: [
+            "bundleType",
+            "sessionId",
+            "proofBundleHash",
+            "publicClaimHash",
+            "publicClaimEventId",
+            "publicClaimEventHash",
+            "publicClaimEventSeq",
+            "claimInputReplayBundleHash",
+            "replayBundleHash",
+            "verifierRunHash",
+            "providerStatusHash",
+            "deploymentRegistryHash",
+            "serverHash",
+            "publicClaim",
+            "replayBundle",
+            "providerStatuses",
+            "deploymentRegistry",
+            "server",
+            "winnerClaimAllowed",
+          ],
+          properties: {
+            bundleType: { const: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1" },
+            sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            proofBundleHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            publicClaimHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            publicClaimEventId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            publicClaimEventHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            publicClaimEventSeq: { type: "integer", minimum: 1 },
+            claimInputReplayBundleHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            replayBundleHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            verifierRunHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            providerStatusHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            deploymentRegistryHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
+            serverHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            publicClaim: { type: "object", additionalProperties: true },
+            replayBundle: { type: "object", additionalProperties: true },
+            providerStatuses: { type: "array", items: { type: "object", additionalProperties: true } },
+            deploymentRegistry: { anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }] },
+            server: {
+              type: "object",
+              required: ["proofBundleVersion", "commit", "buildTime", "generatedAt"],
+              properties: {
+                proofBundleVersion: { const: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1" },
+                commit: { anyOf: [{ type: "string" }, { type: "null" }] },
+                buildTime: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
+                generatedAt: { type: "string", format: "date-time" },
+              },
+            },
+            winnerClaimAllowed: { const: true },
           },
         }),
         JudgeCheckData: {
@@ -2587,6 +2660,7 @@ function apiRoleForPath(path: string): ApiRole | null {
     case "/api/v1/evidence/claim-readiness":
     case "/api/v1/evidence/live-preflight":
     case "/api/v1/evidence/public-claim":
+    case "/api/v1/evidence/proof-bundle":
       return "operator";
     case "/api/v1/sources/challenge":
       return "challenge_submitter";
@@ -2677,6 +2751,8 @@ function responseSchemaFor(path: string): Record<string, unknown> {
       return { $ref: "#/components/schemas/LiveProofPreflightResponse" };
     case "/api/v1/evidence/public-claim":
       return { $ref: "#/components/schemas/PublicClaimResponse" };
+    case "/api/v1/evidence/proof-bundle":
+      return { $ref: "#/components/schemas/ProofBundleResponse" };
     case "/api/v1/caw/receipts/ingest":
       return { $ref: "#/components/schemas/CawReceiptIngestResponse" };
     case "/api/v1/caw/live/identity/probe":

@@ -20,6 +20,10 @@ PACTFUSE_MCP_AUDIT_TOKEN=replace-with-mcp-audit-hmac-secret
 PACTFUSE_GATE_INGEST_TOKEN=replace-with-gate-ingest-hmac-secret
 PACTFUSE_CAW_INGEST_TOKEN=replace-with-caw-ingest-bearer-token
 
+# Server provenance embedded in public proof bundles
+PACTFUSE_SERVER_COMMIT=replace-with-deployed-git-commit
+PACTFUSE_BUILD_TIME=2026-06-11T00:00:00.000Z
+
 # Chain and indexer
 PACTFUSE_CHAIN_RPC_URL=https://base-sepolia-rpc.example.com
 PACTFUSE_CHAIN_ID=84532

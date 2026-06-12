@@ -211,6 +211,7 @@ Important `/api/v1` routes:
 | `GET /api/v1/evidence/claim-readiness` | Operator-only derivation of current and target claim modes from evidence gates |
 | `GET /api/v1/evidence/live-preflight` | Operator-only live provider, production auth, indexer, and claim-readiness blockers before any public claim |
 | `GET /api/v1/evidence/public-claim` | Operator-only fail-closed public-claim authorization gate |
+| `GET /api/v1/evidence/proof-bundle` | Operator-only immutable public proof bundle for the latest authorized public claim |
 | `GET /api/v1/evidence/replay-bundle` | Read `PACTFUSE_EVIDENCE_V1` summary plus embedded replay page proofs |
 | `GET /api/v1/evidence/replay-page` | Read paged replay collections |
 | `GET /api/v1/evidence/agent-transcript` | Read MCP transcript summary |
@@ -237,6 +238,7 @@ Expected behavior:
 - full verifier mode rejects it because the example is pending, not final proof.
 - `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` remain `false` until every final replay gate passes.
 - `GET /api/v1/evidence/public-claim` requires the operator bearer token and returns `proof_pending` until claim readiness, verifier output, replay hash, and every live evidence gate are simultaneously green.
+- `GET /api/v1/evidence/proof-bundle` requires the operator bearer token and exports `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1` only when the latest event is a proof-authorized `public.claim.authorized` event. The bundle binds the public claim, claim-input replay hash, provider status hash, deployment registry hash, server metadata hash, and proof bundle hash.
 
 The replay verifier checks:
 
@@ -266,6 +268,8 @@ The replay verifier checks:
 | `PACTFUSE_MCP_AUDIT_TOKEN` | HMAC token for `/api/v1/mcp/audit` |
 | `PACTFUSE_GATE_INGEST_TOKEN` | HMAC token for gate event ingest |
 | `PACTFUSE_CAW_INGEST_TOKEN` | Bearer token for raw CAW receipt ingest |
+| `PACTFUSE_SERVER_COMMIT` | Optional server commit embedded in public proof bundles; falls back to `VERCEL_GIT_COMMIT_SHA` |
+| `PACTFUSE_BUILD_TIME` | Optional build timestamp embedded in public proof bundles |
 
 ### External Integrations
 
@@ -301,8 +305,9 @@ Required result:
 - chain, CAW live, CAW receipt export, and MCP lease providers are ready
 - `/api/v1/evidence/live-preflight` returns `readyForPublicClaim=true` with no blockers
 - `/api/v1/evidence/public-claim` returns `authorized_public_claim`, `finalVerifierComplete=true`, and `winnerClaimAllowed=true`
+- `/api/v1/evidence/proof-bundle` returns `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1`, and its replay, provider, deployment-registry, server, and bundle hashes recompute from the response body
 
-For `mock-test-token`, claim readiness also requires a live deployment registry entry for the payment token address, deployment transaction, explorer URL, decimals, and bytecode hash. Official Base Sepolia USDC is accepted only on chain id `84532`.
+For `mock-test-token`, claim readiness also requires a live deployment registry entry for the payment token address, non-zero deployment transaction hash, public HTTPS explorer URL, decimals, and non-zero bytecode hash. Official Base Sepolia USDC is accepted only on chain id `84532` with a passed official-USDC probe and a matching live registry entry.
 
 Use [docs/evidence/production-live-env.example](docs/evidence/production-live-env.example) as the non-secret manifest for the real Cobo/RPC/MCP environment.
 
@@ -354,8 +359,9 @@ Before publishing a branch or demo:
 3. Run `pnpm turbo run test --force`.
 4. Run `pnpm test:contracts`.
 5. For live demos, run `pnpm live-smoke` against the real evidence session.
-6. Confirm fixture, pending, manual, and blocked rows do not appear as public proof.
-7. Confirm secrets are not committed.
+6. Confirm the proof bundle hash, replay hash, provider status hash, deployment registry hash, and server hash recompute locally.
+7. Confirm fixture, pending, manual, and blocked rows do not appear as public proof.
+8. Confirm secrets are not committed.
 
 ## Documentation
 

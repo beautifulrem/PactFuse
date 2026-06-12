@@ -40,6 +40,7 @@ try {
   assert(preflightData.security?.cawIngestTokenConfigured === true, "PACTFUSE_CAW_INGEST_TOKEN is not configured", preflightData.security);
 
   let claimData = null;
+  let proofBundleData = null;
   if (requirePublicClaim) {
     const claim = await requestJson(`/api/v1/evidence/public-claim?sessionId=${encodeURIComponent(sessionId)}`);
     claimData = claim.data;
@@ -49,6 +50,28 @@ try {
     assert(claimData.finalVerifierComplete === true, "public-claim finalVerifierComplete is not true", claimData);
     assert(claimData.winnerClaimAllowed === true, "public-claim winnerClaimAllowed is not true", claimData);
     assert(HEX32.test(claimData.publicClaimHash), "public-claim hash is missing or invalid", claimData);
+
+    const proofBundle = await requestJson(`/api/v1/evidence/proof-bundle?sessionId=${encodeURIComponent(sessionId)}`);
+    proofBundleData = proofBundle.data;
+    assert(proofBundle.ok === true && proofBundleData, "proof-bundle did not return data", proofBundle);
+    assert(proofBundleData.bundleType === "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1", "proof-bundle has the wrong bundle type", proofBundleData);
+    assert(proofBundleData.winnerClaimAllowed === true, "proof-bundle winnerClaimAllowed is not true", proofBundleData);
+    assert(proofBundleData.publicClaimHash === claimData.publicClaimHash, "proof-bundle public claim hash does not match public-claim", {
+      proofBundlePublicClaimHash: proofBundleData.publicClaimHash,
+      publicClaimHash: claimData.publicClaimHash,
+    });
+    assert(proofBundleData.claimInputReplayBundleHash === claimData.replayBundleHash, "proof-bundle claim input replay hash does not match public-claim", {
+      claimInputReplayBundleHash: proofBundleData.claimInputReplayBundleHash,
+      publicClaimReplayBundleHash: claimData.replayBundleHash,
+    });
+    assert(proofBundleData.replayBundleHash === claimData.replayBundleHash, "proof-bundle final replay hash does not match public-claim", {
+      proofBundleReplayBundleHash: proofBundleData.replayBundleHash,
+      publicClaimReplayBundleHash: claimData.replayBundleHash,
+    });
+    assert(HEX32.test(proofBundleData.proofBundleHash), "proof-bundle hash is missing or invalid", proofBundleData);
+    assert(HEX32.test(proofBundleData.publicClaimEventId), "proof-bundle public claim event id is missing or invalid", proofBundleData);
+    assert(HEX32.test(proofBundleData.providerStatusHash), "proof-bundle provider status hash is missing or invalid", proofBundleData);
+    assert(HEX32.test(proofBundleData.serverHash), "proof-bundle server hash is missing or invalid", proofBundleData);
   }
 
   console.log(
@@ -60,6 +83,7 @@ try {
         requiredProviders,
         livePreflightStatus: preflightData.status,
         publicClaimHash: claimData?.publicClaimHash ?? null,
+        proofBundleHash: proofBundleData?.proofBundleHash ?? null,
       },
       null,
       2,
@@ -111,7 +135,7 @@ function booleanEnv(name, fallback) {
   if (!raw) {
     return fallback;
   }
-  return !["0", "false", "no", "off"].includes(raw.toLowerCase());
+  return !["0", "false", "no", "off"].includes(raw.trim().toLowerCase());
 }
 
 function listEnv(name, fallback) {

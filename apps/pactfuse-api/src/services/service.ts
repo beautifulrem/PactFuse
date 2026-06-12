@@ -38,6 +38,7 @@ import {
   McpAdapterCallViewSchema,
   QuoteViewSchema,
   PublicClaimViewSchema,
+  ProofBundleViewSchema,
   QuotePayloadSchema,
   RawCawReceiptBundleViewSchema,
   ReplayBundleViewSchema,
@@ -63,6 +64,7 @@ import {
   type LiveProofPreflightView,
   type QuoteStatus,
   type PublicClaimView,
+  type ProofBundleView,
   type ReplayBundleView,
   type SessionScopedEnvelope,
   type SessionView,
@@ -116,6 +118,10 @@ type ReplayCollectionName =
   | "rawCawReceiptBundles"
   | "canonicalCawReceipts"
   | "leaseRuns";
+type ProofBundleProviderStatusView = Omit<ProofProviderStatus, "endpoint"> & { endpoint: string | null };
+type ReplaySnapshotOptions = {
+  asOfEventSeq?: number;
+};
 const REPLAY_SUMMARY_LIMIT = 200;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const REPLAY_COLLECTION_NAMES: ReplayCollectionName[] = [
@@ -4409,6 +4415,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
     providerGate(proofProviders, "caw", ["claimMode", "winnerClaimAllowed"]),
     providerGate(proofProviders, "mcp_lease", ["winnerClaimAllowed"]),
     productionSecurityReadinessGate(ctx),
+    replaySummaryCapGate(ctx, parsedSessionId),
     eventGate(
       "caw_identity_probe",
       "CAW identity probe",
@@ -4621,13 +4628,20 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
 }
 
 function latestAuthorizedPublicClaim(ctx: ServiceCtx, sessionId: string): PublicClaimView | null {
+  return latestAuthorizedPublicClaimRecord(ctx, sessionId)?.claim ?? null;
+}
+
+function latestAuthorizedPublicClaimRecord(
+  ctx: ServiceCtx,
+  sessionId: string,
+): { claim: PublicClaimView; eventSeq: number; eventId: string; eventHash: string; asOfEventSeq: number } | null {
   const session = getSessionRow(ctx, sessionId);
   if (!session) {
     return null;
   }
   const row = ctx.db.sqlite
     .prepare(
-      `SELECT event_seq, payload_json
+      `SELECT event_id, event_seq, event_hash, authority, payload_json
        FROM evidence_events
        WHERE session_id = ? AND kind = 'public.claim.authorized'
        ORDER BY event_seq DESC
@@ -4638,10 +4652,38 @@ function latestAuthorizedPublicClaim(ctx: ServiceCtx, sessionId: string): Public
     return null;
   }
   try {
+    if (row.authority !== "proof") {
+      return null;
+    }
     const payload = JSON.parse(String(row.payload_json)) as unknown;
-    const claim = payload && typeof payload === "object" && !Array.isArray(payload) ? (payload as Record<string, unknown>).claim : null;
+    const payloadObject = payload && typeof payload === "object" && !Array.isArray(payload) ? (payload as Record<string, unknown>) : null;
+    if (
+      !payloadObject ||
+      payloadObject.proofAuthority !== true ||
+      payloadObject.winnerClaimAllowed !== true ||
+      typeof payloadObject.publicClaimHash !== "string" ||
+      typeof payloadObject.asOfEventSeq !== "number" ||
+      !Number.isInteger(payloadObject.asOfEventSeq)
+    ) {
+      return null;
+    }
+    const claim = payloadObject.claim ?? null;
     const parsed = PublicClaimViewSchema.safeParse(claim);
-    return parsed.success ? parsed.data : null;
+    if (!parsed.success || parsed.data.publicClaimHash !== payloadObject.publicClaimHash) {
+      return null;
+    }
+    if (payloadObject.asOfEventSeq !== Number(row.event_seq) - 1) {
+      return null;
+    }
+    return parsed.success
+      ? {
+          claim: parsed.data,
+          eventSeq: Number(row.event_seq),
+          eventId: String(row.event_id),
+          eventHash: String(row.event_hash),
+          asOfEventSeq: payloadObject.asOfEventSeq,
+        }
+      : null;
   } catch {
     return null;
   }
@@ -4721,6 +4763,57 @@ export async function readLiveProofPreflight(sessionId: string, ctx: ServiceCtx)
     winnerClaimAllowed: readyForPublicClaim,
   });
   return { ok: true, requestId, data };
+}
+
+export async function readProofBundle(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<ProofBundleView>> {
+  const requestId = newRequestId("proof_bundle");
+  const parsedSessionId = parseStrict(Hex32Schema, sessionId);
+  assertSession(ctx, parsedSessionId, requestId);
+  const latestClaim = latestAuthorizedPublicClaimRecord(ctx, parsedSessionId);
+  if (!latestClaim) {
+    return {
+      ok: false,
+      requestId,
+      error: proofPendingError(requestId, "proof bundle export requires the latest event to be public.claim.authorized"),
+    };
+  }
+  const replayBundle = finalClaimReplayBundleData(parsedSessionId, ctx, { asOfEventSeq: latestClaim.asOfEventSeq });
+  const providerStatuses = (await readProofProviderStatus(ctx)).map(redactProofProviderStatus);
+  const deploymentRegistry = ctx.deploymentRegistry ?? null;
+  const server = {
+    proofBundleVersion: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+    commit: ctx.server.commit,
+    buildTime: ctx.server.buildTime,
+    generatedAt: ctx.clock.now().toISOString(),
+  };
+  const base = {
+    bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+    sessionId: parsedSessionId,
+    publicClaimHash: latestClaim.claim.publicClaimHash,
+    publicClaimEventId: latestClaim.eventId,
+    publicClaimEventHash: latestClaim.eventHash,
+    publicClaimEventSeq: latestClaim.eventSeq,
+    claimInputReplayBundleHash: latestClaim.claim.replayBundleHash,
+    replayBundleHash: hashJson(replayBundle),
+    verifierRunHash: hashJson(latestClaim.claim.verifierRun),
+    providerStatusHash: hashJson(providerStatuses),
+    deploymentRegistryHash: deploymentRegistry ? hashJson(deploymentRegistry) : null,
+    serverHash: hashJson(server),
+    publicClaim: latestClaim.claim,
+    replayBundle,
+    providerStatuses,
+    deploymentRegistry,
+    server,
+    winnerClaimAllowed: true,
+  };
+  return {
+    ok: true,
+    requestId,
+    data: ProofBundleViewSchema.parse({
+      ...base,
+      proofBundleHash: hashJson(base),
+    }),
+  };
 }
 
 type ClaimGateBlock = "claimMode" | "paymentMode" | "tokenMode" | "identityMode" | "winnerClaimAllowed";
@@ -4892,6 +4985,9 @@ function livePreflightInputsForClaimGate(gateId: string, fallback: string[]): st
       "PACTFUSE_OPERATOR_TOKEN, PACTFUSE_CAW_INGEST_TOKEN, PACTFUSE_MCP_AUDIT_TOKEN, PACTFUSE_GATE_INGEST_TOKEN, and PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=false",
     ];
   }
+  if (gateId === "replay_summary_cap") {
+    return ["full paged replay verifier support or a new live session whose proof collections fit the current summary cap"];
+  }
   if (gateId === "final_verifier_complete" || gateId === "proof_chip_allowed" || gateId === "verifier_winner_claim") {
     return ["full chain/signature/hash verifier that can set finalVerifierComplete=true"];
   }
@@ -4937,6 +5033,21 @@ function productionSecurityReadinessGate(ctx: ServiceCtx): ClaimReadinessGate {
       : security.allowInsecureMissingRoleTokens
         ? "insecure missing-role-token bypass is enabled"
         : "role tokens or evidence ingest secrets are not fully configured",
+    evidenceEventId: null,
+  };
+}
+
+function replaySummaryCapGate(ctx: ServiceCtx, sessionId: string): ClaimReadinessGate {
+  const errors = replaySummaryCapErrors(ctx, sessionId);
+  return {
+    gateId: "replay_summary_cap",
+    label: "Replay summary cap",
+    status: errors.length === 0 ? "pass" : "blocked",
+    blocks: ["winnerClaimAllowed"],
+    reason:
+      errors.length === 0
+        ? "replay summary collections fit the current verifier cap"
+        : `replay summary exceeds verifier cap: ${errors.join("; ")}`,
     evidenceEventId: null,
   };
 }
@@ -5031,20 +5142,31 @@ function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent 
   const chainId = String(payload.chainId ?? "");
   const paymentToken = String(payload.paymentToken ?? "").toLowerCase();
   const tokenMode = tokenModeForPaymentToken(paymentToken);
+  const registry = ctx.deploymentRegistry;
   if (tokenMode === "official-testnet-usdc") {
-    const pass = chainId === "84532";
+    const entry = registry?.entries.find(
+      (candidate) =>
+        candidate.contractName === "PaymentToken" &&
+        candidate.chainId === chainId &&
+        candidate.address.toLowerCase() === paymentToken &&
+        candidate.tokenMode === "official-testnet-usdc",
+    );
+    const pass =
+      chainId === "84532" &&
+      registry?.mode === "live" &&
+      registry.officialUsdcProbe?.status === "passed" &&
+      Boolean(entry && isLiveDeploymentRegistryEntry(entry));
     return {
       gateId: "token_deployment_registry",
       label: "Token deployment registry",
-      status: pass ? "pass" : "blocked",
+      status: pass ? "pass" : "pending",
       blocks,
       reason: pass
-        ? "payment token is the official Base Sepolia USDC address"
-        : "official USDC token mode requires Base Sepolia chainId 84532",
-      evidenceEventId: tokenDelta.eventId,
+        ? "official Base Sepolia USDC registry and probe evidence are live"
+        : "official USDC token mode requires Base Sepolia chainId 84532, passed USDC probe evidence, and a live registry entry",
+      evidenceEventId: pass ? tokenDelta.eventId : null,
     };
   }
-  const registry = ctx.deploymentRegistry;
   const entry = registry?.entries.find(
     (candidate) =>
       candidate.contractName === "PaymentToken" &&
@@ -5052,7 +5174,7 @@ function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent 
       candidate.address.toLowerCase() === paymentToken &&
       candidate.tokenMode === "mock-test-token",
   );
-  const pass = registry?.mode === "live" && Boolean(entry);
+  const pass = registry?.mode === "live" && Boolean(entry && isLiveDeploymentRegistryEntry(entry));
   return {
     gateId: "token_deployment_registry",
     label: "Token deployment registry",
@@ -5063,6 +5185,39 @@ function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent 
       : "missing live deployment registry entry for the mock payment token",
     evidenceEventId: pass ? tokenDelta.eventId : null,
   };
+}
+
+function isLiveDeploymentRegistryEntry(entry: {
+  deploymentTxHash: string;
+  codeHash: string;
+  explorerUrl: string;
+  decimals?: number | undefined;
+}): boolean {
+  return (
+    isNonZeroHex32(entry.deploymentTxHash) &&
+    isNonZeroHex32(entry.codeHash) &&
+    typeof entry.decimals === "number" &&
+    Number.isInteger(entry.decimals) &&
+    entry.decimals >= 0 &&
+    isPublicExplorerUrl(entry.explorerUrl)
+  );
+}
+
+function isNonZeroHex32(value: string): boolean {
+  return /^0x[0-9a-fA-F]{64}$/.test(value) && value !== ZERO_HASH;
+}
+
+function isPublicExplorerUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:") {
+      return false;
+    }
+    const host = url.hostname.toLowerCase();
+    return host !== "example.com" && !host.endsWith(".example.com");
+  } catch {
+    return false;
+  }
 }
 
 function identityTargetMode(event: EvidenceEvent): "p0-win-separate-identities" | "p0-floor-one-wallet" {
@@ -5146,6 +5301,9 @@ function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: C
         "PACTFUSE_OPERATOR_TOKEN, PACTFUSE_CAW_INGEST_TOKEN, PACTFUSE_MCP_AUDIT_TOKEN, PACTFUSE_GATE_INGEST_TOKEN, and PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=false",
       );
     }
+    if (gate.gateId === "replay_summary_cap") {
+      inputs.add("full paged replay verifier support or a new live session whose proof collections fit the current summary cap");
+    }
     if (gate.gateId === "final_verifier_complete" || gate.gateId === "proof_chip_allowed" || gate.gateId === "verifier_winner_claim") {
       inputs.add("full chain/signature/hash verifier that can set finalVerifierComplete=true");
     }
@@ -5179,6 +5337,30 @@ async function proofProviderStatusOrBlocked(
   }
 }
 
+function redactProofProviderStatus(provider: ProofProviderStatus): ProofBundleProviderStatusView {
+  return {
+    ...provider,
+    endpoint: redactEndpoint(provider.endpoint),
+  };
+}
+
+function redactEndpoint(endpoint: string | undefined): string | null {
+  if (!endpoint) {
+    return null;
+  }
+  try {
+    const url = new URL(endpoint);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    const [redacted] = endpoint.split(/[?#]/);
+    return redacted || endpoint;
+  }
+}
+
 export async function readJudgeCheck(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<JudgeCheckView>> {
   const requestId = newRequestId("judge_check");
   const parsedSessionId = parseStrict(Hex32Schema, sessionId);
@@ -5208,8 +5390,10 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
   return { ok: true, requestId, data };
 }
 
-function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBundleView {
-  const events = listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT);
+function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx, options: ReplaySnapshotOptions = {}): ReplayBundleView {
+  const events = listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT).filter((event) =>
+    options.asOfEventSeq === undefined ? true : event.eventSeq <= options.asOfEventSeq,
+  );
   const mcpAdapterCalls = listMcpAdapterCalls(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const sources = listSources(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const spends = listSpends(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
@@ -5222,7 +5406,7 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBun
   const canonicalCawReceipts = listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const leaseRuns = listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const agentTranscript = buildAgentTranscriptData(sessionId, ctx, mcpAdapterCalls.length);
-  const replayPageIndex = replayPageIndexFor(ctx, sessionId);
+  const replayPageIndex = replayPageIndexFor(ctx, sessionId, options);
   return ReplayBundleViewSchema.parse({
     bundleType: "PACTFUSE_EVIDENCE_V1",
     sessionId,
@@ -5247,12 +5431,12 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBun
     leaseRuns,
     judgeCheck: readJudgeCheckData(sessionId, ctx),
     replayPageIndex,
-    replayPages: replayPagesFor(ctx, sessionId, replayPageIndex),
+    replayPages: replayPagesFor(ctx, sessionId, replayPageIndex, options),
   });
 }
 
-function finalClaimReplayBundleData(sessionId: string, ctx: ServiceCtx): ReplayBundleView {
-  const bundle = assembleReplayBundleData(sessionId, ctx);
+function finalClaimReplayBundleData(sessionId: string, ctx: ServiceCtx, options: ReplaySnapshotOptions = {}): ReplayBundleView {
+  const bundle = assembleReplayBundleData(sessionId, ctx, options);
   return ReplayBundleViewSchema.parse({
     ...bundle,
     winnerClaimAllowed: true,
@@ -5401,9 +5585,9 @@ function mcpToolsFromToolsListResponse(response: Record<string, JsonValue>): Arr
   return tools as Array<Record<string, unknown>>;
 }
 
-function replayPageIndexFor(ctx: ServiceCtx, sessionId: string) {
+function replayPageIndexFor(ctx: ServiceCtx, sessionId: string, options: ReplaySnapshotOptions = {}) {
   const collections = Object.fromEntries(
-    REPLAY_COLLECTION_NAMES.map((collection) => [collection, replayPageCollection(ctx, sessionId, collection)]),
+    REPLAY_COLLECTION_NAMES.map((collection) => [collection, replayPageCollection(ctx, sessionId, collection, options)]),
   );
   return {
     pageSize: REPLAY_SUMMARY_LIMIT,
@@ -5412,23 +5596,23 @@ function replayPageIndexFor(ctx: ServiceCtx, sessionId: string) {
   };
 }
 
-function replayPagesFor(ctx: ServiceCtx, sessionId: string, index = replayPageIndexFor(ctx, sessionId)) {
+function replayPagesFor(ctx: ServiceCtx, sessionId: string, index = replayPageIndexFor(ctx, sessionId), options: ReplaySnapshotOptions = {}) {
   return Object.fromEntries(
     REPLAY_COLLECTION_NAMES.map((collection) => {
       const pageCount = index.collections[collection]?.pageCount ?? 0;
-      const pages = Array.from({ length: pageCount }, (_, pageIndex) => replayPageData(ctx, sessionId, collection, pageIndex));
+      const pages = Array.from({ length: pageCount }, (_, pageIndex) => replayPageData(ctx, sessionId, collection, pageIndex, options));
       return [collection, pages];
     }),
   );
 }
 
-function replayPageCollection(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName) {
-  const totalRows = replayCollectionRowCount(ctx, sessionId, collection);
+function replayPageCollection(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName, options: ReplaySnapshotOptions = {}) {
+  const totalRows = replayCollectionRowCount(ctx, sessionId, collection, options);
   const pageCount = Math.ceil(totalRows / REPLAY_SUMMARY_LIMIT);
   const pageHashes: string[] = [];
   const orderBy = replayCollectionOrderBy(collection);
   for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
-    const rows = replayCollectionRows(ctx, sessionId, collection, pageIndex);
+    const rows = replayCollectionRows(ctx, sessionId, collection, pageIndex, options);
     pageHashes.push(replayPageHash(sessionId, collection, pageIndex, orderBy, rows));
   }
   return {
@@ -5464,9 +5648,9 @@ export async function readReplayPage(
   return { ok: true, requestId, data };
 }
 
-function replayPageData(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName, pageIndex: number) {
+function replayPageData(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName, pageIndex: number, options: ReplaySnapshotOptions = {}) {
   const orderBy = replayCollectionOrderBy(collection);
-  const rows = replayCollectionRows(ctx, sessionId, collection, pageIndex);
+  const rows = replayCollectionRows(ctx, sessionId, collection, pageIndex, options);
   return ReplayPageViewSchema.parse({
     bundleType: "PACTFUSE_REPLAY_PAGE_V1",
     sessionId,
@@ -5487,11 +5671,13 @@ function isReplayCollectionName(value: string): value is ReplayCollectionName {
   return (REPLAY_COLLECTION_NAMES as string[]).includes(value);
 }
 
-function replayCollectionRows(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName, pageIndex: number) {
+function replayCollectionRows(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName, pageIndex: number, options: ReplaySnapshotOptions = {}) {
   const offset = pageIndex * REPLAY_SUMMARY_LIMIT;
   switch (collection) {
     case "events":
-      return listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT, offset);
+      return listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT, offset).filter((event) =>
+        options.asOfEventSeq === undefined ? true : event.eventSeq <= options.asOfEventSeq,
+      );
     case "sources":
       return listSources(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
     case "spends":
@@ -5517,7 +5703,13 @@ function replayCollectionRows(ctx: ServiceCtx, sessionId: string, collection: Re
   }
 }
 
-function replayCollectionRowCount(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName): number {
+function replayCollectionRowCount(ctx: ServiceCtx, sessionId: string, collection: ReplayCollectionName, options: ReplaySnapshotOptions = {}): number {
+  if (collection === "events" && options.asOfEventSeq !== undefined) {
+    const row = ctx.db.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM evidence_events WHERE session_id = ? AND event_seq <= ?")
+      .get(sessionId, options.asOfEventSeq) as Row;
+    return Number(row.count ?? 0);
+  }
   const table = replayCollectionTable(collection);
   const row = ctx.db.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE session_id = ?`).get(sessionId) as Row;
   return Number(row.count ?? 0);
@@ -10505,7 +10697,13 @@ function listLeaseRuns(ctx: ServiceCtx, sessionId: string, limit: number, offset
 
 function verifyReplaySummaryCapIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   replayPageIndexFor(ctx, sessionId);
-  return [];
+  return replaySummaryCapErrors(ctx, sessionId);
+}
+
+function replaySummaryCapErrors(ctx: ServiceCtx, sessionId: string): string[] {
+  return Object.entries(replaySummaryCounts(ctx, sessionId))
+    .filter(([, count]) => count > REPLAY_SUMMARY_LIMIT)
+    .map(([name, count]) => `${name} has ${count} rows, above final verifier cap ${REPLAY_SUMMARY_LIMIT}`);
 }
 
 function assertReplaySummaryRoomForArtifactIssue(ctx: ServiceCtx, sessionId: string, requestId: string): void {

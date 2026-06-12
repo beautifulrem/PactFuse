@@ -23,6 +23,8 @@ The backend exposes `/api/v1/evidence/claim-readiness?sessionId=<id>` as the ope
 
 The public claim gate is `/api/v1/evidence/public-claim?sessionId=<id>`, also operator-only because it runs deep live proof checks. It returns `proof_pending` with blockers until claim readiness, replay bundle hash, verifier `final_replay_claim`, `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` are all true in the same session. Public copy must not treat readiness target modes as an authorized claim.
 
+After authorization, `/api/v1/evidence/proof-bundle?sessionId=<id>` exports `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1` only while the latest event is a proof-authorized `public.claim.authorized` event. The bundle must bind the public claim hash, the replay bundle hash used as claim input, the verifier run hash, redacted provider status hash, deployment registry hash, server metadata hash, and proof bundle hash. Advisory events, stale cached claims, fixture rows, or later mutable session state cannot stand in for this bundle.
+
 ## Upgrade Current Claim To `caw-target-real`
 
 This section is for the final/current public claim, not the hour-4 `TARGET_*` candidate block.
@@ -58,8 +60,8 @@ Headline: `Cobo param-bound source fuse`.
 
 W1 default order: probe `official-testnet-usdc` (Circle Base Sepolia USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e`) FIRST at hour 0; `mock-test-token` is the fallback rung and the fallback reason must be recorded in `docs/evidence/mock-token.json`.
 
-- `official-testnet-usdc`: requires official/sponsor token evidence for the exact chain/address.
-- `mock-test-token`: requires public testnet mock ERC20 deployment evidence in `docs/evidence/mock-token.json` plus the recorded official-USDC probe failure reason.
+- `official-testnet-usdc`: requires official/sponsor token evidence for the exact chain/address, a passed Base Sepolia USDC probe, and a live registry entry for the official token.
+- `mock-test-token`: requires public testnet mock ERC20 deployment evidence in `docs/evidence/mock-token.json` plus the recorded official-USDC probe failure reason. Runtime claim readiness also requires a live deployment registry entry with non-zero deployment transaction hash, non-zero code hash, public HTTPS explorer URL, decimals, and the exact payment-token address.
 - `local-mocked`: local only, not a winner claim.
 
 ## Identity Mode Rules

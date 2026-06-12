@@ -964,6 +964,43 @@ export const PublicClaimViewSchema = z
   })
   .strict();
 
+export const ProofBundleProviderStatusSchema = ProofProviderStatusSchema.extend({
+  endpoint: z.string().min(1).max(1000).nullable(),
+}).strict();
+
+export const ProofBundleServerSchema = z
+  .object({
+    proofBundleVersion: z.literal("PACTFUSE_PUBLIC_PROOF_BUNDLE_V1"),
+    commit: z.string().min(1).max(160).nullable(),
+    buildTime: IsoDateStringSchema.nullable(),
+    generatedAt: IsoDateStringSchema,
+  })
+  .strict();
+
+export const ProofBundleViewSchema = z
+  .object({
+    bundleType: z.literal("PACTFUSE_PUBLIC_PROOF_BUNDLE_V1"),
+    sessionId: Hex32Schema,
+    proofBundleHash: Hex32Schema,
+    publicClaimHash: Hex32Schema,
+    publicClaimEventId: Hex32Schema,
+    publicClaimEventHash: Hex32Schema,
+    publicClaimEventSeq: z.number().int().min(1),
+    claimInputReplayBundleHash: Hex32Schema,
+    replayBundleHash: Hex32Schema,
+    verifierRunHash: Hex32Schema,
+    providerStatusHash: Hex32Schema,
+    deploymentRegistryHash: Hex32Schema.nullable(),
+    serverHash: Hex32Schema,
+    publicClaim: PublicClaimViewSchema,
+    replayBundle: ReplayBundleViewSchema,
+    providerStatuses: z.array(ProofBundleProviderStatusSchema),
+    deploymentRegistry: DeploymentRegistrySchema.nullable(),
+    server: ProofBundleServerSchema,
+    winnerClaimAllowed: z.literal(true),
+  })
+  .strict();
+
 export const LiveProofPreflightCheckSchema = z
   .object({
     checkId: z.string().min(1).max(100),
@@ -1071,6 +1108,7 @@ export type ClaimReadinessView = z.infer<typeof ClaimReadinessViewSchema>;
 export type PublicClaimView = z.infer<typeof PublicClaimViewSchema>;
 export type DeploymentRegistry = z.infer<typeof DeploymentRegistrySchema>;
 export type DeploymentRegistryEntry = z.infer<typeof DeploymentRegistryEntrySchema>;
+export type ProofBundleView = z.infer<typeof ProofBundleViewSchema>;
 export type LiveProofPreflightView = z.infer<typeof LiveProofPreflightViewSchema>;
 export type ReplayBundleView = z.infer<typeof ReplayBundleViewSchema>;
 export type QuoteStatus = z.infer<typeof QuoteStatusSchema>;

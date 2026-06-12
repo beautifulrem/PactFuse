@@ -187,6 +187,11 @@ export type ApiSecurityConfig = {
   sourceChallengeRateLimitMax: number;
 };
 
+export type RuntimeServerMetadata = {
+  commit: string | null;
+  buildTime: string | null;
+};
+
 export type ServiceCtx = {
   db: PactFuseDb;
   verifier: EvidenceVerifier;
@@ -199,6 +204,7 @@ export type ServiceCtx = {
   gateIngestSecret: string | null;
   cawIngestToken: string | null;
   deploymentRegistry: DeploymentRegistry | undefined;
+  server: RuntimeServerMetadata;
   apiSecurity: ApiSecurityConfig;
   requiredIndexerCursors: RequiredIndexerCursor[];
   clock: Clock;
