@@ -313,6 +313,14 @@ describe("pactfuse-api P0", () => {
         "proof-bundle providerStatusHash does not recompute",
       ],
       [
+        "replay deployment registry hash",
+        (proofBundle) => {
+          const replayBundle = proofBundle.replayBundle as Record<string, unknown>;
+          replayBundle.deploymentRegistryHash = hex32("live-smoke-bad-replay-registry");
+        },
+        "proof-bundle replay deploymentRegistryHash does not recompute",
+      ],
+      [
         "public claim event hash",
         (proofBundle) => {
           proofBundle.publicClaimEventHash = hex32("live-smoke-bad-public-claim-event");
@@ -10079,6 +10087,8 @@ function liveSmokeFixture(): {
     asOfEventSeq: 49,
     winnerClaimAllowed: true,
     eventRoot: hashForTestJson(events.map((event) => event.eventHash)),
+    deploymentRegistry: null,
+    deploymentRegistryHash: null,
     events,
     replayPageIndex: { pageSize: 200, pageRoot: hashForTestJson([]), collections: {} },
     replayPages: {},

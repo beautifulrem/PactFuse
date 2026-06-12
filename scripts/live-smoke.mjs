@@ -193,6 +193,7 @@ function verifyProofBundleHashes(proofBundle, claim) {
       actual: hashJson(publicClaimHashInput(proofBundle.publicClaim)),
     },
   );
+  verifyReplayDeploymentRegistryBinding(proofBundle);
   assert(hashJson(proofBundle.replayBundle) === proofBundle.replayBundleHash, "proof-bundle replayBundleHash does not recompute", {
     expected: proofBundle.replayBundleHash,
     actual: hashJson(proofBundle.replayBundle),
@@ -222,6 +223,46 @@ function verifyProofBundleHashes(proofBundle, claim) {
     expected: proofBundle.proofBundleHash,
     actual: hashJson(bundleBase),
   });
+}
+
+function verifyReplayDeploymentRegistryBinding(proofBundle) {
+  const replayBundle = proofBundle.replayBundle;
+  assert(isObject(replayBundle), "proof-bundle replayBundle must be an object", replayBundle);
+  assert(
+    Object.prototype.hasOwnProperty.call(replayBundle, "deploymentRegistry"),
+    "proof-bundle replayBundle.deploymentRegistry is missing",
+    replayBundle,
+  );
+  assert(
+    Object.prototype.hasOwnProperty.call(replayBundle, "deploymentRegistryHash"),
+    "proof-bundle replayBundle.deploymentRegistryHash is missing",
+    replayBundle,
+  );
+  const replayDeploymentRegistryHash = replayBundle.deploymentRegistry === null ? null : hashJson(replayBundle.deploymentRegistry);
+  assert(
+    replayDeploymentRegistryHash === replayBundle.deploymentRegistryHash,
+    "proof-bundle replay deploymentRegistryHash does not recompute",
+    {
+      expected: replayBundle.deploymentRegistryHash,
+      actual: replayDeploymentRegistryHash,
+    },
+  );
+  assert(
+    canonicalizeJson(replayBundle.deploymentRegistry) === canonicalizeJson(proofBundle.deploymentRegistry),
+    "proof-bundle replay deploymentRegistry does not match authorization snapshot",
+    {
+      replayDeploymentRegistryHash,
+      proofBundleDeploymentRegistryHash: proofBundle.deploymentRegistryHash,
+    },
+  );
+  assert(
+    replayBundle.deploymentRegistryHash === proofBundle.deploymentRegistryHash,
+    "proof-bundle replay deploymentRegistryHash does not match authorization snapshot",
+    {
+      replayDeploymentRegistryHash: replayBundle.deploymentRegistryHash,
+      proofBundleDeploymentRegistryHash: proofBundle.deploymentRegistryHash,
+    },
+  );
 }
 
 function verifyReplayBundleEvents(replayBundle, expectedAsOfEventSeq) {
