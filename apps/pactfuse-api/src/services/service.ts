@@ -37,7 +37,9 @@ import {
   McpAdapterAuditPayloadSchema,
   McpAdapterCallViewSchema,
   QuoteViewSchema,
+  PublicClaimAuthorizedPayloadSchema,
   PublicClaimViewSchema,
+  ProofBundleAuthorizationSnapshotSchema,
   ProofBundleViewSchema,
   QuotePayloadSchema,
   RawCawReceiptBundleViewSchema,
@@ -63,6 +65,7 @@ import {
   type JudgeCheckView,
   type LiveProofPreflightView,
   type QuoteStatus,
+  type ProofBundleAuthorizationSnapshot,
   type PublicClaimView,
   type ProofBundleView,
   type ReplayBundleView,
@@ -119,6 +122,14 @@ type ReplayCollectionName =
   | "canonicalCawReceipts"
   | "leaseRuns";
 type ProofBundleProviderStatusView = Omit<ProofProviderStatus, "endpoint"> & { endpoint: string | null };
+type AuthorizedPublicClaimRecord = {
+  claim: PublicClaimView;
+  eventSeq: number;
+  eventId: string;
+  eventHash: string;
+  asOfEventSeq: number;
+  snapshot: ProofBundleAuthorizationSnapshot;
+};
 type ReplaySnapshotOptions = {
   asOfEventSeq?: number;
 };
@@ -4623,7 +4634,22 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
     winnerClaimAllowed: true,
     publicClaimHash,
   });
-  appendPublicClaimAuthorizedEvent(ctx, parsedSessionId, claim);
+  const providerStatuses = await readProofProviderStatus(ctx);
+  const providerBlockers = publicClaimProviderBlockers(providerStatuses);
+  if (providerBlockers.length > 0) {
+    return {
+      ok: false,
+      requestId,
+      error: {
+        ...proofPendingError(requestId, "public claim provider readiness changed before authorization"),
+        details: {
+          blockers: providerBlockers,
+          replayBundleHash: data.replayBundleHash,
+        },
+      },
+    };
+  }
+  appendPublicClaimAuthorizedEvent(ctx, parsedSessionId, claim, providerStatuses);
   return { ok: true, requestId, data: claim };
 }
 
@@ -4634,7 +4660,7 @@ function latestAuthorizedPublicClaim(ctx: ServiceCtx, sessionId: string): Public
 function latestAuthorizedPublicClaimRecord(
   ctx: ServiceCtx,
   sessionId: string,
-): { claim: PublicClaimView; eventSeq: number; eventId: string; eventHash: string; eventCreatedAt: string; asOfEventSeq: number } | null {
+): AuthorizedPublicClaimRecord | null {
   const session = getSessionRow(ctx, sessionId);
   if (!session) {
     return null;
@@ -4655,57 +4681,103 @@ function latestAuthorizedPublicClaimRecord(
     if (row.authority !== "proof") {
       return null;
     }
-    const payload = JSON.parse(String(row.payload_json)) as unknown;
-    const payloadObject = payload && typeof payload === "object" && !Array.isArray(payload) ? (payload as Record<string, unknown>) : null;
-    if (
-      !payloadObject ||
-      payloadObject.proofAuthority !== true ||
-      payloadObject.winnerClaimAllowed !== true ||
-      typeof payloadObject.publicClaimHash !== "string" ||
-      typeof payloadObject.asOfEventSeq !== "number" ||
-      !Number.isInteger(payloadObject.asOfEventSeq)
-    ) {
+    const payload = PublicClaimAuthorizedPayloadSchema.safeParse(JSON.parse(String(row.payload_json)) as unknown);
+    if (!payload.success) {
       return null;
     }
-    const claim = payloadObject.claim ?? null;
-    const parsed = PublicClaimViewSchema.safeParse(claim);
-    if (!parsed.success || parsed.data.publicClaimHash !== payloadObject.publicClaimHash) {
+    const parsed = payload.data;
+    if (parsed.claim.publicClaimHash !== parsed.publicClaimHash || parsed.claim.replayBundleHash !== parsed.replayBundleHash) {
       return null;
     }
-    if (payloadObject.asOfEventSeq !== Number(row.event_seq) - 1) {
+    if (parsed.verifierRunHash !== hashJson(parsed.claim.verifierRun)) {
       return null;
     }
-    return parsed.success
-      ? {
-          claim: parsed.data,
-          eventSeq: Number(row.event_seq),
-          eventId: String(row.event_id),
-          eventHash: String(row.event_hash),
-          eventCreatedAt: String(row.created_at),
-          asOfEventSeq: payloadObject.asOfEventSeq,
-        }
-      : null;
+    if (parsed.asOfEventSeq !== Number(row.event_seq) - 1) {
+      return null;
+    }
+    if (parsed.providerStatusHash !== hashJson(parsed.providerStatuses)) {
+      return null;
+    }
+    if (parsed.deploymentRegistryHash !== (parsed.deploymentRegistry ? hashJson(parsed.deploymentRegistry) : null)) {
+      return null;
+    }
+    if (parsed.server.generatedAt !== String(row.created_at) || parsed.serverHash !== hashJson(parsed.server)) {
+      return null;
+    }
+    return {
+      claim: parsed.claim,
+      eventSeq: Number(row.event_seq),
+      eventId: String(row.event_id),
+      eventHash: String(row.event_hash),
+      asOfEventSeq: parsed.asOfEventSeq,
+      snapshot: {
+        providerStatuses: parsed.providerStatuses,
+        providerStatusHash: parsed.providerStatusHash,
+        deploymentRegistry: parsed.deploymentRegistry,
+        deploymentRegistryHash: parsed.deploymentRegistryHash,
+        server: parsed.server,
+        serverHash: parsed.serverHash,
+      },
+    };
   } catch {
     return null;
   }
 }
 
-function appendPublicClaimAuthorizedEvent(ctx: ServiceCtx, sessionId: string, claim: PublicClaimView): EvidenceEvent {
+function appendPublicClaimAuthorizedEvent(
+  ctx: ServiceCtx,
+  sessionId: string,
+  claim: PublicClaimView,
+  providerStatuses: ProofProviderStatus[],
+): EvidenceEvent {
   const session = requireSessionRow(ctx, sessionId, "public_claim_event");
   const asOfEventSeq = Number(session.latest_event_seq);
+  const createdAt = ctx.clock.now().toISOString();
+  const snapshot = proofBundleAuthorizationSnapshot(ctx, providerStatuses, createdAt);
   return appendEvidenceEvent(ctx, {
     sessionId,
     authority: "proof",
     kind: "public.claim.authorized",
+    createdAt,
     payload: jsonRecord({
       claim,
       publicClaimHash: claim.publicClaimHash,
       replayBundleHash: claim.replayBundleHash,
       verifierRunHash: hashJson(claim.verifierRun),
       asOfEventSeq,
+      ...snapshot,
       proofAuthority: true,
       winnerClaimAllowed: true,
     }),
+  });
+}
+
+function publicClaimProviderBlockers(providers: ProofProviderStatus[]): string[] {
+  return providers
+    .filter((provider) => provider.ready !== true || provider.mode !== "live")
+    .map((provider) => `provider_${provider.name}: ${provider.reason}`);
+}
+
+function proofBundleAuthorizationSnapshot(
+  ctx: ServiceCtx,
+  providerStatuses: ProofProviderStatus[],
+  generatedAt: string,
+): ProofBundleAuthorizationSnapshot {
+  const redactedProviderStatuses = providerStatuses.map(redactProofProviderStatus);
+  const deploymentRegistry = ctx.deploymentRegistry ?? null;
+  const server = {
+    proofBundleVersion: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1" as const,
+    commit: ctx.server.commit,
+    buildTime: ctx.server.buildTime,
+    generatedAt,
+  };
+  return ProofBundleAuthorizationSnapshotSchema.parse({
+    providerStatuses: redactedProviderStatuses,
+    providerStatusHash: hashJson(redactedProviderStatuses),
+    deploymentRegistry,
+    deploymentRegistryHash: deploymentRegistry ? hashJson(deploymentRegistry) : null,
+    server,
+    serverHash: hashJson(server),
   });
 }
 
@@ -4779,14 +4851,7 @@ export async function readProofBundle(sessionId: string, ctx: ServiceCtx): Promi
     };
   }
   const replayBundle = finalClaimReplayBundleData(parsedSessionId, ctx, { asOfEventSeq: latestClaim.asOfEventSeq });
-  const providerStatuses = (await readProofProviderStatus(ctx)).map(redactProofProviderStatus);
-  const deploymentRegistry = ctx.deploymentRegistry ?? null;
-  const server = {
-    proofBundleVersion: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
-    commit: ctx.server.commit,
-    buildTime: ctx.server.buildTime,
-    generatedAt: latestClaim.eventCreatedAt,
-  };
+  const { providerStatuses, providerStatusHash, deploymentRegistry, deploymentRegistryHash, server, serverHash } = latestClaim.snapshot;
   const base = {
     bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
     sessionId: parsedSessionId,
@@ -4797,9 +4862,9 @@ export async function readProofBundle(sessionId: string, ctx: ServiceCtx): Promi
     claimInputReplayBundleHash: latestClaim.claim.replayBundleHash,
     replayBundleHash: hashJson(replayBundle),
     verifierRunHash: hashJson(latestClaim.claim.verifierRun),
-    providerStatusHash: hashJson(providerStatuses),
-    deploymentRegistryHash: deploymentRegistry ? hashJson(deploymentRegistry) : null,
-    serverHash: hashJson(server),
+    providerStatusHash,
+    deploymentRegistryHash,
+    serverHash,
     publicClaim: latestClaim.claim,
     replayBundle,
     providerStatuses,
@@ -6020,6 +6085,7 @@ export function appendEvidenceEvent(
   input: {
     sessionId: string;
     authority: "proof" | "delivery" | "operator" | "advisory";
+    createdAt?: string;
     kind:
       | "session.created"
       | "source.registered"
@@ -6072,7 +6138,7 @@ export function appendEvidenceEvent(
       throw new Error("session not found for evidence append");
     }
     const eventSeq = Number(session.latest_event_seq) + 1;
-    const createdAt = ctx.clock.now().toISOString();
+    const createdAt = input.createdAt ?? ctx.clock.now().toISOString();
     const payloadHash = hashJson(input.payload);
     const prevProofEventHash = input.authority === "proof" ? String(session.latest_proof_event_hash) : null;
     const eventHash = hashJson({

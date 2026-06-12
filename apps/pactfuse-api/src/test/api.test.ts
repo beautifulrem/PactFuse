@@ -874,9 +874,15 @@ describe("pactfuse-api P0", () => {
         proofAuthority: true,
         winnerClaimAllowed: true,
         asOfEventSeq: claimEvents[0].event_seq - 1,
+        providerStatusHash: proofBundleJson.data.providerStatusHash,
+        deploymentRegistryHash: proofBundleJson.data.deploymentRegistryHash,
+        serverHash: proofBundleJson.data.serverHash,
       }),
     );
     expect(claimEventPayload.claim).toEqual(expect.objectContaining({ publicClaimHash: claimJson.data.publicClaimHash }));
+    expect(claimEventPayload.providerStatuses).toEqual(proofBundleJson.data.providerStatuses);
+    expect(claimEventPayload.deploymentRegistry).toEqual(proofBundleJson.data.deploymentRegistry);
+    expect(claimEventPayload.server).toEqual(proofBundleJson.data.server);
     expect(proofBundle.status).toBe(200);
     expect(proofBundleJson.data).toEqual(
       expect.objectContaining({
@@ -906,7 +912,17 @@ describe("pactfuse-api P0", () => {
     const proofBundleBase = { ...proofBundleJson.data };
     delete (proofBundleBase as { proofBundleHash?: string }).proofBundleHash;
     expect(hashForTestJson(proofBundleBase)).toBe(proofBundleJson.data.proofBundleHash);
+    const originalChain = ctx.chain;
+    const originalCaw = ctx.caw;
+    const originalCawLive = ctx.cawLive;
+    const originalMcpLease = ctx.mcpLease;
+    const originalDeploymentRegistry = ctx.deploymentRegistry;
     ctx.clock.now = () => new Date("2026-06-12T00:00:00.000Z");
+    ctx.chain = createUnconfiguredChainClient();
+    ctx.caw = createUnconfiguredCawReceiptSource();
+    ctx.cawLive = createUnconfiguredCawLiveClient();
+    ctx.mcpLease = createUnconfiguredMcpLeaseClient();
+    ctx.deploymentRegistry = undefined;
     const stableProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
       headers: { authorization: "Bearer operator-test-token" },
     });
@@ -914,8 +930,17 @@ describe("pactfuse-api P0", () => {
 
     expect(stableProofBundle.status).toBe(200);
     expect(stableProofBundleJson.data.server.generatedAt).toBe(claimEvents[0].created_at);
+    expect(stableProofBundleJson.data.providerStatuses).toEqual(proofBundleJson.data.providerStatuses);
+    expect(stableProofBundleJson.data.providerStatusHash).toBe(proofBundleJson.data.providerStatusHash);
+    expect(stableProofBundleJson.data.deploymentRegistry).toEqual(proofBundleJson.data.deploymentRegistry);
+    expect(stableProofBundleJson.data.deploymentRegistryHash).toBe(proofBundleJson.data.deploymentRegistryHash);
     expect(stableProofBundleJson.data.serverHash).toBe(proofBundleJson.data.serverHash);
     expect(stableProofBundleJson.data.proofBundleHash).toBe(proofBundleJson.data.proofBundleHash);
+    ctx.chain = originalChain;
+    ctx.caw = originalCaw;
+    ctx.cawLive = originalCawLive;
+    ctx.mcpLease = originalMcpLease;
+    ctx.deploymentRegistry = originalDeploymentRegistry;
 
     appendEvidenceEvent(ctx, {
       sessionId,

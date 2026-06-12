@@ -977,6 +977,27 @@ export const ProofBundleServerSchema = z
   })
   .strict();
 
+export const ProofBundleAuthorizationSnapshotSchema = z
+  .object({
+    providerStatuses: z.array(ProofBundleProviderStatusSchema),
+    providerStatusHash: Hex32Schema,
+    deploymentRegistry: DeploymentRegistrySchema.nullable(),
+    deploymentRegistryHash: Hex32Schema.nullable(),
+    server: ProofBundleServerSchema,
+    serverHash: Hex32Schema,
+  })
+  .strict();
+
+export const PublicClaimAuthorizedPayloadSchema = ProofBundleAuthorizationSnapshotSchema.extend({
+  claim: PublicClaimViewSchema,
+  publicClaimHash: Hex32Schema,
+  replayBundleHash: Hex32Schema,
+  verifierRunHash: Hex32Schema,
+  asOfEventSeq: z.number().int().min(0),
+  proofAuthority: z.literal(true),
+  winnerClaimAllowed: z.literal(true),
+}).strict();
+
 export const ProofBundleViewSchema = z
   .object({
     bundleType: z.literal("PACTFUSE_PUBLIC_PROOF_BUNDLE_V1"),
@@ -1108,6 +1129,7 @@ export type ClaimReadinessView = z.infer<typeof ClaimReadinessViewSchema>;
 export type PublicClaimView = z.infer<typeof PublicClaimViewSchema>;
 export type DeploymentRegistry = z.infer<typeof DeploymentRegistrySchema>;
 export type DeploymentRegistryEntry = z.infer<typeof DeploymentRegistryEntrySchema>;
+export type ProofBundleAuthorizationSnapshot = z.infer<typeof ProofBundleAuthorizationSnapshotSchema>;
 export type ProofBundleView = z.infer<typeof ProofBundleViewSchema>;
 export type LiveProofPreflightView = z.infer<typeof LiveProofPreflightViewSchema>;
 export type ReplayBundleView = z.infer<typeof ReplayBundleViewSchema>;
