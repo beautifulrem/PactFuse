@@ -2,6 +2,7 @@ node_modules/
 dist/
 .turbo/
 .pactfuse/
+.codegraph/
 contracts/cache/
 contracts/out/
 *.log
