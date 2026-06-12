@@ -364,6 +364,17 @@ describe("pactfuse-api P0", () => {
     }
   });
 
+  it("live-smoke rejects a self-consistent downgraded verifier run", async () => {
+    const result = await runLiveSmokeAgainstStub(undefined, (fixture) => {
+      const claim = fixture.claim as { verifierRun: Record<string, unknown> };
+      claim.verifierRun.proofLevel = "fail_closed_no_claim";
+      resealLiveSmokeProofBundleForTest(fixture.proofBundle);
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("proof-bundle verifierRun proofLevel is not final_replay_claim");
+  });
+
   it("fails closed when protected mutation role tokens are missing unless test/dev mode explicitly opts in", async () => {
     const secure = makeApp(":memory:", {
       apiSecurity: {
@@ -9965,12 +9976,18 @@ async function startMcpJsonRpcServer(respond: (request: Record<string, unknown>)
   };
 }
 
-async function runLiveSmokeAgainstStub(mutateProofBundle?: (proofBundle: Record<string, unknown>) => void): Promise<{
+async function runLiveSmokeAgainstStub(
+  mutateProofBundle?: (proofBundle: Record<string, unknown>) => void,
+  mutateFixture?: (fixture: ReturnType<typeof liveSmokeFixture>) => void,
+): Promise<{
   status: number | null;
   stdout: string;
   stderr: string;
 }> {
   const fixture = liveSmokeFixture();
+  if (mutateFixture) {
+    mutateFixture(fixture);
+  }
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     const proofBundle = deepClone(fixture.proofBundle);
@@ -10027,6 +10044,24 @@ async function runLiveSmokeAgainstStub(mutateProofBundle?: (proofBundle: Record<
 }
 
 function resealLiveSmokeProofBundleForTest(proofBundle: Record<string, unknown>): void {
+  const publicClaim = proofBundle.publicClaim as Record<string, unknown>;
+  const verifierRun = publicClaim.verifierRun as Record<string, unknown>;
+  publicClaim.publicClaimHash = hashForTestJson({
+    sessionId: publicClaim.sessionId,
+    claimMode: publicClaim.claimMode,
+    paymentMode: publicClaim.paymentMode,
+    tokenMode: publicClaim.tokenMode,
+    identityMode: publicClaim.identityMode,
+    replayBundleHash: publicClaim.replayBundleHash,
+    verifierRun: {
+      proofLevel: verifierRun.proofLevel,
+      proofChipAllowed: verifierRun.proofChipAllowed,
+      finalVerifierComplete: verifierRun.finalVerifierComplete,
+      winnerClaimAllowed: verifierRun.winnerClaimAllowed,
+    },
+  });
+  proofBundle.publicClaimHash = publicClaim.publicClaimHash;
+  proofBundle.verifierRunHash = hashForTestJson(publicClaim.verifierRun);
   proofBundle.providerStatusHash = hashForTestJson(proofBundle.providerStatuses);
   const replayBundle = proofBundle.replayBundle as { events?: Array<Record<string, unknown>> };
   const previousProofEventHash =

@@ -194,6 +194,7 @@ function verifyProofBundleHashes(proofBundle, claim) {
       actual: hashJson(publicClaimHashInput(proofBundle.publicClaim)),
     },
   );
+  verifyPublicClaimVerifierRun(proofBundle);
   verifyReplayDeploymentRegistryBinding(proofBundle);
   verifyPublicClaimDeploymentRegistry(proofBundle);
   assert(hashJson(proofBundle.replayBundle) === proofBundle.replayBundleHash, "proof-bundle replayBundleHash does not recompute", {
@@ -226,6 +227,19 @@ function verifyProofBundleHashes(proofBundle, claim) {
     expected: proofBundle.proofBundleHash,
     actual: hashJson(bundleBase),
   });
+}
+
+function verifyPublicClaimVerifierRun(proofBundle) {
+  const verifierRun = proofBundle.publicClaim?.verifierRun;
+  assert(isObject(verifierRun), "proof-bundle publicClaim.verifierRun is missing", proofBundle.publicClaim);
+  assert(verifierRun.proofLevel === "final_replay_claim", "proof-bundle verifierRun proofLevel is not final_replay_claim", verifierRun);
+  assert(verifierRun.schemaOk === true, "proof-bundle verifierRun schemaOk is not true", verifierRun);
+  assert(verifierRun.proofChipAllowed === true, "proof-bundle verifierRun proofChipAllowed is not true", verifierRun);
+  assert(verifierRun.finalVerifierComplete === true, "proof-bundle verifierRun finalVerifierComplete is not true", verifierRun);
+  assert(verifierRun.winnerClaimAllowed === true, "proof-bundle verifierRun winnerClaimAllowed is not true", verifierRun);
+  assert(verifierRun.requestedWinnerClaimAllowed === true, "proof-bundle verifierRun requestedWinnerClaimAllowed is not true", verifierRun);
+  assert(Array.isArray(verifierRun.errors) && verifierRun.errors.length === 0, "proof-bundle verifierRun errors is not empty", verifierRun);
+  assert(Array.isArray(verifierRun.warnings) && verifierRun.warnings.length === 0, "proof-bundle verifierRun warnings is not empty", verifierRun);
 }
 
 function verifyProofBundleProviderStatuses(proofBundle) {
