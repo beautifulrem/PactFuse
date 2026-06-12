@@ -7,9 +7,9 @@ import { STAGE } from "../machine.mjs";
 
 const RAIL = [
   { id: STAGE.pending, label: "event" },
-  { id: STAGE.detected, label: "detected" },
-  { id: STAGE.executing, label: "responding" },
-  { id: STAGE.success, label: "outcome" },
+  { id: STAGE.detected, label: "detect" },
+  { id: STAGE.executing, label: "respond" },
+  { id: STAGE.success, label: "done" },
 ];
 
 export function mountScenarioPanel(host, { machine, scenarios }) {
@@ -61,7 +61,7 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
       b.setAttribute("aria-checked", String(sel));
       b.classList.toggle("is-selected", sel);
     });
-    const running = [STAGE.pending, STAGE.detected, STAGE.executing, STAGE.loading].includes(ms.stage);
+    const running = [STAGE.pending, STAGE.detected, STAGE.executing].includes(ms.stage);
     runBtn.disabled = !ms.scenario || running;
     runBtn.innerHTML =
       ms.stage === STAGE.failed

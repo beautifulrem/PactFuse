@@ -63,7 +63,7 @@ function deriveModel(pb, { failFlag }) {
       flow: "trip",
       outcome: {
         label: "protected · 0 moved on the challenged source",
-        tone: "danger",
+        tone: "success",
         detail: `spends ${short(tripped[0]?.spendId, 6, 4)} and ${short(tripped[1]?.spendId, 6, 4)} tripped on-chain before settlement`,
       },
       steps: [
@@ -79,6 +79,7 @@ function deriveModel(pb, { failFlag }) {
           stage: STAGE.detected,
           flow: "trip-detect",
           tone: "warning",
+          risk: "chain risk event",
           title: "SourceChallenged finalized on Base Sepolia",
           detail: "the indexer confirms the public-chain risk event",
           evidence: { tx: challenge.txHash, block: challenge.blockNumber },
@@ -234,10 +235,10 @@ function deriveModel(pb, { failFlag }) {
       "attestation key": pb.verifierAttestation?.publicKeyHash,
     },
     metrics: [
-      { label: "evidence events", value: pb.asOfEventSeq ?? events.length },
+      { label: "ledger seq", value: pb.asOfEventSeq ?? events.length },
       { label: "caw audit rows", value: auditCount },
       { label: "settled (atomic)", value: settleAmount, tone: "success" },
-      { label: "judge check", value: judgeRows.filter((r) => r.status === "pass").length, suffix: `/${judgeRows.length} pass` },
+      { label: "at-risk blocked (atomic)", value: tripped.reduce((sum, s) => sum + Number(s.maxPriceAtomic ?? 0), 0) },
     ],
     facts: { identity, allowance, settled, delta, challenge, lease, registry, gate, blocks },
     scenarios,

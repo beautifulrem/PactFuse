@@ -40,7 +40,7 @@ export function mountInspector(host) {
     }
     const r = ms.stage === STAGE.failed ? { label: "execution failed", tone: "danger" } : RISK[step.tone ?? "info"];
     risk.dataset.tone = r.tone;
-    risk.textContent = r.label;
+    risk.textContent = ms.stage === STAGE.failed ? r.label : (step.risk ?? r.label);
     title.textContent = step.title;
     detail.textContent = ms.stage === STAGE.failed ? (ms.error ?? "failed") : step.detail;
     const rows = Object.entries(step.evidence ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== "");
@@ -74,7 +74,7 @@ export function mountLog(host) {
 
   let rendered = 0;
   function apply(ms, type) {
-    if (type === "reset" || type === "run-start") {
+    if (type === "reset" || type === "run-start" || type === "select") {
       list.innerHTML = "";
       rendered = 0;
     }

@@ -8,8 +8,8 @@ export function mountHeader(host, model) {
   const claim = model.claim;
   host.innerHTML = `
     <div class="head-brand">
-      <p class="head-kicker mono">pactfuse · fusebox console</p>
-      <h1 class="head-title">Source-fresh procurement for agent spending</h1>
+      <p class="head-kicker mono">fusebox console · cobo agentic wallet track</p>
+      <h1 class="head-title"><em>PactFuse</em> · source-fresh procurement for agent spending</h1>
       <p class="head-lede">PactFuse watches the chain while an agent buys tool leases with its Cobo Agentic Wallet.
       If a pinned source turns unsafe, the on-chain gate interrupts the spend <em>before payment</em>; clean leases settle and deliver — every claim below replays signed evidence.</p>
     </div>
@@ -21,10 +21,10 @@ export function mountHeader(host, model) {
         <span class="chip" data-tone="${model.source === "verified" ? "success" : "warning"}">
           ${model.source === "verified" ? "verified evidence" : "fixture fallback"}
         </span>
-        ${claim ? `<span class="chip" data-tone="provenance" title="authorized ${claim.authorizedAt}">${claim.claimMode} · ${claim.tokenSettlementClaim}</span>` : ""}
+        ${claim ? `<span class="chip" data-tone="provenance" title="${claim.claimMode} · ${claim.tokenSettlementClaim} · authorized ${claim.authorizedAt}">live claim · mock-ERC20 settlement (testnet)</span>` : ""}
       </div>
       <div class="head-links">
-        <button class="btn btn-ghost" id="openJudge" type="button">${icon("check")} judge check ${model.judgeRows.filter((r) => r.status === "pass").length}/${model.judgeRows.length || "—"}</button>
+        <button class="btn btn-ghost" id="openJudge" type="button">${icon("check")} ${model.judgeRows.length ? `judge check ${model.judgeRows.filter((r) => r.status === "pass").length}/${model.judgeRows.length}` : "judge check —"}</button>
         <button class="btn btn-ghost" id="openHashes" type="button">${icon("pulse")} proof hashes</button>
       </div>
     </div>
@@ -60,6 +60,12 @@ export function mountMetrics(host, model) {
   });
 }
 
+function claimStatementItem(model) {
+  const c = model.claim;
+  if (!c) return "";
+  return `<div class="hx-item"><p class="hx-k mono">authorized public claim</p><div class="hx-v"><code class="mono">${c.claimStatus} @ ${c.authorizedAt} · claimMode=${c.claimMode} · tokenSettlementClaim=${c.tokenSettlementClaim} · winnerClaimAllowed=${c.winnerClaimAllowed} (session-scoped)</code></div></div>`;
+}
+
 export function mountDrawers(root, model, toast) {
   root.innerHTML = `
     <div class="drawer" id="drawerJudge" role="dialog" aria-modal="true" aria-label="Judge check" hidden>
@@ -89,6 +95,7 @@ export function mountDrawers(root, model, toast) {
       <header><h3>Proof hashes</h3><span class="mono drawer-sub">recompute offline · verify-live-artifacts</span>
         <button class="btn btn-ghost drawer-x" type="button" data-close aria-label="Close">${icon("close")}</button></header>
       <div class="drawer-body">
+        ${claimStatementItem(model)}
         ${Object.entries(model.hashes)
           .map(
             ([k, v]) => `
@@ -118,7 +125,7 @@ export function mountDrawers(root, model, toast) {
   const closeAll = () => {
     root.querySelectorAll(".drawer.is-open").forEach((d) => {
       d.classList.remove("is-open");
-      setTimeout(() => (d.hidden = true), 280);
+      setTimeout(() => (d.hidden = true), 260);
     });
     scrim.hidden = true;
     lastFocus?.focus?.();
@@ -129,16 +136,36 @@ export function mountDrawers(root, model, toast) {
     if (c) navigator.clipboard.writeText(c.dataset.copy).then(() => toast("hash copied"), () => toast("copy failed"));
   });
   scrim.addEventListener("click", closeAll);
-  document.addEventListener("keydown", (e) => e.key === "Escape" && closeAll());
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeAll();
+    if (e.key === "Tab") {
+      const openDrawer = root.querySelector(".drawer.is-open");
+      if (!openDrawer) return;
+      const focusables = [...openDrawer.querySelectorAll("button, a[href]")];
+      if (!focusables.length) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      } else if (!openDrawer.contains(document.activeElement)) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  });
 
   return { openJudge: () => open("#drawerJudge"), openHashes: () => open("#drawerHashes") };
 }
 
 export function mountFooter(host, model) {
-  host.innerHTML =
+  host.textContent =
     model.source === "verified"
-      ? `verified replay · ${model.claim?.claimStatus} @ ${model.claim?.authorizedAt} · winnerClaimAllowed=${model.claim?.winnerClaimAllowed} (session-scoped, by the fail-closed gate) · tokenSettlementClaim=${model.claim?.tokenSettlementClaim} — the console renders evidence; it never creates proof authority`
-      : `fixture fallback — proof artifacts unreachable from this origin. fixture states render no proof pass; serve the repo root to load the verified session`;
+      ? `verified replay · public claim authorized ${(model.claim?.authorizedAt ?? "").slice(0, 10)} · the console renders evidence — it never creates proof authority`
+      : `fixture fallback — proof artifacts unreachable from this origin; fixture states render no proof pass. serve the repo root to load the verified session`;
 }
 
 export function makeToast(host) {

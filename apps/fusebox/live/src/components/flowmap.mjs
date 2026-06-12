@@ -13,14 +13,14 @@ export function mountFlowMap(host, facts = {}) {
   host.innerHTML = `
   <svg class="fm" viewBox="0 0 ${VB.w} ${VB.h}" role="img" aria-label="System map: idle">
     <g class="fm-paths" aria-hidden="true">
-      <path id="fm-p-ap"  class="fm-path" d="M104 192 H 196"/>
-      <path id="fm-p-pg"  class="fm-path" d="M244 192 H 344"/>
-      <path id="fm-p-gm"  class="fm-path" d="M456 192 H 560"/>
-      <path id="fm-p-sig" class="fm-path fm-path-sig" d="M400 96 V 156"/>
-      <path id="fm-d-ap"  class="fm-draw" pathLength="100" d="M104 192 H 196"/>
-      <path id="fm-d-pg"  class="fm-draw" pathLength="100" d="M244 192 H 344"/>
-      <path id="fm-d-gm"  class="fm-draw" pathLength="100" d="M456 192 H 560"/>
-      <path id="fm-d-sig" class="fm-draw" pathLength="100" d="M400 96 V 156"/>
+      <path id="fm-p-ap"  class="fm-path" d="M106 192 H 196"/>
+      <path id="fm-p-pg"  class="fm-path" d="M244 192 H 356"/>
+      <path id="fm-p-gm"  class="fm-path" d="M444 192 H 574"/>
+      <path id="fm-p-sig" class="fm-path" d="M400 94 V 148"/>
+      <path id="fm-d-ap"  class="fm-draw" pathLength="100" d="M106 192 H 196"/>
+      <path id="fm-d-pg"  class="fm-draw" pathLength="100" d="M244 192 H 356"/>
+      <path id="fm-d-gm"  class="fm-draw" pathLength="100" d="M444 192 H 574"/>
+      <path id="fm-d-sig" class="fm-draw" pathLength="100" d="M400 94 V 148"/>
     </g>
 
     <g class="fm-node fm-agent" transform="translate(70,192)" aria-hidden="true">
@@ -34,8 +34,8 @@ export function mountFlowMap(host, facts = {}) {
       <rect x="-14" y="-30" width="9" height="60" rx="2.5" class="fm-shape"/>
       <rect x="5" y="-30" width="9" height="60" rx="2.5" class="fm-shape"/>
       <circle class="fm-deny-ring" r="34" />
-      <text class="fm-name" y="44">pact policy</text>
-      <text class="fm-sub" y="58">allowlist · limits</text>
+      <text class="fm-name" y="48">pact policy</text>
+      <text class="fm-sub" y="62">allowlist · limits</text>
     </g>
 
     <g class="fm-node fm-gate" transform="translate(400,192)" aria-hidden="true">
@@ -56,21 +56,21 @@ export function mountFlowMap(host, facts = {}) {
         <path class="fm-beacon-core" d="M0-34 6-28 0-22-6-28Z"/>
         <circle class="fm-beacon-ring" r="10" cy="-28"/>
       </g>
-      <text class="fm-name" y="-34">source registry</text>
+      <text class="fm-name" x="-38" y="4" style="text-anchor:end">source registry</text>
     </g>
 
     <g class="fm-node fm-market" transform="translate(610,192)" aria-hidden="true">
       <rect x="-26" y="-26" width="52" height="52" rx="9" class="fm-shape"/>
       <path class="fm-glyph fm-market-doc" d="M-7-10h9l5 5v15h-14v-20Z"/>
-      <path class="fm-glyph fm-market-check" pathLength="100" d="m-7 1 5 5 9-10"/>
-      <text class="fm-name" y="46">artifact market</text>
-      <text class="fm-sub" y="60">paid delivery</text>
+      <path class="fm-glyph fm-market-check" pathLength="100" d="m-5 1 4 4 7-8"/>
+      <text class="fm-name" y="44">artifact market</text>
+      <text class="fm-sub" y="58">paid delivery</text>
     </g>
 
     <g class="fm-tags" aria-hidden="true">
-      <text id="fm-tag-sig" class="fm-tag" x="490" y="126"></text>
-      <text id="fm-tag-pg" class="fm-tag" x="294" y="178"></text>
-      <text id="fm-tag-gm" class="fm-tag" x="508" y="178"></text>
+      <text id="fm-tag-sig" class="fm-tag" x="412" y="126" text-anchor="start"></text>
+      <text id="fm-tag-pg" class="fm-tag" x="252" y="176" text-anchor="start"></text>
+      <text id="fm-tag-gm" class="fm-tag" x="452" y="176" text-anchor="start"></text>
       <text id="fm-tag-out" class="fm-tag fm-tag-out" x="400" y="296"></text>
     </g>
   </svg>`;
@@ -87,13 +87,14 @@ export function mountFlowMap(host, facts = {}) {
 
   function apply(ms) {
     const flow =
-      ms.stage === "success"
-        ? `${ms.scenario?.flow}-done`
-        : (ms.activeStep?.flow ?? (ms.scenario ? "armed" : "idle"));
+      ms.stage === "failed"
+        ? (ms.stepIndex >= 0 ? ms.scenario.steps[ms.stepIndex].flow : "armed")
+        : ms.stage === "success"
+          ? `${ms.scenario?.flow}-done`
+          : (ms.activeStep?.flow ?? (ms.scenario ? "armed" : "idle"));
     svg.dataset.flow = flow;
     svg.dataset.stage = ms.stage;
     const f = facts ?? {};
-    const tags = { idle: {}, armed: {} };
     const sc = ms.scenario?.id;
     if (sc === "trip") {
       const t = {
@@ -106,8 +107,8 @@ export function mountFlowMap(host, facts = {}) {
     } else if (sc === "settle") {
       const t = {
         "settle-approve": { pg: "approve in policy" },
-        "settle-allow": { pg: `allowance 0 → ${fmt(f.allowance?.allowanceAfter)}` },
-        "settle-pay": { pg: `allowance ${fmt(f.allowance?.allowanceAfter)}`, gm: `${fmt((f.delta?.marketAfter ?? 0) - (f.delta?.marketBefore ?? 0))} atomic`, out: `SpendSettled · block ${f.settled?.blockNumber ?? "—"}` },
+        "settle-allow": { pg: `allow 0 → ${fmt(f.allowance?.allowanceAfter)}` },
+        "settle-pay": { pg: `allow ${fmt(f.allowance?.allowanceAfter)}`, gm: `${fmt((f.delta?.marketAfter ?? 0) - (f.delta?.marketBefore ?? 0))} atomic`, out: `SpendSettled · block ${f.settled?.blockNumber ?? "—"}` },
         "settle-deliver": { gm: `${fmt((f.delta?.marketAfter ?? 0) - (f.delta?.marketBefore ?? 0))} atomic`, out: `artifact ${short(f.lease?.artifactHash ?? "", 8, 4)} · lease run live` },
         "settle-done": { gm: "delivered", out: "settled · artifact consumed through bounded MCP lease" },
       }[flow];
@@ -126,6 +127,7 @@ export function mountFlowMap(host, facts = {}) {
     const labels = {
       idle: "System map: idle",
       armed: `System map: scenario armed — ${ms.scenario?.title ?? ""}`,
+      failed: "System map: protective action failed — retry available",
     };
     svg.setAttribute("aria-label", labels[flow] ?? `System map: ${ms.activeStep?.title ?? ms.stage}`);
   }

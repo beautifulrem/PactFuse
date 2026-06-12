@@ -11,7 +11,9 @@
   --border-strong: rgba(255, 255, 255, 0.16);
   --text-primary: #e9edf4;
   --text-secondary: #9aa6b7;
-  --text-muted: #67738a;
+  --text-muted: #7e8aa3;
+  --text-inverse: #0a0f1a;
+  --scrim: rgba(4, 6, 10, 0.55);
 
   --accent: #5b8af6;
   --accent-bg: rgba(91, 138, 246, 0.09);
@@ -22,7 +24,6 @@
   --success: #34d399;
   --success-bg: rgba(52, 211, 153, 0.09);
   --pending: #8b97ad;
-  --pending-bg: rgba(139, 151, 173, 0.08);
   --provenance: #c9a86a;
   --provenance-bg: rgba(201, 168, 106, 0.08);
 
@@ -31,10 +32,13 @@
   --font-ui: "IBM Plex Sans", "Helvetica Neue", system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
   --fs-hero: clamp(26px, 3vw, 34px);
+  --fs-data: 22px;
   --fs-h2: 17px;
   --fs-body: 14px;
   --fs-meta: 12px;
   --fs-micro: 10.5px;
+  --fs-tag: 10.5px;
+  --fs-tag-lg: 11.5px;
 
   /* space (4pt scale) */
   --s1: 4px;
@@ -57,9 +61,9 @@
   --dur-slow: 420ms;
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-snap: cubic-bezier(0.5, 0, 0.2, 1);
+  --ease-spring: linear(0, 0.42 22%, 0.86 38%, 1.06 58%, 0.98 78%, 1);
 
   /* layout */
   --shell-max: 1480px;
   --console-left: 360px;
-  --rail-w: 56px;
 }

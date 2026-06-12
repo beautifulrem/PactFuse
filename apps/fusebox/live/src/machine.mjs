@@ -5,7 +5,6 @@
 
 export const STAGE = {
   idle: "idle",
-  loading: "loading",
   pending: "pending",
   detected: "detected",
   executing: "executing",
@@ -48,6 +47,7 @@ export function createMachine() {
     state.activeStep = null;
     state.outcome = null;
     state.error = null;
+    state.log = [];
     emit("select");
   }
 
