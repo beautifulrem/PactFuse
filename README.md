@@ -238,7 +238,7 @@ Expected behavior:
 - full verifier mode rejects it because the example is pending, not final proof.
 - `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` remain `false` until every final replay gate passes.
 - `GET /api/v1/evidence/public-claim` requires the operator bearer token and returns `proof_pending` until claim readiness, verifier output, replay hash, and every live evidence gate are simultaneously green.
-- `GET /api/v1/evidence/proof-bundle` requires the operator bearer token and exports `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1` only when the latest event is a proof-authorized `public.claim.authorized` event. The bundle binds the public claim, claim-input replay hash, provider status hash, deployment registry hash, server metadata hash, and proof bundle hash.
+- `GET /api/v1/evidence/proof-bundle` requires the operator bearer token and exports `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1` only when the latest event is a proof-authorized `public.claim.authorized` event. The bundle binds the public claim, claim-input replay hash, provider status hash, deployment registry hash, server metadata hash, and proof bundle hash. Its `server.generatedAt` is the authorization event timestamp, so repeated reads of the same proof event keep the same bundle hash.
 
 The replay verifier checks:
 

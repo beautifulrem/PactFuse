@@ -814,12 +814,20 @@ describe("pactfuse-api P0", () => {
     const proofBundleJson = await proofBundle.json();
     const claimEvents = ctx.db.sqlite
       .prepare(
-        `SELECT event_id, event_seq, event_hash, authority, kind, payload_json
+        `SELECT event_id, event_seq, event_hash, authority, kind, payload_json, created_at
          FROM evidence_events
          WHERE session_id = ? AND kind = 'public.claim.authorized'
          ORDER BY event_seq ASC`,
       )
-      .all(sessionId) as Array<{ event_id: string; event_seq: number; event_hash: string; authority: string; kind: string; payload_json: string }>;
+      .all(sessionId) as Array<{
+        event_id: string;
+        event_seq: number;
+        event_hash: string;
+        authority: string;
+        kind: string;
+        payload_json: string;
+        created_at: string;
+      }>;
     const claimEventPayload = JSON.parse(claimEvents[0]?.payload_json ?? "{}") as Record<string, unknown>;
 
     expect(identity.status).toBe(202);
@@ -898,6 +906,16 @@ describe("pactfuse-api P0", () => {
     const proofBundleBase = { ...proofBundleJson.data };
     delete (proofBundleBase as { proofBundleHash?: string }).proofBundleHash;
     expect(hashForTestJson(proofBundleBase)).toBe(proofBundleJson.data.proofBundleHash);
+    ctx.clock.now = () => new Date("2026-06-12T00:00:00.000Z");
+    const stableProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const stableProofBundleJson = await stableProofBundle.json();
+
+    expect(stableProofBundle.status).toBe(200);
+    expect(stableProofBundleJson.data.server.generatedAt).toBe(claimEvents[0].created_at);
+    expect(stableProofBundleJson.data.serverHash).toBe(proofBundleJson.data.serverHash);
+    expect(stableProofBundleJson.data.proofBundleHash).toBe(proofBundleJson.data.proofBundleHash);
 
     appendEvidenceEvent(ctx, {
       sessionId,

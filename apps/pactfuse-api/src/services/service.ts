@@ -4634,14 +4634,14 @@ function latestAuthorizedPublicClaim(ctx: ServiceCtx, sessionId: string): Public
 function latestAuthorizedPublicClaimRecord(
   ctx: ServiceCtx,
   sessionId: string,
-): { claim: PublicClaimView; eventSeq: number; eventId: string; eventHash: string; asOfEventSeq: number } | null {
+): { claim: PublicClaimView; eventSeq: number; eventId: string; eventHash: string; eventCreatedAt: string; asOfEventSeq: number } | null {
   const session = getSessionRow(ctx, sessionId);
   if (!session) {
     return null;
   }
   const row = ctx.db.sqlite
     .prepare(
-      `SELECT event_id, event_seq, event_hash, authority, payload_json
+      `SELECT event_id, event_seq, event_hash, authority, payload_json, created_at
        FROM evidence_events
        WHERE session_id = ? AND kind = 'public.claim.authorized'
        ORDER BY event_seq DESC
@@ -4681,6 +4681,7 @@ function latestAuthorizedPublicClaimRecord(
           eventSeq: Number(row.event_seq),
           eventId: String(row.event_id),
           eventHash: String(row.event_hash),
+          eventCreatedAt: String(row.created_at),
           asOfEventSeq: payloadObject.asOfEventSeq,
         }
       : null;
@@ -4784,7 +4785,7 @@ export async function readProofBundle(sessionId: string, ctx: ServiceCtx): Promi
     proofBundleVersion: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
     commit: ctx.server.commit,
     buildTime: ctx.server.buildTime,
-    generatedAt: ctx.clock.now().toISOString(),
+    generatedAt: latestClaim.eventCreatedAt,
   };
   const base = {
     bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
