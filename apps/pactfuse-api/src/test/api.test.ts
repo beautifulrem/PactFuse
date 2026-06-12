@@ -2132,6 +2132,8 @@ describe("pactfuse-api P0", () => {
       "eventRoot",
       "agentTranscriptHash",
       "fullReplayRoot",
+      "deploymentRegistry",
+      "deploymentRegistryHash",
       "events",
       "sources",
       "spends",
@@ -2152,6 +2154,7 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("rawCawReceiptBundles");
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("canonicalCawReceipts");
     expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("leaseRuns");
+    expect(json.paths["/api/v1/evidence/replay-bundle"].get["x-pactfuse-proof-fields"]).toContain("deploymentRegistryHash");
     expect(json.paths["/api/v1/evidence/replay-page"].get.responses["200"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/ReplayPageResponse",
     );
@@ -5888,6 +5891,16 @@ describe("pactfuse-api P0", () => {
         },
       },
     });
+    const verifyTamperedDeploymentRegistry = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-replay-deployment-registry-tampered",
+      payload: {
+        replayBundle: {
+          ...replayJson.data,
+          deploymentRegistryHash: hex32("tampered-deployment-registry"),
+        },
+      },
+    });
     const replayMissingSources = { ...replayJson.data } as Record<string, unknown>;
     delete replayMissingSources.sources;
     const verifyMissingSources = await post(app, "/api/v1/evidence/verify", {
@@ -5910,6 +5923,8 @@ describe("pactfuse-api P0", () => {
     expect(verifyTamperedReplayPages.json.data.errors).toContain("replayBundle.replayPages does not match the server snapshot");
     expect(verifyTamperedJudgeCheck.json.data.schemaOk).toBe(false);
     expect(verifyTamperedJudgeCheck.json.data.errors).toContain("replayBundle.judgeCheck does not match the server snapshot");
+    expect(verifyTamperedDeploymentRegistry.json.data.schemaOk).toBe(false);
+    expect(verifyTamperedDeploymentRegistry.json.data.errors).toContain("replayBundle.deploymentRegistryHash does not match the server snapshot");
     expect(verifyMissingSources.json.data.schemaOk).toBe(false);
     expect(verifyMissingSources.json.data.errors).toContain("replayBundle.sources is missing from the verifier replay bundle");
   });

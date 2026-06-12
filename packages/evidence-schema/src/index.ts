@@ -811,6 +811,8 @@ export const ReplayBundleViewSchema = z
     eventRoot: Hex32Schema,
     agentTranscriptHash: Hex32Schema,
     fullReplayRoot: Hex32Schema,
+    deploymentRegistry: DeploymentRegistrySchema.nullable(),
+    deploymentRegistryHash: Hex32Schema.nullable(),
     events: z.array(EvidenceEventSchema).max(200),
     sources: z.array(SourceViewSchema).max(200),
     spends: z.array(SpendViewSchema).max(200),

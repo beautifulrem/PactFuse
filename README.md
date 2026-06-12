@@ -239,6 +239,7 @@ Expected behavior:
 - `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` remain `false` until every final replay gate passes.
 - `GET /api/v1/evidence/public-claim` requires the operator bearer token and returns `proof_pending` until claim readiness, verifier output, replay hash, and every live evidence gate are simultaneously green.
 - `GET /api/v1/evidence/proof-bundle` requires the operator bearer token and exports `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1` only when the latest event is a proof-authorized `public.claim.authorized` event. The authorization event stores the redacted provider status snapshot, deployment registry snapshot, and server metadata snapshot. The bundle binds those snapshots plus the public claim, claim-input replay hash, provider status hash, deployment registry hash, server metadata hash, and proof bundle hash. Its `server.generatedAt` is the authorization event timestamp, so repeated reads of the same proof event keep the same bundle hash even if provider configuration later changes.
+- `PACTFUSE_EVIDENCE_V1` replay bundles now carry `deploymentRegistry` and `deploymentRegistryHash`; final verifier authority requires the chain-settleable payment token to match live registry evidence and the official-USDC probe status.
 
 The replay verifier checks:
 
@@ -307,7 +308,7 @@ Required result:
 - `/api/v1/evidence/public-claim` returns `authorized_public_claim`, `finalVerifierComplete=true`, and `winnerClaimAllowed=true`
 - `/api/v1/evidence/proof-bundle` returns `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1`, and its public claim, public-claim event hash, replay, verifier run, provider, deployment-registry, server, and bundle hashes recompute from the response body
 
-For `mock-test-token`, claim readiness also requires a recorded failed official-USDC probe reason plus a live deployment registry entry for the payment token address, non-zero deployment transaction hash, public HTTPS explorer URL, decimals, and non-zero bytecode hash. Official Base Sepolia USDC is accepted only on chain id `84532` with a passed official-USDC probe and a matching live registry entry.
+For `mock-test-token`, claim readiness and final replay verification require a recorded failed official-USDC probe reason plus a live deployment registry entry for the payment token address, non-zero deployment transaction hash, public HTTPS explorer URL, decimals, and non-zero bytecode hash. Official Base Sepolia USDC is accepted only on chain id `84532` with a passed official-USDC probe and a matching live registry entry.
 
 Use [docs/evidence/production-live-env.example](docs/evidence/production-live-env.example) as the non-secret manifest for the real Cobo/RPC/MCP environment.
 

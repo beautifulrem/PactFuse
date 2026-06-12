@@ -2654,6 +2654,58 @@ export function createServerRuntimeVerifierOptions(options = {}) {
   };
 }
 
+function deploymentRegistryEntryHasLiveFields(entry) {
+  return (
+    isObject(entry) &&
+    isHex32(entry.deploymentTxHash) &&
+    entry.deploymentTxHash !== ZERO_HASH &&
+    typeof entry.explorerUrl === "string" &&
+    entry.explorerUrl.startsWith("https://") &&
+    isHex32(entry.codeHash) &&
+    entry.codeHash !== ZERO_HASH &&
+    Number.isInteger(entry.decimals)
+  );
+}
+
+function deploymentRegistryBlockersForPaymentToken(registry, paymentToken, chainId) {
+  if (!isObject(registry) || registry.mode !== "live") {
+    return ["final verifier requires live deployment registry evidence for the payment token"];
+  }
+  if (asText(registry.chainId) !== asText(chainId)) {
+    return ["final verifier requires deployment registry chainId to match the chain-settleable quote"];
+  }
+  const tokenMode = tokenModeForPaymentToken(paymentToken);
+  if (tokenMode === "local-mocked") {
+    return ["final verifier refuses local-mocked token mode for chain-settleable quotes"];
+  }
+  const entries = Array.isArray(registry.entries) ? registry.entries : [];
+  const paymentTokenAddress = lowerHex(paymentToken);
+  const entry = entries.find(
+    (candidate) =>
+      candidate?.contractName === "PaymentToken" &&
+      asText(candidate.chainId) === asText(chainId) &&
+      lowerHex(candidate.address) === paymentTokenAddress &&
+      candidate.tokenMode === tokenMode,
+  );
+  if (!entry || !deploymentRegistryEntryHasLiveFields(entry)) {
+    return ["final verifier requires a live PaymentToken deployment registry entry for the chain-settleable payment token"];
+  }
+  const probeStatus = registry.officialUsdcProbe?.status;
+  if (tokenMode === "official-testnet-usdc") {
+    if (paymentTokenAddress !== BASE_SEPOLIA_USDC || asText(chainId) !== "84532") {
+      return ["final verifier only accepts official Base Sepolia USDC on chain 84532"];
+    }
+    if (probeStatus !== "passed") {
+      return ["final verifier requires official Base Sepolia USDC to include a passed official-USDC probe"];
+    }
+    return [];
+  }
+  if (probeStatus !== "failed" || asText(registry.officialUsdcProbe?.reason).length === 0) {
+    return ["final verifier requires mock token fallback to include a failed official-USDC probe reason"];
+  }
+  return [];
+}
+
 function latestReplayEvent(eventsById, kind, predicate = () => true) {
   return [...eventsById.values()]
     .filter((event) => isObject(event) && event.kind === kind && predicate(event))
@@ -2840,6 +2892,15 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
   const spends = Array.isArray(bundle.spends) ? bundle.spends : [];
   const spendsById = new Map(spends.filter(isObject).map((spend) => [spend.spendId, spend]));
   const accessTokens = Array.isArray(bundle.artifactAccessTokens) ? bundle.artifactAccessTokens : [];
+  const liveTokenRegistryBlockerSet = new Set();
+  for (const quote of quotes.filter((candidate) => candidate?.status === CHAIN_SETTLEABLE_QUOTE_STATUS)) {
+    const spend = spendsById.get(quote.spendId);
+    const tokenBlockers = deploymentRegistryBlockersForPaymentToken(bundle.deploymentRegistry, spend?.paymentToken, quote.chainId);
+    for (const blocker of tokenBlockers) {
+      liveTokenRegistryBlockerSet.add(blocker);
+    }
+  }
+  blockers.push(...liveTokenRegistryBlockerSet);
   if (quotes.length === 0) {
     blockers.push("final verifier requires at least one artifact quote bound to the payment");
   } else if (quotes.some((quote) => quote?.status === MOCK_QUOTE_STATUS)) {
@@ -2976,6 +3037,29 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     "replayPages",
   ]) {
     requirePath(bundle, [field], errors);
+  }
+  for (const field of ["deploymentRegistry", "deploymentRegistryHash"]) {
+    if (!Object.prototype.hasOwnProperty.call(bundle, field)) {
+      errors.push(`missing required field: ${field}`);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(bundle, "deploymentRegistry") && bundle.deploymentRegistry !== null && !isObject(bundle.deploymentRegistry)) {
+    errors.push("deploymentRegistry must be an object or null");
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(bundle, "deploymentRegistryHash") &&
+    bundle.deploymentRegistryHash !== null &&
+    !isHex32(bundle.deploymentRegistryHash)
+  ) {
+    errors.push("deploymentRegistryHash must be a 32-byte hash or null");
+  }
+  if (isObject(bundle.deploymentRegistry)) {
+    const deploymentRegistryHash = safeHashJson(bundle.deploymentRegistry, "deploymentRegistry", errors);
+    if (deploymentRegistryHash && bundle.deploymentRegistryHash !== deploymentRegistryHash) {
+      errors.push("deploymentRegistryHash must equal the hash of deploymentRegistry");
+    }
+  } else if (Object.prototype.hasOwnProperty.call(bundle, "deploymentRegistryHash") && bundle.deploymentRegistryHash !== null) {
+    errors.push("deploymentRegistryHash must be null when deploymentRegistry is null");
   }
   if (bundle.bundleType !== "PACTFUSE_EVIDENCE_V1") {
     errors.push("bundleType must be PACTFUSE_EVIDENCE_V1");

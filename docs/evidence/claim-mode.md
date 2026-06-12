@@ -40,7 +40,7 @@ Allowed only when all are true:
 - `SpendTripped` A/B and `SpendSettled` C are real chain events in the same session
 - artifact quote status is exactly `chain_settleable_after_preflight`, its `quoteHash` binds status, chain id, payer, agent wallet, token, market, price, and preflight fields, and the artifact access token references that quote; the quote chain id and expiry must also match the verified token settlement block, and artifact read/lease paths must still re-check the token's settlement and quote binding at use time
 - Judge Check rows for CAW boundary, source challenge, A/B trip, and C settlement are `pass`
-- `PACTFUSE_EVIDENCE_V1` replay bundle binds the CAW receipts, tx/log refs, source proof, artifact records, Agent Transcript, Judge Check rows, and verifier output under one `sessionId`
+- `PACTFUSE_EVIDENCE_V1` replay bundle binds the CAW receipts, tx/log refs, source proof, artifact records, Agent Transcript, deployment registry hash, Judge Check rows, and verifier output under one `sessionId`
 
 Headline: `Contract-enforced source fuse behind a Cobo Pact target allowlist`.
 

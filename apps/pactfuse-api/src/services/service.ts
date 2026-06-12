@@ -132,6 +132,7 @@ type AuthorizedPublicClaimRecord = {
 };
 type ReplaySnapshotOptions = {
   asOfEventSeq?: number;
+  deploymentRegistry?: ProofBundleAuthorizationSnapshot["deploymentRegistry"];
 };
 const REPLAY_SUMMARY_LIMIT = 200;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -4866,7 +4867,10 @@ export async function readProofBundle(sessionId: string, ctx: ServiceCtx): Promi
       error: proofPendingError(requestId, "proof bundle export requires the latest event to be public.claim.authorized"),
     };
   }
-  const replayBundle = finalClaimReplayBundleData(parsedSessionId, ctx, { asOfEventSeq: latestClaim.asOfEventSeq });
+  const replayBundle = finalClaimReplayBundleData(parsedSessionId, ctx, {
+    asOfEventSeq: latestClaim.asOfEventSeq,
+    deploymentRegistry: latestClaim.snapshot.deploymentRegistry,
+  });
   const replayBundleHash = hashJson(replayBundle);
   if (replayBundleHash !== latestClaim.claim.replayBundleHash) {
     return {
@@ -5504,6 +5508,7 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx, options: R
   const canonicalCawReceipts = listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const leaseRuns = listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const agentTranscript = buildAgentTranscriptData(sessionId, ctx, mcpAdapterCalls.length);
+  const deploymentRegistry = options.deploymentRegistry ?? ctx.deploymentRegistry ?? null;
   const replayPageIndex = replayPageIndexFor(ctx, sessionId, options);
   return ReplayBundleViewSchema.parse({
     bundleType: "PACTFUSE_EVIDENCE_V1",
@@ -5515,6 +5520,8 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx, options: R
     eventRoot: hashJson(events.map((event) => event.eventHash)),
     agentTranscriptHash: hashJson(agentTranscript),
     fullReplayRoot: replayPageIndex.pageRoot,
+    deploymentRegistry,
+    deploymentRegistryHash: deploymentRegistry ? hashJson(deploymentRegistry) : null,
     events,
     sources,
     spends,
@@ -12367,6 +12374,14 @@ function verifyReplayBundleBindings(
   if (bundle.agentTranscriptHash !== hashJson(buildAgentTranscriptData(sessionId, ctx, asOfCount))) {
     errors.push("replayBundle.agentTranscriptHash does not match the server transcript snapshot");
   }
+  const expectedDeploymentRegistry = ctx.deploymentRegistry ?? null;
+  compareReplaySnapshot(errors, "replayBundle.deploymentRegistry", bundle.deploymentRegistry, expectedDeploymentRegistry);
+  compareReplaySnapshot(
+    errors,
+    "replayBundle.deploymentRegistryHash",
+    bundle.deploymentRegistryHash,
+    expectedDeploymentRegistry ? hashJson(expectedDeploymentRegistry) : null,
+  );
   compareReplaySnapshot(errors, "replayBundle.events", bundle.events, expectedEvents);
   compareReplaySnapshot(errors, "replayBundle.sources", bundle.sources, listSources(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.spends", bundle.spends, listSpends(ctx, sessionId, REPLAY_SUMMARY_LIMIT));

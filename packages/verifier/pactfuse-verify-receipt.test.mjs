@@ -129,6 +129,37 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.winnerClaimAllowed).toBe(true);
   });
 
+  it("keeps final authority closed when token deployment registry evidence is missing", () => {
+    const bundle = replayBundleWithLease();
+    promoteFirstQuoteToChainSettleableForTest(bundle);
+    appendCawIdentityProbeForTest(bundle);
+    const denyProbe = appendCawDenyProbeForTest(bundle);
+    appendFinalCawReceiptCoverageForTest(bundle, denyProbe);
+    appendFinalTripProofsForTest(bundle);
+    const sourceEvent = appendFinalSourceChallengeForTest(bundle);
+    appendArtifactAccessEventForTest(bundle);
+    passJudgeRowForTest(bundle, "source_challenge", "proof", sourceEvent.eventId, "finalized source challenge proof");
+    passJudgeRowForTest(bundle, "c_settlement", "proof", latestEventForTest(bundle, "token.balance_delta.verified").eventId, "token balance delta settled");
+    bundle.deploymentRegistry = null;
+    bundle.deploymentRegistryHash = null;
+    bundle.winnerClaimAllowed = true;
+    refreshReplayPagingForTest(bundle);
+
+    const result = verifyEvidence(
+      bundle,
+      createServerRuntimeVerifierOptions({
+        cliMode: "proof-chip",
+        proofProviders: liveProofProvidersForTest(),
+      }),
+    );
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.winnerClaimAllowed).toBe(false);
+    expect(result.proofCompletenessErrors).toContain("final verifier requires live deployment registry evidence for the payment token");
+  });
+
   it("rejects caller-supplied live provider flags without server runtime authority", () => {
     const bundle = replayBundle();
     const result = verifyEvidence(bundle, {
@@ -946,6 +977,7 @@ function replayBundle() {
   const agentWallet = "0x1000000000000000000000000000000000000001";
   const paymentToken = "0x4000000000000000000000000000000000000004";
   const market = "0x5000000000000000000000000000000000000005";
+  const deploymentRegistry = deploymentRegistryForTest(paymentToken);
 	  const quoteHash = hashJson({
 	    sessionId,
 	    spendId,
@@ -977,6 +1009,8 @@ function replayBundle() {
     eventRoot: ZERO_HASH,
     agentTranscriptHash: hashJson(agentTranscriptForTest(sessionId, [])),
     fullReplayRoot: ZERO_HASH,
+    deploymentRegistry,
+    deploymentRegistryHash: hashJson(deploymentRegistry),
     events,
     sources: [],
     spends: [
@@ -3033,6 +3067,30 @@ function lockedRuntimeModes() {
     TOKEN_MODE: "local-mocked",
     IDENTITY_MODE: "pending",
     WINNER_CLAIM_ALLOWED: false,
+  };
+}
+
+function deploymentRegistryForTest(paymentToken) {
+  return {
+    mode: "live",
+    chainId: "84532",
+    officialUsdcProbe: {
+      status: "failed",
+      reason: "test fixture uses mock token after official USDC probe failed",
+    },
+    entries: [
+      {
+        contractName: "PaymentToken",
+        chainId: "84532",
+        address: paymentToken,
+        deploymentTxHash: hex32("test-payment-token-deploy"),
+        explorerUrl: "https://sepolia.basescan.org/tx/0x0000000000000000000000000000000000000000000000000000000000000000",
+        codeHash: hex32("test-payment-token-code"),
+        tokenMode: "mock-test-token",
+        symbol: "MOCK",
+        decimals: 18,
+      },
+    ],
   };
 }
 

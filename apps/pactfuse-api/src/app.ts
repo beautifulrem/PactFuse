@@ -304,6 +304,8 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "winnerClaimAllowed",
     "eventRoot",
     "fullReplayRoot",
+    "deploymentRegistry",
+    "deploymentRegistryHash",
     "mcpAdapterCalls",
     "cawReceiptOperations",
     "cawLiveInteractions",
@@ -1895,6 +1897,8 @@ function buildOpenApi(): Record<string, unknown> {
             "eventRoot",
             "agentTranscriptHash",
             "fullReplayRoot",
+            "deploymentRegistry",
+            "deploymentRegistryHash",
             "events",
             "sources",
             "spends",
@@ -1921,6 +1925,8 @@ function buildOpenApi(): Record<string, unknown> {
             eventRoot: { type: "string" },
             agentTranscriptHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             fullReplayRoot: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            deploymentRegistry: { anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }] },
+            deploymentRegistryHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
             events: {
               type: "array",
               items: {
