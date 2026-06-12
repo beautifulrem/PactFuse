@@ -375,6 +375,17 @@ describe("pactfuse-api P0", () => {
     expect(result.stderr).toContain("proof-bundle verifierRun proofLevel is not final_replay_claim");
   });
 
+  it("live-smoke rejects a self-consistent public-claim and verifier mode mismatch", async () => {
+    const result = await runLiveSmokeAgainstStub(undefined, (fixture) => {
+      const claim = fixture.claim as { verifierRun: Record<string, unknown> };
+      claim.verifierRun.tokenMode = "local-mocked";
+      resealLiveSmokeProofBundleForTest(fixture.proofBundle);
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("proof-bundle publicClaim.tokenMode does not match verifierRun.tokenMode");
+  });
+
   it("fails closed when protected mutation role tokens are missing unless test/dev mode explicitly opts in", async () => {
     const secure = makeApp(":memory:", {
       apiSecurity: {

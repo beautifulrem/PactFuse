@@ -195,6 +195,7 @@ function verifyProofBundleHashes(proofBundle, claim) {
     },
   );
   verifyPublicClaimVerifierRun(proofBundle);
+  verifyPublicClaimModeAlignment(proofBundle);
   verifyReplayDeploymentRegistryBinding(proofBundle);
   verifyPublicClaimDeploymentRegistry(proofBundle);
   assert(hashJson(proofBundle.replayBundle) === proofBundle.replayBundleHash, "proof-bundle replayBundleHash does not recompute", {
@@ -240,6 +241,28 @@ function verifyPublicClaimVerifierRun(proofBundle) {
   assert(verifierRun.requestedWinnerClaimAllowed === true, "proof-bundle verifierRun requestedWinnerClaimAllowed is not true", verifierRun);
   assert(Array.isArray(verifierRun.errors) && verifierRun.errors.length === 0, "proof-bundle verifierRun errors is not empty", verifierRun);
   assert(Array.isArray(verifierRun.warnings) && verifierRun.warnings.length === 0, "proof-bundle verifierRun warnings is not empty", verifierRun);
+}
+
+function verifyPublicClaimModeAlignment(proofBundle) {
+  const claim = proofBundle.publicClaim;
+  const verifierRun = claim?.verifierRun;
+  assert(isObject(claim) && isObject(verifierRun), "proof-bundle publicClaim/verifierRun is missing", claim);
+  for (const field of ["claimMode", "paymentMode", "tokenMode", "identityMode"]) {
+    assert(claim[field] === verifierRun[field], `proof-bundle publicClaim.${field} does not match verifierRun.${field}`, {
+      publicClaim: claim[field],
+      verifierRun: verifierRun[field],
+    });
+  }
+  for (const field of ["proofChipAllowed", "finalVerifierComplete", "winnerClaimAllowed"]) {
+    assert(claim[field] === verifierRun[field], `proof-bundle publicClaim.${field} does not match verifierRun.${field}`, {
+      publicClaim: claim[field],
+      verifierRun: verifierRun[field],
+    });
+  }
+  assert(proofBundle.winnerClaimAllowed === claim.winnerClaimAllowed, "proof-bundle winnerClaimAllowed does not match publicClaim", {
+    proofBundle: proofBundle.winnerClaimAllowed,
+    publicClaim: claim.winnerClaimAllowed,
+  });
 }
 
 function verifyProofBundleProviderStatuses(proofBundle) {
