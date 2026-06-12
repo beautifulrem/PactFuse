@@ -1334,6 +1334,57 @@ describe("pactfuse-api P0", () => {
     );
   });
 
+  it("does not pass the mock token deployment registry gate without a failed official USDC probe", async () => {
+    const registry = testDeploymentRegistry();
+    const { app, ctx } = makeApp(":memory:", {
+      deploymentRegistry: {
+        ...registry,
+        officialUsdcProbe: {
+          status: "not_attempted",
+          reason: "official USDC probe was not recorded",
+        },
+      },
+    });
+    const sessionId = await createSession(app, "sess-registry-mock-requires-official-probe");
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "token.balance_delta.verified",
+      payload: {
+        spendId: hex32("registry-mock-probe-spend"),
+        settlementEventId: hex32("registry-mock-probe-settlement"),
+        txHash: hex32("registry-mock-probe-tx"),
+        chainProviderMode: "live",
+        chainId: "84532",
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const registryGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry");
+
+    expect(res.status).toBe(200);
+    expect(json.data.targetTokenMode).toBe("mock-test-token");
+    expect(registryGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        evidenceEventId: null,
+        reason: "mock token fallback requires a failed official-USDC probe reason",
+      }),
+    );
+    expect(json.data.requiredExternalInputs).toContain(
+      "live deployment registry for the payment token address, deployment tx, explorer URL, decimals, and code hash",
+    );
+  });
+
   it("does not pass the official USDC registry gate without a passed probe and live registry entry", async () => {
     const { app, ctx } = makeApp(":memory:", {
       deploymentRegistry: {

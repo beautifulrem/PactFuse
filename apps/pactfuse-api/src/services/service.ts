@@ -5268,7 +5268,9 @@ function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent 
       candidate.address.toLowerCase() === paymentToken &&
       candidate.tokenMode === "mock-test-token",
   );
-  const pass = registry?.mode === "live" && Boolean(entry && isLiveDeploymentRegistryEntry(entry));
+  const liveEntry = Boolean(entry && isLiveDeploymentRegistryEntry(entry));
+  const fallbackProbeRecorded = registry?.officialUsdcProbe?.status === "failed";
+  const pass = registry?.mode === "live" && liveEntry && fallbackProbeRecorded;
   return {
     gateId: "token_deployment_registry",
     label: "Token deployment registry",
@@ -5276,7 +5278,9 @@ function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent 
     blocks,
     reason: pass
       ? `mock token deployment registry binds ${entry?.symbol ?? "PaymentToken"} on chain ${chainId}`
-      : "missing live deployment registry entry for the mock payment token",
+      : liveEntry
+        ? "mock token fallback requires a failed official-USDC probe reason"
+        : "missing live deployment registry entry for the mock payment token",
     evidenceEventId: pass ? tokenDelta.eventId : null,
   };
 }
