@@ -61,7 +61,7 @@ Headline: `Cobo param-bound source fuse`.
 W1 default order: probe `official-testnet-usdc` (Circle Base Sepolia USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e`) FIRST at hour 0; `mock-test-token` is the fallback rung and the fallback reason must be recorded in `docs/evidence/mock-token.json`.
 
 - `official-testnet-usdc`: requires official/sponsor token evidence for the exact chain/address, a passed Base Sepolia USDC probe, and a live registry entry for the official token.
-- `mock-test-token`: requires public testnet mock ERC20 deployment evidence in `docs/evidence/mock-token.json` plus the recorded official-USDC probe failure reason. Runtime claim readiness also requires a live deployment registry entry with non-zero deployment transaction hash, non-zero code hash, public HTTPS explorer URL, decimals, and the exact payment-token address.
+- `mock-test-token`: requires public testnet mock ERC20 deployment evidence in `docs/evidence/mock-token.json` plus the recorded official-USDC probe failure reason. Runtime claim readiness also requires a live deployment registry entry with non-zero deployment transaction hash, a public HTTPS explorer URL that points to that transaction, a deployment receipt whose `contractAddress` matches the exact payment-token address, `codeHash = keccak256(eth_getCode(address))`, and ERC20 `decimals()`/`symbol()` metadata matching the registry.
 - `local-mocked`: local only, not a winner claim.
 
 ## Identity Mode Rules

@@ -58,6 +58,7 @@ export type ChainClient = {
   status: () => Promise<ProofProviderStatus>;
   getBlockNumber: () => Promise<number>;
   getTransactionReceipt: (txHash: string) => Promise<Record<string, unknown>>;
+  getCode: (address: string) => Promise<string>;
   getLogs: (input: Record<string, unknown>) => Promise<Record<string, unknown>[]>;
   readContract: (input: {
     address: string;

@@ -1348,7 +1348,7 @@ describe("pactfuse-api P0", () => {
     expect(json.data.requiredExternalInputs).toContain("PACTFUSE_LEASE_MCP_URL for a live MCP lease runner");
     expect(json.data.requiredExternalInputs).toContain("raw CAW API/export receipts canonicalized for deny_probe, approve, and activate_tool");
     expect(json.data.requiredExternalInputs).toContain(
-      "live deployment registry for the payment token address, deployment tx, explorer URL, decimals, and code hash",
+      "live deployment registry whose tx receipt, bytecode hash, explorer URL, decimals, and symbol match the payment token",
     );
     expect(json.data.requiredExternalInputs).toContain("full chain/signature/hash verifier that can set finalVerifierComplete=true");
     expect(json.data.verifierRun.winnerClaimAllowed).toBe(false);
@@ -1402,7 +1402,7 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(json.data.requiredExternalInputs).toContain(
-      "live deployment registry for the payment token address, deployment tx, explorer URL, decimals, and code hash",
+      "live deployment registry whose tx receipt, bytecode hash, explorer URL, decimals, and symbol match the payment token",
     );
   });
 
@@ -1449,6 +1449,294 @@ describe("pactfuse-api P0", () => {
         status: "pending",
         evidenceEventId: null,
         reason: "missing live deployment registry entry for the mock payment token",
+      }),
+    );
+  });
+
+  it("does not pass the mock token deployment registry gate with a localhost explorer URL", async () => {
+    const registry = testDeploymentRegistry();
+    const { app, ctx } = makeApp(":memory:", {
+      deploymentRegistry: {
+        ...registry,
+        entries: registry.entries.map((entry) => ({
+          ...entry,
+          explorerUrl: `https://localhost/tx/${entry.deploymentTxHash}`,
+        })),
+      },
+    });
+    const sessionId = await createSession(app, "sess-registry-localhost-explorer");
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "token.balance_delta.verified",
+      payload: {
+        spendId: hex32("registry-localhost-explorer-spend"),
+        settlementEventId: hex32("registry-localhost-explorer-settlement"),
+        txHash: hex32("registry-localhost-explorer-tx"),
+        chainProviderMode: "live",
+        chainId: "84532",
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const registryGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry");
+
+    expect(res.status).toBe(200);
+    expect(registryGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        evidenceEventId: null,
+        reason: "missing live deployment registry entry for the mock payment token",
+      }),
+    );
+  });
+
+  it("does not pass the mock token deployment registry gate when live bytecode hash does not match the registry", async () => {
+    const registry = testDeploymentRegistry();
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({
+        contractCodes: {
+          [TEST_PAYMENT_TOKEN_ADDRESS.toLowerCase()]: "0x6002600055",
+        },
+      }),
+      deploymentRegistry: registry,
+    });
+    const sessionId = await createSession(app, "sess-registry-codehash-mismatch");
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "token.balance_delta.verified",
+      payload: {
+        spendId: hex32("registry-codehash-mismatch-spend"),
+        settlementEventId: hex32("registry-codehash-mismatch-settlement"),
+        txHash: hex32("registry-codehash-mismatch-tx"),
+        chainProviderMode: "live",
+        chainId: "84532",
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const registryGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry");
+
+    expect(res.status).toBe(200);
+    expect(registryGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        evidenceEventId: null,
+        reason: "mock token deployment registry entry failed live chain verification: registry codeHash does not match eth_getCode bytecode hash",
+      }),
+    );
+  });
+
+  it("does not pass the mock token deployment registry gate when the deployment receipt hash is missing", async () => {
+    const registry = testDeploymentRegistry();
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({
+        deploymentReceipts: {
+          [TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH.toLowerCase()]: {
+            blockNumber: 99,
+            status: "success",
+            contractAddress: TEST_PAYMENT_TOKEN_ADDRESS,
+          },
+        },
+      }),
+      deploymentRegistry: registry,
+    });
+    const sessionId = await createSession(app, "sess-registry-receipt-missing-hash");
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "token.balance_delta.verified",
+      payload: {
+        spendId: hex32("registry-receipt-missing-hash-spend"),
+        settlementEventId: hex32("registry-receipt-missing-hash-settlement"),
+        txHash: hex32("registry-receipt-missing-hash-tx"),
+        chainProviderMode: "live",
+        chainId: "84532",
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const registryGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry");
+
+    expect(res.status).toBe(200);
+    expect(registryGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        evidenceEventId: null,
+        reason: "mock token deployment registry entry failed live chain verification: deployment receipt hash does not match registry deploymentTxHash",
+      }),
+    );
+  });
+
+  it("does not pass the mock token deployment registry gate when the deployment receipt does not bind the token address", async () => {
+    const registry = testDeploymentRegistry();
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({
+        deploymentReceipts: {
+          [TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH.toLowerCase()]: {
+            transactionHash: TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH,
+            blockNumber: 99,
+            status: "success",
+          },
+        },
+      }),
+      deploymentRegistry: registry,
+    });
+    const sessionId = await createSession(app, "sess-registry-receipt-no-contract");
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "token.balance_delta.verified",
+      payload: {
+        spendId: hex32("registry-receipt-no-contract-spend"),
+        settlementEventId: hex32("registry-receipt-no-contract-settlement"),
+        txHash: hex32("registry-receipt-no-contract-tx"),
+        chainProviderMode: "live",
+        chainId: "84532",
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const registryGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry");
+
+    expect(res.status).toBe(200);
+    expect(registryGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        evidenceEventId: null,
+        reason: "mock token deployment registry entry failed live chain verification: deployment receipt does not expose a contractAddress",
+      }),
+    );
+  });
+
+  it("does not pass the mock token deployment registry gate when the deployment receipt status is not successful", async () => {
+    const registry = testDeploymentRegistry();
+    const { app, ctx } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({
+        deploymentReceipts: {
+          [TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH.toLowerCase()]: {
+            transactionHash: TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH,
+            blockNumber: 99,
+            status: "failed",
+            contractAddress: TEST_PAYMENT_TOKEN_ADDRESS,
+          },
+        },
+      }),
+      deploymentRegistry: registry,
+    });
+    const sessionId = await createSession(app, "sess-registry-receipt-failed");
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "token.balance_delta.verified",
+      payload: {
+        spendId: hex32("registry-receipt-failed-spend"),
+        settlementEventId: hex32("registry-receipt-failed-settlement"),
+        txHash: hex32("registry-receipt-failed-tx"),
+        chainProviderMode: "live",
+        chainId: "84532",
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const registryGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry");
+
+    expect(res.status).toBe(200);
+    expect(registryGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        evidenceEventId: null,
+        reason: "mock token deployment registry entry failed live chain verification: deployment transaction receipt is not explicitly successful",
+      }),
+    );
+  });
+
+  it("does not pass the mock token deployment registry gate when the registry chainId does not match settlement chain", async () => {
+    const registry = testDeploymentRegistry();
+    const { app, ctx } = makeApp(":memory:", {
+      deploymentRegistry: {
+        ...registry,
+        chainId: "1",
+      },
+    });
+    const sessionId = await createSession(app, "sess-registry-chain-mismatch");
+    appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "token.balance_delta.verified",
+      payload: {
+        spendId: hex32("registry-chain-mismatch-spend"),
+        settlementEventId: hex32("registry-chain-mismatch-settlement"),
+        txHash: hex32("registry-chain-mismatch-tx"),
+        chainProviderMode: "live",
+        chainId: "84532",
+        paymentToken: TEST_PAYMENT_TOKEN_ADDRESS,
+        agentWallet: TEST_PAYER_ADDRESS,
+        market: TEST_MARKET_ADDRESS,
+        amountAtomic: "1000",
+        agentDeltaAtomic: "-1000",
+        marketDeltaAtomic: "1000",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const registryGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "token_deployment_registry");
+
+    expect(res.status).toBe(200);
+    expect(registryGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        evidenceEventId: null,
+        reason: "mock token deployment registry chainId does not match the token settlement chainId",
       }),
     );
   });
@@ -1500,7 +1788,7 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(json.data.requiredExternalInputs).toContain(
-      "live deployment registry for the payment token address, deployment tx, explorer URL, decimals, and code hash",
+      "live deployment registry whose tx receipt, bytecode hash, explorer URL, decimals, and symbol match the payment token",
     );
   });
 
@@ -1552,7 +1840,7 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(json.data.requiredExternalInputs).toContain(
-      "live deployment registry for the payment token address, deployment tx, explorer URL, decimals, and code hash",
+      "live deployment registry whose tx receipt, bytecode hash, explorer URL, decimals, and symbol match the payment token",
     );
   });
 
@@ -8678,6 +8966,9 @@ async function quoteArtifactForTest(
 const INDEXER_ADDRESS = "0x1111111111111111111111111111111111111111";
 const TEST_PAYER_ADDRESS = "0x1000000000000000000000000000000000000001";
 const TEST_PAYMENT_TOKEN_ADDRESS = "0x4000000000000000000000000000000000000004";
+const TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH = hex32("test-payment-token-deploy");
+const TEST_PAYMENT_TOKEN_CODE = "0x6001600055" as const;
+const TEST_PAYMENT_TOKEN_CODE_HASH = keccak256(TEST_PAYMENT_TOKEN_CODE);
 const TEST_MARKET_ADDRESS = "0x5000000000000000000000000000000000000005";
 const BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
 const TEST_PACT_ID = hex32("pact-c");
@@ -8686,7 +8977,7 @@ const TEST_ARTIFACT_PAYLOAD = Object.freeze({ artifactType: "source-bound-code-s
 const TEST_ARTIFACT_HASH = hashForTestJson(TEST_ARTIFACT_PAYLOAD);
 
 function testDeploymentRegistry(): NonNullable<ServiceCtx["deploymentRegistry"]> {
-  const deploymentTxHash = hex32("test-payment-token-deploy");
+  const deploymentTxHash = TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH;
   return {
     mode: "live",
     chainId: "84532",
@@ -8701,7 +8992,7 @@ function testDeploymentRegistry(): NonNullable<ServiceCtx["deploymentRegistry"]>
         address: TEST_PAYMENT_TOKEN_ADDRESS,
         deploymentTxHash,
         explorerUrl: `https://sepolia.basescan.org/tx/${deploymentTxHash}`,
-        codeHash: hex32("test-payment-token-code"),
+        codeHash: TEST_PAYMENT_TOKEN_CODE_HASH,
         tokenMode: "mock-test-token",
         symbol: "MOCK",
         decimals: 18,
@@ -8779,6 +9070,9 @@ function createFakeIndexerChainClient(config: {
   }>;
   sourceStates?: Record<string, number>;
   tokenBalances?: Record<string, string>;
+  contractCodes?: Record<string, string>;
+  tokenMetadata?: Record<string, { decimals: number; symbol: string }>;
+  deploymentReceipts?: Record<string, Record<string, unknown>>;
   ignoreAddressFilter?: boolean;
 }): ChainClient {
   return {
@@ -8795,6 +9089,19 @@ function createFakeIndexerChainClient(config: {
       return config.currentBlockNumber ?? 101;
     },
     async getTransactionReceipt(txHash: string) {
+      const configuredReceipt = config.deploymentReceipts?.[txHash.toLowerCase()];
+      if (configuredReceipt) {
+        return configuredReceipt;
+      }
+      if (txHash.toLowerCase() === TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH.toLowerCase()) {
+        return {
+          transactionHash: txHash,
+          blockNumber: 99,
+          status: "success",
+          contractAddress: TEST_PAYMENT_TOKEN_ADDRESS,
+          to: null,
+        };
+      }
       const matchingLog = (config.logs ?? []).find((log) => {
         return typeof log.transactionHash === "string" && log.transactionHash.toLowerCase() === txHash.toLowerCase();
       });
@@ -8803,6 +9110,13 @@ function createFakeIndexerChainClient(config: {
         blockNumber: matchingLog?.blockNumber ?? config.currentBlockNumber ?? 101,
         status: "success",
       };
+    },
+    async getCode(address: string) {
+      const normalized = address.toLowerCase();
+      if (config.contractCodes?.[normalized] !== undefined) {
+        return config.contractCodes[normalized];
+      }
+      return normalized === TEST_PAYMENT_TOKEN_ADDRESS.toLowerCase() ? TEST_PAYMENT_TOKEN_CODE : "0x";
     },
     async getLogs(query: Record<string, unknown>) {
       if (config.getLogsError) {
@@ -8920,6 +9234,14 @@ function createFakeIndexerChainClient(config: {
           throw new Error(`missing fake allowance for ${token}:${owner}:${spender}:${blockNumber}`);
         }
         return allowance;
+      }
+      if (input.functionName === "decimals") {
+        const token = input.address.toLowerCase();
+        return config.tokenMetadata?.[token]?.decimals ?? (token === TEST_PAYMENT_TOKEN_ADDRESS.toLowerCase() ? 18 : 0);
+      }
+      if (input.functionName === "symbol") {
+        const token = input.address.toLowerCase();
+        return config.tokenMetadata?.[token]?.symbol ?? (token === TEST_PAYMENT_TOKEN_ADDRESS.toLowerCase() ? "MOCK" : "");
       }
       throw new Error(`unsupported fake contract read: ${input.functionName}`);
     },
@@ -9058,6 +9380,9 @@ function createFakeGateChainClient(currentBlockNumber = 101, chainId = "84532"):
         blockNumber: 100,
         status: "success",
       };
+    },
+    async getCode() {
+      return "0x";
     },
     async getLogs(input: Record<string, unknown>) {
       if (input.reorged === true) {

@@ -78,6 +78,7 @@ import {
   type CawLiveIdentityProbePayload,
   type CawLivePactSubmitPayload,
   type CawLiveTransferSubmitPayload,
+  type DeploymentRegistryEntry,
   type TokenBalanceDeltaVerifyPayload,
   type VerifierRunView,
 } from "@pactfuse/evidence-schema";
@@ -281,6 +282,24 @@ const ERC20_ALLOWANCE_ABI = [
       { name: "spender", type: "address" },
     ],
     outputs: [{ name: "", type: "uint256" }],
+  },
+] as const;
+const ERC20_DECIMALS_ABI = [
+  {
+    type: "function",
+    name: "decimals",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "uint8" }],
+  },
+] as const;
+const ERC20_SYMBOL_ABI = [
+  {
+    type: "function",
+    name: "symbol",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "string" }],
   },
 ] as const;
 const PROCUREMENT_GATE_ACTIVATE_TOOL_ABI = [
@@ -4419,7 +4438,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
   const cawAllowance = latestKind("caw.allowance.verified");
   const cawActivation = latestKind("caw.activation.verified");
   const tokenDelta = latest((event) => event.kind === "token.balance_delta.verified" && isLiveChainProofPayload(eventPayload(event)));
-  const tokenDeployment = tokenDeploymentRegistryGate(ctx, tokenDelta);
+  const tokenDeployment = await tokenDeploymentRegistryGate(ctx, tokenDelta);
   const liveArtifactQuote = hasLiveArtifactQuote(replayBundle);
   const gates = [
     providerGate(proofProviders, "chain", ["paymentMode", "tokenMode", "winnerClaimAllowed"]),
@@ -5224,7 +5243,7 @@ function tokenModeForPaymentToken(paymentToken: string): "official-testnet-usdc"
   return normalized ? "mock-test-token" : null;
 }
 
-function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent | null): ClaimReadinessGate {
+async function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent | null): Promise<ClaimReadinessGate> {
   const blocks: ClaimGateBlock[] = ["tokenMode", "winnerClaimAllowed"];
   if (!tokenDelta) {
     return {
@@ -5241,6 +5260,7 @@ function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent 
   const paymentToken = String(payload.paymentToken ?? "").toLowerCase();
   const tokenMode = tokenModeForPaymentToken(paymentToken);
   const registry = ctx.deploymentRegistry;
+  const registryChainMatches = registry?.mode === "live" && String(registry.chainId) === chainId;
   if (tokenMode === "official-testnet-usdc") {
     const entry = registry?.entries.find(
       (candidate) =>
@@ -5251,18 +5271,25 @@ function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent 
     );
     const pass =
       chainId === "84532" &&
-      registry?.mode === "live" &&
+      registryChainMatches &&
       registry.officialUsdcProbe?.status === "passed" &&
       Boolean(entry && isLiveDeploymentRegistryEntry(entry));
+    const chainProof = pass ? await verifyDeploymentRegistryEntryOnChain(ctx, entry, chainId) : { pass: false, reason: "" };
+    const reason =
+      pass && chainProof.pass
+        ? "official Base Sepolia USDC registry and probe evidence are live"
+        : pass
+          ? `official USDC registry entry failed live chain verification: ${chainProof.reason}`
+          : registry?.mode === "live" && String(registry.chainId) !== chainId
+            ? "official USDC token mode requires deployment registry chainId to match the token settlement chainId"
+            : "official USDC token mode requires Base Sepolia chainId 84532, passed USDC probe evidence, and a live registry entry";
     return {
       gateId: "token_deployment_registry",
       label: "Token deployment registry",
-      status: pass ? "pass" : "pending",
+      status: pass && chainProof.pass ? "pass" : "pending",
       blocks,
-      reason: pass
-        ? "official Base Sepolia USDC registry and probe evidence are live"
-        : "official USDC token mode requires Base Sepolia chainId 84532, passed USDC probe evidence, and a live registry entry",
-      evidenceEventId: pass ? tokenDelta.eventId : null,
+      reason,
+      evidenceEventId: pass && chainProof.pass ? tokenDelta.eventId : null,
     };
   }
   const entry = registry?.entries.find(
@@ -5274,19 +5301,85 @@ function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent 
   );
   const liveEntry = Boolean(entry && isLiveDeploymentRegistryEntry(entry));
   const fallbackProbeRecorded = registry?.officialUsdcProbe?.status === "failed";
-  const pass = registry?.mode === "live" && liveEntry && fallbackProbeRecorded;
+  const pass = registryChainMatches && liveEntry && fallbackProbeRecorded;
+  const chainProof = pass ? await verifyDeploymentRegistryEntryOnChain(ctx, entry, chainId) : { pass: false, reason: "" };
+  const reason =
+    pass && chainProof.pass
+      ? `mock token deployment registry binds ${entry?.symbol ?? "PaymentToken"} on chain ${chainId}`
+      : pass
+        ? `mock token deployment registry entry failed live chain verification: ${chainProof.reason}`
+        : registry?.mode === "live" && String(registry.chainId) !== chainId
+          ? "mock token deployment registry chainId does not match the token settlement chainId"
+          : liveEntry
+            ? "mock token fallback requires a failed official-USDC probe reason"
+            : "missing live deployment registry entry for the mock payment token";
   return {
     gateId: "token_deployment_registry",
     label: "Token deployment registry",
-    status: pass ? "pass" : "pending",
+    status: pass && chainProof.pass ? "pass" : "pending",
     blocks,
-    reason: pass
-      ? `mock token deployment registry binds ${entry?.symbol ?? "PaymentToken"} on chain ${chainId}`
-      : liveEntry
-        ? "mock token fallback requires a failed official-USDC probe reason"
-        : "missing live deployment registry entry for the mock payment token",
-    evidenceEventId: pass ? tokenDelta.eventId : null,
+    reason,
+    evidenceEventId: pass && chainProof.pass ? tokenDelta.eventId : null,
   };
+}
+
+async function verifyDeploymentRegistryEntryOnChain(
+  ctx: ServiceCtx,
+  entry: DeploymentRegistryEntry | undefined,
+  chainId: string,
+): Promise<{ pass: boolean; reason: string }> {
+  if (!entry) {
+    return { pass: false, reason: "entry is missing" };
+  }
+  try {
+    const provider = await ctx.chain.status();
+    if (provider.ready !== true || provider.mode !== "live") {
+      return { pass: false, reason: `chain provider is not live-ready: ${provider.reason}` };
+    }
+    if (provider.chainId && String(provider.chainId) !== chainId) {
+      return { pass: false, reason: `chain provider chainId ${provider.chainId} does not match registry chainId ${chainId}` };
+    }
+
+    const receipt = await ctx.chain.getTransactionReceipt(entry.deploymentTxHash);
+    const receiptTxHash = optionalHex(receipt.transactionHash ?? receipt.txHash ?? receipt.hash);
+    if (!receiptTxHash || receiptTxHash.toLowerCase() !== entry.deploymentTxHash.toLowerCase()) {
+      return { pass: false, reason: "deployment receipt hash does not match registry deploymentTxHash" };
+    }
+    const receiptStatus = receipt.status;
+    if (!isSuccessfulReceiptStatus(receiptStatus)) {
+      return { pass: false, reason: "deployment transaction receipt is not explicitly successful" };
+    }
+    const deployedAddress = optionalEvmAddressText(receipt.contractAddress);
+    if (!deployedAddress) {
+      return { pass: false, reason: "deployment receipt does not expose a contractAddress" };
+    }
+    if (deployedAddress !== entry.address.toLowerCase()) {
+      return { pass: false, reason: "deployment receipt contractAddress does not match registry token address" };
+    }
+
+    const code = await ctx.chain.getCode(entry.address);
+    if (!code || code === "0x") {
+      return { pass: false, reason: "registry token address has no bytecode" };
+    }
+    const codeHash = keccak256(code as `0x${string}`);
+    if (codeHash.toLowerCase() !== entry.codeHash.toLowerCase()) {
+      return { pass: false, reason: "registry codeHash does not match eth_getCode bytecode hash" };
+    }
+
+    const decimals = await ctx.chain.readContract({ address: entry.address, abi: ERC20_DECIMALS_ABI, functionName: "decimals" });
+    if (Number(decimals) !== entry.decimals) {
+      return { pass: false, reason: "registry decimals does not match ERC20 decimals()" };
+    }
+    if (entry.symbol) {
+      const symbol = await ctx.chain.readContract({ address: entry.address, abi: ERC20_SYMBOL_ABI, functionName: "symbol" });
+      if (String(symbol) !== entry.symbol) {
+        return { pass: false, reason: "registry symbol does not match ERC20 symbol()" };
+      }
+    }
+    return { pass: true, reason: "deployment registry entry matches live chain receipt, bytecode, and ERC20 metadata" };
+  } catch (error) {
+    return { pass: false, reason: chainFailureMessage("deployment registry live chain verification failed", error) };
+  }
 }
 
 function isLiveDeploymentRegistryEntry(entry: {
@@ -5321,10 +5414,14 @@ function isPublicExplorerUrl(value: string): boolean {
       return false;
     }
     const host = url.hostname.toLowerCase();
-    return host !== "example.com" && !host.endsWith(".example.com");
+    return host !== "example.com" && !host.endsWith(".example.com") && host !== "localhost" && !host.endsWith(".localhost");
   } catch {
     return false;
   }
+}
+
+function isSuccessfulReceiptStatus(value: unknown): boolean {
+  return value === "success" || value === "0x1" || value === 1 || value === true;
 }
 
 function identityTargetMode(event: EvidenceEvent): "p0-win-separate-identities" | "p0-floor-one-wallet" {
@@ -5398,7 +5495,7 @@ function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: C
       inputs.add("public ERC20 token tx/log/balance evidence for the finalized settlement");
     }
     if (gate.gateId === "token_deployment_registry") {
-      inputs.add("live deployment registry for the payment token address, deployment tx, explorer URL, decimals, and code hash");
+      inputs.add("live deployment registry whose tx receipt, bytecode hash, explorer URL, decimals, and symbol match the payment token");
     }
     if (gate.gateId === "artifact_quote_live") {
       inputs.add("chain-settleable artifact quote issued after preflight");
@@ -9089,6 +9186,10 @@ function normalizeChainJson(value: unknown): JsonValue {
 
 function optionalHex(value: unknown): string | null {
   return typeof value === "string" && /^0x[0-9a-fA-F]+$/.test(value) ? value : null;
+}
+
+function optionalEvmAddressText(value: unknown): string | null {
+  return isEvmAddressText(value) ? value.toLowerCase() : null;
 }
 
 function optionalString(value: unknown): string | null {

@@ -80,6 +80,9 @@ export function createUnconfiguredChainClient(): ChainClient {
     async getTransactionReceipt() {
       throw new Error("chain provider is unconfigured; cannot verify transaction receipt");
     },
+    async getCode() {
+      throw new Error("chain provider is unconfigured; cannot verify contract bytecode");
+    },
     async getLogs() {
       throw new Error("chain provider is unconfigured; cannot verify event logs");
     },
@@ -135,6 +138,9 @@ export function createViemChainClient(input: { rpcUrl: string; chainId?: string 
     async getTransactionReceipt(txHash: string) {
       const receipt = await client.getTransactionReceipt({ hash: txHash as `0x${string}` });
       return normalizeChainValue(receipt) as Record<string, unknown>;
+    },
+    async getCode(address: string) {
+      return String(await client.getCode({ address: address as `0x${string}` }));
     },
     async getLogs(query: Record<string, unknown>) {
       if (configuredChainId !== undefined && typeof query.chainId === "string" && query.chainId !== configuredChainId) {

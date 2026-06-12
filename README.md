@@ -308,7 +308,7 @@ Required result:
 - `/api/v1/evidence/public-claim` returns `authorized_public_claim`, `finalVerifierComplete=true`, and `winnerClaimAllowed=true`
 - `/api/v1/evidence/proof-bundle` returns `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1`, and its public claim, public-claim event hash, replay, verifier run, provider, deployment-registry, server, and bundle hashes recompute from the response body
 
-For `mock-test-token`, claim readiness and final replay verification require a recorded failed official-USDC probe reason plus a live deployment registry entry for the payment token address, non-zero deployment transaction hash, public HTTPS explorer URL, decimals, and non-zero bytecode hash. Official Base Sepolia USDC is accepted only on chain id `84532` with a passed official-USDC probe and a matching live registry entry.
+For `mock-test-token`, claim readiness and final replay verification require a recorded failed official-USDC probe reason plus a live deployment registry entry for the payment token address, non-zero deployment transaction hash, a public HTTPS explorer URL that points to that transaction, deployment receipt `contractAddress` matching the token address, `codeHash = keccak256(eth_getCode(address))`, and matching ERC20 `decimals()`/`symbol()` metadata. Official Base Sepolia USDC is accepted only on chain id `84532` with a passed official-USDC probe and a matching live registry entry.
 
 Use [docs/evidence/production-live-env.example](docs/evidence/production-live-env.example) as the non-secret manifest for the real Cobo/RPC/MCP environment.
 
