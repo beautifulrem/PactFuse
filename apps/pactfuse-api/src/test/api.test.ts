@@ -912,6 +912,19 @@ describe("pactfuse-api P0", () => {
     const proofBundleBase = { ...proofBundleJson.data };
     delete (proofBundleBase as { proofBundleHash?: string }).proofBundleHash;
     expect(hashForTestJson(proofBundleBase)).toBe(proofBundleJson.data.proofBundleHash);
+    const originalClaimEventPayloadJson = claimEvents[0].payload_json;
+    ctx.db.sqlite
+      .prepare("UPDATE evidence_events SET payload_json = ? WHERE event_id = ?")
+      .run(canonicalizeJson({ ...claimEventPayload, providerStatusHash: ZERO_HASH }), claimEvents[0].event_id);
+    const tamperedProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const tamperedProofBundleJson = await tamperedProofBundle.json();
+    expect(tamperedProofBundle.status).toBe(423);
+    expect(tamperedProofBundleJson.error.code).toBe("proof_pending");
+    ctx.db.sqlite
+      .prepare("UPDATE evidence_events SET payload_json = ? WHERE event_id = ?")
+      .run(originalClaimEventPayloadJson, claimEvents[0].event_id);
     const originalChain = ctx.chain;
     const originalCaw = ctx.caw;
     const originalCawLive = ctx.cawLive;

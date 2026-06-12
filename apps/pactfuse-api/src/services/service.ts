@@ -4667,7 +4667,7 @@ function latestAuthorizedPublicClaimRecord(
   }
   const row = ctx.db.sqlite
     .prepare(
-      `SELECT event_id, event_seq, event_hash, authority, payload_json, created_at
+      `SELECT event_id, event_seq, event_hash, prev_proof_event_hash, authority, kind, payload_hash, payload_json, created_at
        FROM evidence_events
        WHERE session_id = ? AND kind = 'public.claim.authorized'
        ORDER BY event_seq DESC
@@ -4686,6 +4686,22 @@ function latestAuthorizedPublicClaimRecord(
       return null;
     }
     const parsed = payload.data;
+    const payloadHash = hashJson(parsed);
+    if (payloadHash !== row.payload_hash) {
+      return null;
+    }
+    const prevProofEventHash = row.prev_proof_event_hash === null ? null : String(row.prev_proof_event_hash);
+    const eventHash = hashJson({
+      sessionId,
+      eventSeq: Number(row.event_seq),
+      authority: row.authority,
+      kind: row.kind,
+      payloadHash,
+      prevProofEventHash,
+    });
+    if (eventHash !== row.event_hash || eventHash !== row.event_id || eventHash !== session.latest_proof_event_hash) {
+      return null;
+    }
     if (parsed.claim.publicClaimHash !== parsed.publicClaimHash || parsed.claim.replayBundleHash !== parsed.replayBundleHash) {
       return null;
     }
