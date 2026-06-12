@@ -211,7 +211,7 @@ Important `/api/v1` routes:
 | `GET /api/v1/evidence/claim-readiness` | Operator-only derivation of current and target claim modes from evidence gates |
 | `GET /api/v1/evidence/live-preflight` | Operator-only live provider, production auth, indexer, and claim-readiness blockers before any public claim |
 | `GET /api/v1/evidence/public-claim` | Operator-only fail-closed public-claim authorization gate |
-| `GET /api/v1/evidence/proof-bundle` | Operator-only immutable public proof bundle for the latest authorized public claim |
+| `GET /api/v1/evidence/proof-bundle` | Operator-only immutable public proof bundle for the latest authorized public claim, or for an explicit `publicClaimEventId` |
 | `GET /api/v1/evidence/replay-bundle` | Read `PACTFUSE_EVIDENCE_V1` summary plus embedded replay page proofs |
 | `GET /api/v1/evidence/replay-page` | Read paged replay collections |
 | `GET /api/v1/evidence/agent-transcript` | Read MCP transcript summary |
@@ -238,14 +238,14 @@ Expected behavior:
 - full verifier mode rejects it because the example is pending, not final proof.
 - `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` remain `false` until every final replay gate passes.
 - `GET /api/v1/evidence/public-claim` requires the operator bearer token and returns `proof_pending` until claim readiness, verifier output, replay hash, and every live evidence gate are simultaneously green.
-- `GET /api/v1/evidence/proof-bundle` requires the operator bearer token and exports `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1` only when the latest event is a proof-authorized `public.claim.authorized` event. The authorization event stores the redacted provider status snapshot, deployment registry snapshot, and server metadata snapshot. The bundle binds those snapshots plus the public claim, claim-input replay hash, provider status hash, deployment registry hash, server metadata hash, and proof bundle hash. Its `server.generatedAt` is the authorization event timestamp, so repeated reads of the same proof event keep the same bundle hash even if provider configuration later changes.
+- `GET /api/v1/evidence/proof-bundle` requires the operator bearer token and exports `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1` when the latest event is a proof-authorized `public.claim.authorized` event. If later verification or advisory events exist, callers may pass `publicClaimEventId=<event_id>` to read that historical proof-authorized bundle without treating it as the latest mutable session state. The authorization event stores the frozen replay bundle, redacted provider status snapshot, deployment registry snapshot, and server metadata snapshot. The bundle binds those snapshots plus the public claim, claim-input replay hash, provider status hash, deployment registry hash, server metadata hash, and proof bundle hash. Its `server.generatedAt` is the authorization event timestamp, so repeated reads of the same proof event keep the same bundle hash even if provider configuration or later non-event rows change.
 - `PACTFUSE_EVIDENCE_V1` replay bundles now carry `deploymentRegistry` and `deploymentRegistryHash`; final verifier authority requires the chain-settleable payment token to match live registry evidence and the official-USDC probe status.
 
 The replay verifier checks:
 
 - canonical JSON hashes
 - event payload hashes and event roots
-- CAW raw and canonical receipt bindings
+- CAW raw and canonical receipt bindings, including readiness-time re-fetch of stored CAW export receipt rows
 - quote and artifact preflight bindings
 - bearer-bound artifact access proofs
 - MCP request/response hashes
@@ -271,6 +271,8 @@ The replay verifier checks:
 | `PACTFUSE_CAW_INGEST_TOKEN` | Bearer token for raw CAW receipt ingest |
 | `PACTFUSE_SERVER_COMMIT` | Optional server commit embedded in public proof bundles; falls back to `VERCEL_GIT_COMMIT_SHA` |
 | `PACTFUSE_BUILD_TIME` | Optional build timestamp embedded in public proof bundles |
+| `PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM` / `PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PATH` | Ed25519 signing key for public proof-bundle verifier attestations |
+| `PACTFUSE_TRUSTED_PROOF_KEY_HASHES` | Comma-separated trusted proof signing public-key hashes; public-claim readiness blocks if the runtime signing key is absent from this set |
 
 ### External Integrations
 
@@ -283,7 +285,7 @@ The replay verifier checks:
 | `PACTFUSE_INDEXER_ENABLED` | Enables the chain indexer worker |
 | `PACTFUSE_INDEXER_ADDRESS` | Optional indexed contract address |
 | `PACTFUSE_INDEXER_TOPICS` | Optional comma-separated topic filter |
-| `PACTFUSE_CAW_EXPORT_URL` | HTTPS CAW receipt export source on `api.cobo.com` or `api.dev.cobo.com` |
+| `PACTFUSE_CAW_EXPORT_URL` | HTTPS CAW receipt export source on `api.agenticwallet.cobo.com`, `api.cobo.com`, or `api.dev.cobo.com` |
 | `PACTFUSE_CAW_API_KEY` | CAW export API key |
 | `PACTFUSE_CAW_WALLET_ID` | CAW wallet id |
 | `PACTFUSE_LEASE_MCP_URL` | MCP JSON-RPC endpoint for clean lease execution |
@@ -297,8 +299,25 @@ The production claim path has a separate smoke gate. It does not create server-s
 PACTFUSE_API_BASE_URL=http://127.0.0.1:8787 \
 PACTFUSE_OPERATOR_TOKEN=... \
 PACTFUSE_LIVE_SMOKE_SESSION_ID=0x... \
+PACTFUSE_TRUSTED_PROOF_KEY_HASHES=0x... \
 PACTFUSE_LIVE_SMOKE_OUTPUT_DIR=artifacts/live/0x... \
 pnpm live-smoke
+```
+
+Before running the smoke gate, use the machine-readable environment report:
+
+```sh
+pnpm live-env-report -- --allow-missing
+pnpm live-env-report
+```
+
+`--allow-missing` prints the external variables still needed without passing the gate. The plain command must exit `0` before a production live smoke is meaningful.
+
+After the smoke gate writes artifacts, verify the exported bundle offline:
+
+```sh
+PACTFUSE_TRUSTED_PROOF_KEY_HASHES=0x... \
+pnpm verify-live-artifacts artifacts/live/0x...
 ```
 
 Required result:
@@ -306,11 +325,12 @@ Required result:
 - authenticated `/readyz` runs deep proof-provider checks
 - chain, CAW live, CAW receipt export, and MCP lease providers are ready
 - `/api/v1/evidence/live-preflight` returns `readyForPublicClaim=true` with no blockers
-- `/api/v1/evidence/public-claim` returns `authorized_public_claim`, `finalVerifierComplete=true`, and `winnerClaimAllowed=true`
-- `/api/v1/evidence/proof-bundle` returns `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1`, and its public claim, public-claim event hash, replay, verifier run, provider, deployment-registry, server, and bundle hashes recompute from the response body
+- `/api/v1/evidence/public-claim` returns `authorized_public_claim`, `finalVerifierComplete=true`, `winnerClaimAllowed=true`, and a `tokenSettlementClaim` that matches the public token mode
+- `/api/v1/evidence/proof-bundle` returns `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1`; when preserving a published artifact URL after later session events, call it with the bundle's `publicClaimEventId`. Its public claim, public-claim event hash, replay, verifier run, provider, deployment-registry, server, and bundle hashes recompute from the response body
 - when `PACTFUSE_LIVE_SMOKE_OUTPUT_DIR` is set, the smoke gate writes `live-preflight.json`, `public-claim.json`, `proof-bundle.json`, and `manifest.json`; the output directory must be empty, and the manifest records SHA-256 hashes over sorted-key canonical JSON for each artifact plus the recomputed public-claim, proof-bundle, replay, provider, deployment-registry, and server hashes
+- `pnpm verify-live-artifacts <artifact-dir>` exits `0` with the same trusted proof key hash set
 
-For `mock-test-token`, claim readiness and final replay verification require a recorded failed official-USDC probe reason plus a live deployment registry entry for the payment token address, non-zero deployment transaction hash, a public HTTPS explorer URL that points to that transaction, deployment receipt `contractAddress` matching the token address, `codeHash = keccak256(eth_getCode(address))`, and matching ERC20 `decimals()`/`symbol()` metadata. Official Base Sepolia USDC is accepted only on chain id `84532` with a passed official-USDC probe and a matching live registry entry.
+For `mock-test-token`, claim readiness and final replay verification require a recorded failed official-USDC probe reason plus a live deployment registry entry for the payment token address, non-zero deployment transaction hash, a public HTTPS explorer URL that points to that transaction, deployment receipt `contractAddress` matching the token address, `codeHash = keccak256(eth_getCode(address))`, and matching ERC20 `decimals()`/`symbol()` metadata. Its public `tokenSettlementClaim` is `live-mock-erc20-fallback`, not official USDC. Official Base Sepolia USDC is accepted only on chain id `84532` with a passed official-USDC probe, a matching live registry entry, and `tokenSettlementClaim=official-testnet-usdc`.
 
 Generate that registry from the live RPC before starting the API:
 

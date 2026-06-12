@@ -23,7 +23,7 @@ The backend exposes `/api/v1/evidence/claim-readiness?sessionId=<id>` as the ope
 
 The public claim gate is `/api/v1/evidence/public-claim?sessionId=<id>`, also operator-only because it runs deep live proof checks. It returns `proof_pending` with blockers until claim readiness, replay bundle hash, verifier `final_replay_claim`, `proofChipAllowed`, `finalVerifierComplete`, and `winnerClaimAllowed` are all true in the same session. Public copy must not treat readiness target modes as an authorized claim.
 
-After authorization, `/api/v1/evidence/proof-bundle?sessionId=<id>` exports `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1` only while the latest event is a proof-authorized `public.claim.authorized` event. The authorization event must capture the redacted provider status snapshot, deployment registry snapshot, and server metadata snapshot used by the bundle. The bundle must bind the public claim hash, proof event id/sequence/hash, the replay bundle hash used as claim input, the verifier run hash, redacted provider status hash, deployment registry hash, server metadata hash, and proof bundle hash. Advisory events, stale cached claims, fixture rows, or later mutable session state cannot stand in for this bundle.
+After authorization, `/api/v1/evidence/proof-bundle?sessionId=<id>` exports `PACTFUSE_PUBLIC_PROOF_BUNDLE_V1` while the latest event is a proof-authorized `public.claim.authorized` event. If later verification or advisory events are appended, `/api/v1/evidence/proof-bundle?sessionId=<id>&publicClaimEventId=<event_id>` can still export the historical proof-authorized bundle. The authorization event must capture the redacted provider status snapshot, deployment registry snapshot, and server metadata snapshot used by the bundle. The bundle must bind the public claim hash, proof event id/sequence/hash, the replay bundle hash used as claim input, the verifier run hash, redacted provider status hash, deployment registry hash, server metadata hash, and proof bundle hash. Advisory events, stale cached claims, fixture rows, or later mutable session state cannot stand in for this bundle; only the signed proof event identified by `publicClaimEventId` can be replayed historically.
 
 ## Upgrade Current Claim To `caw-target-real`
 
@@ -33,8 +33,9 @@ Allowed only when all are true:
 
 - `docs/evidence/caw-identity-probe.json` has `mode: real`, `pass: true`, and `proofAuthority: true`, while its evidence row still has `winnerClaimAllowed: false`; only the final `public.claim.authorized` event may set `winnerClaimAllowed: true`
 - the probed `walletAddress` matches the settled C spend `payer` and `agentWallet`
+- public-claim authorization rechecks the CAW live wallet endpoint and requires the current redacted wallet response hash to match the stored identity probe
 - CAW policy receipt plus matching tx/audit evidence proves chain, target, selector, expiry, tx-count/request-count limits, and usage
-- CAW receipt ingest proves every CAW operation came from raw API/export JSON, not hand-entered fields
+- CAW receipt ingest proves every CAW operation came from raw API/export JSON, not hand-entered fields, and public-claim readiness re-fetches the CAW source to confirm the stored deny_probe, approve, and activate_tool raw receipt rows are still present
 - wrong-target bypass has a real CAW deny request id or audit receipt
 - clean activation has a real CAW allow receipt
 - `SpendTripped` A/B and `SpendSettled` C are real chain events in the same session
@@ -60,8 +61,8 @@ Headline: `Cobo param-bound source fuse`.
 
 W1 default order: probe `official-testnet-usdc` (Circle Base Sepolia USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e`) FIRST at hour 0; `mock-test-token` is the fallback rung and the fallback reason must be recorded in `docs/evidence/mock-token.json`.
 
-- `official-testnet-usdc`: requires official/sponsor token evidence for the exact chain/address, a passed Base Sepolia USDC probe, and a live registry entry for the official token.
-- `mock-test-token`: requires public testnet mock ERC20 deployment evidence in `docs/evidence/mock-token.json` plus the recorded official-USDC probe failure reason. Runtime claim readiness also requires a live deployment registry entry with non-zero deployment transaction hash, a public HTTPS explorer URL that points to that transaction, a deployment receipt whose `contractAddress` matches the exact payment-token address, `codeHash = keccak256(eth_getCode(address))`, and ERC20 `decimals()`/`symbol()` metadata matching the registry.
+- `official-testnet-usdc`: requires official/sponsor token evidence for the exact chain/address, a passed Base Sepolia USDC probe, a live registry entry for the official token, and public `tokenSettlementClaim=official-testnet-usdc`.
+- `mock-test-token`: requires public testnet mock ERC20 deployment evidence in `docs/evidence/mock-token.json` plus the recorded official-USDC probe failure reason. Runtime claim readiness also requires a live deployment registry entry with non-zero deployment transaction hash, a public HTTPS explorer URL that points to that transaction, a deployment receipt whose `contractAddress` matches the exact payment-token address, `codeHash = keccak256(eth_getCode(address))`, and ERC20 `decimals()`/`symbol()` metadata matching the registry. Public claim/proof-bundle output must set `tokenSettlementClaim=live-mock-erc20-fallback`; it must not be described as official USDC settlement.
 - `local-mocked`: local only, not a winner claim.
 
 ## Identity Mode Rules

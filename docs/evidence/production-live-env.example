@@ -2,18 +2,24 @@
 #
 # Copy these names into your secret manager or local untracked env file.
 # Do not commit real values.
+# After replacing placeholders, run:
+#   pnpm live-env-report
+#   pnpm live-smoke
+#   pnpm verify-live-artifacts "$PACTFUSE_LIVE_SMOKE_OUTPUT_DIR"
 
 # API target for pnpm live-smoke
 PACTFUSE_API_BASE_URL=https://pactfuse-api.example.com
 PACTFUSE_LIVE_SMOKE_SESSION_ID=0x0000000000000000000000000000000000000000000000000000000000000000
 PACTFUSE_LIVE_SMOKE_REQUIRE_PUBLIC_CLAIM=true
 PACTFUSE_LIVE_SMOKE_REQUIRED_PROVIDERS=chain,caw_live,caw,mcp_lease
+PACTFUSE_LIVE_SMOKE_OUTPUT_DIR=artifacts/live/replace-with-session-id
 
 # Operator and role tokens
 PACTFUSE_OPERATOR_TOKEN=replace-with-operator-token
 PACTFUSE_CHALLENGE_SUBMITTER_TOKEN=replace-with-challenge-submitter-token
 PACTFUSE_ARTIFACT_SIGNER_TOKEN=replace-with-artifact-signer-token
 PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=false
+PACTFUSE_ALLOW_INSECURE_PUBLIC_EVIDENCE_URLS=false
 
 # Evidence ingest secrets
 PACTFUSE_MCP_AUDIT_TOKEN=replace-with-mcp-audit-hmac-secret
@@ -23,6 +29,9 @@ PACTFUSE_CAW_INGEST_TOKEN=replace-with-caw-ingest-bearer-token
 # Server provenance embedded in public proof bundles
 PACTFUSE_SERVER_COMMIT=replace-with-deployed-git-commit
 PACTFUSE_BUILD_TIME=2026-06-11T00:00:00.000Z
+PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PATH=secrets/pactfuse-proof-signing-key.pem
+PACTFUSE_PROOF_KEY_ID=replace-with-proof-key-id
+PACTFUSE_TRUSTED_PROOF_KEY_HASHES=0x0000000000000000000000000000000000000000000000000000000000000000
 
 # Chain and indexer
 PACTFUSE_CHAIN_RPC_URL=https://base-sepolia-rpc.example.com
@@ -49,13 +58,16 @@ PACTFUSE_INDEXER_START_BLOCK=0
 PACTFUSE_INDEXER_TOPICS=
 
 # Cobo Agentic Wallet / CAW live API
-AGENT_WALLET_API_URL=https://api.dev.cobo.com/v2
+PACTFUSE_CAW_LIVE_API_URL=https://api.agenticwallet.cobo.com
+PACTFUSE_CAW_LIVE_API_KEY=replace-with-cobo-agentic-wallet-api-key
+PACTFUSE_CAW_LIVE_WALLET_ID=replace-with-wallet-id
+AGENT_WALLET_API_URL=https://api.agenticwallet.cobo.com
 AGENT_WALLET_API_KEY=replace-with-cobo-agentic-wallet-api-key
 AGENT_WALLET_WALLET_ID=replace-with-wallet-id
 PACTFUSE_CAW_LIVE_TIMEOUT_MS=10000
 
 # CAW receipt export source
-PACTFUSE_CAW_EXPORT_URL=https://api.dev.cobo.com/v2/audit-logs
+PACTFUSE_CAW_EXPORT_URL=https://api.agenticwallet.cobo.com/api/v1/audit-logs
 PACTFUSE_CAW_API_KEY=replace-with-caw-export-api-key
 PACTFUSE_CAW_WALLET_ID=replace-with-wallet-id
 PACTFUSE_CAW_EXPORT_LIMIT=50
