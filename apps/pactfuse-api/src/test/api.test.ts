@@ -919,6 +919,29 @@ describe("pactfuse-api P0", () => {
     const proofBundleBase = { ...proofBundleJson.data };
     delete (proofBundleBase as { proofBundleHash?: string }).proofBundleHash;
     expect(hashForTestJson(proofBundleBase)).toBe(proofBundleJson.data.proofBundleHash);
+    const replayInputEvent = ctx.db.sqlite
+      .prepare(
+        `SELECT event_id, payload_json
+         FROM evidence_events
+         WHERE session_id = ? AND event_seq < ?
+         ORDER BY event_seq ASC
+         LIMIT 1`,
+      )
+      .get(sessionId, claimEvents[0].event_seq) as { event_id: string; payload_json: string };
+    const replayInputEventPayload = JSON.parse(replayInputEvent.payload_json) as Record<string, unknown>;
+    ctx.db.sqlite
+      .prepare("UPDATE evidence_events SET payload_json = ? WHERE event_id = ?")
+      .run(canonicalizeJson({ ...replayInputEventPayload, replayDrift: true }), replayInputEvent.event_id);
+    const replayDriftProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const replayDriftProofBundleJson = await replayDriftProofBundle.json();
+    expect(replayDriftProofBundle.status).toBe(422);
+    expect(replayDriftProofBundleJson.error.code).toBe("proof_blocked");
+    expect(replayDriftProofBundleJson.error.message).toContain("replay hash no longer matches");
+    ctx.db.sqlite
+      .prepare("UPDATE evidence_events SET payload_json = ? WHERE event_id = ?")
+      .run(replayInputEvent.payload_json, replayInputEvent.event_id);
     const originalClaimEventPayloadJson = claimEvents[0].payload_json;
     ctx.db.sqlite
       .prepare("UPDATE evidence_events SET payload_json = ? WHERE event_id = ?")

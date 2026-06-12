@@ -4867,6 +4867,18 @@ export async function readProofBundle(sessionId: string, ctx: ServiceCtx): Promi
     };
   }
   const replayBundle = finalClaimReplayBundleData(parsedSessionId, ctx, { asOfEventSeq: latestClaim.asOfEventSeq });
+  const replayBundleHash = hashJson(replayBundle);
+  if (replayBundleHash !== latestClaim.claim.replayBundleHash) {
+    return {
+      ok: false,
+      requestId,
+      error: proofBlockedError(requestId, "proof bundle replay hash no longer matches the authorized public claim input", {
+        expectedReplayBundleHash: latestClaim.claim.replayBundleHash,
+        actualReplayBundleHash: replayBundleHash,
+        publicClaimEventId: latestClaim.eventId,
+      }),
+    };
+  }
   const { providerStatuses, providerStatusHash, deploymentRegistry, deploymentRegistryHash, server, serverHash } = latestClaim.snapshot;
   const base = {
     bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
@@ -4876,7 +4888,7 @@ export async function readProofBundle(sessionId: string, ctx: ServiceCtx): Promi
     publicClaimEventHash: latestClaim.eventHash,
     publicClaimEventSeq: latestClaim.eventSeq,
     claimInputReplayBundleHash: latestClaim.claim.replayBundleHash,
-    replayBundleHash: hashJson(replayBundle),
+    replayBundleHash,
     verifierRunHash: hashJson(latestClaim.claim.verifierRun),
     providerStatusHash,
     deploymentRegistryHash,
