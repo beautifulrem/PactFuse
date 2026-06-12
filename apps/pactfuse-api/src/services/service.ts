@@ -4626,34 +4626,10 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
       },
     };
   }
-  const publicClaimHash = hashJson({
-    sessionId: parsedSessionId,
-    claimMode: data.targetClaimMode,
-    paymentMode: data.targetPaymentMode,
-    tokenMode: data.targetTokenMode,
-    identityMode: data.targetIdentityMode,
-    replayBundleHash: data.replayBundleHash,
-    verifierRun: {
-      proofLevel: data.verifierRun.proofLevel,
-      proofChipAllowed: data.verifierRun.proofChipAllowed,
-      finalVerifierComplete: data.verifierRun.finalVerifierComplete,
-      winnerClaimAllowed: data.verifierRun.winnerClaimAllowed,
-    },
-  });
-  const claim = PublicClaimViewSchema.parse({
-    sessionId: parsedSessionId,
-    claimStatus: "authorized_public_claim",
-    claimMode: data.targetClaimMode,
-    paymentMode: data.targetPaymentMode,
-    tokenMode: data.targetTokenMode,
-    identityMode: data.targetIdentityMode,
-    replayBundleHash: data.replayBundleHash,
-    verifierRun: data.verifierRun,
-    proofChipAllowed: true,
-    finalVerifierComplete: true,
-    winnerClaimAllowed: true,
-    publicClaimHash,
-  });
+  const session = requireSessionRow(ctx, parsedSessionId, requestId);
+  const asOfEventSeq = Number(session.latest_event_seq);
+  const authorizedEventSeq = asOfEventSeq + 1;
+  const authorizedAt = ctx.clock.now().toISOString();
   const providerStatuses = await readProofProviderStatus(ctx);
   const providerBlockers = publicClaimProviderBlockers(providerStatuses);
   if (providerBlockers.length > 0) {
@@ -4669,7 +4645,52 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
       },
     };
   }
-  appendPublicClaimAuthorizedEvent(ctx, parsedSessionId, claim, providerStatuses);
+  const snapshot = proofBundleAuthorizationSnapshot(ctx, providerStatuses, authorizedAt);
+  const publicClaimHash = hashJson({
+    sessionId: parsedSessionId,
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt,
+    authorizedEventSeq,
+    asOfEventSeq,
+    claimMode: data.targetClaimMode,
+    paymentMode: data.targetPaymentMode,
+    tokenMode: data.targetTokenMode,
+    identityMode: data.targetIdentityMode,
+    replayBundleHash: data.replayBundleHash,
+    providerStatusHash: snapshot.providerStatusHash,
+    deploymentRegistryHash: snapshot.deploymentRegistryHash,
+    serverHash: snapshot.serverHash,
+    verifierRun: {
+      proofLevel: data.verifierRun.proofLevel,
+      proofChipAllowed: data.verifierRun.proofChipAllowed,
+      finalVerifierComplete: data.verifierRun.finalVerifierComplete,
+      winnerClaimAllowed: data.verifierRun.winnerClaimAllowed,
+    },
+  });
+  const claim = PublicClaimViewSchema.parse({
+    sessionId: parsedSessionId,
+    claimStatus: "authorized_public_claim",
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt,
+    authorizedEventSeq,
+    asOfEventSeq,
+    claimMode: data.targetClaimMode,
+    paymentMode: data.targetPaymentMode,
+    tokenMode: data.targetTokenMode,
+    identityMode: data.targetIdentityMode,
+    replayBundleHash: data.replayBundleHash,
+    providerStatusHash: snapshot.providerStatusHash,
+    deploymentRegistryHash: snapshot.deploymentRegistryHash,
+    serverHash: snapshot.serverHash,
+    verifierRun: data.verifierRun,
+    proofChipAllowed: true,
+    finalVerifierComplete: true,
+    winnerClaimAllowed: true,
+    publicClaimHash,
+  });
+  appendPublicClaimAuthorizedEvent(ctx, parsedSessionId, claim, snapshot);
   return { ok: true, requestId, data: claim };
 }
 
@@ -4731,10 +4752,26 @@ function latestAuthorizedPublicClaimRecord(
     if (parsed.asOfEventSeq !== Number(row.event_seq) - 1) {
       return null;
     }
+    if (
+      parsed.claim.snapshotScope !== "authorization_event" ||
+      parsed.claim.providerSnapshotOnly !== true ||
+      parsed.claim.authorizedEventSeq !== Number(row.event_seq) ||
+      parsed.claim.asOfEventSeq !== parsed.asOfEventSeq ||
+      parsed.claim.authorizedAt !== String(row.created_at)
+    ) {
+      return null;
+    }
     if (parsed.providerStatusHash !== hashJson(parsed.providerStatuses)) {
       return null;
     }
     if (parsed.deploymentRegistryHash !== (parsed.deploymentRegistry ? hashJson(parsed.deploymentRegistry) : null)) {
+      return null;
+    }
+    if (
+      parsed.claim.providerStatusHash !== parsed.providerStatusHash ||
+      parsed.claim.deploymentRegistryHash !== parsed.deploymentRegistryHash ||
+      parsed.claim.serverHash !== parsed.serverHash
+    ) {
       return null;
     }
     if (parsed.server.generatedAt !== String(row.created_at) || parsed.serverHash !== hashJson(parsed.server)) {
@@ -4764,23 +4801,19 @@ function appendPublicClaimAuthorizedEvent(
   ctx: ServiceCtx,
   sessionId: string,
   claim: PublicClaimView,
-  providerStatuses: ProofProviderStatus[],
+  snapshot: ProofBundleAuthorizationSnapshot,
 ): EvidenceEvent {
-  const session = requireSessionRow(ctx, sessionId, "public_claim_event");
-  const asOfEventSeq = Number(session.latest_event_seq);
-  const createdAt = ctx.clock.now().toISOString();
-  const snapshot = proofBundleAuthorizationSnapshot(ctx, providerStatuses, createdAt);
   return appendEvidenceEvent(ctx, {
     sessionId,
     authority: "proof",
     kind: "public.claim.authorized",
-    createdAt,
+    createdAt: claim.authorizedAt,
     payload: jsonRecord({
       claim,
       publicClaimHash: claim.publicClaimHash,
       replayBundleHash: claim.replayBundleHash,
       verifierRunHash: hashJson(claim.verifierRun),
-      asOfEventSeq,
+      asOfEventSeq: claim.asOfEventSeq,
       ...snapshot,
       proofAuthority: true,
       winnerClaimAllowed: true,
@@ -4910,6 +4943,10 @@ export async function readProofBundle(sessionId: string, ctx: ServiceCtx): Promi
     publicClaimEventId: latestClaim.eventId,
     publicClaimEventHash: latestClaim.eventHash,
     publicClaimEventSeq: latestClaim.eventSeq,
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt: latestClaim.claim.authorizedAt,
+    asOfEventSeq: latestClaim.asOfEventSeq,
     claimInputReplayBundleHash: latestClaim.claim.replayBundleHash,
     replayBundleHash,
     verifierRunHash: hashJson(latestClaim.claim.verifierRun),
@@ -8019,9 +8056,9 @@ async function requireTransactionReceiptBlock(ctx: ServiceCtx, txHash: `0x${stri
     });
   }
   const status = receipt.status;
-  if (status === "reverted" || status === "0x0" || status === 0 || status === false) {
-    throw Object.assign(new Error(`${label} transaction receipt is reverted`), {
-      apiError: proofBlockedError(requestId, `${label} transaction receipt is reverted`, { txHash }),
+  if (!isSuccessfulReceiptStatus(status)) {
+    throw Object.assign(new Error(`${label} transaction receipt is not explicitly successful`), {
+      apiError: proofBlockedError(requestId, `${label} transaction receipt is not explicitly successful`, { txHash }),
     });
   }
   const blockNumber = optionalChainNumber(receipt.blockNumber);
@@ -9110,9 +9147,9 @@ function assertReceiptMatchesGatePayload(
     });
   }
   const status = receipt.status;
-  if (status === "reverted" || status === "0x0" || status === 0 || status === false) {
-    throw Object.assign(new Error("gate transaction receipt is reverted"), {
-      apiError: proofBlockedError(requestId, "gate transaction receipt is reverted"),
+  if (!isSuccessfulReceiptStatus(status)) {
+    throw Object.assign(new Error("gate transaction receipt is not explicitly successful"), {
+      apiError: proofBlockedError(requestId, "gate transaction receipt is not explicitly successful"),
     });
   }
 }

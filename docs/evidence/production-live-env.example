@@ -37,13 +37,13 @@ PACTFUSE_INDEXER_START_BLOCK=0
 PACTFUSE_INDEXER_TOPICS=
 
 # Cobo Agentic Wallet / CAW live API
-AGENT_WALLET_API_URL=https://api.cobo.example.com
+AGENT_WALLET_API_URL=https://api.dev.cobo.com/v2
 AGENT_WALLET_API_KEY=replace-with-cobo-agentic-wallet-api-key
 AGENT_WALLET_WALLET_ID=replace-with-wallet-id
 PACTFUSE_CAW_LIVE_TIMEOUT_MS=10000
 
 # CAW receipt export source
-PACTFUSE_CAW_EXPORT_URL=https://caw-export.example.com/receipts
+PACTFUSE_CAW_EXPORT_URL=https://api.dev.cobo.com/v2/audit-logs
 PACTFUSE_CAW_API_KEY=replace-with-caw-export-api-key
 PACTFUSE_CAW_WALLET_ID=replace-with-wallet-id
 PACTFUSE_CAW_EXPORT_LIMIT=50

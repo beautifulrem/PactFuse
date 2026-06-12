@@ -57,6 +57,21 @@ try {
       expected: sessionId,
       actual: claimData.sessionId,
     });
+    assert(claimData.snapshotScope === "authorization_event", "public-claim snapshotScope is not authorization_event", claimData);
+    assert(claimData.providerSnapshotOnly === true, "public-claim providerSnapshotOnly is not true", claimData);
+    assert(typeof claimData.authorizedAt === "string" && claimData.authorizedAt.length > 0, "public-claim authorizedAt is missing", claimData);
+    assert(
+      Number.isInteger(claimData.authorizedEventSeq) && claimData.authorizedEventSeq > 1,
+      "public-claim authorizedEventSeq is missing or invalid",
+      claimData,
+    );
+    assert(
+      Number.isInteger(claimData.asOfEventSeq) && claimData.asOfEventSeq === claimData.authorizedEventSeq - 1,
+      "public-claim asOfEventSeq does not precede authorizedEventSeq",
+      claimData,
+    );
+    assert(HEX32.test(claimData.providerStatusHash), "public-claim providerStatusHash is missing or invalid", claimData);
+    assert(HEX32.test(claimData.serverHash), "public-claim serverHash is missing or invalid", claimData);
     assert(HEX32.test(claimData.publicClaimHash), "public-claim hash is missing or invalid", claimData);
 
     const proofBundle = await requestJson(`/api/v1/evidence/proof-bundle?sessionId=${encodeURIComponent(sessionId)}`);
@@ -94,6 +109,21 @@ try {
     assert(
       Number.isInteger(proofBundleData.publicClaimEventSeq) && proofBundleData.publicClaimEventSeq > 1,
       "proof-bundle public claim event seq is missing or invalid",
+      proofBundleData,
+    );
+    assert(proofBundleData.snapshotScope === "authorization_event", "proof-bundle snapshotScope is not authorization_event", proofBundleData);
+    assert(proofBundleData.providerSnapshotOnly === true, "proof-bundle providerSnapshotOnly is not true", proofBundleData);
+    assert(proofBundleData.authorizedAt === claimData.authorizedAt, "proof-bundle authorizedAt does not match public-claim", {
+      proofBundleAuthorizedAt: proofBundleData.authorizedAt,
+      claimAuthorizedAt: claimData.authorizedAt,
+    });
+    assert(proofBundleData.asOfEventSeq === claimData.asOfEventSeq, "proof-bundle asOfEventSeq does not match public-claim", {
+      proofBundleAsOfEventSeq: proofBundleData.asOfEventSeq,
+      claimAsOfEventSeq: claimData.asOfEventSeq,
+    });
+    assert(
+      proofBundleData.publicClaimEventSeq === claimData.authorizedEventSeq && proofBundleData.asOfEventSeq === proofBundleData.publicClaimEventSeq - 1,
+      "proof-bundle public claim event seq is not bound to the authorization snapshot",
       proofBundleData,
     );
     assert(HEX32.test(proofBundleData.providerStatusHash), "proof-bundle provider status hash is missing or invalid", proofBundleData);
@@ -196,6 +226,7 @@ function verifyProofBundleHashes(proofBundle, claim) {
   );
   verifyPublicClaimVerifierRun(proofBundle);
   verifyPublicClaimModeAlignment(proofBundle);
+  verifyPublicClaimSnapshotBinding(proofBundle);
   verifyReplayDeploymentRegistryBinding(proofBundle);
   verifyPublicClaimDeploymentRegistry(proofBundle);
   assert(hashJson(proofBundle.replayBundle) === proofBundle.replayBundleHash, "proof-bundle replayBundleHash does not recompute", {
@@ -227,6 +258,41 @@ function verifyProofBundleHashes(proofBundle, claim) {
   assert(hashJson(bundleBase) === proofBundle.proofBundleHash, "proof-bundle hash does not recompute", {
     expected: proofBundle.proofBundleHash,
     actual: hashJson(bundleBase),
+  });
+}
+
+function verifyPublicClaimSnapshotBinding(proofBundle) {
+  const claim = proofBundle.publicClaim;
+  assert(isObject(claim), "proof-bundle publicClaim is missing", proofBundle.publicClaim);
+  assert(claim.snapshotScope === "authorization_event", "proof-bundle publicClaim snapshotScope is not authorization_event", claim);
+  assert(claim.providerSnapshotOnly === true, "proof-bundle publicClaim providerSnapshotOnly is not true", claim);
+  assert(claim.authorizedEventSeq === proofBundle.publicClaimEventSeq, "publicClaim authorizedEventSeq does not match proof-bundle event seq", {
+    authorizedEventSeq: claim.authorizedEventSeq,
+    publicClaimEventSeq: proofBundle.publicClaimEventSeq,
+  });
+  assert(claim.asOfEventSeq === proofBundle.publicClaimEventSeq - 1, "publicClaim asOfEventSeq does not precede proof-bundle event seq", {
+    asOfEventSeq: claim.asOfEventSeq,
+    publicClaimEventSeq: proofBundle.publicClaimEventSeq,
+  });
+  assert(proofBundle.asOfEventSeq === claim.asOfEventSeq, "proof-bundle asOfEventSeq does not match publicClaim", {
+    proofBundleAsOfEventSeq: proofBundle.asOfEventSeq,
+    publicClaimAsOfEventSeq: claim.asOfEventSeq,
+  });
+  assert(proofBundle.authorizedAt === claim.authorizedAt, "proof-bundle authorizedAt does not match publicClaim", {
+    proofBundleAuthorizedAt: proofBundle.authorizedAt,
+    publicClaimAuthorizedAt: claim.authorizedAt,
+  });
+  assert(claim.providerStatusHash === proofBundle.providerStatusHash, "publicClaim providerStatusHash does not match proof-bundle snapshot", {
+    publicClaimProviderStatusHash: claim.providerStatusHash,
+    proofBundleProviderStatusHash: proofBundle.providerStatusHash,
+  });
+  assert(claim.deploymentRegistryHash === proofBundle.deploymentRegistryHash, "publicClaim deploymentRegistryHash does not match proof-bundle snapshot", {
+    publicClaimDeploymentRegistryHash: claim.deploymentRegistryHash,
+    proofBundleDeploymentRegistryHash: proofBundle.deploymentRegistryHash,
+  });
+  assert(claim.serverHash === proofBundle.serverHash, "publicClaim serverHash does not match proof-bundle snapshot", {
+    publicClaimServerHash: claim.serverHash,
+    proofBundleServerHash: proofBundle.serverHash,
   });
 }
 
@@ -472,11 +538,19 @@ function verifyPublicClaimEventHash(proofBundle, previousProofEventHash) {
 function publicClaimHashInput(claim) {
   return {
     sessionId: claim.sessionId,
+    snapshotScope: claim.snapshotScope,
+    providerSnapshotOnly: claim.providerSnapshotOnly,
+    authorizedAt: claim.authorizedAt,
+    authorizedEventSeq: claim.authorizedEventSeq,
+    asOfEventSeq: claim.asOfEventSeq,
     claimMode: claim.claimMode,
     paymentMode: claim.paymentMode,
     tokenMode: claim.tokenMode,
     identityMode: claim.identityMode,
     replayBundleHash: claim.replayBundleHash,
+    providerStatusHash: claim.providerStatusHash,
+    deploymentRegistryHash: claim.deploymentRegistryHash,
+    serverHash: claim.serverHash,
     verifierRun: {
       proofLevel: claim.verifierRun.proofLevel,
       proofChipAllowed: claim.verifierRun.proofChipAllowed,

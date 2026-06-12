@@ -283,7 +283,7 @@ The replay verifier checks:
 | `PACTFUSE_INDEXER_ENABLED` | Enables the chain indexer worker |
 | `PACTFUSE_INDEXER_ADDRESS` | Optional indexed contract address |
 | `PACTFUSE_INDEXER_TOPICS` | Optional comma-separated topic filter |
-| `PACTFUSE_CAW_EXPORT_URL` | HTTPS CAW receipt export source |
+| `PACTFUSE_CAW_EXPORT_URL` | HTTPS CAW receipt export source on `api.cobo.com` or `api.dev.cobo.com` |
 | `PACTFUSE_CAW_API_KEY` | CAW export API key |
 | `PACTFUSE_CAW_WALLET_ID` | CAW wallet id |
 | `PACTFUSE_LEASE_MCP_URL` | MCP JSON-RPC endpoint for clean lease execution |

@@ -55,6 +55,7 @@ export const PACTFUSE_CHAIN_EVENT_ABI = [
   },
 ] as const;
 const MAX_MCP_RESPONSE_BYTES = 512 * 1024;
+const OFFICIAL_COBO_API_HOSTS = ["api.cobo.com", "api.dev.cobo.com"] as const;
 const REQUIRED_LEASE_TOOL_ARGUMENTS = [
   "sessionId",
   "leaseRunId",
@@ -253,11 +254,28 @@ export function createHttpsCawReceiptSource(input: {
   apiKey?: string;
   walletId?: string;
   limit?: number;
+  trustedHosts?: readonly string[];
+  allowInsecureTestEndpoint?: boolean;
 }): CawReceiptSource {
   const limit = input.limit ?? 50;
   return {
     async status() {
       try {
+        const trust = cawEndpointTrust({
+          endpoint: input.exportUrl,
+          trustedHosts: input.trustedHosts,
+          allowInsecureTestEndpoint: input.allowInsecureTestEndpoint,
+          label: "CAW export endpoint",
+        });
+        if (!trust.ok) {
+          return {
+            name: "caw",
+            mode: "live",
+            ready: false,
+            reason: trust.reason,
+            endpoint: input.exportUrl,
+          } satisfies ProofProviderStatus;
+        }
         const url = cawExportUrl(input.exportUrl, input.walletId, { limit: 1 });
         const response = await fetch(url, {
           method: "GET",
@@ -290,6 +308,12 @@ export function createHttpsCawReceiptSource(input: {
       }
     },
     async fetchReceiptBundle(request: Record<string, unknown>) {
+      assertTrustedCawEndpoint({
+        endpoint: input.exportUrl,
+        trustedHosts: input.trustedHosts,
+        allowInsecureTestEndpoint: input.allowInsecureTestEndpoint,
+        label: "CAW export endpoint",
+      });
       const url = cawExportUrl(input.exportUrl, input.walletId, {
         limit,
         session_id: optionalString(request.sessionId),
@@ -350,6 +374,8 @@ export function createCoboAgenticWalletClient(input: {
   apiKey: string;
   walletId?: string;
   timeoutMs?: number;
+  trustedHosts?: readonly string[];
+  allowInsecureTestEndpoint?: boolean;
 }): CawLiveClient {
   const baseUrl = input.baseUrl.replace(/\/+$/, "");
   const timeoutMs = input.timeoutMs ?? 10_000;
@@ -364,6 +390,21 @@ export function createCoboAgenticWalletClient(input: {
   return {
     async status() {
       try {
+        const trust = cawEndpointTrust({
+          endpoint: baseUrl,
+          trustedHosts: input.trustedHosts,
+          allowInsecureTestEndpoint: input.allowInsecureTestEndpoint,
+          label: "CAW live API endpoint",
+        });
+        if (!trust.ok) {
+          return {
+            name: "caw_live",
+            mode: "live",
+            ready: false,
+            reason: trust.reason,
+            endpoint: baseUrl,
+          };
+        }
         if (!input.apiKey) {
           return {
             name: "caw_live",
@@ -396,9 +437,21 @@ export function createCoboAgenticWalletClient(input: {
       }
     },
     async getWallet(walletId: string) {
+      assertTrustedCawEndpoint({
+        endpoint: baseUrl,
+        trustedHosts: input.trustedHosts,
+        allowInsecureTestEndpoint: input.allowInsecureTestEndpoint,
+        label: "CAW live API endpoint",
+      });
       return cawSdkData((await walletsApi.getWallet(walletId, true, input.apiKey, requestOptions)).data);
     },
     async submitPact(pact) {
+      assertTrustedCawEndpoint({
+        endpoint: baseUrl,
+        trustedHosts: input.trustedHosts,
+        allowInsecureTestEndpoint: input.allowInsecureTestEndpoint,
+        label: "CAW live API endpoint",
+      });
       return cawSdkData(
         (
           await pactsApi.submitPact(
@@ -417,9 +470,21 @@ export function createCoboAgenticWalletClient(input: {
       );
     },
     async getPact(pactId: string) {
+      assertTrustedCawEndpoint({
+        endpoint: baseUrl,
+        trustedHosts: input.trustedHosts,
+        allowInsecureTestEndpoint: input.allowInsecureTestEndpoint,
+        label: "CAW live API endpoint",
+      });
       return cawSdkData((await pactsApi.getPact(pactId, input.apiKey, requestOptions)).data);
     },
     async transferToken(transfer) {
+      assertTrustedCawEndpoint({
+        endpoint: baseUrl,
+        trustedHosts: input.trustedHosts,
+        allowInsecureTestEndpoint: input.allowInsecureTestEndpoint,
+        label: "CAW live API endpoint",
+      });
       const body = cawLiveTransferBody(transfer);
       return cawSdkData(
         (
@@ -433,6 +498,12 @@ export function createCoboAgenticWalletClient(input: {
       );
     },
     async contractCall(call) {
+      assertTrustedCawEndpoint({
+        endpoint: baseUrl,
+        trustedHosts: input.trustedHosts,
+        allowInsecureTestEndpoint: input.allowInsecureTestEndpoint,
+        label: "CAW live API endpoint",
+      });
       const body = cawLiveContractCallBody(call);
       try {
         return cawSdkData(
@@ -454,6 +525,12 @@ export function createCoboAgenticWalletClient(input: {
       }
     },
     async listAuditLogs(query) {
+      assertTrustedCawEndpoint({
+        endpoint: baseUrl,
+        trustedHosts: input.trustedHosts,
+        allowInsecureTestEndpoint: input.allowInsecureTestEndpoint,
+        label: "CAW live API endpoint",
+      });
       return cawSdkData(
         (
           await auditApi.listAuditLogs(
@@ -844,6 +921,47 @@ export function createStaticTemplateRegistry(bindings: PactTemplateBinding[]): P
       return { ...binding };
     },
   };
+}
+
+function assertTrustedCawEndpoint(input: {
+  endpoint: string;
+  trustedHosts?: readonly string[] | undefined;
+  allowInsecureTestEndpoint?: boolean | undefined;
+  label: string;
+}): void {
+  const trust = cawEndpointTrust(input);
+  if (!trust.ok) {
+    throw new Error(trust.reason);
+  }
+}
+
+function cawEndpointTrust(input: {
+  endpoint: string;
+  trustedHosts?: readonly string[] | undefined;
+  allowInsecureTestEndpoint?: boolean | undefined;
+  label: string;
+}): { ok: true } | { ok: false; reason: string } {
+  let url: URL;
+  try {
+    url = new URL(input.endpoint);
+  } catch {
+    return { ok: false, reason: `${input.label} must be a valid URL` };
+  }
+  if (input.allowInsecureTestEndpoint) {
+    return { ok: true };
+  }
+  if (url.protocol !== "https:") {
+    return { ok: false, reason: `${input.label} must use HTTPS` };
+  }
+  const trustedHosts = new Set(
+    (input.trustedHosts && input.trustedHosts.length > 0 ? input.trustedHosts : OFFICIAL_COBO_API_HOSTS)
+      .map((host) => host.trim().toLowerCase())
+      .filter((host) => host.length > 0),
+  );
+  if (!trustedHosts.has(url.hostname.toLowerCase())) {
+    return { ok: false, reason: `${input.label} host ${url.hostname} is not an official Cobo API host` };
+  }
+  return { ok: true };
 }
 
 function cawExportUrl(base: string, walletId: string | undefined, params: Record<string, string | number | undefined>): URL {

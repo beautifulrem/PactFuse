@@ -310,16 +310,7 @@ describe("pactfuse-api P0", () => {
         (proofBundle) => {
           proofBundle.providerStatusHash = hex32("live-smoke-bad-provider");
         },
-        "proof-bundle providerStatusHash does not recompute",
-      ],
-      [
-        "self-consistent fixture provider snapshot",
-        (proofBundle) => {
-          const providerStatuses = proofBundle.providerStatuses as Array<Record<string, unknown>>;
-          providerStatuses[0] = { ...providerStatuses[0], mode: "fixture" };
-          resealLiveSmokeProofBundleForTest(proofBundle);
-        },
-        "proof-bundle provider chain is not live and ready",
+        "publicClaim providerStatusHash does not match proof-bundle snapshot",
       ],
       [
         "replay deployment registry hash",
@@ -338,7 +329,7 @@ describe("pactfuse-api P0", () => {
           replayBundle.deploymentRegistry = null;
           replayBundle.deploymentRegistryHash = null;
         },
-        "public claim tokenMode requires live deployment registry",
+        "publicClaim deploymentRegistryHash does not match proof-bundle snapshot",
       ],
       [
         "public claim event hash",
@@ -362,6 +353,19 @@ describe("pactfuse-api P0", () => {
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain(expectedError);
     }
+  });
+
+  it("live-smoke rejects a self-consistent downgraded provider snapshot", async () => {
+    const result = await runLiveSmokeAgainstStub(undefined, (fixture) => {
+      const proofBundle = fixture.proofBundle as Record<string, unknown>;
+      const providerStatuses = proofBundle.providerStatuses as Array<Record<string, unknown>>;
+      providerStatuses[0] = { ...providerStatuses[0], mode: "fixture" };
+      resealLiveSmokeProofBundleForTest(proofBundle);
+      fixture.claim = proofBundle.publicClaim as Record<string, unknown>;
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("proof-bundle provider chain is not live and ready");
   });
 
   it("live-smoke rejects a self-consistent downgraded verifier run", async () => {
@@ -930,6 +934,8 @@ describe("pactfuse-api P0", () => {
     expect(claimJson.data).toEqual(
       expect.objectContaining({
         claimStatus: "authorized_public_claim",
+        snapshotScope: "authorization_event",
+        providerSnapshotOnly: true,
         claimMode: "caw-target-real",
         paymentMode: "gate-paid-artifact-real",
         tokenMode: "mock-test-token",
@@ -942,10 +948,21 @@ describe("pactfuse-api P0", () => {
     expect(claimJson.data.publicClaimHash).toMatch(/^0x[0-9a-f]{64}$/);
     expect(repeatedClaim.status).toBe(200);
     expect(repeatedClaimJson.data.publicClaimHash).toBe(claimJson.data.publicClaimHash);
+    expect(repeatedClaimJson.data).toEqual(claimJson.data);
     expect(missingProofBundle.status).toBe(401);
     expect(wrongProofBundle.status).toBe(403);
     expect(claimEvents).toHaveLength(1);
     expect(claimEvents[0]).toEqual(expect.objectContaining({ authority: "proof", kind: "public.claim.authorized" }));
+    expect(claimJson.data).toEqual(
+      expect.objectContaining({
+        authorizedAt: claimEvents[0].created_at,
+        authorizedEventSeq: claimEvents[0].event_seq,
+        asOfEventSeq: claimEvents[0].event_seq - 1,
+        providerStatusHash: proofBundleJson.data.providerStatusHash,
+        deploymentRegistryHash: proofBundleJson.data.deploymentRegistryHash,
+        serverHash: proofBundleJson.data.serverHash,
+      }),
+    );
     expect(claimEventPayload).toEqual(
       expect.objectContaining({
         publicClaimHash: claimJson.data.publicClaimHash,
@@ -971,6 +988,10 @@ describe("pactfuse-api P0", () => {
         publicClaimEventId: claimEvents[0].event_id,
         publicClaimEventHash: claimEvents[0].event_hash,
         publicClaimEventSeq: claimEvents[0].event_seq,
+        snapshotScope: "authorization_event",
+        providerSnapshotOnly: true,
+        authorizedAt: claimJson.data.authorizedAt,
+        asOfEventSeq: claimJson.data.asOfEventSeq,
         claimInputReplayBundleHash: claimJson.data.replayBundleHash,
         replayBundleHash: claimJson.data.replayBundleHash,
         verifierRunHash: hashForTestJson(claimJson.data.verifierRun),
@@ -2022,11 +2043,19 @@ describe("pactfuse-api P0", () => {
     expect(json.components.schemas.LiveProofPreflightResponse.oneOf[0].properties.data.properties.status.enum).toEqual(["ready", "blocked"]);
     expect(json.paths["/api/v1/evidence/public-claim"].get["x-pactfuse-proof-fields"]).toEqual([
       "claimStatus",
+      "snapshotScope",
+      "providerSnapshotOnly",
+      "authorizedAt",
+      "authorizedEventSeq",
+      "asOfEventSeq",
       "claimMode",
       "paymentMode",
       "tokenMode",
       "identityMode",
       "replayBundleHash",
+      "providerStatusHash",
+      "deploymentRegistryHash",
+      "serverHash",
       "publicClaimHash",
       "winnerClaimAllowed",
     ]);
@@ -2037,6 +2066,10 @@ describe("pactfuse-api P0", () => {
       "publicClaimEventId",
       "publicClaimEventHash",
       "publicClaimEventSeq",
+      "snapshotScope",
+      "providerSnapshotOnly",
+      "authorizedAt",
+      "asOfEventSeq",
       "claimInputReplayBundleHash",
       "replayBundleHash",
       "verifierRunHash",
@@ -2055,6 +2088,12 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/evidence/public-claim"].get.responses["200"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/PublicClaimResponse",
     );
+    const publicClaimSchema = json.components.schemas.PublicClaimResponse.oneOf[0].properties.data;
+    expect(publicClaimSchema.required).toEqual(
+      expect.arrayContaining(["snapshotScope", "providerSnapshotOnly", "authorizedAt", "authorizedEventSeq", "asOfEventSeq"]),
+    );
+    expect(publicClaimSchema.properties.snapshotScope.const).toBe("authorization_event");
+    expect(publicClaimSchema.properties.providerSnapshotOnly.const).toBe(true);
     expect(json.paths["/api/v1/caw/live/identity/probe"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/CawLiveIdentityProbeInput",
     );
@@ -2181,11 +2220,11 @@ describe("pactfuse-api P0", () => {
       "activationEventId",
       "activateInteractionId",
       "activateTxHash",
-	      "settlementEventId",
-	      "txHash",
-	      "chainProviderMode",
-	      "chainProviderEndpoint",
-	      "paymentToken",
+        "settlementEventId",
+        "txHash",
+        "chainProviderMode",
+        "chainProviderEndpoint",
+        "paymentToken",
       "agentWallet",
       "market",
       "amountAtomic",
@@ -2248,14 +2287,14 @@ describe("pactfuse-api P0", () => {
       "currentBlockNumber",
       "rawLogHash",
     ]);
-	    expect(json.paths["/api/v1/artifacts/preflight"].post["x-pactfuse-proof-fields"]).toEqual([
-	      "preflightId",
-	      "artifactHashPreview",
-	      "artifactCid",
-	      "priceDisclosureHash",
+      expect(json.paths["/api/v1/artifacts/preflight"].post["x-pactfuse-proof-fields"]).toEqual([
+        "preflightId",
+        "artifactHashPreview",
+        "artifactCid",
+        "priceDisclosureHash",
       "status",
-	      "winnerClaimAllowed",
-	    ]);
+        "winnerClaimAllowed",
+      ]);
     expect(json.paths["/api/v1/artifacts/preflight"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/ArtifactPreflightInput",
     );
@@ -2271,23 +2310,23 @@ describe("pactfuse-api P0", () => {
     expect(json.paths["/api/v1/artifacts/preflight/verify"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/ArtifactPreflightVerifyInput",
     );
-	    expect(json.paths["/api/v1/quotes"].post["x-pactfuse-proof-fields"]).toEqual([
-	      "preflightId",
-	      "artifactCid",
-	      "quoteSignedAfterPreflight",
-	      "priceDisclosureHash",
+      expect(json.paths["/api/v1/quotes"].post["x-pactfuse-proof-fields"]).toEqual([
+        "preflightId",
+        "artifactCid",
+        "quoteSignedAfterPreflight",
+        "priceDisclosureHash",
       "status",
       "chainId",
-	      "winnerClaimAllowed",
-	    ]);
+        "winnerClaimAllowed",
+      ]);
     expect(json.paths["/api/v1/quotes"].post.requestBody.content["application/json"].schema.$ref).toBe("#/components/schemas/QuoteInput");
-	    expect(json.paths["/api/v1/artifacts/access-token"].post["x-pactfuse-proof-fields"]).toEqual([
-	      "tokenId",
-	      "tokenHash",
-	      "quoteId",
-	      "preflightId",
-	      "artifactCid",
-	      "artifactPayloadHash",
+      expect(json.paths["/api/v1/artifacts/access-token"].post["x-pactfuse-proof-fields"]).toEqual([
+        "tokenId",
+        "tokenHash",
+        "quoteId",
+        "preflightId",
+        "artifactCid",
+        "artifactPayloadHash",
       "verifierRunId",
       "settlementEventId",
       "bearerBound",
@@ -3201,6 +3240,7 @@ describe("pactfuse-api P0", () => {
           exportUrl: `http://127.0.0.1:${address.port}/audit`,
           apiKey: "caw-api-key",
           walletId: "wallet-1",
+          allowInsecureTestEndpoint: true,
         }),
       });
       const ready = await app.request("/readyz");
@@ -3238,6 +3278,28 @@ describe("pactfuse-api P0", () => {
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     }
+  });
+
+  it("rejects CAW receipt export sources outside the official Cobo hosts by default", async () => {
+    const source = createHttpsCawReceiptSource({
+      exportUrl: "https://attacker.example.org/audit",
+      apiKey: "caw-api-key",
+    });
+
+    const status = await source.status();
+
+    expect(status).toEqual(
+      expect.objectContaining({
+        name: "caw",
+        mode: "live",
+        ready: false,
+        endpoint: "https://attacker.example.org/audit",
+      }),
+    );
+    expect(status.reason).toContain("not an official Cobo API host");
+    await expect(source.fetchReceiptBundle({ sessionId: hex32("fake-session") })).rejects.toThrow(
+      "not an official Cobo API host",
+    );
   });
 
   it("links non-manual CAW receipt ingest to a built operation", async () => {
@@ -3690,6 +3752,48 @@ describe("pactfuse-api P0", () => {
     expect(finalized.status).toBe(423);
     expect(finalized.json.error.code).toBe("proof_pending");
     expect(finalized.json.error.message).toContain("claimed gate event log was not found on chain");
+  });
+
+  it("blocks finalized gate proofs when the transaction receipt is not explicitly successful", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const txHash = hex32("gate-receipt-missing-status-tx");
+    const { app } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({
+        currentBlockNumber: 101,
+        logs,
+        deploymentReceipts: {
+          [txHash.toLowerCase()]: {
+            transactionHash: txHash,
+            blockNumber: 100,
+          },
+        },
+      }),
+    });
+    const sessionId = await createSession(app, "sess-gate-receipt-missing-status", { finalityDepth: 2 });
+    const spendId = await registerSpend(app, sessionId);
+    const body = gateEventEnvelope(sessionId, spendId, "gate-receipt-missing-status", {
+      blockNumber: 100,
+      currentBlockNumber: 101,
+      txHash,
+      rawLogHash: hex32("gate-receipt-missing-status-log"),
+    });
+    logs.push(
+      indexerLog("gate-receipt-missing-status", 100, {
+        eventName: "SpendSettled",
+        event: "SpendSettled",
+        sessionId,
+        spendId,
+        args: { sessionId, spendId },
+        transactionHash: txHash,
+        rawLogHash: hex32("gate-receipt-missing-status-log"),
+      }),
+    );
+
+    const finalized = await postSignedGateEvent(app, body);
+
+    expect(finalized.status).toBe(422);
+    expect(finalized.json.error.code).toBe("proof_blocked");
+    expect(finalized.json.error.message).toContain("gate transaction receipt is not explicitly successful");
   });
 
   it("blocks signed finalized gate proofs whose chain log address differs from the required gate cursor", async () => {
@@ -4349,12 +4453,12 @@ describe("pactfuse-api P0", () => {
     await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "artifact-summary-cap", finalized);
     const countRow = ctx.db.sqlite.prepare("SELECT COUNT(*) AS count FROM evidence_events WHERE session_id = ?").get(sessionId) as { count: number };
     for (let i = Number(countRow.count); i < 200; i += 1) {
-	      appendEvidenceEvent(ctx, {
-	        sessionId,
-	        authority: "operator",
-	        kind: "runner.heartbeat",
-	        payload: { i, winnerClaimAllowed: false },
-	      });
+        appendEvidenceEvent(ctx, {
+          sessionId,
+          authority: "operator",
+          kind: "runner.heartbeat",
+          payload: { i, winnerClaimAllowed: false },
+        });
     }
 
     const issue = await post(app, "/api/v1/artifacts/access-token", {
@@ -5272,9 +5376,9 @@ describe("pactfuse-api P0", () => {
         evidenceEventId: tokenEvent?.eventId,
       }),
     );
-	  expect(verify.status).toBe(200);
-	  expect(verifyJson.data.schemaOk).toBe(true);
-	});
+    expect(verify.status).toBe(200);
+    expect(verifyJson.data.schemaOk).toBe(true);
+  });
 
   it("refuses CAW allowance and token settlement proof when the chain provider is fixture-mode", async () => {
     const logs: Array<Record<string, unknown>> = [];
@@ -5285,7 +5389,7 @@ describe("pactfuse-api P0", () => {
     });
     const sessionId = await createSession(app, "sess-token-delta-fixture-chain");
     const spendId = await registerSpend(app, sessionId);
-	    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "token-delta-fixture-chain");
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "token-delta-fixture-chain");
     const allowance = await verifyCawAllowanceForTest(
       app,
       logs,
@@ -5296,16 +5400,48 @@ describe("pactfuse-api P0", () => {
       {},
       423,
     );
-	    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
-	    const replayJson = await replay.json();
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
 
     expect((allowance.error as { code?: string }).code).toBe("proof_pending");
     expect((allowance.error as { message?: string }).message).toContain("live chain proof provider");
     expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("caw.allowance.verified");
-	    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("token.balance_delta.verified");
-	  });
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("token.balance_delta.verified");
+  });
 
-	it("blocks ERC20 balance delta verification when the settlement tx has no matching Transfer log", async () => {
+  it("blocks CAW allowance proof when the approve transaction receipt is not explicitly successful", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const tokenBalances: Record<string, string> = {};
+    const key = "token-delta-approve-missing-status";
+    const approveTxHash = hex32(`caw-live-contract:${key}-approve`);
+    const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({
+        currentBlockNumber: 101,
+        logs,
+        tokenBalances,
+        deploymentReceipts: {
+          [approveTxHash.toLowerCase()]: {
+            transactionHash: approveTxHash,
+            blockNumber: 99,
+          },
+        },
+      }),
+    });
+    const sessionId = await createSession(app, "sess-token-delta-approve-missing-status");
+    const spendId = await registerSpend(app, sessionId);
+    await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, key);
+
+    const allowance = await verifyCawAllowanceForTest(app, logs, tokenBalances, sessionId, spendId, key, {}, 422);
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect((allowance.error as { code?: string }).code).toBe("proof_blocked");
+    expect((allowance.error as { message?: string }).message).toContain("CAW approve transaction receipt is not explicitly successful");
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("caw.allowance.verified");
+  });
+
+  it("blocks ERC20 balance delta verification when the settlement tx has no matching Transfer log", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
     const { app, ctx } = makeApp(":memory:", {
@@ -6044,7 +6180,7 @@ describe("pactfuse-api P0", () => {
     expect(cursor).toEqual(expect.objectContaining({ last_indexed_block: 100, status: "caught_up" }));
   });
 
-	  it("marks indexer provider failures degraded and keeps verifier output fail-closed", async () => {
+  it("marks indexer provider failures degraded and keeps verifier output fail-closed", async () => {
     const offline = makeApp(":memory:", {
       cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ ready: false, reason: "rpc offline" }),
@@ -7999,6 +8135,7 @@ describe("pactfuse-api P0", () => {
         baseUrl: `http://127.0.0.1:${address.port}`,
         apiKey: "owner-sdk-key",
         walletId: "wallet-sdk-1",
+        allowInsecureTestEndpoint: true,
       });
 
       const status = await client.status();
@@ -8040,6 +8177,27 @@ describe("pactfuse-api P0", () => {
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     }
+  });
+
+  it("rejects CAW live SDK endpoints outside the official Cobo hosts by default", async () => {
+    const client = createCoboAgenticWalletClient({
+      baseUrl: "https://attacker.example.org/v2",
+      apiKey: "owner-sdk-key",
+      walletId: "wallet-sdk-1",
+    });
+
+    const status = await client.status();
+
+    expect(status).toEqual(
+      expect.objectContaining({
+        name: "caw_live",
+        mode: "live",
+        ready: false,
+        endpoint: "https://attacker.example.org/v2",
+      }),
+    );
+    expect(status.reason).toContain("not an official Cobo API host");
+    await expect(client.getWallet("wallet-sdk-1")).rejects.toThrow("not an official Cobo API host");
   });
 
   it("records live CAW pact, transfer, and audit interactions without storing pact API keys", async () => {
@@ -9741,15 +9899,15 @@ async function verifyCawAllowanceForTest(
   sessionId: string,
   spendId: string,
   key: string,
-	  overrides: Partial<{
-	    paymentToken: string;
-	    agentWallet: string;
-	    procurementGateAddress: string;
-	    amountAtomic: string;
-	    blockNumber: number;
-	  }> = {},
-	  expectedStatus = 202,
-	): Promise<Record<string, unknown>> {
+    overrides: Partial<{
+      paymentToken: string;
+      agentWallet: string;
+      procurementGateAddress: string;
+      amountAtomic: string;
+      blockNumber: number;
+    }> = {},
+    expectedStatus = 202,
+  ): Promise<Record<string, unknown>> {
   const paymentToken = overrides.paymentToken ?? TEST_PAYMENT_TOKEN_ADDRESS;
   const agentWallet = overrides.agentWallet ?? TEST_PAYER_ADDRESS;
   const procurementGateAddress = overrides.procurementGateAddress ?? INDEXER_ADDRESS;
@@ -10452,13 +10610,35 @@ async function runLiveSmokeAgainstStub(
 function resealLiveSmokeProofBundleForTest(proofBundle: Record<string, unknown>): void {
   const publicClaim = proofBundle.publicClaim as Record<string, unknown>;
   const verifierRun = publicClaim.verifierRun as Record<string, unknown>;
+  proofBundle.providerStatusHash = hashForTestJson(proofBundle.providerStatuses);
+  proofBundle.deploymentRegistryHash = proofBundle.deploymentRegistry === null ? null : hashForTestJson(proofBundle.deploymentRegistry);
+  proofBundle.serverHash = hashForTestJson(proofBundle.server);
+  publicClaim.snapshotScope = "authorization_event";
+  publicClaim.providerSnapshotOnly = true;
+  publicClaim.authorizedEventSeq = proofBundle.publicClaimEventSeq;
+  publicClaim.asOfEventSeq = Number(proofBundle.publicClaimEventSeq) - 1;
+  publicClaim.providerStatusHash = proofBundle.providerStatusHash;
+  publicClaim.deploymentRegistryHash = proofBundle.deploymentRegistryHash;
+  publicClaim.serverHash = proofBundle.serverHash;
+  proofBundle.snapshotScope = publicClaim.snapshotScope;
+  proofBundle.providerSnapshotOnly = publicClaim.providerSnapshotOnly;
+  proofBundle.authorizedAt = publicClaim.authorizedAt;
+  proofBundle.asOfEventSeq = publicClaim.asOfEventSeq;
   publicClaim.publicClaimHash = hashForTestJson({
     sessionId: publicClaim.sessionId,
+    snapshotScope: publicClaim.snapshotScope,
+    providerSnapshotOnly: publicClaim.providerSnapshotOnly,
+    authorizedAt: publicClaim.authorizedAt,
+    authorizedEventSeq: publicClaim.authorizedEventSeq,
+    asOfEventSeq: publicClaim.asOfEventSeq,
     claimMode: publicClaim.claimMode,
     paymentMode: publicClaim.paymentMode,
     tokenMode: publicClaim.tokenMode,
     identityMode: publicClaim.identityMode,
     replayBundleHash: publicClaim.replayBundleHash,
+    providerStatusHash: publicClaim.providerStatusHash,
+    deploymentRegistryHash: publicClaim.deploymentRegistryHash,
+    serverHash: publicClaim.serverHash,
     verifierRun: {
       proofLevel: verifierRun.proofLevel,
       proofChipAllowed: verifierRun.proofChipAllowed,
@@ -10468,7 +10648,6 @@ function resealLiveSmokeProofBundleForTest(proofBundle: Record<string, unknown>)
   });
   proofBundle.publicClaimHash = publicClaim.publicClaimHash;
   proofBundle.verifierRunHash = hashForTestJson(publicClaim.verifierRun);
-  proofBundle.providerStatusHash = hashForTestJson(proofBundle.providerStatuses);
   const replayBundle = proofBundle.replayBundle as { events?: Array<Record<string, unknown>> };
   const previousProofEventHash =
     replayBundle.events
@@ -10479,7 +10658,7 @@ function resealLiveSmokeProofBundleForTest(proofBundle: Record<string, unknown>)
     publicClaimHash: proofBundle.publicClaimHash,
     replayBundleHash: proofBundle.claimInputReplayBundleHash,
     verifierRunHash: proofBundle.verifierRunHash,
-    asOfEventSeq: Number(proofBundle.publicClaimEventSeq) - 1,
+    asOfEventSeq: publicClaim.asOfEventSeq,
     providerStatuses: proofBundle.providerStatuses,
     providerStatusHash: proofBundle.providerStatusHash,
     deploymentRegistry: proofBundle.deploymentRegistry,
@@ -10631,10 +10810,10 @@ function liveSmokeFixture(): {
     replayPages: {},
   };
   const replayBundleHash = hashForTestJson(replayBundle);
-  const verifierRun = {
-    sessionId,
-    proofLevel: "final_replay_claim",
-    claimMode: "caw-target-real",
+    const verifierRun = {
+      sessionId,
+      proofLevel: "final_replay_claim",
+      claimMode: "caw-target-real",
     paymentMode: "gate-paid-artifact-real",
     tokenMode: "mock-test-token",
     identityMode: "p0-floor-one-wallet",
@@ -10644,56 +10823,82 @@ function liveSmokeFixture(): {
     requestedWinnerClaimAllowed: true,
     finalVerifierComplete: true,
     errors: [],
-    warnings: [],
-    raw: {},
-  };
-  const publicClaimHash = hashForTestJson({
-    sessionId,
-    claimMode: "caw-target-real",
-    paymentMode: "gate-paid-artifact-real",
-    tokenMode: "mock-test-token",
-    identityMode: "p0-floor-one-wallet",
-    replayBundleHash,
-    verifierRun: {
-      proofLevel: verifierRun.proofLevel,
-      proofChipAllowed: verifierRun.proofChipAllowed,
+      warnings: [],
+      raw: {},
+    };
+    const authorizedAt = "2026-06-11T00:00:00.000Z";
+    const authorizedEventSeq = 50;
+    const asOfEventSeq = 49;
+    const server = {
+      proofBundleVersion: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+      commit: "stub-commit",
+      buildTime: "2026-06-11T00:00:00.000Z",
+      generatedAt: authorizedAt,
+    };
+    const providerStatusHash = hashForTestJson(providerStatuses);
+    const deploymentRegistryHash = hashForTestJson(deploymentRegistry);
+    const serverHash = hashForTestJson(server);
+    const publicClaimHash = hashForTestJson({
+      sessionId,
+      snapshotScope: "authorization_event",
+      providerSnapshotOnly: true,
+      authorizedAt,
+      authorizedEventSeq,
+      asOfEventSeq,
+      claimMode: "caw-target-real",
+      paymentMode: "gate-paid-artifact-real",
+      tokenMode: "mock-test-token",
+      identityMode: "p0-floor-one-wallet",
+      replayBundleHash,
+      providerStatusHash,
+      deploymentRegistryHash,
+      serverHash,
+      verifierRun: {
+        proofLevel: verifierRun.proofLevel,
+        proofChipAllowed: verifierRun.proofChipAllowed,
       finalVerifierComplete: verifierRun.finalVerifierComplete,
       winnerClaimAllowed: verifierRun.winnerClaimAllowed,
     },
   });
-  const claim = {
-    sessionId,
-    claimStatus: "authorized_public_claim",
-    claimMode: "caw-target-real",
-    paymentMode: "gate-paid-artifact-real",
-    tokenMode: "mock-test-token",
-    identityMode: "p0-floor-one-wallet",
-    replayBundleHash,
-    publicClaimHash,
-    verifierRun,
-    proofChipAllowed: true,
-    finalVerifierComplete: true,
-    winnerClaimAllowed: true,
-  };
-  const server = {
-    proofBundleVersion: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
-    commit: "stub-commit",
-    buildTime: "2026-06-11T00:00:00.000Z",
-    generatedAt: "2026-06-11T00:00:00.000Z",
-  };
-  const proofBundleBase = {
-    bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
-    sessionId,
-    publicClaimHash,
-    publicClaimEventSeq: 50,
-    claimInputReplayBundleHash: replayBundleHash,
-    replayBundleHash,
-    verifierRunHash: hashForTestJson(verifierRun),
-    providerStatusHash: hashForTestJson(providerStatuses),
-    deploymentRegistryHash: hashForTestJson(deploymentRegistry),
-    serverHash: hashForTestJson(server),
-    publicClaim: claim,
-    replayBundle,
+    const claim = {
+      sessionId,
+      claimStatus: "authorized_public_claim",
+      snapshotScope: "authorization_event",
+      providerSnapshotOnly: true,
+      authorizedAt,
+      authorizedEventSeq,
+      asOfEventSeq,
+      claimMode: "caw-target-real",
+      paymentMode: "gate-paid-artifact-real",
+      tokenMode: "mock-test-token",
+      identityMode: "p0-floor-one-wallet",
+      replayBundleHash,
+      providerStatusHash,
+      deploymentRegistryHash,
+      serverHash,
+      publicClaimHash,
+      verifierRun,
+      proofChipAllowed: true,
+      finalVerifierComplete: true,
+      winnerClaimAllowed: true,
+    };
+    const proofBundleBase = {
+      bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+      sessionId,
+      publicClaimHash,
+      publicClaimEventSeq: authorizedEventSeq,
+      snapshotScope: "authorization_event",
+      providerSnapshotOnly: true,
+      authorizedAt,
+      asOfEventSeq,
+      claimInputReplayBundleHash: replayBundleHash,
+      replayBundleHash,
+      verifierRunHash: hashForTestJson(verifierRun),
+      providerStatusHash,
+      deploymentRegistryHash,
+      serverHash,
+      publicClaim: claim,
+      replayBundle,
     providerStatuses,
     deploymentRegistry,
     server,
@@ -10701,11 +10906,11 @@ function liveSmokeFixture(): {
   };
   const publicClaimPayloadHash = hashForTestJson({
     claim,
-    publicClaimHash,
-    replayBundleHash,
-    verifierRunHash: proofBundleBase.verifierRunHash,
-    asOfEventSeq: 49,
-    providerStatuses,
+      publicClaimHash,
+      replayBundleHash,
+      verifierRunHash: proofBundleBase.verifierRunHash,
+      asOfEventSeq,
+      providerStatuses,
     providerStatusHash: proofBundleBase.providerStatusHash,
     deploymentRegistry,
     deploymentRegistryHash: proofBundleBase.deploymentRegistryHash,
