@@ -16,6 +16,41 @@ export const IdempotencyKeySchema = z.string().min(4).max(160).regex(/^[a-z][a-z
 export const DecimalStringSchema = z.string().regex(/^(0|[1-9][0-9]*)$/);
 export const CawAmountStringSchema = z.string().regex(/^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$/);
 export const IsoDateStringSchema = z.string().datetime({ offset: true });
+export const GitCommitShaSchema = z.string().regex(/^[0-9a-fA-F]{6,64}$/);
+export const GitHubRepoUrlSchema = z
+  .string()
+  .min(1)
+  .max(500)
+  .refine((value) => {
+    try {
+      const url = new URL(value);
+      if (url.protocol !== "https:" || url.hostname !== "github.com" || url.username || url.password || url.search || url.hash) {
+        return false;
+      }
+      if (url.pathname.endsWith("/")) {
+        return false;
+      }
+      const parts = url.pathname.split("/").filter(Boolean);
+      if (parts.length !== 2) {
+        return false;
+      }
+      const owner = parts[0];
+      const repo = parts[1];
+      if (!owner || !repo) {
+        return false;
+      }
+      return (
+        /^[A-Za-z0-9_.-]+$/.test(owner) &&
+        owner !== "." &&
+        owner !== ".." &&
+        /^[A-Za-z0-9_.-]+(?:\.git)?$/.test(repo) &&
+        repo !== "." &&
+        repo !== ".."
+      );
+    } catch {
+      return false;
+    }
+  }, "targetRepo must be an https://github.com/{owner}/{repo} URL without credentials, query, or fragment");
 
 export const JsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 export type JsonPrimitive = z.infer<typeof JsonPrimitiveSchema>;
@@ -28,6 +63,7 @@ export const JsonObjectSchema = z.record(z.string(), JsonValueSchema);
 export const ClaimModeSchema = z.enum(["simulated", "caw-target-real", "caw-stable-params-real"]);
 export const PaymentModeSchema = z.enum(["mocked", "gate-paid-artifact-real", "permit-payment-real"]);
 export const TokenModeSchema = z.enum(["local-mocked", "mock-test-token", "official-testnet-usdc"]);
+export const TokenSettlementClaimSchema = z.enum(["live-mock-erc20-fallback", "official-testnet-usdc"]);
 export const IdentityModeSchema = z.enum(["pending", "p0-floor-one-wallet", "p0-win-separate-identities"]);
 export const QuoteStatusSchema = z.enum(["mocked_after_preflight_not_chain_settleable", "chain_settleable_after_preflight"]);
 
@@ -248,6 +284,7 @@ export const CawLiveContractCallSubmitPayloadSchema = z
     valueAtomic: DecimalStringSchema.default("0"),
     procurementGateAddress: AddressSchema.optional(),
     requestId: z.string().min(1).max(160).optional(),
+    sourceAddress: z.string().min(1).max(160).optional(),
     sponsor: z.boolean().optional(),
     gasProvider: z.string().min(1).max(120).optional(),
     description: z.string().min(1).max(240).optional(),
@@ -294,13 +331,22 @@ export const ArtifactPreflightPayloadSchema = z
 export const ArtifactPreflightVerifyPayloadSchema = z
   .object({
     preflightId: Hex32Schema,
-    artifactPayloadHash: Hex32Schema,
-    artifactCid: ArtifactCidSchema,
-    manifestFetchHash: Hex32Schema,
-    endpointResponseHash: Hex32Schema,
-    leaseDryRunHash: Hex32Schema,
+    verificationMode: z.enum(["caller_hash_attestation", "server_live_fetch"]).default("caller_hash_attestation"),
+    artifactPayloadHash: Hex32Schema.optional(),
+    artifactCid: ArtifactCidSchema.optional(),
+    manifestFetchHash: Hex32Schema.optional(),
+    endpointResponseHash: Hex32Schema.optional(),
+    leaseDryRunHash: Hex32Schema.optional(),
   })
-  .strict();
+  .strict()
+  .refine(
+    (payload) =>
+      payload.verificationMode === "server_live_fetch" ||
+      Boolean(payload.artifactPayloadHash && payload.artifactCid && payload.manifestFetchHash && payload.endpointResponseHash && payload.leaseDryRunHash),
+    {
+      message: "caller_hash_attestation requires artifactPayloadHash, artifactCid, manifestFetchHash, endpointResponseHash, and leaseDryRunHash",
+    },
+  );
 
 export const QuotePayloadSchema = z
   .object({
@@ -337,8 +383,8 @@ export const LeaseExecutePayloadSchema = z
     spendId: Hex32Schema,
     payer: HexSchema,
     artifactHash: Hex32Schema,
-    targetRepo: z.string().min(1).max(500),
-    targetCommit: z.string().min(6).max(128),
+    targetRepo: GitHubRepoUrlSchema,
+    targetCommit: GitCommitShaSchema,
   })
   .strict();
 
@@ -455,6 +501,7 @@ export const McpAdapterAuditPayloadSchema = z
     toolName: z.string().min(1).max(160),
     request: JsonObjectSchema,
     response: JsonObjectSchema,
+    redactedFields: z.array(z.string().min(1).max(160)).max(16).optional(),
     status: z.enum(["succeeded", "failed", "blocked"]),
   })
   .strict();
@@ -572,6 +619,7 @@ export const McpAdapterCallViewSchema = z
     responseHash: Hex32Schema,
     request: JsonObjectSchema,
     response: JsonObjectSchema,
+    redactedFields: z.array(z.string().min(1).max(160)).max(16).optional(),
     status: z.enum(["succeeded", "failed", "blocked"]),
     createdAt: IsoDateStringSchema,
     proofAuthority: z.literal(false),
@@ -805,8 +853,8 @@ export const ReplayBundleViewSchema = z
     bundleType: z.literal("PACTFUSE_EVIDENCE_V1"),
     sessionId: Hex32Schema,
     summaryMode: z.literal(true),
-    asOfEventSeq: z.number().int().min(0).max(200),
-    asOfMcpAdapterCallCount: z.number().int().min(0).max(200),
+    asOfEventSeq: z.number().int().min(0),
+    asOfMcpAdapterCallCount: z.number().int().min(0),
     winnerClaimAllowed: z.boolean(),
     eventRoot: Hex32Schema,
     agentTranscriptHash: Hex32Schema,
@@ -880,8 +928,8 @@ export const AgentTranscriptViewSchema = z
     toolsCallHash: Hex32Schema.nullable(),
     transcriptHash: Hex32Schema.nullable(),
     boundedToPinnedManifest: z.boolean(),
-    callCount: z.number().int().min(0).max(200),
-    calls: z.array(AgentTranscriptCallSummarySchema).max(200),
+    callCount: z.number().int().min(0),
+    calls: z.array(AgentTranscriptCallSummarySchema),
     winnerClaimAllowed: z.literal(false),
   })
   .strict();
@@ -961,6 +1009,7 @@ export const PublicClaimViewSchema = z
     claimMode: z.literal("caw-target-real"),
     paymentMode: z.literal("gate-paid-artifact-real"),
     tokenMode: z.enum(["mock-test-token", "official-testnet-usdc"]),
+    tokenSettlementClaim: TokenSettlementClaimSchema,
     identityMode: z.enum(["p0-floor-one-wallet", "p0-win-separate-identities"]),
     replayBundleHash: Hex32Schema,
     providerStatusHash: Hex32Schema,
@@ -972,7 +1021,36 @@ export const PublicClaimViewSchema = z
     winnerClaimAllowed: z.literal(true),
     publicClaimHash: Hex32Schema,
   })
-  .strict();
+  .strict()
+  .superRefine((claim, ctx) => {
+    const expected =
+      claim.tokenMode === "official-testnet-usdc" ? "official-testnet-usdc" : "live-mock-erc20-fallback";
+    if (claim.tokenSettlementClaim !== expected) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["tokenSettlementClaim"],
+        message: "tokenSettlementClaim must match tokenMode",
+      });
+    }
+    for (const field of ["claimMode", "paymentMode", "tokenMode", "identityMode"] as const) {
+      if (claim.verifierRun[field] !== claim[field]) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["verifierRun", field],
+          message: `verifierRun.${field} must match public claim ${field}`,
+        });
+      }
+    }
+    for (const field of ["proofChipAllowed", "finalVerifierComplete", "winnerClaimAllowed"] as const) {
+      if (claim.verifierRun[field] !== claim[field]) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["verifierRun", field],
+          message: `verifierRun.${field} must match public claim ${field}`,
+        });
+      }
+    }
+  });
 
 export const ProofBundleProviderStatusSchema = ProofProviderStatusSchema.extend({
   endpoint: z.string().min(1).max(1000).nullable(),
@@ -984,6 +1062,17 @@ export const ProofBundleServerSchema = z
     commit: z.string().min(1).max(160).nullable(),
     buildTime: IsoDateStringSchema.nullable(),
     generatedAt: IsoDateStringSchema,
+  })
+  .strict();
+
+export const ProofBundleVerifierAttestationSchema = z
+  .object({
+    scheme: z.literal("ed25519"),
+    keyId: z.string().min(1).max(160),
+    publicKeyPem: z.string().min(1).max(2000),
+    publicKeyHash: Hex32Schema,
+    signedPayloadHash: Hex32Schema,
+    signature: z.string().min(80).max(200),
   })
   .strict();
 
@@ -1001,8 +1090,10 @@ export const ProofBundleAuthorizationSnapshotSchema = z
 export const PublicClaimAuthorizedPayloadSchema = ProofBundleAuthorizationSnapshotSchema.extend({
   claim: PublicClaimViewSchema,
   publicClaimHash: Hex32Schema,
+  replayBundle: ReplayBundleViewSchema.optional(),
   replayBundleHash: Hex32Schema,
   verifierRunHash: Hex32Schema,
+  verifierAttestation: ProofBundleVerifierAttestationSchema,
   asOfEventSeq: z.number().int().min(0),
   proofAuthority: z.literal(true),
   winnerClaimAllowed: z.literal(true),
@@ -1032,6 +1123,7 @@ export const ProofBundleViewSchema = z
     providerStatuses: z.array(ProofBundleProviderStatusSchema),
     deploymentRegistry: DeploymentRegistrySchema.nullable(),
     server: ProofBundleServerSchema,
+    verifierAttestation: ProofBundleVerifierAttestationSchema,
     winnerClaimAllowed: z.literal(true),
   })
   .strict();
@@ -1054,6 +1146,7 @@ export const LiveProofPreflightSecuritySchema = z
     artifactSignerTokenConfigured: z.boolean(),
     roleTokenFallbackToOperator: z.boolean(),
     allowInsecureMissingRoleTokens: z.boolean(),
+    allowInsecurePublicEvidenceUrls: z.boolean(),
     cawIngestTokenConfigured: z.boolean(),
     mcpAuditSecretConfigured: z.boolean(),
     gateIngestSecretConfigured: z.boolean(),
@@ -1141,9 +1234,11 @@ export type JudgeCheckView = z.infer<typeof JudgeCheckViewSchema>;
 export type VerifierRunView = z.infer<typeof VerifierRunViewSchema>;
 export type ClaimReadinessView = z.infer<typeof ClaimReadinessViewSchema>;
 export type PublicClaimView = z.infer<typeof PublicClaimViewSchema>;
+export type TokenSettlementClaim = z.infer<typeof TokenSettlementClaimSchema>;
 export type DeploymentRegistry = z.infer<typeof DeploymentRegistrySchema>;
 export type DeploymentRegistryEntry = z.infer<typeof DeploymentRegistryEntrySchema>;
 export type ProofBundleAuthorizationSnapshot = z.infer<typeof ProofBundleAuthorizationSnapshotSchema>;
+export type ProofBundleVerifierAttestation = z.infer<typeof ProofBundleVerifierAttestationSchema>;
 export type ProofBundleView = z.infer<typeof ProofBundleViewSchema>;
 export type LiveProofPreflightView = z.infer<typeof LiveProofPreflightViewSchema>;
 export type ReplayBundleView = z.infer<typeof ReplayBundleViewSchema>;
@@ -1157,4 +1252,6 @@ export type CawLiveTransferSubmitPayload = z.infer<typeof CawLiveTransferSubmitP
 export type CawLiveContractCallSubmitPayload = z.infer<typeof CawLiveContractCallSubmitPayloadSchema>;
 export type CawAllowanceVerifyPayload = z.infer<typeof CawAllowanceVerifyPayloadSchema>;
 export type CawLiveAuditSyncPayload = z.infer<typeof CawLiveAuditSyncPayloadSchema>;
+export type ArtifactPreflightPayload = z.infer<typeof ArtifactPreflightPayloadSchema>;
+export type ArtifactPreflightVerifyPayload = z.infer<typeof ArtifactPreflightVerifyPayloadSchema>;
 export type TokenBalanceDeltaVerifyPayload = z.infer<typeof TokenBalanceDeltaVerifyPayloadSchema>;

@@ -1,9 +1,11 @@
+import { createPrivateKey, createPublicKey, sign as cryptoSign, verify as cryptoVerify } from "node:crypto";
 import { readFileSync } from "node:fs";
 import pino from "pino";
 import { DeploymentRegistrySchema, type DeploymentRegistry } from "@pactfuse/evidence-schema";
 import { openPactFuseDb } from "./db/index.js";
 import {
   createCoboAgenticWalletClient,
+  createHttpArtifactDeliveryVerifier,
   createLocalTemplateRegistry,
   createHttpJsonRpcMcpLeaseClient,
   createHttpsCawReceiptSource,
@@ -16,6 +18,7 @@ import {
 import { createVerifierAdapter } from "./services/verifier.js";
 import type { Clock, Logger, ServiceCtx } from "./types.js";
 import type { ChainIndexerWorkerCursorConfig, IndexerWorkerOptions } from "./services/indexer-worker.js";
+import { sha256Hex } from "./util.js";
 
 function createRuntimeCawSource() {
   if (!process.env.PACTFUSE_CAW_EXPORT_URL) {
@@ -87,6 +90,43 @@ function createRuntimeServerMetadata() {
   };
 }
 
+function createRuntimeProofBundleSigner(): ServiceCtx["proofBundleSigner"] {
+  const privateKeyPem = pemEnvOrFile("PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM", "PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PATH");
+  if (!privateKeyPem) {
+    return null;
+  }
+  const privateKey = createPrivateKey(privateKeyPem);
+  const publicKeyPem =
+    pemEnvOrFile("PACTFUSE_PROOF_SIGNING_PUBLIC_KEY_PEM", "PACTFUSE_PROOF_SIGNING_PUBLIC_KEY_PATH") ??
+    createPublicKey(privateKey).export({ type: "spki", format: "pem" }).toString();
+  const publicKey = createPublicKey(publicKeyPem);
+  const selfTestPayload = Buffer.from("PACTFUSE_PUBLIC_PROOF_SIGNER_SELF_TEST_V1", "utf8");
+  const selfTestSignature = cryptoSign(null, selfTestPayload, privateKey);
+  if (!cryptoVerify(null, selfTestPayload, publicKey, selfTestSignature)) {
+    throw new Error("PACTFUSE proof signing public key does not match the private key");
+  }
+  const publicKeyHash = sha256Hex(publicKeyPem);
+  return {
+    scheme: "ed25519",
+    keyId: process.env.PACTFUSE_PROOF_KEY_ID ?? publicKeyHash,
+    publicKeyPem,
+    publicKeyHash,
+    signPayloadHash(payloadHash) {
+      return cryptoSign(null, Buffer.from(payloadHash.slice(2), "hex"), privateKey).toString("base64");
+    },
+  };
+}
+
+function pemEnvOrFile(envName: string, pathEnvName: string): string | null {
+  const rawPem = process.env[envName];
+  const pemPath = process.env[pathEnvName];
+  if (rawPem && pemPath) {
+    throw new Error(`set either ${envName} or ${pathEnvName}, not both`);
+  }
+  const pem = rawPem ?? (pemPath ? readFileSync(pemPath, "utf8") : null);
+  return pem ? pem.replace(/\\n/g, "\n") : null;
+}
+
 function numberEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) {
@@ -136,6 +176,22 @@ function topicsEnv(name: string): Array<`0x${string}` | null> {
     .filter((part) => part.length > 0)
     .map((part) => (part.toLowerCase() === "null" ? null : (part as `0x${string}`)))
     .filter((part): part is `0x${string}` | null => part === null || /^0x[0-9a-fA-F]+$/.test(part));
+}
+
+function listEnv(name: string, fallback: string[]): string[] {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  const values = raw
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return values.length > 0 ? values : fallback;
+}
+
+function createRuntimeTrustedProofKeyHashes(): Set<string> {
+  return new Set(listEnv("PACTFUSE_TRUSTED_PROOF_KEY_HASHES", []).map((value) => value.toLowerCase()));
 }
 
 export function createRuntimeIndexerWorkerOptions():
@@ -190,6 +246,7 @@ export function createServiceCtx(options: {
     caw: createRuntimeCawSource(),
     cawLive: createRuntimeCawLiveClient(),
     mcpLease: createRuntimeMcpLeaseClient(),
+    artifactDelivery: createHttpArtifactDeliveryVerifier(),
     templates: createLocalTemplateRegistry(),
     mcpAuditSecret: process.env.PACTFUSE_MCP_AUDIT_TOKEN ?? null,
     gateIngestSecret: process.env.PACTFUSE_GATE_INGEST_TOKEN ?? null,
@@ -197,6 +254,8 @@ export function createServiceCtx(options: {
     deploymentRegistry: createRuntimeDeploymentRegistry(),
     server: createRuntimeServerMetadata(),
     requiredIndexerCursors: options.requiredIndexerCursors ?? runtimeIndexerOptions?.cursors ?? [],
+    proofBundleSigner: createRuntimeProofBundleSigner(),
+    trustedProofKeyHashes: createRuntimeTrustedProofKeyHashes(),
     apiSecurity: {
       operatorToken: process.env.PACTFUSE_OPERATOR_TOKEN ?? null,
       challengeSubmitterToken: process.env.PACTFUSE_CHALLENGE_SUBMITTER_TOKEN ?? null,
@@ -206,6 +265,9 @@ export function createServiceCtx(options: {
       defaultRateLimitMax: numberEnv("PACTFUSE_RATE_LIMIT_MAX_REQUESTS", 600),
       sessionCreateRateLimitMax: numberEnv("PACTFUSE_SESSION_RATE_LIMIT_MAX_REQUESTS", 60),
       sourceChallengeRateLimitMax: numberEnv("PACTFUSE_CHALLENGE_RATE_LIMIT_MAX_REQUESTS", 20),
+    },
+    publicEvidence: {
+      allowInsecureTestUrls: booleanEnv("PACTFUSE_ALLOW_INSECURE_PUBLIC_EVIDENCE_URLS", false),
     },
     clock: options.clock ?? { now: () => new Date() },
     logger: options.logger ?? pino({ name: "pactfuse-api" }),

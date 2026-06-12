@@ -106,6 +106,7 @@ export type CawLiveContractCallInput = {
   calldata: string;
   valueAtomic?: string;
   requestId?: string;
+  sourceAddress?: string;
   sponsor?: boolean;
   gasProvider?: string;
   description?: string;
@@ -128,6 +129,7 @@ export type CawLiveAuditInput = {
 export type CawLiveClient = {
   status: () => Promise<ProofProviderStatus>;
   getWallet: (walletId: string) => Promise<Record<string, unknown>>;
+  listWalletAddresses: (walletId: string) => Promise<Record<string, unknown>>;
   submitPact: (input: CawLivePactSubmitInput) => Promise<Record<string, unknown>>;
   getPact: (pactId: string) => Promise<Record<string, unknown>>;
   transferToken: (input: CawLiveTransferInput) => Promise<Record<string, unknown>>;
@@ -166,6 +168,37 @@ export type McpLeaseClient = {
   executeCleanLease: (input: McpLeaseExecutionInput) => Promise<McpLeaseExecutionResult>;
 };
 
+export type ArtifactDeliverySourceManifest = {
+  sourceHash: string;
+  manifestUrl: string;
+  manifestHash: string;
+};
+
+export type ArtifactDeliveryVerificationInput = {
+  sessionId: string;
+  preflightId: string;
+  spendId: string;
+  artifactHashPreview: string;
+  artifactCid: string;
+  endpointUrl: string;
+  priceDisclosureHash: string;
+  sourceStateSnapshotHash: string;
+  sourceManifests: ArtifactDeliverySourceManifest[];
+};
+
+export type ArtifactDeliveryVerificationResult = {
+  artifactPayloadHash: string;
+  artifactCid: string;
+  manifestFetchHash: string;
+  endpointResponseHash: string;
+  leaseDryRunHash: string;
+  evidenceHash: string;
+};
+
+export type ArtifactDeliveryVerifier = {
+  verify: (input: ArtifactDeliveryVerificationInput) => Promise<ArtifactDeliveryVerificationResult>;
+};
+
 export type PactTemplateBinding = {
   mode: "gate-paid-artifact-real" | "permit-payment-real";
   sourcePath: string;
@@ -188,9 +221,21 @@ export type ApiSecurityConfig = {
   sourceChallengeRateLimitMax: number;
 };
 
+export type PublicEvidenceConfig = {
+  allowInsecureTestUrls: boolean;
+};
+
 export type RuntimeServerMetadata = {
   commit: string | null;
   buildTime: string | null;
+};
+
+export type ProofBundleSigner = {
+  scheme: "ed25519";
+  keyId: string;
+  publicKeyPem: string;
+  publicKeyHash: `0x${string}`;
+  signPayloadHash: (payloadHash: `0x${string}`) => string;
 };
 
 export type ServiceCtx = {
@@ -200,6 +245,7 @@ export type ServiceCtx = {
   caw: CawReceiptSource;
   cawLive: CawLiveClient;
   mcpLease: McpLeaseClient;
+  artifactDelivery: ArtifactDeliveryVerifier;
   templates: PactTemplateRegistry;
   mcpAuditSecret: string | null;
   gateIngestSecret: string | null;
@@ -207,7 +253,10 @@ export type ServiceCtx = {
   deploymentRegistry: DeploymentRegistry | undefined;
   server: RuntimeServerMetadata;
   apiSecurity: ApiSecurityConfig;
+  publicEvidence: PublicEvidenceConfig;
   requiredIndexerCursors: RequiredIndexerCursor[];
+  proofBundleSigner: ProofBundleSigner | null;
+  trustedProofKeyHashes: Set<string>;
   clock: Clock;
   logger: Logger;
   config: RuntimeConfig;

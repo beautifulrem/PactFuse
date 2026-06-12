@@ -1,4 +1,4 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, generateKeyPairSync, sign as cryptoSign } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, keccak256, toBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { canonicalizeJson, DeploymentRegistrySchema } from "@pactfuse/evidence-schema";
+import { canonicalizeJson, DeploymentRegistrySchema, LOCKED_RUNTIME_MODES } from "@pactfuse/evidence-schema";
 import { createApp } from "../app.js";
 import { openPactFuseDb } from "../db/index.js";
 import { completeJob, enqueueJob, leaseNextJob, requeueExpiredLeases } from "../services/jobs.js";
@@ -15,8 +15,10 @@ import { INDEX_CHAIN_WINDOW_JOB_KIND, runIndexerWorkerOnce } from "../services/i
 import {
   createCoboAgenticWalletClient,
   createHttpsCawReceiptSource,
+  createHttpArtifactDeliveryVerifier,
   createHttpJsonRpcMcpLeaseClient,
   createStaticTemplateRegistry,
+  createUnconfiguredArtifactDeliveryVerifier,
   createUnconfiguredCawLiveClient,
   createUnconfiguredCawReceiptSource,
   createUnconfiguredChainClient,
@@ -27,7 +29,16 @@ import {
 import { createRuntimeIndexerWorkerOptions, createServiceCtx } from "../runtime.js";
 import { appendEvidenceEvent, recordMcpAdapterCall } from "../services/service.js";
 import { createVerifierAdapter } from "../services/verifier.js";
-import type { ApiSecurityConfig, CawLiveClient, CawReceiptSource, ChainClient, McpLeaseClient, ServiceCtx } from "../types.js";
+import type {
+  ApiSecurityConfig,
+  ArtifactDeliveryVerifier,
+  CawLiveClient,
+  CawReceiptSource,
+  ChainClient,
+  McpLeaseClient,
+  ProofBundleSigner,
+  ServiceCtx,
+} from "../types.js";
 
 const MCP_AUDIT_TOKEN = "test-mcp-audit-token";
 const GATE_INGEST_TOKEN = "test-gate-ingest-token";
@@ -37,6 +48,7 @@ const ERC20_APPROVE_SELECTOR = "0x095ea7b3";
 const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const ERC20_APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
+const LIVE_SMOKE_TEST_PROOF_SIGNER = makeTestProofBundleSigner("live-smoke-test-proof-key");
 const ERC20_APPROVE_ABI = [
   {
     type: "function",
@@ -69,13 +81,17 @@ function makeApp(
     cawLive?: CawLiveClient;
     chain?: ChainClient;
     mcpLease?: McpLeaseClient;
+    artifactDelivery?: ArtifactDeliveryVerifier;
     mcpAuditSecret?: string | null;
     gateIngestSecret?: string | null;
     cawIngestToken?: string | null;
     deploymentRegistry?: ServiceCtx["deploymentRegistry"];
     apiSecurity?: Partial<ApiSecurityConfig>;
+    publicEvidence?: Partial<ServiceCtx["publicEvidence"]>;
     requiredIndexerCursors?: ServiceCtx["requiredIndexerCursors"];
     verifier?: ServiceCtx["verifier"];
+    proofBundleSigner?: ServiceCtx["proofBundleSigner"];
+    trustedProofKeyHashes?: Iterable<string>;
   } = {},
 ) {
   const mcpAuditSecret = options.mcpAuditSecret === undefined ? MCP_AUDIT_TOKEN : options.mcpAuditSecret;
@@ -98,6 +114,7 @@ function makeApp(
     caw: options.caw ?? createUnconfiguredCawReceiptSource(),
     cawLive: options.cawLive ?? createUnconfiguredCawLiveClient(),
     mcpLease: options.mcpLease ?? createUnconfiguredMcpLeaseClient(),
+    artifactDelivery: options.artifactDelivery ?? createUnconfiguredArtifactDeliveryVerifier(),
     templates: createStaticTemplateRegistry([
       {
         mode: "gate-paid-artifact-real",
@@ -119,7 +136,13 @@ function makeApp(
       buildTime: "2026-06-11T00:00:00.000Z",
     },
     requiredIndexerCursors: options.requiredIndexerCursors ?? [],
+    proofBundleSigner: options.proofBundleSigner ?? null,
+    trustedProofKeyHashes: new Set(options.trustedProofKeyHashes ?? []),
     apiSecurity,
+    publicEvidence: {
+      allowInsecureTestUrls: false,
+      ...options.publicEvidence,
+    },
     clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
     logger: {
       info: () => undefined,
@@ -179,6 +202,39 @@ describe("pactfuse-api P0", () => {
     expect(conflict.status).toBe(409);
     expect(conflict.json.ok).toBe(false);
     expect(conflict.json.error.code).toBe("idempotency_conflict");
+  });
+
+  it("reclaims stale pending idempotency rows for the same request hash", async () => {
+    const { app, ctx } = makeApp();
+    const body = { idempotencyKey: "sess-stale-pending", payload: { label: "stale" } };
+    const parsedBody = {
+      idempotencyKey: body.idempotencyKey,
+      payload: { ...body.payload, finalityDepth: 2, modes: LOCKED_RUNTIME_MODES, metadata: {} },
+    };
+    ctx.db.sqlite
+      .prepare(
+        `INSERT INTO api_requests
+          (request_id, action_scope, idempotency_key, request_hash, response_json, status, created_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+      )
+      .run(
+        "req_stale_pending",
+        "sessions:create",
+        body.idempotencyKey,
+        hashForTestJson(parsedBody),
+        JSON.stringify({ ok: false, requestId: "req_stale_pending" }),
+        "2026-06-10T00:00:00.000Z",
+      );
+
+    const created = await post(app, "/api/v1/sessions", body);
+    const row = ctx.db.sqlite
+      .prepare("SELECT request_id, status, response_json FROM api_requests WHERE action_scope = ? AND idempotency_key = ?")
+      .get("sessions:create", body.idempotencyKey) as { request_id: string; status: string; response_json: string };
+
+    expect(created.status).toBe(201);
+    expect(row.request_id).not.toBe("req_stale_pending");
+    expect(row.status).toBe("completed");
+    expect(JSON.parse(row.response_json).data.sessionId).toBe(created.json.data.sessionId);
   });
 
   it("requires configured role tokens before protected mutations read request bodies", async () => {
@@ -291,6 +347,65 @@ describe("pactfuse-api P0", () => {
       ).toThrow("PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS must be one of");
     } finally {
       restoreEnv("PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS", previousAllowInsecure);
+    }
+  });
+
+  it("fails fast when proof signing public and private keys do not match", () => {
+    const previousPrivate = process.env.PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM;
+    const previousPublic = process.env.PACTFUSE_PROOF_SIGNING_PUBLIC_KEY_PEM;
+    const first = generateKeyPairSync("ed25519");
+    const second = generateKeyPairSync("ed25519");
+    try {
+      process.env.PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM = first.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+      process.env.PACTFUSE_PROOF_SIGNING_PUBLIC_KEY_PEM = second.publicKey.export({ type: "spki", format: "pem" }).toString();
+
+      expect(() =>
+        createServiceCtx({
+          dbPath: ":memory:",
+          logger: {
+            info: () => undefined,
+            warn: () => undefined,
+            error: () => undefined,
+          },
+          clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
+        }),
+      ).toThrow("PACTFUSE proof signing public key does not match the private key");
+    } finally {
+      restoreEnv("PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM", previousPrivate);
+      restoreEnv("PACTFUSE_PROOF_SIGNING_PUBLIC_KEY_PEM", previousPublic);
+    }
+  });
+
+  it("constructs a runtime proof bundle signer from matching PEM keys", () => {
+    const previousPrivate = process.env.PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM;
+    const previousPublic = process.env.PACTFUSE_PROOF_SIGNING_PUBLIC_KEY_PEM;
+    const keyPair = generateKeyPairSync("ed25519");
+    try {
+      const publicKeyPem = keyPair.publicKey.export({ type: "spki", format: "pem" }).toString();
+      process.env.PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM = keyPair.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+      process.env.PACTFUSE_PROOF_SIGNING_PUBLIC_KEY_PEM = publicKeyPem;
+
+      const ctx = createServiceCtx({
+        dbPath: ":memory:",
+        logger: {
+          info: () => undefined,
+          warn: () => undefined,
+          error: () => undefined,
+        },
+        clock: { now: () => new Date("2026-06-11T00:00:00.000Z") },
+      });
+
+      expect(ctx.proofBundleSigner).toEqual(
+        expect.objectContaining({
+          scheme: "ed25519",
+          publicKeyPem,
+          publicKeyHash: hashForTestText(publicKeyPem),
+        }),
+      );
+      expect(ctx.proofBundleSigner?.signPayloadHash(hex32("runtime-proof-signer-test"))).toEqual(expect.any(String));
+    } finally {
+      restoreEnv("PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM", previousPrivate);
+      restoreEnv("PACTFUSE_PROOF_SIGNING_PUBLIC_KEY_PEM", previousPublic);
     }
   });
 
@@ -506,6 +621,83 @@ describe("pactfuse-api P0", () => {
     }
   });
 
+  it("live-env-report lists missing live release variables without passing the gate", async () => {
+    const result = await runNodeScript([join(process.cwd(), "../../scripts/live-env-report.mjs"), "--allow-missing"], {
+      cwd: join(process.cwd(), "../.."),
+      env: scriptTestEnv(),
+    });
+    const stdout = JSON.parse(result.stdout) as {
+      ok: boolean;
+      summary: { missingRequired: number };
+      missingRequired: Array<{ id: string }>;
+      requiredLiveActions: string[];
+      localBackendGaps?: unknown[];
+    };
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(stdout.ok).toBe(false);
+    expect(stdout.summary.missingRequired).toBeGreaterThan(0);
+    expect(stdout.missingRequired.map((item) => item.id)).toEqual(
+      expect.arrayContaining([
+        "api.operator_token",
+        "caw.live_api_key",
+        "chain.deployment_registry",
+        "mcp.lease_url",
+      ]),
+    );
+    expect(stdout.requiredLiveActions).toEqual(
+      expect.arrayContaining([
+        "fund the CAW-controlled Base Sepolia wallet with gas and the selected payment token",
+        "execute /api/v1/evidence/public-claim and export live-smoke artifacts after every gate passes",
+      ]),
+    );
+    expect(stdout).not.toHaveProperty("localBackendGaps");
+  });
+
+  it("live-env-report passes when all external live variables are present", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-env-report-"));
+    try {
+      const proofKeyPath = join(dir, "proof-signing-key.pem");
+      const registryPath = join(dir, "deployment-registry.json");
+      writeFileSync(proofKeyPath, "test proof key fixture\n", "utf8");
+      writeFileSync(registryPath, `${JSON.stringify(testDeploymentRegistry(), null, 2)}\n`, "utf8");
+
+      const result = await runNodeScript([join(process.cwd(), "../../scripts/live-env-report.mjs")], {
+        cwd: join(process.cwd(), "../.."),
+        env: scriptTestEnv({
+          PACTFUSE_API_BASE_URL: "https://pactfuse-live.invalid",
+          PACTFUSE_LIVE_SMOKE_SESSION_ID: hex32("live-env-report-session"),
+          PACTFUSE_OPERATOR_TOKEN: "operator-live-token",
+          PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS: "false",
+          PACTFUSE_ALLOW_INSECURE_PUBLIC_EVIDENCE_URLS: "false",
+          PACTFUSE_MCP_AUDIT_TOKEN: "mcp-audit-live-secret",
+          PACTFUSE_GATE_INGEST_TOKEN: "gate-ingest-live-secret",
+          PACTFUSE_CAW_INGEST_TOKEN: "caw-ingest-live-token",
+          PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PATH: proofKeyPath,
+          PACTFUSE_TRUSTED_PROOF_KEY_HASHES: hex32("trusted-proof-key"),
+          PACTFUSE_CHAIN_RPC_URL: "https://base-sepolia-rpc.publicnode.com",
+          PACTFUSE_CHAIN_ID: "84532",
+          PACTFUSE_DEPLOYMENT_REGISTRY_PATH: registryPath,
+          PACTFUSE_CAW_LIVE_API_URL: "https://api.dev.cobo.com/v2",
+          PACTFUSE_CAW_LIVE_API_KEY: "caw-live-api-key",
+          PACTFUSE_CAW_LIVE_WALLET_ID: "caw-live-wallet-id",
+          PACTFUSE_CAW_EXPORT_URL: "https://api.dev.cobo.com/v2/audit-logs",
+          PACTFUSE_CAW_API_KEY: "caw-export-api-key",
+          PACTFUSE_CAW_WALLET_ID: "caw-export-wallet-id",
+          PACTFUSE_LEASE_MCP_URL: "https://lease-runner.invalid/jsonrpc",
+        }),
+      });
+      const stdout = JSON.parse(result.stdout) as { ok: boolean; missingRequired: unknown[]; requiredLiveActions: string[] };
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(stdout.ok).toBe(true);
+      expect(stdout.missingRequired).toEqual([]);
+      expect(stdout.requiredLiveActions.length).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("live-smoke recomputes public proof bundle hashes against a live endpoint", async () => {
     const result = await runLiveSmokeAgainstStub();
     const stdout = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -513,6 +705,26 @@ describe("pactfuse-api P0", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(stdout.ok).toBe(true);
     expect(stdout.proofBundleHash).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  it("live-smoke reads payment quote and spend bindings from replay pages", async () => {
+    const result = await runLiveSmokeAgainstStub(undefined, (fixture) => {
+      moveLiveSmokeReplayRowsToPagesOnlyForTest(fixture, ["quotes", "spends"]);
+    });
+    const stdout = JSON.parse(result.stdout) as Record<string, unknown>;
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(stdout.ok).toBe(true);
+    expect(stdout.proofBundleHash).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  it("live-smoke refuses public proof bundles without a trusted proof key hash", async () => {
+    const result = await runLiveSmokeAgainstStub(undefined, undefined, {
+      PACTFUSE_TRUSTED_PROOF_KEY_HASHES: "",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("readyz proof bundle signing publicKeyHash is not trusted");
   });
 
   it("live-smoke exports public proof artifacts with a recomputable manifest", async () => {
@@ -559,7 +771,12 @@ describe("pactfuse-api P0", () => {
 
       const verifyResult = await runNodeScript([join(process.cwd(), "../../scripts/verify-live-artifacts.mjs"), dir], {
         cwd: join(process.cwd(), "../.."),
-        env: process.env,
+        env: {
+          ...process.env,
+          PACTFUSE_TRUSTED_PROOF_KEY_HASHES: String(
+            (proofBundle.verifierAttestation as Record<string, unknown>).publicKeyHash,
+          ),
+        },
       });
       const verifyStdout = JSON.parse(verifyResult.stdout) as Record<string, unknown>;
       expect(verifyResult.status, verifyResult.stderr).toBe(0);
@@ -579,6 +796,36 @@ describe("pactfuse-api P0", () => {
     }
   });
 
+  it("verify-live-artifacts reads payment quote and spend bindings from replay pages", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-smoke-paged-bindings-"));
+    try {
+      const result = await runLiveSmokeAgainstStub(
+        undefined,
+        (fixture) => {
+          moveLiveSmokeReplayRowsToPagesOnlyForTest(fixture, ["quotes", "spends"]);
+        },
+        { PACTFUSE_LIVE_SMOKE_OUTPUT_DIR: dir },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      const proofBundle = readJsonFile(join(dir, "proof-bundle.json"));
+      const verifyResult = await runNodeScript([join(process.cwd(), "../../scripts/verify-live-artifacts.mjs"), dir], {
+        cwd: join(process.cwd(), "../.."),
+        env: {
+          ...process.env,
+          PACTFUSE_TRUSTED_PROOF_KEY_HASHES: String(
+            (proofBundle.verifierAttestation as Record<string, unknown>).publicKeyHash,
+          ),
+        },
+      });
+      const verifyStdout = JSON.parse(verifyResult.stdout) as Record<string, unknown>;
+
+      expect(verifyResult.status, verifyResult.stderr).toBe(0);
+      expect(verifyStdout).toEqual(expect.objectContaining({ ok: true, artifactDir: dir }));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("verify-live-artifacts rejects manifest drift", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-smoke-manifest-drift-"));
     try {
@@ -588,12 +835,18 @@ describe("pactfuse-api P0", () => {
       expect(result.status, result.stderr).toBe(0);
       const manifestPath = join(dir, "manifest.json");
       const manifest = readJsonFile(manifestPath);
+      const proofBundle = readJsonFile(join(dir, "proof-bundle.json"));
       manifest.proofBundleHash = hex32("tampered-manifest-proof-bundle");
       writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 
       const verifyResult = await runNodeScript([join(process.cwd(), "../../scripts/verify-live-artifacts.mjs"), dir], {
         cwd: join(process.cwd(), "../.."),
-        env: process.env,
+        env: {
+          ...process.env,
+          PACTFUSE_TRUSTED_PROOF_KEY_HASHES: String(
+            (proofBundle.verifierAttestation as Record<string, unknown>).publicKeyHash,
+          ),
+        },
       });
 
       expect(verifyResult.status).not.toBe(0);
@@ -617,12 +870,136 @@ describe("pactfuse-api P0", () => {
 
       const verifyResult = await runNodeScript([join(process.cwd(), "../../scripts/verify-live-artifacts.mjs"), dir], {
         cwd: join(process.cwd(), "../.."),
-        env: process.env,
+        env: {
+          ...process.env,
+          PACTFUSE_TRUSTED_PROOF_KEY_HASHES: String(
+            (proofBundle.verifierAttestation as Record<string, unknown>).publicKeyHash,
+          ),
+        },
       });
 
       expect(verifyResult.status).not.toBe(0);
       expect(verifyResult.stderr).toContain("artifact proof-bundle.json");
       expect(verifyResult.stderr).toContain("bytes does not match manifest");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("verify-live-artifacts rejects a self-consistent downgraded provider snapshot", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-smoke-provider-downgrade-"));
+    try {
+      const result = await runLiveSmokeAgainstStub(undefined, undefined, {
+        PACTFUSE_LIVE_SMOKE_OUTPUT_DIR: dir,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      const proofBundlePath = join(dir, "proof-bundle.json");
+      const publicClaimPath = join(dir, "public-claim.json");
+      const proofBundle = readJsonFile(proofBundlePath);
+      const providers = proofBundle.providerStatuses as Array<Record<string, unknown>>;
+      providers[0] = { ...providers[0], ready: false, reason: "self-consistent downgraded provider" };
+      resealLiveSmokeProofBundleForTest(proofBundle);
+      writeLiveSmokeArtifactForTest(proofBundlePath, proofBundle);
+      writeLiveSmokeArtifactForTest(publicClaimPath, proofBundle.publicClaim as Record<string, unknown>);
+      resealLiveSmokeManifestForTest(dir);
+
+      const verifyResult = await runNodeScript([join(process.cwd(), "../../scripts/verify-live-artifacts.mjs"), dir], {
+        cwd: join(process.cwd(), "../.."),
+        env: {
+          ...process.env,
+          PACTFUSE_TRUSTED_PROOF_KEY_HASHES: String(
+            (proofBundle.verifierAttestation as Record<string, unknown>).publicKeyHash,
+          ),
+        },
+      });
+
+      expect(verifyResult.status).not.toBe(0);
+      expect(verifyResult.stderr).toContain("proof-bundle provider chain is not live and ready");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("verify-live-artifacts rejects a self-consistent deployment registry with a mismatched explorer tx URL", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-smoke-registry-downgrade-"));
+    try {
+      const result = await runLiveSmokeAgainstStub(undefined, undefined, {
+        PACTFUSE_LIVE_SMOKE_OUTPUT_DIR: dir,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      const proofBundlePath = join(dir, "proof-bundle.json");
+      const publicClaimPath = join(dir, "public-claim.json");
+      const proofBundle = readJsonFile(proofBundlePath);
+      const registry = proofBundle.deploymentRegistry as { entries: Array<Record<string, unknown>> };
+      registry.entries[0] = {
+        ...registry.entries[0],
+        explorerUrl: `https://sepolia.basescan.org/tx/${hex32("different-registry-tx")}`,
+      };
+      const replayBundle = proofBundle.replayBundle as Record<string, unknown>;
+      replayBundle.deploymentRegistry = registry;
+      replayBundle.deploymentRegistryHash = hashForTestJson(registry);
+      const replayBundleHash = hashForTestJson(replayBundle);
+      proofBundle.claimInputReplayBundleHash = replayBundleHash;
+      proofBundle.replayBundleHash = replayBundleHash;
+      (proofBundle.publicClaim as Record<string, unknown>).replayBundleHash = replayBundleHash;
+      resealLiveSmokeProofBundleForTest(proofBundle);
+      writeLiveSmokeArtifactForTest(proofBundlePath, proofBundle);
+      writeLiveSmokeArtifactForTest(publicClaimPath, proofBundle.publicClaim as Record<string, unknown>);
+      resealLiveSmokeManifestForTest(dir);
+
+      const verifyResult = await runNodeScript([join(process.cwd(), "../../scripts/verify-live-artifacts.mjs"), dir], {
+        cwd: join(process.cwd(), "../.."),
+        env: {
+          ...process.env,
+          PACTFUSE_TRUSTED_PROOF_KEY_HASHES: String(
+            (proofBundle.verifierAttestation as Record<string, unknown>).publicKeyHash,
+          ),
+        },
+      });
+
+      expect(verifyResult.status).not.toBe(0);
+      expect(verifyResult.stderr).toContain("PaymentToken deployment registry entry is not live-proof complete");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("verify-live-artifacts rejects a self-consistent registry missing the live PaidArtifactMarket entry", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-live-smoke-missing-market-registry-"));
+    try {
+      const result = await runLiveSmokeAgainstStub(undefined, undefined, {
+        PACTFUSE_LIVE_SMOKE_OUTPUT_DIR: dir,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      const proofBundlePath = join(dir, "proof-bundle.json");
+      const publicClaimPath = join(dir, "public-claim.json");
+      const proofBundle = readJsonFile(proofBundlePath);
+      const registry = proofBundle.deploymentRegistry as { entries: Array<Record<string, unknown>> };
+      registry.entries = registry.entries.filter((entry) => entry.contractName !== "PaidArtifactMarket");
+      const replayBundle = proofBundle.replayBundle as Record<string, unknown>;
+      replayBundle.deploymentRegistry = registry;
+      replayBundle.deploymentRegistryHash = hashForTestJson(registry);
+      const replayBundleHash = hashForTestJson(replayBundle);
+      proofBundle.claimInputReplayBundleHash = replayBundleHash;
+      proofBundle.replayBundleHash = replayBundleHash;
+      (proofBundle.publicClaim as Record<string, unknown>).replayBundleHash = replayBundleHash;
+      resealLiveSmokeProofBundleForTest(proofBundle);
+      writeLiveSmokeArtifactForTest(proofBundlePath, proofBundle);
+      writeLiveSmokeArtifactForTest(publicClaimPath, proofBundle.publicClaim as Record<string, unknown>);
+      resealLiveSmokeManifestForTest(dir);
+
+      const verifyResult = await runNodeScript([join(process.cwd(), "../../scripts/verify-live-artifacts.mjs"), dir], {
+        cwd: join(process.cwd(), "../.."),
+        env: {
+          ...process.env,
+          PACTFUSE_TRUSTED_PROOF_KEY_HASHES: String(
+            (proofBundle.verifierAttestation as Record<string, unknown>).publicKeyHash,
+          ),
+        },
+      });
+
+      expect(verifyResult.status).not.toBe(0);
+      expect(verifyResult.stderr).toContain("public claim requires a live PaidArtifactMarket deployment registry entry");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -813,6 +1190,28 @@ describe("pactfuse-api P0", () => {
     expect(result.stderr).toContain("PaymentToken deployment registry entry is not live-proof complete");
   });
 
+  it("live-smoke rejects a self-consistent registry missing the live PaidArtifactMarket entry", async () => {
+    const result = await runLiveSmokeAgainstStub(undefined, (fixture) => {
+      const proofBundle = fixture.proofBundle as Record<string, unknown>;
+      const claim = fixture.claim as Record<string, unknown>;
+      const registry = proofBundle.deploymentRegistry as { entries: Array<Record<string, unknown>> };
+      const replayBundle = proofBundle.replayBundle as Record<string, unknown>;
+      registry.entries = registry.entries.filter((entry) => entry.contractName !== "PaidArtifactMarket");
+      const deploymentRegistryHash = hashForTestJson(registry);
+      proofBundle.deploymentRegistryHash = deploymentRegistryHash;
+      replayBundle.deploymentRegistry = registry;
+      replayBundle.deploymentRegistryHash = deploymentRegistryHash;
+      const replayBundleHash = hashForTestJson(replayBundle);
+      proofBundle.replayBundleHash = replayBundleHash;
+      proofBundle.claimInputReplayBundleHash = replayBundleHash;
+      claim.replayBundleHash = replayBundleHash;
+      resealLiveSmokeProofBundleForTest(proofBundle);
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("public claim requires a live PaidArtifactMarket deployment registry entry");
+  });
+
   it("live-smoke rejects a self-consistent deployment registry with a non-explorer tx URL", async () => {
     const result = await runLiveSmokeAgainstStub(undefined, (fixture) => {
       const proofBundle = fixture.proofBundle as Record<string, unknown>;
@@ -878,6 +1277,7 @@ describe("pactfuse-api P0", () => {
         operatorToken: "operator-test-token",
         allowInsecureMissingRoleTokens: false,
       },
+      proofBundleSigner: makeTestProofBundleSigner(),
     });
 
     const unauthReady = await app.request("/readyz");
@@ -941,6 +1341,47 @@ describe("pactfuse-api P0", () => {
     expect(verify.json.data.warnings).toContain("caw proof provider is live: CAW export status exploded");
   });
 
+  it("redacts provider status endpoints and failure reasons before exposing proof status", async () => {
+    const secretEndpoint = "https://rpc-user:rpc-pass@rpc.example.test/v3/super-secret?api_key=hidden#frag";
+    const secretReason = `RPC failed at ${secretEndpoint} Authorization: Bearer bearer-secret token=token-secret password=password-secret`;
+    const { app } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({
+        ready: false,
+        reason: secretReason,
+        endpoint: secretEndpoint,
+      }),
+    });
+    const ready = await app.request("/readyz");
+    const readyJson = await ready.json();
+    const sessionId = await createSession(app, "sess-provider-status-redaction");
+    const verify = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-provider-status-redaction",
+      payload: { receipt: { receiptId: "provider-status-redaction" } },
+    });
+    const serialized = JSON.stringify({ ready: readyJson, verify: verify.json.data.raw.proofProviders, warnings: verify.json.data.warnings });
+    const chainStatus = readyJson.proofProviders.find((provider: { name: string }) => provider.name === "chain");
+
+    expect(ready.status).toBe(200);
+    expect(chainStatus).toEqual(
+      expect.objectContaining({
+        endpoint: "https://rpc.example.test/",
+        reason: expect.stringContaining("https://rpc.example.test/"),
+      }),
+    );
+    expect(chainStatus.reason).toContain("Authorization: Bearer [redacted]");
+    expect(chainStatus.reason).toContain("token=[redacted]");
+    expect(chainStatus.reason).toContain("password=[redacted]");
+    expect(verify.status).toBe(200);
+    expect(serialized).not.toContain("rpc-user");
+    expect(serialized).not.toContain("rpc-pass");
+    expect(serialized).not.toContain("super-secret");
+    expect(serialized).not.toContain("api_key=hidden");
+    expect(serialized).not.toContain("bearer-secret");
+    expect(serialized).not.toContain("token-secret");
+    expect(serialized).not.toContain("password-secret");
+  });
+
   it("falls back to the shared operator token for specialized roles when no role token is configured", async () => {
     const { app } = makeApp(":memory:", {
       apiSecurity: {
@@ -969,6 +1410,39 @@ describe("pactfuse-api P0", () => {
 
     expect(first.status).toBe(201);
     expect(first.headers.get("x-ratelimit-limit")).toBe("2");
+    expect(second.status).toBe(201);
+    expect(third.status).toBe(429);
+    expect(third.json.error.code).toBe("rate_limited");
+  });
+
+  it("does not let caller-supplied forwarding headers bypass unauthenticated rate limits", async () => {
+    const { app } = makeApp(":memory:", {
+      apiSecurity: {
+        sessionCreateRateLimitMax: 2,
+        defaultRateLimitMax: 100,
+      },
+    });
+
+    const first = await post(
+      app,
+      "/api/v1/sessions",
+      { idempotencyKey: "xff-rate-1", payload: { label: "a" } },
+      { "x-forwarded-for": "198.51.100.1" },
+    );
+    const second = await post(
+      app,
+      "/api/v1/sessions",
+      { idempotencyKey: "xff-rate-2", payload: { label: "b" } },
+      { "x-forwarded-for": "198.51.100.2", "cf-connecting-ip": "198.51.100.22" },
+    );
+    const third = await post(
+      app,
+      "/api/v1/sessions",
+      { idempotencyKey: "xff-rate-3", payload: { label: "c" } },
+      { "x-forwarded-for": "198.51.100.3" },
+    );
+
+    expect(first.status).toBe(201);
     expect(second.status).toBe(201);
     expect(third.status).toBe(429);
     expect(third.json.error.code).toBe("rate_limited");
@@ -1234,8 +1708,14 @@ describe("pactfuse-api P0", () => {
     const { app, ctx } = makeApp(":memory:", {
       caw: createFakeCawReceiptSource({ receipts: cawReceipts, mode: "live" }),
       cawLive: createFakeCawLiveClient(),
-      chain: createFakeIndexerChainClient({ currentBlockNumber: 130, logs, tokenBalances }),
+      chain: createFakeIndexerChainClient({
+        currentBlockNumber: 130,
+        logs,
+        tokenBalances,
+        endpoint: "https://base-sepolia-rpc.public.example/",
+      }),
       mcpLease: createFakeMcpLeaseClient("pactfuse_code_scan", "live"),
+      artifactDelivery: createFakeArtifactDeliveryVerifier(),
       deploymentRegistry: testDeploymentRegistry(),
     });
     const sessionId = await createSession(app, "sess-public-claim-authorized");
@@ -1251,6 +1731,7 @@ describe("pactfuse-api P0", () => {
     const quoted = await quoteArtifactForTest(app, sessionId, spendId, "public-claim-artifact", {
       artifactPayload: TEST_ARTIFACT_PAYLOAD,
       settlementMode: "chain_settleable_after_preflight",
+      verificationMode: "server_live_fetch",
     });
     const identity = await post(app, "/api/v1/caw/live/identity/probe", {
       sessionId,
@@ -1386,6 +1867,76 @@ describe("pactfuse-api P0", () => {
     );
     ctx.apiSecurity.operatorToken = "operator-test-token";
     ctx.apiSecurity.allowInsecureMissingRoleTokens = false;
+    const unsignedReadiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const unsignedReadinessJson = await unsignedReadiness.json();
+    const unsignedClaim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const unsignedClaimJson = await unsignedClaim.json();
+    expect(unsignedReadiness.status).toBe(200);
+    expect(unsignedReadinessJson.data.winnerClaimAllowed).toBe(false);
+    expect(unsignedReadinessJson.data.blockers).toContain(
+      "production_security: proof bundle verifier attestation signing key is not configured",
+    );
+    expect(unsignedClaim.status).toBe(423);
+    expect(unsignedClaimJson.error.details.blockers).toContain("claim readiness winnerClaimAllowed is false");
+    const proofSigner = makeTestProofBundleSigner();
+    ctx.proofBundleSigner = proofSigner;
+    const untrustedSignerReadiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const untrustedSignerReadinessJson = await untrustedSignerReadiness.json();
+    const untrustedSignerClaim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const untrustedSignerClaimJson = await untrustedSignerClaim.json();
+
+    expect(untrustedSignerReadiness.status).toBe(200);
+    expect(untrustedSignerReadinessJson.data.blockers).toContain(
+      "production_security: proof bundle verifier attestation signing key is not trusted",
+    );
+    expect(untrustedSignerClaim.status).toBe(423);
+    expect(untrustedSignerClaimJson.error.details.blockers).toContain("claim readiness winnerClaimAllowed is false");
+    ctx.trustedProofKeyHashes.add(proofSigner.publicKeyHash.toLowerCase());
+    const allowanceEventRow = ctx.db.sqlite
+      .prepare(
+        `SELECT event_id, payload_json
+         FROM evidence_events
+         WHERE session_id = ? AND kind = 'caw.allowance.verified'
+         ORDER BY event_seq DESC
+         LIMIT 1`,
+      )
+      .get(sessionId) as { event_id: string; payload_json: string };
+    const allowanceEventPayload = JSON.parse(allowanceEventRow.payload_json) as Record<string, unknown>;
+    try {
+      ctx.db.sqlite
+        .prepare("UPDATE evidence_events SET payload_json = ? WHERE event_id = ?")
+        .run(canonicalizeJson({ ...allowanceEventPayload, chainProviderMode: "fixture" }), allowanceEventRow.event_id);
+      const fixtureAllowanceReadiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`, {
+        headers: { authorization: "Bearer operator-test-token" },
+      });
+      const fixtureAllowanceReadinessJson = await fixtureAllowanceReadiness.json();
+      const fixtureAllowanceGate = fixtureAllowanceReadinessJson.data.gates.find(
+        (gate: { gateId: string }) => gate.gateId === "caw_allowance_proof",
+      );
+
+      expect(fixtureAllowanceReadiness.status).toBe(200);
+      expect(fixtureAllowanceGate).toEqual(
+        expect.objectContaining({
+          status: "pending",
+          reason: "missing live caw.allowance.verified proof event",
+        }),
+      );
+      expect(fixtureAllowanceReadinessJson.data.blockers).toContain(
+        "caw_allowance_proof: missing live caw.allowance.verified proof event",
+      );
+    } finally {
+      ctx.db.sqlite
+        .prepare("UPDATE evidence_events SET payload_json = ? WHERE event_id = ?")
+        .run(allowanceEventRow.payload_json, allowanceEventRow.event_id);
+    }
     const readiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`, {
       headers: { authorization: "Bearer operator-test-token" },
     });
@@ -1450,6 +2001,7 @@ describe("pactfuse-api P0", () => {
         claimMode: "caw-target-real",
         paymentMode: "gate-paid-artifact-real",
         tokenMode: "mock-test-token",
+        tokenSettlementClaim: "live-mock-erc20-fallback",
         identityMode: "p0-floor-one-wallet",
         proofChipAllowed: true,
         finalVerifierComplete: true,
@@ -1457,6 +2009,14 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(claimJson.data.publicClaimHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(claimJson.data.verifierRun).toEqual(
+      expect.objectContaining({
+        claimMode: claimJson.data.claimMode,
+        paymentMode: claimJson.data.paymentMode,
+        tokenMode: claimJson.data.tokenMode,
+        identityMode: claimJson.data.identityMode,
+      }),
+    );
     expect(repeatedClaim.status).toBe(200);
     expect(repeatedClaimJson.data.publicClaimHash).toBe(claimJson.data.publicClaimHash);
     expect(repeatedClaimJson.data).toEqual(claimJson.data);
@@ -1487,9 +2047,12 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(claimEventPayload.claim).toEqual(expect.objectContaining({ publicClaimHash: claimJson.data.publicClaimHash }));
+    expect(claimEventPayload.replayBundle).toEqual(proofBundleJson.data.replayBundle);
+    expect(hashForTestJson(claimEventPayload.replayBundle)).toBe(claimJson.data.replayBundleHash);
     expect(claimEventPayload.providerStatuses).toEqual(proofBundleJson.data.providerStatuses);
     expect(claimEventPayload.deploymentRegistry).toEqual(proofBundleJson.data.deploymentRegistry);
     expect(claimEventPayload.server).toEqual(proofBundleJson.data.server);
+    expect(claimEventPayload.verifierAttestation).toEqual(proofBundleJson.data.verifierAttestation);
     expect(proofBundle.status).toBe(200);
     expect(proofBundleJson.data).toEqual(
       expect.objectContaining({
@@ -1516,6 +2079,16 @@ describe("pactfuse-api P0", () => {
         winnerClaimAllowed: true,
       }),
     );
+    expect(proofBundleJson.data.verifierAttestation).toEqual(
+      expect.objectContaining({
+        scheme: "ed25519",
+        keyId: "test-proof-key",
+        publicKeyPem: expect.stringContaining("BEGIN PUBLIC KEY"),
+        publicKeyHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        signedPayloadHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        signature: expect.any(String),
+      }),
+    );
     expect(proofBundleJson.data.publicClaim).toEqual(claimJson.data);
     expect(proofBundleJson.data.replayBundle.winnerClaimAllowed).toBe(true);
     expect(hashForTestJson(proofBundleJson.data.replayBundle)).toBe(claimJson.data.replayBundleHash);
@@ -1523,6 +2096,33 @@ describe("pactfuse-api P0", () => {
     const proofBundleBase = { ...proofBundleJson.data };
     delete (proofBundleBase as { proofBundleHash?: string }).proofBundleHash;
     expect(hashForTestJson(proofBundleBase)).toBe(proofBundleJson.data.proofBundleHash);
+    ctx.db.sqlite
+      .prepare(
+        `INSERT INTO sources
+         (source_id, session_id, source_hash, manifest_url, manifest_hash, issuer, signature, capability_vector_json, proof_status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        hex32("post-claim-source-id"),
+        sessionId,
+        hex32("post-claim-source"),
+        "https://public.example.dev/post-claim-manifest.json",
+        hex32("post-claim-manifest"),
+        null,
+        null,
+        canonicalizeJson({ language: "ts" }),
+        "active",
+        "2026-06-11T00:01:00.000Z",
+      );
+    const nonEventDriftProofBundle = await app.request(
+      `/api/v1/evidence/proof-bundle?sessionId=${sessionId}&publicClaimEventId=${claimEvents[0].event_id}`,
+      {
+        headers: { authorization: "Bearer operator-test-token" },
+      },
+    );
+    const nonEventDriftProofBundleJson = await nonEventDriftProofBundle.json();
+    expect(nonEventDriftProofBundle.status).toBe(200);
+    expect(nonEventDriftProofBundleJson.data.proofBundleHash).toBe(proofBundleJson.data.proofBundleHash);
     const replayInputEvent = ctx.db.sqlite
       .prepare(
         `SELECT event_id, payload_json
@@ -1540,9 +2140,8 @@ describe("pactfuse-api P0", () => {
       headers: { authorization: "Bearer operator-test-token" },
     });
     const replayDriftProofBundleJson = await replayDriftProofBundle.json();
-    expect(replayDriftProofBundle.status).toBe(422);
-    expect(replayDriftProofBundleJson.error.code).toBe("proof_blocked");
-    expect(replayDriftProofBundleJson.error.message).toContain("replay hash no longer matches");
+    expect(replayDriftProofBundle.status).toBe(200);
+    expect(replayDriftProofBundleJson.data.proofBundleHash).toBe(proofBundleJson.data.proofBundleHash);
     ctx.db.sqlite
       .prepare("UPDATE evidence_events SET payload_json = ? WHERE event_id = ?")
       .run(replayInputEvent.payload_json, replayInputEvent.event_id);
@@ -1559,6 +2158,141 @@ describe("pactfuse-api P0", () => {
     ctx.db.sqlite
       .prepare("UPDATE evidence_events SET payload_json = ? WHERE event_id = ?")
       .run(originalClaimEventPayloadJson, claimEvents[0].event_id);
+    const claimEventRow = ctx.db.sqlite
+      .prepare(
+        `SELECT event_id, event_seq, event_hash, prev_proof_event_hash, authority, kind, payload_hash, payload_json, created_at
+         FROM evidence_events
+         WHERE event_id = ?`,
+      )
+      .get(claimEvents[0].event_id) as {
+      event_id: string;
+      event_seq: number;
+      event_hash: string;
+      prev_proof_event_hash: string | null;
+      authority: string;
+      kind: string;
+      payload_hash: string;
+      payload_json: string;
+      created_at: string;
+    };
+    if (!ctx.proofBundleSigner) {
+      throw new Error("test proof signer missing");
+    }
+    let currentClaimEventId = claimEventRow.event_id;
+    const writeSelfConsistentClaimEventPayload = (payload: Record<string, unknown>): string => {
+      const payloadHash = hashForTestJson(payload);
+      const eventHash = hashForTestJson({
+        sessionId,
+        eventSeq: Number(claimEventRow.event_seq),
+        authority: claimEventRow.authority,
+        kind: claimEventRow.kind,
+        payloadHash,
+        prevProofEventHash: claimEventRow.prev_proof_event_hash,
+      });
+      ctx.db.sqlite
+        .prepare("UPDATE evidence_events SET event_id = ?, event_hash = ?, payload_hash = ?, payload_json = ? WHERE event_id = ?")
+        .run(eventHash, eventHash, payloadHash, canonicalizeJson(payload), currentClaimEventId);
+      ctx.db.sqlite.prepare("UPDATE sessions SET latest_proof_event_hash = ? WHERE session_id = ?").run(eventHash, sessionId);
+      currentClaimEventId = eventHash;
+      return eventHash;
+    };
+    const restoreSelfConsistentClaimEventPayload = () => {
+      ctx.db.sqlite
+        .prepare("UPDATE evidence_events SET event_id = ?, event_hash = ?, payload_hash = ?, payload_json = ? WHERE event_id = ?")
+        .run(
+          claimEventRow.event_id,
+          claimEventRow.event_hash,
+          claimEventRow.payload_hash,
+          claimEventRow.payload_json,
+          currentClaimEventId,
+        );
+      ctx.db.sqlite
+        .prepare("UPDATE sessions SET latest_proof_event_hash = ? WHERE session_id = ?")
+        .run(claimEventRow.event_hash, sessionId);
+      currentClaimEventId = claimEventRow.event_id;
+    };
+    const originalClaimPayload = claimEventPayload.claim as Record<string, unknown>;
+    const originalVerifierAttestation = claimEventPayload.verifierAttestation as Record<string, unknown>;
+    writeSelfConsistentClaimEventPayload({
+      ...claimEventPayload,
+      claim: {
+        ...originalClaimPayload,
+        tokenMode: "official-testnet-usdc",
+      },
+    });
+    const claimHashMismatchProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const claimHashMismatchProofBundleJson = await claimHashMismatchProofBundle.json();
+    expect(claimHashMismatchProofBundle.status).toBe(423);
+    expect(claimHashMismatchProofBundleJson.error.code).toBe("proof_pending");
+    restoreSelfConsistentClaimEventPayload();
+    const mismatchedPublicKeyHash = hex32("public-claim-tampered-proof-key");
+    const tamperedSignerForHash: ProofBundleSigner = {
+      ...ctx.proofBundleSigner,
+      publicKeyHash: mismatchedPublicKeyHash,
+    };
+    const attestationFields = {
+      sessionId,
+      publicClaimHash: claimJson.data.publicClaimHash,
+      publicClaimEventSeq: Number(claimEventRow.event_seq),
+      authorizedAt: claimEventRow.created_at,
+      asOfEventSeq: claimJson.data.asOfEventSeq,
+      claimInputReplayBundleHash: claimJson.data.replayBundleHash,
+      replayBundleHash: claimJson.data.replayBundleHash,
+      verifierRunHash: hashForTestJson(claimJson.data.verifierRun),
+      providerStatusHash: proofBundleJson.data.providerStatusHash,
+      deploymentRegistryHash: proofBundleJson.data.deploymentRegistryHash,
+      serverHash: proofBundleJson.data.serverHash,
+    };
+    writeSelfConsistentClaimEventPayload({
+      ...claimEventPayload,
+      verifierAttestation: {
+        ...originalVerifierAttestation,
+        publicKeyHash: mismatchedPublicKeyHash,
+        signedPayloadHash: hashForTestJson(proofBundleVerifierAttestationInputForTest(tamperedSignerForHash, attestationFields)),
+      },
+    });
+    const keyMismatchProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const keyMismatchProofBundleJson = await keyMismatchProofBundle.json();
+    expect(keyMismatchProofBundle.status).toBe(423);
+    expect(keyMismatchProofBundleJson.error.code).toBe("proof_pending");
+    restoreSelfConsistentClaimEventPayload();
+    writeSelfConsistentClaimEventPayload({
+      ...claimEventPayload,
+      verifierAttestation: {
+        ...originalVerifierAttestation,
+        signature: Buffer.alloc(64).toString("base64"),
+      },
+    });
+    const invalidSignatureProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const invalidSignatureProofBundleJson = await invalidSignatureProofBundle.json();
+    expect(invalidSignatureProofBundle.status).toBe(423);
+    expect(invalidSignatureProofBundleJson.error.code).toBe("proof_pending");
+    restoreSelfConsistentClaimEventPayload();
+    writeSelfConsistentClaimEventPayload({
+      ...claimEventPayload,
+      verifierAttestation: signProofBundleVerifierAttestationForTest(makeTestProofBundleSigner("forged-proof-key"), attestationFields),
+    });
+    const forgedSignerProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const forgedSignerProofBundleJson = await forgedSignerProofBundle.json();
+    expect(forgedSignerProofBundle.status).toBe(423);
+    expect(forgedSignerProofBundleJson.error.code).toBe("proof_pending");
+    restoreSelfConsistentClaimEventPayload();
+    ctx.trustedProofKeyHashes.delete(String(proofSigner.publicKeyHash).toLowerCase());
+    const untrustedStoredClaimProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const untrustedStoredClaimProofBundleJson = await untrustedStoredClaimProofBundle.json();
+    expect(untrustedStoredClaimProofBundle.status).toBe(423);
+    expect(untrustedStoredClaimProofBundleJson.error.code).toBe("proof_pending");
+    ctx.trustedProofKeyHashes.add(String(proofSigner.publicKeyHash).toLowerCase());
     const originalChain = ctx.chain;
     const originalCaw = ctx.caw;
     const originalCawLive = ctx.cawLive;
@@ -1582,14 +2316,45 @@ describe("pactfuse-api P0", () => {
     expect(stableProofBundleJson.data.deploymentRegistry).toEqual(proofBundleJson.data.deploymentRegistry);
     expect(stableProofBundleJson.data.deploymentRegistryHash).toBe(proofBundleJson.data.deploymentRegistryHash);
     expect(stableProofBundleJson.data.serverHash).toBe(proofBundleJson.data.serverHash);
+    expect(stableProofBundleJson.data.verifierAttestation).toEqual(proofBundleJson.data.verifierAttestation);
     expect(stableProofBundleJson.data.proofBundleHash).toBe(proofBundleJson.data.proofBundleHash);
+    const originalProofBundleSigner = ctx.proofBundleSigner;
+    ctx.proofBundleSigner = null;
+    const rotatedKeyClaim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const rotatedKeyProofBundle = await app.request(`/api/v1/evidence/proof-bundle?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const rotatedKeyProofBundleJson = await rotatedKeyProofBundle.json();
+    expect(rotatedKeyClaim.status).toBe(200);
+    expect(rotatedKeyProofBundle.status).toBe(200);
+    expect(rotatedKeyProofBundleJson.data.proofBundleHash).toBe(proofBundleJson.data.proofBundleHash);
+    expect(rotatedKeyProofBundleJson.data.verifierAttestation).toEqual(proofBundleJson.data.verifierAttestation);
+    ctx.proofBundleSigner = originalProofBundleSigner;
+    const stableProofBundleVerify = await post(
+      app,
+      "/api/v1/evidence/verify",
+      {
+        sessionId,
+        idempotencyKey: "verify-public-proof-bundle-authorization-snapshot",
+        payload: { receipt: proofBundleJson.data },
+      },
+      { authorization: "Bearer operator-test-token" },
+    );
+    expect(stableProofBundleVerify.status, JSON.stringify(stableProofBundleVerify.json)).toBe(200);
+    expect(stableProofBundleVerify.json.data.schemaOk, JSON.stringify(stableProofBundleVerify.json.data.errors)).toBe(true);
+    expect(stableProofBundleVerify.json.data.finalVerifierComplete).toBe(true);
+    expect(stableProofBundleVerify.json.data.proofChipAllowed).toBe(true);
+    expect(stableProofBundleVerify.json.data.winnerClaimAllowed).toBe(true);
+    expect(stableProofBundleVerify.json.data.errors).toEqual([]);
     ctx.chain = originalChain;
     ctx.caw = originalCaw;
     ctx.cawLive = originalCawLive;
     ctx.mcpLease = originalMcpLease;
     ctx.deploymentRegistry = originalDeploymentRegistry;
 
-    appendEvidenceEvent(ctx, {
+    const advisoryEvent = appendEvidenceEvent(ctx, {
       sessionId,
       authority: "advisory",
       kind: "public.claim.authorized",
@@ -1610,6 +2375,26 @@ describe("pactfuse-api P0", () => {
 
     expect(advisoryProofBundle.status).toBe(423);
     expect(advisoryProofBundleJson.error.code).toBe("proof_pending");
+    const advisoryEventProofBundle = await app.request(
+      `/api/v1/evidence/proof-bundle?sessionId=${sessionId}&publicClaimEventId=${advisoryEvent.eventId}`,
+      {
+        headers: { authorization: "Bearer operator-test-token" },
+      },
+    );
+    const advisoryEventProofBundleJson = await advisoryEventProofBundle.json();
+    expect(advisoryEventProofBundle.status).toBe(423);
+    expect(advisoryEventProofBundleJson.error.code).toBe("proof_pending");
+    const historicalProofBundle = await app.request(
+      `/api/v1/evidence/proof-bundle?sessionId=${sessionId}&publicClaimEventId=${claimEvents[0].event_id}`,
+      {
+        headers: { authorization: "Bearer operator-test-token" },
+      },
+    );
+    const historicalProofBundleJson = await historicalProofBundle.json();
+    expect(historicalProofBundle.status).toBe(200);
+    expect(historicalProofBundleJson.data.publicClaimEventId).toBe(claimEvents[0].event_id);
+    expect(historicalProofBundleJson.data.proofBundleHash).toBe(proofBundleJson.data.proofBundleHash);
+    expect(historicalProofBundleJson.data.verifierAttestation).toEqual(proofBundleJson.data.verifierAttestation);
 
     const refreshedClaim = await app.request(`/api/v1/evidence/public-claim?sessionId=${sessionId}`, {
       headers: { authorization: "Bearer operator-test-token" },
@@ -1841,6 +2626,47 @@ describe("pactfuse-api P0", () => {
     expect(json.data.rows).toHaveLength(6);
     expect(json.data.rows.every((row: { status: string }) => row.status === "pending")).toBe(true);
     expect(json.data.winnerClaimAllowed).toBe(false);
+  });
+
+  it("requires proof authority for proof-only Judge Check rows", async () => {
+    const { app, ctx } = makeApp();
+    const sessionId = await createSession(app, "sess-judge-authority-policy");
+    const event = ctx.db.sqlite
+      .prepare("SELECT event_id FROM evidence_events WHERE session_id = ? ORDER BY event_seq ASC LIMIT 1")
+      .get(sessionId) as { event_id: string };
+    ctx.db.sqlite
+      .prepare(
+        `UPDATE judge_check_rows
+         SET status = 'pass', authority = 'delivery', reason = 'delivery cannot prove CAW boundary', evidence_event_id = ?
+         WHERE session_id = ? AND row_id = 'caw_boundary'`,
+      )
+      .run(event.event_id, sessionId);
+    ctx.db.sqlite
+      .prepare(
+        `UPDATE judge_check_rows
+         SET status = 'pass', authority = 'delivery', reason = 'delivery may prove lease execution', evidence_event_id = ?
+         WHERE session_id = ? AND row_id = 'lease_execution'`,
+      )
+      .run(event.event_id, sessionId);
+
+    const res = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const json = await res.json();
+    const cawGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "judge_caw_boundary");
+    const leaseGate = json.data.gates.find((gate: { gateId: string }) => gate.gateId === "judge_lease_execution");
+
+    expect(res.status).toBe(200);
+    expect(cawGate).toEqual(
+      expect.objectContaining({
+        status: "pending",
+        reason: "caw_boundary Judge Check row must pass with proof authority",
+      }),
+    );
+    expect(leaseGate).toEqual(
+      expect.objectContaining({
+        status: "pass",
+        reason: "lease_execution Judge Check row passes with delivery authority",
+      }),
+    );
   });
 
   it("reports evidence-derived claim readiness gates without unlocking public modes by default", async () => {
@@ -2515,6 +3341,54 @@ describe("pactfuse-api P0", () => {
     expect(json.data.claimReadiness.requiredExternalInputs).not.toContain("PACTFUSE_LEASE_MCP_URL for a live MCP lease runner");
   });
 
+  it("blocks live proof preflight when the public evidence URL test bypass is enabled", async () => {
+    const { app } = makeApp(":memory:", {
+      apiSecurity: {
+        operatorToken: "operator-test-token",
+        challengeSubmitterToken: "challenge-test-token",
+        artifactSignerToken: "artifact-test-token",
+        allowInsecureMissingRoleTokens: false,
+      },
+      publicEvidence: { allowInsecureTestUrls: true },
+      proofBundleSigner: makeTestProofBundleSigner("public-evidence-url-test-bypass"),
+    });
+    const session = await post(
+      app,
+      "/api/v1/sessions",
+      { idempotencyKey: "sess-live-preflight-public-url-bypass", payload: { label: "live-preflight-public-url-bypass" } },
+      { authorization: "Bearer operator-test-token" },
+    );
+    const sessionId = session.json.data.sessionId;
+
+    const res = await app.request(`/api/v1/evidence/live-preflight?sessionId=${sessionId}`, {
+      headers: { authorization: "Bearer operator-test-token" },
+    });
+    const json = await res.json();
+
+    expect(session.status).toBe(201);
+    expect(res.status).toBe(200);
+    expect(json.data.security).toEqual(expect.objectContaining({ allowInsecurePublicEvidenceUrls: true }));
+    expect(json.data.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          checkId: "security_public_evidence_urls",
+          status: "blocked",
+          reason: "insecure public-evidence URL test bypass is enabled",
+        }),
+      ]),
+    );
+    expect(json.data.claimReadiness.gates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          gateId: "production_security",
+          status: "blocked",
+          reason: "insecure public-evidence URL test bypass is enabled",
+        }),
+      ]),
+    );
+    expect(json.data.requiredExternalInputs).toContain("PACTFUSE_ALLOW_INSECURE_PUBLIC_EVIDENCE_URLS=false");
+  });
+
   it("records a live CAW identity probe that can satisfy the readiness identity gate", async () => {
     const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
     const sessionId = await createSession(app, "sess-caw-identity-probe");
@@ -2550,8 +3424,127 @@ describe("pactfuse-api P0", () => {
     expect(readinessJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "caw_identity_probe")).toEqual(
       expect.objectContaining({ status: "pass", evidenceEventId: probe.json.evidenceEventId }),
     );
+    expect(readinessJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "caw_identity_live_recheck")).toEqual(
+      expect.objectContaining({ status: "pass", evidenceEventId: probe.json.evidenceEventId }),
+    );
     expect(readinessJson.data.winnerClaimAllowed).toBe(false);
     expect(identityEvent.payload).toEqual(expect.objectContaining({ proofAuthority: true, winnerClaimAllowed: false }));
+  });
+
+  it("blocks claim readiness when the live CAW identity recheck no longer matches the wallet proof", async () => {
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
+    const sessionId = await createSession(app, "sess-caw-identity-recheck");
+
+    const probe = await post(app, "/api/v1/caw/live/identity/probe", {
+      sessionId,
+      idempotencyKey: "caw-identity-recheck",
+      payload: {
+        walletId: "wallet-live-1",
+        expectedWalletAddress: TEST_PAYER_ADDRESS,
+        identityMode: "p0-floor-one-wallet",
+      },
+    });
+    const row = ctx.db.sqlite
+      .prepare("SELECT event_id, payload_json FROM evidence_events WHERE session_id = ? AND kind = 'caw.identity.probed' LIMIT 1")
+      .get(sessionId) as { event_id: string; payload_json: string };
+    const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+    ctx.db.sqlite
+      .prepare("UPDATE evidence_events SET payload_json = ? WHERE event_id = ?")
+      .run(canonicalizeJson({ ...payload, walletAddress: "0x2222222222222222222222222222222222222222" }), row.event_id);
+
+    const readiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const readinessJson = await readiness.json();
+
+    expect(probe.status).toBe(202);
+    expect(readiness.status).toBe(200);
+    expect(readinessJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "caw_identity_live_recheck")).toEqual(
+      expect.objectContaining({
+        status: "blocked",
+        reason: "CAW live wallet identity no longer matches the stored proof",
+      }),
+    );
+    expect(readinessJson.data.targetClaimMode).toBe(null);
+    expect(readinessJson.data.blockers).toContain(
+      "caw_identity_live_recheck: CAW live wallet identity no longer matches the stored proof",
+    );
+  });
+
+  it("blocks claim readiness when current CAW export no longer contains the stored raw receipts", async () => {
+    const cawReceipts = [
+      cawReceiptFields("raw-recheck-deny", {
+        operationKind: "deny_probe",
+        effect: "deny",
+        status: "denied",
+        target: INDEXER_ADDRESS,
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+      }),
+      cawReceiptFields("raw-recheck-approve", {
+        operationKind: "approve",
+        target: TEST_PAYMENT_TOKEN_ADDRESS,
+        selector: ERC20_APPROVE_SELECTOR,
+      }),
+      cawReceiptFields("raw-recheck-activate", {
+        operationKind: "activate_tool",
+        target: INDEXER_ADDRESS,
+        selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+      }),
+    ];
+    const { app, ctx } = makeApp(":memory:", { caw: createFakeCawReceiptSource({ receipts: cawReceipts, mode: "live" }) });
+    const sessionId = await createSession(app, "sess-caw-raw-recheck");
+    const spendId = await registerSpend(app, sessionId);
+
+    await buildAndIngestCawReceiptForTest(app, sessionId, spendId, "raw-recheck-deny", {
+      operationKind: "deny_probe",
+      target: INDEXER_ADDRESS,
+      selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+    });
+    await buildAndIngestCawReceiptForTest(app, sessionId, spendId, "raw-recheck-approve", {
+      operationKind: "approve",
+      target: TEST_PAYMENT_TOKEN_ADDRESS,
+      selector: ERC20_APPROVE_SELECTOR,
+    });
+    await buildAndIngestCawReceiptForTest(app, sessionId, spendId, "raw-recheck-activate", {
+      operationKind: "activate_tool",
+      target: INDEXER_ADDRESS,
+      selector: PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR,
+    });
+    insertEarlierCawReceiptFillerRowsForTest(ctx, sessionId);
+
+    const passingReadiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const passingJson = await passingReadiness.json();
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    cawReceipts.pop();
+    const blockedReadiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const blockedJson = await blockedReadiness.json();
+
+    expect(replay.status, JSON.stringify(replayJson)).toBe(200);
+    expect(replayJson.data.rawCawReceiptBundles).toHaveLength(200);
+    expect(replayJson.data.canonicalCawReceipts).toHaveLength(200);
+    expect(replayJson.data.replayPageIndex.collections.rawCawReceiptBundles.totalRows).toBeGreaterThan(200);
+    expect(replayJson.data.replayPageIndex.collections.canonicalCawReceipts.totalRows).toBeGreaterThan(200);
+    expect(
+      replayRowsForTest(replayJson.data, "canonicalCawReceipts").some(
+        (receipt) => receipt.operationKind === "activate_tool" && receipt.effect === "allow",
+      ),
+    ).toBe(true);
+    expect(passingJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "caw_raw_receipts_live_recheck")).toEqual(
+      expect.objectContaining({
+        status: "pass",
+        reason: "current CAW export still contains the stored deny_probe, approve, and activate_tool raw receipts",
+      }),
+    );
+    expect(blockedReadiness.status).toBe(200);
+    expect(blockedJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "caw_raw_receipts_live_recheck")).toEqual(
+      expect.objectContaining({
+        status: "blocked",
+        reason: "CAW current raw receipt export no longer contains the stored activate_tool allow receipt",
+      }),
+    );
+    expect(blockedJson.data.targetClaimMode).toBe(null);
+    expect(blockedJson.data.blockers).toContain(
+      "caw_raw_receipts_live_recheck: CAW current raw receipt export no longer contains the stored activate_tool allow receipt",
+    );
   });
 
   it("returns bad_request for missing evidence query parameters", async () => {
@@ -2590,6 +3583,7 @@ describe("pactfuse-api P0", () => {
       "readyForPublicClaim",
       "providerStatuses.ready",
       "security.allowInsecureMissingRoleTokens",
+      "security.allowInsecurePublicEvidenceUrls",
       "indexer.status",
       "blockingReasons",
       "requiredExternalInputs",
@@ -2634,24 +3628,55 @@ describe("pactfuse-api P0", () => {
       "providerStatusHash",
       "deploymentRegistryHash",
       "serverHash",
+      "verifierAttestation.signedPayloadHash",
+      "verifierAttestation.publicKeyHash",
       "winnerClaimAllowed",
     ]);
     expect(json.paths["/api/v1/evidence/proof-bundle"].get.responses["200"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/ProofBundleResponse",
     );
+    expect(json.paths["/api/v1/evidence/proof-bundle"].get.parameters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "publicClaimEventId",
+          in: "query",
+          required: false,
+          schema: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+        }),
+      ]),
+    );
     const proofBundleProviderStatus =
       json.components.schemas.ProofBundleResponse.oneOf[0].properties.data.properties.providerStatuses.items;
     expect(proofBundleProviderStatus.required).toEqual(["name", "mode", "ready", "reason", "endpoint"]);
     expect(proofBundleProviderStatus.properties.endpoint.anyOf).toEqual([{ type: "string" }, { type: "null" }]);
+    const proofBundleAttestation =
+      json.components.schemas.ProofBundleResponse.oneOf[0].properties.data.properties.verifierAttestation;
+    expect(proofBundleAttestation.required).toEqual([
+      "scheme",
+      "keyId",
+      "publicKeyPem",
+      "publicKeyHash",
+      "signedPayloadHash",
+      "signature",
+    ]);
+    expect(proofBundleAttestation.properties.scheme.const).toBe("ed25519");
     expect(json.paths["/api/v1/evidence/public-claim"].get.responses["200"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/PublicClaimResponse",
     );
     const publicClaimSchema = json.components.schemas.PublicClaimResponse.oneOf[0].properties.data;
     expect(publicClaimSchema.required).toEqual(
-      expect.arrayContaining(["snapshotScope", "providerSnapshotOnly", "authorizedAt", "authorizedEventSeq", "asOfEventSeq"]),
+      expect.arrayContaining([
+        "snapshotScope",
+        "providerSnapshotOnly",
+        "authorizedAt",
+        "authorizedEventSeq",
+        "asOfEventSeq",
+        "tokenSettlementClaim",
+      ]),
     );
     expect(publicClaimSchema.properties.snapshotScope.const).toBe("authorization_event");
     expect(publicClaimSchema.properties.providerSnapshotOnly.const).toBe(true);
+    expect(publicClaimSchema.properties.tokenSettlementClaim.enum).toEqual(["live-mock-erc20-fallback", "official-testnet-usdc"]);
     expect(json.paths["/api/v1/caw/live/identity/probe"].post.requestBody.content["application/json"].schema.$ref).toBe(
       "#/components/schemas/CawLiveIdentityProbeInput",
     );
@@ -2672,7 +3697,7 @@ describe("pactfuse-api P0", () => {
       expect.objectContaining({
         name: "authorization",
         in: "header",
-        required: false,
+        required: true,
       }),
     ]);
     expect(json.components.schemas.CreateSessionInput.properties.payload.additionalProperties).toBe(false);
@@ -2683,7 +3708,7 @@ describe("pactfuse-api P0", () => {
       expect.objectContaining({
         name: "authorization",
         in: "header",
-        required: false,
+        required: true,
         description: expect.stringContaining("PACTFUSE_CHALLENGE_SUBMITTER_TOKEN"),
       }),
     ]);
@@ -2719,7 +3744,7 @@ describe("pactfuse-api P0", () => {
       expect.objectContaining({
         name: "authorization",
         in: "header",
-        required: false,
+        required: true,
         description: expect.stringContaining("PACTFUSE_ARTIFACT_SIGNER_TOKEN"),
       }),
     ]);
@@ -2782,6 +3807,9 @@ describe("pactfuse-api P0", () => {
         "txHash",
         "chainProviderMode",
         "chainProviderEndpoint",
+      "transferLogBindingHash",
+      "balanceReadHash",
+      "chainReadProofHash",
         "paymentToken",
       "agentWallet",
       "market",
@@ -2797,7 +3825,7 @@ describe("pactfuse-api P0", () => {
       expect.objectContaining({
         name: "authorization",
         in: "header",
-        required: false,
+        required: true,
       }),
     ]);
     expect(json.paths["/api/v1/token/balance-deltas/verify"].post.requestBody.content["application/json"].schema.$ref).toBe(
@@ -2815,7 +3843,7 @@ describe("pactfuse-api P0", () => {
       expect.objectContaining({
         name: "authorization",
         in: "header",
-        required: false,
+        required: true,
       }),
     ]);
     expect(json.paths["/api/v1/indexer/backfill"].post.requestBody.content["application/json"].schema.$ref).toBe(
@@ -2862,6 +3890,8 @@ describe("pactfuse-api P0", () => {
       "manifestFetchHash",
       "endpointResponseHash",
       "leaseDryRunHash",
+      "deliveryVerificationAuthority",
+      "artifactDeliveryEvidenceHash",
       "status",
       "winnerClaimAllowed",
     ]);
@@ -2897,7 +3927,7 @@ describe("pactfuse-api P0", () => {
       expect.objectContaining({
         name: "authorization",
         in: "header",
-        required: false,
+        required: true,
         description: expect.stringContaining("PACTFUSE_ARTIFACT_SIGNER_TOKEN"),
       }),
     ]);
@@ -2973,6 +4003,8 @@ describe("pactfuse-api P0", () => {
       "targetRepo",
       "targetCommit",
     ]);
+    expect(json.components.schemas.LeaseExecutePayload.properties.targetRepo.pattern).toContain("github");
+    expect(json.components.schemas.LeaseExecutePayload.properties.targetCommit.pattern).toBe("^[0-9a-fA-F]{6,64}$");
     expect(json.paths["/api/v1/lease/execute"].post.responses["202"].content["application/json"].schema.$ref).toBe(
       "#/components/schemas/LeaseExecuteResponse",
     );
@@ -3261,6 +4293,10 @@ describe("pactfuse-api P0", () => {
       "mcp-json-rpc",
     );
     expect(json.components.schemas.AgentTranscriptResponse.oneOf[0].properties.data.properties.boundedToPinnedManifest.type).toBe("boolean");
+    expect(json.components.schemas.AgentTranscriptResponse.oneOf[0].properties.data.properties.callCount).toEqual({
+      type: "integer",
+      minimum: 0,
+    });
     expect(json.components.schemas.FailClosedProofState.properties.proofChipAllowed.type).toBe("boolean");
     expect(json.components.schemas.FailClosedProofState.properties.winnerClaimAllowed.type).toBe("boolean");
     expect(json.components.schemas.FailClosedProofState.properties.finalVerifierComplete.type).toBe("boolean");
@@ -3372,6 +4408,56 @@ describe("pactfuse-api P0", () => {
       expect(res.json.error.code).toBe("proof_blocked");
       expect(res.json.error.message).toContain(entry.expected);
     }
+  });
+
+  it("rejects source manifest URLs that would leak credentials in public replay evidence", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-source-manifest-url-secret");
+
+    const res = await post(app, "/api/v1/sources/register", {
+      sessionId,
+      idempotencyKey: "source-secret-url",
+      payload: {
+        sourceId: "secret-url-source",
+        sourceHash: hex32("secret-url-source"),
+        manifestUrl: "https://user:pass@example.com/manifest.json?token=secret#frag",
+        manifestHash: hex32("secret-url-manifest"),
+        capabilityVector: defaultSourceCapabilityForTest(),
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(res.status).toBe(422);
+    expect(res.json.error.code).toBe("proof_blocked");
+    expect(res.json.error.message).toContain("source manifestUrl must not contain credentials, query strings, or fragments");
+    expect(JSON.stringify(replayJson.data)).not.toContain("token=secret");
+    expect(replayJson.data.sources).toEqual([]);
+  });
+
+  it("rejects source manifest URLs that are not public replay evidence URLs", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-source-manifest-url-private");
+
+    const res = await post(app, "/api/v1/sources/register", {
+      sessionId,
+      idempotencyKey: "source-private-url",
+      payload: {
+        sourceId: "private-url-source",
+        sourceHash: hex32("private-url-source"),
+        manifestUrl: "https://127.0.0.1/manifest.json",
+        manifestHash: hex32("private-url-manifest"),
+        capabilityVector: defaultSourceCapabilityForTest(),
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(res.status).toBe(422);
+    expect(res.json.error.code).toBe("proof_blocked");
+    expect(res.json.error.message).toContain("source manifestUrl must use a public hostname");
+    expect(JSON.stringify(replayJson.data)).not.toContain("127.0.0.1");
+    expect(replayJson.data.sources).toEqual([]);
   });
 
   it("rejects source-bound spends whose spendId is not the W8.1 preimage hash", async () => {
@@ -3774,10 +4860,10 @@ describe("pactfuse-api P0", () => {
   });
 
   it("fetches raw CAW receipts from a configured export source", async () => {
-    const requests: Array<{ url: string; authorization: string | undefined }> = [];
+    const requests: Array<{ url: string; authorization: string | undefined; xApiKey: string | undefined }> = [];
     const server = createServer((req, res) => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
-      requests.push({ url: url.toString(), authorization: req.headers.authorization });
+      requests.push({ url: url.toString(), authorization: req.headers.authorization, xApiKey: req.headers["x-api-key"] as string | undefined });
       const operationId = url.searchParams.get("operation_id");
       const sessionId = url.searchParams.get("session_id");
       const operationKind = url.searchParams.get("operation_kind") ?? "activate_tool";
@@ -3840,9 +4926,12 @@ describe("pactfuse-api P0", () => {
       expect(readyJson.proofProviders.find((provider: { name: string }) => provider.name === "caw").ready).toBe(true);
       expect(ingest.status).toBe(202);
       expect(ingest.json.data.canonicalReceiptCount).toBe(1);
+      expect(requests.every((request) => request.xApiKey === "caw-api-key")).toBe(true);
       expect(requests.every((request) => request.authorization === "Bearer caw-api-key")).toBe(true);
       expect(requests.some((request) => request.url.includes("wallet_id=wallet-1"))).toBe(true);
       expect(requests.some((request) => request.url.includes(`operation_id=${operation.json.data.operationId}`))).toBe(true);
+      expect(requests.some((request) => request.url.includes("action=contract_call.allowed"))).toBe(true);
+      expect(requests.some((request) => request.url.includes("result=allowed"))).toBe(true);
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     }
@@ -3867,6 +4956,24 @@ describe("pactfuse-api P0", () => {
     expect(status.reason).toContain("not an official Cobo API host");
     await expect(source.fetchReceiptBundle({ sessionId: hex32("fake-session") })).rejects.toThrow(
       "not an official Cobo API host",
+    );
+  });
+
+  it("trusts the current CAW Agentic Wallet production host for receipt export", async () => {
+    const source = createHttpsCawReceiptSource({
+      exportUrl: "https://api.agenticwallet.cobo.com/api/v1/audit-logs",
+    });
+
+    const status = await source.status();
+
+    expect(status).toEqual(
+      expect.objectContaining({
+        name: "caw",
+        mode: "live",
+        ready: false,
+        endpoint: "https://api.agenticwallet.cobo.com/api/v1/audit-logs",
+        reason: "CAW export API key is missing",
+      }),
     );
   });
 
@@ -4508,6 +5615,61 @@ describe("pactfuse-api P0", () => {
     );
   });
 
+  it("reconciles manual indexer backfill logs into finalized gate proof events", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const { app, ctx } = makeApp(":memory:", { cawLive: createFakeCawLiveClient(), chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs }) });
+    const sessionId = await createSession(app, "sess-manual-backfill-reconciles", { finalityDepth: 2 });
+    const spendId = await registerSpend(app, sessionId);
+    logs.push(
+      indexerLog("manual-backfill-reconciles", 100, {
+        eventName: "SpendSettled",
+        event: "SpendSettled",
+        sessionId,
+        spendId,
+        args: { sessionId, spendId, ...contractRegisteredSpendArgsForTest(ctx, sessionId, spendId) },
+        transactionHash: hex32("manual-backfill-reconciles-tx"),
+        rawLogHash: hex32("manual-backfill-reconciles-log"),
+      }),
+    );
+
+    const backfill = await post(app, "/api/v1/indexer/backfill", {
+      idempotencyKey: "manual-backfill-reconciles",
+      payload: {
+        cursorId: "gate:indexer",
+        chainId: "84532",
+        fromBlock: 100,
+        toBlock: 100,
+        finalityDepth: 2,
+        address: INDEXER_ADDRESS,
+        topics: [],
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const proofEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "gate.spend_settled");
+    const row = ctx.db.sqlite
+      .prepare("SELECT status, finalized_event_id FROM gate_chain_events WHERE session_id = ? AND spend_id = ?")
+      .get(sessionId, spendId) as Record<string, unknown>;
+
+    expect(backfill.status).toBe(202);
+    expect(backfill.json.data.insertedLogCount).toBe(1);
+    expect(row.status).toBe("finalized");
+    expect(row.finalized_event_id).toBe(proofEvent?.eventId);
+    expect(proofEvent).toEqual(
+      expect.objectContaining({
+        authority: "proof",
+        payload: expect.objectContaining({
+          spendId,
+          cursorId: "gate:indexer",
+          finalityStatus: "finalized",
+          contractStateVerified: true,
+          proofAuthority: true,
+          winnerClaimAllowed: false,
+        }),
+      }),
+    );
+  });
+
   it("blocks mutated gate log replay for the same tx/log/event identity", async () => {
     const { app } = makeApp(":memory:", { chain: createFakeGateChainClient() });
     const sessionId = await createSession(app, "sess-gate-mutated", { finalityDepth: 2 });
@@ -4703,6 +5865,9 @@ describe("pactfuse-api P0", () => {
     const verifierRun = ctx.db.sqlite
       .prepare("SELECT schema_ok FROM verifier_runs WHERE session_id = ? AND verifier_run_id = ?")
       .get(sessionId, issued.json.data.verifierRunId) as { schema_ok: number } | undefined;
+    const idempotencyRow = ctx.db.sqlite
+      .prepare("SELECT response_json FROM api_requests WHERE idempotency_key = ?")
+      .get("issue-artifact-token") as { response_json: string } | undefined;
     const issuedEvent = ctx.db.sqlite
       .prepare("SELECT kind, authority, payload_json FROM evidence_events WHERE event_id = ?")
       .get(issued.json.evidenceEventId) as { kind: string; authority: string; payload_json: string } | undefined;
@@ -4725,6 +5890,9 @@ describe("pactfuse-api P0", () => {
     expect(issued.status).toBe(202);
     expect(issuedReplay.status).toBe(202);
     expect(issuedReplay.json.requestId).toBe(issued.json.requestId);
+    expect(issuedReplay.json.data.accessToken).toBeNull();
+    expect(issuedReplay.json.data.tokenHash).toBe(issued.json.data.tokenHash);
+    expect(idempotencyRow?.response_json).not.toContain("pf_at_");
     expect(duplicateIssue.status).toBe(409);
     expect(duplicateIssue.json.error.code).toBe("idempotency_conflict");
     expect(issued.json.data).toEqual(
@@ -5098,6 +6266,60 @@ describe("pactfuse-api P0", () => {
     expect(preflight.json.error.code).toBe("not_found");
   });
 
+  it("rejects artifact delivery URLs that would leak credentials in public replay evidence", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-preflight-secret-url");
+    const spendId = await registerSpend(app, sessionId);
+
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "preflight-secret-url",
+      payload: {
+        spendId,
+        artifactHashPreview: TEST_ARTIFACT_HASH,
+        artifactCid: artifactCidForTest(TEST_ARTIFACT_HASH),
+        endpointUrl: "https://user:pass@example.com/artifact.json?token=secret#frag",
+        priceDisclosureHash: hex32("secret-preflight-price"),
+        sourceStateSnapshotHash: hex32("secret-preflight-source"),
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(preflight.status).toBe(422);
+    expect(preflight.json.error.code).toBe("proof_blocked");
+    expect(preflight.json.error.message).toContain("artifact preflight endpointUrl must not contain credentials, query strings, or fragments");
+    expect(JSON.stringify(replayJson.data)).not.toContain("token=secret");
+    expect(replayJson.data.artifactPreflights).toEqual([]);
+  });
+
+  it("rejects artifact delivery URLs that are not public replay evidence URLs", async () => {
+    const { app } = makeApp();
+    const sessionId = await createSession(app, "sess-preflight-private-url");
+    const spendId = await registerSpend(app, sessionId);
+
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "preflight-private-url",
+      payload: {
+        spendId,
+        artifactHashPreview: TEST_ARTIFACT_HASH,
+        artifactCid: artifactCidForTest(TEST_ARTIFACT_HASH),
+        endpointUrl: "https://metadata.internal/artifact.json",
+        priceDisclosureHash: hex32("private-preflight-price"),
+        sourceStateSnapshotHash: hex32("private-preflight-source"),
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(preflight.status).toBe(422);
+    expect(preflight.json.error.code).toBe("proof_blocked");
+    expect(preflight.json.error.message).toContain("artifact preflight endpointUrl must use a public hostname");
+    expect(JSON.stringify(replayJson.data)).not.toContain("metadata.internal");
+    expect(replayJson.data.artifactPreflights).toEqual([]);
+  });
+
   it("requires an artifact preflight before signing mocked quotes", async () => {
     const { app } = makeApp();
     const sessionId = await createSession(app, "sess-quote-preflight-required");
@@ -5230,6 +6452,212 @@ describe("pactfuse-api P0", () => {
         }),
       }),
     );
+  });
+
+  it("verifies artifact preflight by fetching the delivery endpoint server-side", async () => {
+    const artifactPayload = artifactPayloadForTest("server-live-fetch");
+    const artifactHash = hashForTestJson(artifactPayload);
+    const manifestBody = JSON.stringify({ sourceId: "clean-source", tool: "pactfuse_code_scan" });
+    const server = await startArtifactDeliveryServerForTest({ artifactPayload, manifestBody });
+    const { app } = makeApp(":memory:", {
+      artifactDelivery: createHttpArtifactDeliveryVerifier({ allowInsecureTestEndpoint: true }),
+      publicEvidence: { allowInsecureTestUrls: true },
+    });
+    try {
+      const sessionId = await createSession(app, "sess-server-live-fetch-preflight");
+      const capabilityVector = defaultSourceCapabilityForTest();
+      const sourceHashes = [hex32("source")];
+      await registerSource(app, sessionId, capabilityVector, {
+        manifestUrl: server.manifestUrl,
+        manifestHash: hashForTestText(manifestBody),
+      });
+      const spendId = await computeSpendIdForTest(app, sessionId, sourceHashes, capabilityVector, { artifactHash });
+      const spend = await post(app, "/api/v1/spends/register-batch", {
+        sessionId,
+        idempotencyKey: "server-live-fetch-spend-register",
+        payload: {
+          spends: [
+            spendRegistrationForTest(spendId, { sourceHashes, artifactHash }),
+          ],
+        },
+      });
+      const preflight = await post(app, "/api/v1/artifacts/preflight", {
+        sessionId,
+        idempotencyKey: "server-live-fetch-preflight",
+        payload: {
+          spendId,
+          artifactHashPreview: artifactHash,
+          artifactCid: artifactCidForTest(artifactHash),
+          endpointUrl: server.artifactUrl,
+          priceDisclosureHash: hex32("server-live-fetch-price"),
+          sourceStateSnapshotHash: hex32("server-live-fetch-source-state"),
+        },
+      });
+      const verify = await post(app, "/api/v1/artifacts/preflight/verify", {
+        sessionId,
+        idempotencyKey: "server-live-fetch-verify",
+        payload: {
+          preflightId: preflight.json.data.preflightId,
+          verificationMode: "server_live_fetch",
+        },
+      });
+      const quote = await post(app, "/api/v1/quotes", {
+        sessionId,
+        idempotencyKey: "server-live-fetch-quote",
+        payload: {
+          spendId,
+          preflightId: preflight.json.data.preflightId,
+          artifactCommitment: artifactHash,
+          priceAtomic: "1000",
+          quoteNonce: "server-live-fetch-quote-nonce",
+          validUntilBlock: "1000000",
+        },
+      });
+      const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+      const replayJson = await replay.json();
+      const verifiedEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "artifact.preflight.verified");
+
+      expect(spend.status).toBe(201);
+      expect(preflight.status).toBe(202);
+      expect(verify.status, JSON.stringify(verify.json)).toBe(202);
+      expect(verify.json.data).toEqual(
+        expect.objectContaining({
+          deliveryVerificationAuthority: "server_live_fetch",
+          artifactDeliveryEvidenceHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+          manifestFetchHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+          endpointResponseHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+          leaseDryRunHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        }),
+      );
+      expect(verifiedEvent.payload).toEqual(
+        expect.objectContaining({
+          deliveryVerificationAuthority: "server_live_fetch",
+          artifactDeliveryEvidenceHash: verify.json.data.artifactDeliveryEvidenceHash,
+          winnerClaimAllowed: false,
+        }),
+      );
+      expect(quote.status).toBe(201);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("blocks server-owned artifact preflight when the delivery endpoint redirects", async () => {
+    const artifactPayload = artifactPayloadForTest("server-live-fetch-redirect");
+    const artifactHash = hashForTestJson(artifactPayload);
+    const manifestBody = JSON.stringify({ sourceId: "clean-source", tool: "pactfuse_code_scan" });
+    const server = await startArtifactDeliveryServerForTest({ artifactPayload, manifestBody, redirectArtifact: true });
+    const verifier = createHttpArtifactDeliveryVerifier({ allowInsecureTestEndpoint: true, timeoutMs: 1_000 });
+    try {
+      await expect(
+        verifier.verify({
+          sessionId: hex32("server-live-fetch-redirect-session"),
+          preflightId: hex32("server-live-fetch-redirect-preflight"),
+          spendId: hex32("server-live-fetch-redirect-spend"),
+          artifactHashPreview: artifactHash,
+          artifactCid: artifactCidForTest(artifactHash),
+          endpointUrl: server.artifactUrl,
+          priceDisclosureHash: hex32("server-live-fetch-redirect-price"),
+          sourceStateSnapshotHash: hex32("server-live-fetch-redirect-source"),
+          sourceManifests: [],
+        }),
+      ).rejects.toThrow("artifact delivery endpoint returned HTTP 302");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("blocks server-owned artifact preflight when fetched manifest bytes do not match the registered hash", async () => {
+    const artifactPayload = artifactPayloadForTest("server-live-fetch-manifest-mismatch");
+    const artifactHash = hashForTestJson(artifactPayload);
+    const manifestBody = JSON.stringify({ sourceId: "clean-source", tool: "pactfuse_code_scan" });
+    const server = await startArtifactDeliveryServerForTest({ artifactPayload, manifestBody });
+    const { app } = makeApp(":memory:", {
+      artifactDelivery: createHttpArtifactDeliveryVerifier({ allowInsecureTestEndpoint: true }),
+      publicEvidence: { allowInsecureTestUrls: true },
+    });
+    try {
+      const sessionId = await createSession(app, "sess-server-live-fetch-manifest-mismatch");
+      const capabilityVector = defaultSourceCapabilityForTest();
+      const sourceHashes = [hex32("source")];
+      await registerSource(app, sessionId, capabilityVector, {
+        manifestUrl: server.manifestUrl,
+        manifestHash: hex32("wrong-manifest-body"),
+      });
+      const spendId = await computeSpendIdForTest(app, sessionId, sourceHashes, capabilityVector, { artifactHash });
+      const spend = await post(app, "/api/v1/spends/register-batch", {
+        sessionId,
+        idempotencyKey: "server-live-fetch-manifest-mismatch-spend-register",
+        payload: {
+          spends: [
+            spendRegistrationForTest(spendId, { sourceHashes, artifactHash }),
+          ],
+        },
+      });
+      const preflight = await post(app, "/api/v1/artifacts/preflight", {
+        sessionId,
+        idempotencyKey: "server-live-fetch-manifest-mismatch-preflight",
+        payload: {
+          spendId,
+          artifactHashPreview: artifactHash,
+          artifactCid: artifactCidForTest(artifactHash),
+          endpointUrl: server.artifactUrl,
+          priceDisclosureHash: hex32("server-live-fetch-manifest-mismatch-price"),
+          sourceStateSnapshotHash: hex32("server-live-fetch-manifest-mismatch-source-state"),
+        },
+      });
+      const verify = await post(app, "/api/v1/artifacts/preflight/verify", {
+        sessionId,
+        idempotencyKey: "server-live-fetch-manifest-mismatch-verify",
+        payload: {
+          preflightId: preflight.json.data.preflightId,
+          verificationMode: "server_live_fetch",
+        },
+      });
+
+      expect(spend.status).toBe(201);
+      expect(preflight.status).toBe(202);
+      expect(verify.status).toBe(423);
+      expect(verify.json.error.code).toBe("proof_pending");
+      expect(verify.json.error.message).toContain("source manifest");
+      expect(verify.json.error.message).toContain("manifestHash");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("blocks server-owned artifact preflight when the verifier returns a different payload hash", async () => {
+    const { app } = makeApp(":memory:", {
+      artifactDelivery: createFakeArtifactDeliveryVerifier({ artifactPayloadHash: hex32("wrong-server-artifact-payload") }),
+    });
+    const sessionId = await createSession(app, "sess-server-live-fetch-payload-mismatch");
+    const spendId = await registerSpend(app, sessionId);
+    const artifactHashPreview = TEST_ARTIFACT_HASH;
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "server-live-fetch-payload-mismatch-preflight",
+      payload: {
+        spendId,
+        artifactHashPreview,
+        artifactCid: artifactCidForTest(artifactHashPreview),
+        endpointUrl: "https://example.com/artifact",
+        priceDisclosureHash: hex32("server-live-fetch-payload-mismatch-price"),
+        sourceStateSnapshotHash: hex32("server-live-fetch-payload-mismatch-source-state"),
+      },
+    });
+    const verify = await post(app, "/api/v1/artifacts/preflight/verify", {
+      sessionId,
+      idempotencyKey: "server-live-fetch-payload-mismatch-verify",
+      payload: {
+        preflightId: preflight.json.data.preflightId,
+        verificationMode: "server_live_fetch",
+      },
+    });
+
+    expect(preflight.status).toBe(202);
+    expect(verify.status).toBe(422);
+    expect(verify.json.error.code).toBe("proof_blocked");
+    expect(verify.json.error.message).toContain("artifact delivery payload hash does not match preflight preview");
   });
 
   it("binds mocked quote signing to the matching artifact preflight", async () => {
@@ -5378,9 +6806,60 @@ describe("pactfuse-api P0", () => {
     expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("quote.signed.chain_settleable");
   });
 
+  it("blocks chain-settleable quotes from caller-attested preflight hashes", async () => {
+    const { app } = makeApp(":memory:", {
+      chain: createFakeIndexerChainClient({ mode: "live", chainId: "84532", currentBlockNumber: 100, logs: [] }),
+    });
+    const sessionId = await createSession(app, "sess-live-quote-caller-attestation");
+    const spendId = await registerSpend(app, sessionId);
+    const artifactHashPreview = TEST_ARTIFACT_HASH;
+    const preflight = await post(app, "/api/v1/artifacts/preflight", {
+      sessionId,
+      idempotencyKey: "live-quote-caller-preflight",
+      payload: {
+        spendId,
+        artifactHashPreview,
+        artifactCid: artifactCidForTest(artifactHashPreview),
+        endpointUrl: "https://example.com/artifact",
+        priceDisclosureHash: hex32("live-quote-caller-price"),
+        sourceStateSnapshotHash: hex32("live-quote-caller-source"),
+      },
+    });
+    await verifyArtifactPreflightForTest(
+      app,
+      sessionId,
+      preflight.json.data.preflightId,
+      artifactHashPreview,
+      artifactCidForTest(artifactHashPreview),
+      "live-quote-caller",
+    );
+
+    const quote = await post(app, "/api/v1/quotes", {
+      sessionId,
+      idempotencyKey: "live-quote-caller-attestation",
+      payload: {
+        spendId,
+        preflightId: preflight.json.data.preflightId,
+        artifactCommitment: artifactHashPreview,
+        priceAtomic: "1000",
+        quoteNonce: "live-quote-caller-attestation",
+        validUntilBlock: "123",
+        settlementMode: "chain_settleable_after_preflight",
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+
+    expect(quote.status).toBe(422);
+    expect(quote.json.error.code).toBe("proof_blocked");
+    expect(quote.json.error.message).toContain("server-owned artifact delivery preflight");
+    expect(replayJson.data.events.map((event: { kind: string }) => event.kind)).not.toContain("quote.signed.chain_settleable");
+  });
+
   it("signs chain-settleable quotes with live chain and payment bindings", async () => {
     const { app, ctx } = makeApp(":memory:", {
       chain: createFakeIndexerChainClient({ mode: "live", chainId: "84532", currentBlockNumber: 100, logs: [] }),
+      artifactDelivery: createFakeArtifactDeliveryVerifier(),
     });
     const sessionId = await createSession(app, "sess-live-quote-bound");
     const spendId = await registerSpend(app, sessionId);
@@ -5404,6 +6883,7 @@ describe("pactfuse-api P0", () => {
       artifactHashPreview,
       artifactCidForTest(artifactHashPreview),
       "live-quote-bound",
+      "server_live_fetch",
     );
     const quote = await post(app, "/api/v1/quotes", {
       sessionId,
@@ -5418,8 +6898,11 @@ describe("pactfuse-api P0", () => {
         settlementMode: "chain_settleable_after_preflight",
       },
     });
+    insertEarlierQuoteFillerRowsForTest(ctx, sessionId, spendId, preflight.json.data.preflightId, artifactHashPreview);
     const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
     const replayJson = await replay.json();
+    const readiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const readinessJson = await readiness.json();
     const quoteEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "quote.signed.chain_settleable");
     const quoteRow = ctx.db.sqlite.prepare("SELECT status, chain_id FROM quotes WHERE quote_id = ?").get(quote.json.data.quoteId) as Record<
       string,
@@ -5430,6 +6913,18 @@ describe("pactfuse-api P0", () => {
     expect(quote.json.data.status).toBe("chain_settleable_after_preflight");
     expect(quote.json.data.chainId).toBe("84532");
     expect(quoteRow).toEqual(expect.objectContaining({ status: "chain_settleable_after_preflight", chain_id: "84532" }));
+    expect(replay.status, JSON.stringify(replayJson)).toBe(200);
+    expect(readiness.status, JSON.stringify(readinessJson)).toBe(200);
+    expect(replayJson.data.quotes).toHaveLength(200);
+    expect(replayJson.data.quotes.some((row: { quoteId?: string }) => row.quoteId === quote.json.data.quoteId)).toBe(false);
+    expect(replayJson.data.replayPageIndex.collections.quotes.totalRows).toBeGreaterThan(200);
+    expect(replayRowsForTest(replayJson.data, "quotes").some((row) => row.quoteId === quote.json.data.quoteId)).toBe(true);
+    expect(readinessJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "artifact_quote_live")).toEqual(
+      expect.objectContaining({
+        status: "pass",
+        reason: "artifact quote is chain-settleable",
+      }),
+    );
     expect(quoteEvent).toEqual(
       expect.objectContaining({
         authority: "delivery",
@@ -5921,9 +7416,11 @@ describe("pactfuse-api P0", () => {
   it("verifies ERC20 balance deltas only when the finalized SpendSettled tx contains the matching Transfer log", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
+    const secretRpcEndpoint = "https://rpc-user:rpc-pass@rpc.example.test/v3/super-secret-key?api_key=hidden#frag";
+    const publicRpcEndpoint = "https://rpc.example.test/";
     const { app, ctx } = makeApp(":memory:", {
       cawLive: createFakeCawLiveClient(),
-      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances, endpoint: secretRpcEndpoint }),
     });
     const sessionId = await createSession(app, "sess-token-balance-delta");
     const spendId = await registerSpend(app, sessionId);
@@ -5933,6 +7430,9 @@ describe("pactfuse-api P0", () => {
     const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
     const replayJson = await replay.json();
     const tokenEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "token.balance_delta.verified");
+    const allowanceEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "caw.allowance.verified");
+    const activationEvent = replayJson.data.events.find((event: { kind: string }) => event.kind === "caw.activation.verified");
+    const replaySerialized = JSON.stringify(replayJson.data);
     const judge = await app.request(`/api/v1/evidence/judge-check?sessionId=${sessionId}`);
     const judgeJson = await judge.json();
     const settlementRow = judgeJson.data.rows.find((row: { rowId: string }) => row.rowId === "c_settlement");
@@ -5950,12 +7450,33 @@ describe("pactfuse-api P0", () => {
         amountAtomic: "1000",
         agentDeltaAtomic: "-1000",
         marketDeltaAtomic: "1000",
+        transferLogBindingHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        balanceReadHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        chainReadProofHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+        chainProviderEndpoint: publicRpcEndpoint,
         payerAgentWalletSame: true,
         proofAuthority: true,
         winnerClaimAllowed: false,
       }),
     );
-    expect(tokenEvent).toEqual(expect.objectContaining({ authority: "proof", payload: expect.objectContaining({ transferLogIndex: 20 }) }));
+    expect(tokenEvent).toEqual(
+      expect.objectContaining({
+        authority: "proof",
+        payload: expect.objectContaining({
+          transferLogIndex: 20,
+          transferLogBindingHash: verified.transferLogBindingHash,
+          balanceReadHash: verified.balanceReadHash,
+          chainReadProofHash: verified.chainReadProofHash,
+          chainProviderEndpoint: publicRpcEndpoint,
+        }),
+      }),
+    );
+    expect(allowanceEvent.payload.chainProviderEndpoint).toBe(publicRpcEndpoint);
+    expect(activationEvent.payload.chainProviderEndpoint).toBe(publicRpcEndpoint);
+    expect(replaySerialized).not.toContain("rpc-user");
+    expect(replaySerialized).not.toContain("rpc-pass");
+    expect(replaySerialized).not.toContain("super-secret-key");
+    expect(replaySerialized).not.toContain("api_key=hidden");
     expect(settlementRow).toEqual(
       expect.objectContaining({
         status: "pass",
@@ -6824,6 +8345,18 @@ describe("pactfuse-api P0", () => {
         payload: { i, winnerClaimAllowed: false },
       });
     }
+    const secondPageIdentityProbe = appendEvidenceEvent(ctx, {
+      sessionId,
+      authority: "proof",
+      kind: "caw.identity.probed",
+      payload: {
+        mode: "real",
+        pass: true,
+        identityMode: "p0-floor-one-wallet",
+        proofAuthority: true,
+        winnerClaimAllowed: false,
+      },
+    });
     const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
     const replayJson = await replay.json();
     const eventPage0 = await app.request(`/api/v1/evidence/replay-page?sessionId=${sessionId}&collection=events&page=0`);
@@ -6834,6 +8367,8 @@ describe("pactfuse-api P0", () => {
     const emptyPageJson = await emptyPage.json();
     const outOfRange = await app.request(`/api/v1/evidence/replay-page?sessionId=${sessionId}&collection=events&page=99`);
     const outOfRangeJson = await outOfRange.json();
+    const readiness = await app.request(`/api/v1/evidence/claim-readiness?sessionId=${sessionId}`);
+    const readinessJson = await readiness.json();
     const verify = await post(app, "/api/v1/evidence/verify", {
       sessionId,
       idempotencyKey: "verify-replay-summary-cap",
@@ -6842,6 +8377,7 @@ describe("pactfuse-api P0", () => {
 
     expect(replay.status).toBe(200);
     expect(replayJson.data.events).toHaveLength(200);
+    expect(replayJson.data.asOfEventSeq).toBe(replayJson.data.replayPageIndex.collections.events.totalRows);
     expect(replayJson.data.fullReplayRoot).toBe(replayJson.data.replayPageIndex.pageRoot);
     expect(replayJson.data.replayPageIndex.collections.events.totalRows).toBeGreaterThan(200);
     expect(replayJson.data.replayPageIndex.collections.events.pageHashes.length).toBeGreaterThan(1);
@@ -6863,11 +8399,27 @@ describe("pactfuse-api P0", () => {
     expect(emptyPageJson.error.code).toBe("bad_request");
     expect(outOfRange.status).toBe(400);
     expect(outOfRangeJson.error.code).toBe("bad_request");
-    expect(verify.status).toBe(200);
-    expect(verify.json.data.schemaOk).toBe(false);
-    expect(verify.json.data.errors).toContain(
-      `replayBundle.events has ${replayJson.data.replayPageIndex.collections.events.totalRows} rows, above final verifier cap 200`,
+    expect(readiness.status).toBe(200);
+    expect(readinessJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "replay_paged_integrity")).toEqual(
+      expect.objectContaining({
+        status: "pass",
+        reason: "replay page index covers all replay collections",
+      }),
     );
+    expect(secondPageIdentityProbe.eventSeq).toBeGreaterThan(200);
+    expect(readinessJson.data.targetIdentityMode).toBe("p0-floor-one-wallet");
+    expect(readinessJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "caw_identity_probe")).toEqual(
+      expect.objectContaining({
+        status: "pass",
+        evidenceEventId: secondPageIdentityProbe.eventId,
+      }),
+    );
+    expect(readinessJson.data.blockers).not.toEqual(expect.arrayContaining([expect.stringContaining("replay_paged_integrity")]));
+    expect(verify.status).toBe(200);
+    expect(verify.json.data.schemaOk).toBe(true);
+    expect(verify.json.data.finalVerifierComplete).toBe(false);
+    expect(verify.json.data.errors).not.toEqual(expect.arrayContaining([expect.stringContaining("above final verifier cap")]));
+    expect(verify.json.data.errors).toContain("final verifier requires live chain proof provider");
   });
 
   it("rejects supplied replay bundles whose asOfEventSeq is ahead of the server session", async () => {
@@ -7408,6 +8960,54 @@ describe("pactfuse-api P0", () => {
     expect(judgeJson.data.winnerClaimAllowed).toBe(false);
   });
 
+  it("rejects unsafe lease targets before bearer or MCP work", async () => {
+    const { app } = makeApp();
+    const basePayload = {
+      spendId: hex32("unsafe-lease-target-spend"),
+      payer: "0x1000000000000000000000000000000000000001",
+      artifactHash: TEST_ARTIFACT_HASH,
+    };
+    const unsafeRepo = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId: hex32("unsafe-lease-target-session"),
+        idempotencyKey: "lease-unsafe-repo-target",
+        payload: {
+          ...basePayload,
+          targetRepo: "file:///tmp/repo",
+          targetCommit: "abcdef123456",
+        },
+      },
+      { authorization: "Bearer should-not-matter" },
+    );
+    const unsafeCommit = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId: hex32("unsafe-lease-target-session"),
+        idempotencyKey: "lease-unsafe-commit-target",
+        payload: {
+          ...basePayload,
+          targetRepo: "https://github.com/example/repo",
+          targetCommit: "main;rm-rf",
+        },
+      },
+      { authorization: "Bearer should-not-matter" },
+    );
+
+    expect(unsafeRepo.status).toBe(400);
+    expect(unsafeRepo.json.error.code).toBe("bad_request");
+    expect(unsafeRepo.json.error.details.issues).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: expect.stringContaining("targetRepo") })]),
+    );
+    expect(unsafeCommit.status).toBe(400);
+    expect(unsafeCommit.json.error.code).toBe("bad_request");
+    expect(unsafeCommit.json.error.details.issues).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: expect.stringContaining("targetCommit") })]),
+    );
+  });
+
   it("requires a matching bearer-bound artifact token before lease execution", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
@@ -7567,13 +9167,81 @@ describe("pactfuse-api P0", () => {
     );
   });
 
+  it("blocks fixture MCP lease clients before recording a live transcript", async () => {
+    const logs: Array<Record<string, unknown>> = [];
+    const tokenBalances: Record<string, string> = {};
+    let executeCalls = 0;
+    const mcpLease: McpLeaseClient = {
+      async status() {
+        return { name: "mcp_lease", mode: "fixture", ready: true, reason: "fixture MCP lease client" };
+      },
+      async executeCleanLease(input) {
+        executeCalls += 1;
+        return createFakeMcpLeaseClient().executeCleanLease(input);
+      },
+    };
+    const { app, ctx } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient(),
+      chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
+      mcpLease,
+    });
+    const sessionId = await createSession(app, "sess-lease-fixture-provider-blocked");
+    const spendId = await registerSpend(app, sessionId);
+    const payer = "0x1000000000000000000000000000000000000001";
+    const quoted = await quoteArtifactForTest(app, sessionId, spendId, "lease-fixture-provider");
+    const finalized = await finalizeSpendSettlement(app, ctx, logs, sessionId, spendId, "lease-fixture-provider");
+    await verifyTokenBalanceDeltaForTest(app, logs, tokenBalances, sessionId, spendId, "lease-fixture-provider", finalized);
+    const issued = await post(app, "/api/v1/artifacts/access-token", {
+      sessionId,
+      idempotencyKey: "issue-fixture-provider-token",
+      payload: {
+        spendId,
+        payer,
+        quoteId: quoted.quoteId,
+        artifactHash: quoted.artifactHash,
+        artifactPayload: quoted.artifactPayload,
+      },
+    });
+    const lease = await post(
+      app,
+      "/api/v1/lease/execute",
+      {
+        sessionId,
+        idempotencyKey: "lease-fixture-provider-blocked",
+        payload: {
+          spendId,
+          payer,
+          artifactHash: quoted.artifactHash,
+          targetRepo: "https://github.com/example/independent-target",
+          targetCommit: "abcdef123456",
+        },
+      },
+      { authorization: `Bearer ${issued.json.data.accessToken}` },
+    );
+    const tokenRow = ctx.db.sqlite
+      .prepare("SELECT status FROM artifact_access_tokens WHERE session_id = ? AND token_id = ?")
+      .get(sessionId, issued.json.data.tokenId) as { status: string };
+    const succeededLeaseCount = ctx.db.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM lease_runs WHERE session_id = ? AND status = 'succeeded_live_mcp_transcript'")
+      .get(sessionId) as { count: number };
+
+    expect(issued.status).toBe(202);
+    expect(lease.status).toBe(202);
+    expect(lease.json.data.status).toBe("blocked_missing_runner_execution");
+    expect(lease.json.data.transcriptHash).toBe(null);
+    expect(lease.json.data.winnerClaimAllowed).toBe(false);
+    expect(tokenRow.status).toBe("blocked");
+    expect(succeededLeaseCount.count).toBe(0);
+    expect(executeCalls).toBe(0);
+  });
+
   it("executes a clean lease through MCP JSON-RPC and binds the transcript into replay evidence", async () => {
     const logs: Array<Record<string, unknown>> = [];
     const tokenBalances: Record<string, string> = {};
     const { app, ctx } = makeApp(":memory:", {
       cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
-      mcpLease: createFakeMcpLeaseClient(),
+      mcpLease: createFakeMcpLeaseClient("pactfuse_code_scan", "live"),
     });
     const sessionId = await createSession(app, "sess-lease-transcript-success");
     const spendId = await registerSpend(app, sessionId);
@@ -7709,10 +9377,15 @@ describe("pactfuse-api P0", () => {
       }),
     );
     expect(replayJson.data.mcpAdapterCalls).toHaveLength(2);
+    expect(replayJson.data.mcpAdapterCalls[1].redactedFields).toEqual(["request.params.arguments.artifactPayload"]);
     expect(replayJson.data.mcpAdapterCalls[1].request.params.arguments).toEqual(
       expect.objectContaining({
         artifactPayloadHash: issued.json.data.artifactPayloadHash,
-        artifactPayload: quoted.artifactPayload,
+        artifactPayload: {
+          redacted: true,
+          reason: "artifact_bearer_required",
+          artifactPayloadHash: issued.json.data.artifactPayloadHash,
+        },
       }),
     );
     expect(replayJson.data.sources).toEqual([
@@ -7739,6 +9412,12 @@ describe("pactfuse-api P0", () => {
         spendId,
         payer,
         artifactHash,
+        artifactPayloadHash: issued.json.data.artifactPayloadHash,
+        artifactPayload: {
+          redacted: true,
+          reason: "artifact_bearer_required",
+          artifactPayloadHash: issued.json.data.artifactPayloadHash,
+        },
         tokenHash: issued.json.data.tokenHash,
         issuedByVerifierRunId: issued.json.data.verifierRunId,
         settlementEventId: issued.json.data.settlementEventId,
@@ -7832,7 +9511,7 @@ describe("pactfuse-api P0", () => {
     const consumedArtifactPayloadHash = artifactHash;
     const consumedArtifactPayload = TEST_ARTIFACT_PAYLOAD;
 
-    for (let index = 0; index < 100; index += 1) {
+    for (let index = 0; index < 101; index += 1) {
       const leaseRunId = hex32(`lease-boundary-run-${index}`);
       const auditPrefix = leaseRunId.slice(2, 22);
       const targetRepo = "https://github.com/example/boundary-target";
@@ -7938,6 +9617,13 @@ describe("pactfuse-api P0", () => {
 
     const cleanTranscript = await app.request(`/api/v1/evidence/agent-transcript?sessionId=${sessionId}`);
     const cleanTranscriptJson = await cleanTranscript.json();
+    const cleanReplay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const cleanReplayJson = await cleanReplay.json();
+    const verifyCleanReplay = await post(app, "/api/v1/evidence/verify", {
+      sessionId,
+      idempotencyKey: "verify-lease-transcript-page-boundary-clean",
+      payload: { replayBundle: cleanReplayJson.data },
+    });
     const extraAuditPayload = {
       sessionId,
       auditNonce: "audit-extra-page-boundary",
@@ -7960,12 +9646,23 @@ describe("pactfuse-api P0", () => {
     });
 
     expect(cleanTranscript.status).toBe(200);
-    expect(cleanTranscriptJson.data.callCount).toBe(200);
+    expect(cleanTranscriptJson.data.callCount).toBe(202);
     expect(cleanTranscriptJson.data.boundedToPinnedManifest).toBe(true);
+    expect(cleanReplay.status).toBe(200);
+    expect(cleanReplayJson.data.asOfMcpAdapterCallCount).toBe(202);
+    expect(cleanReplayJson.data.mcpAdapterCalls).toHaveLength(200);
+    expect(verifyCleanReplay.status).toBe(200);
+    expect(verifyCleanReplay.json.data.errors).not.toEqual(
+      expect.arrayContaining([
+        "asOfMcpAdapterCallCount must be an integer in [0,200]",
+        "asOfMcpAdapterCallCount must equal mcpAdapterCalls.length in the replay summary",
+        "agentTranscript with succeeded leases must contain only pinned manifest MCP transcript frames",
+      ]),
+    );
     expect(extraAudit.status).toBe(202);
-    expect(pollutedTranscriptJson.data.callCount).toBe(200);
+    expect(pollutedTranscriptJson.data.callCount).toBe(203);
     expect(pollutedTranscriptJson.data.boundedToPinnedManifest).toBe(false);
-    expect(pollutedReplayJson.data.replayPageIndex.collections.mcpAdapterCalls.totalRows).toBe(201);
+    expect(pollutedReplayJson.data.replayPageIndex.collections.mcpAdapterCalls.totalRows).toBe(203);
     expect(verifyPollutedReplay.status).toBe(200);
     expect(verifyPollutedReplay.json.data.schemaOk).toBe(false);
     expect(verifyPollutedReplay.json.data.errors).toContain(
@@ -8037,7 +9734,7 @@ describe("pactfuse-api P0", () => {
       expect(lease.status).toBe(202);
       expect(lease.json.data.status).toBe("succeeded_live_mcp_transcript");
       expect(tokenRow.status).toBe("consumed");
-      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/list", "tools/call"]);
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/list", "tools/list", "tools/call"]);
     } finally {
       await mcp.close();
     }
@@ -8099,6 +9796,24 @@ describe("pactfuse-api P0", () => {
         }),
       );
       expect(mcp.calls).toEqual([]);
+    } finally {
+      await mcp.close();
+    }
+  });
+
+  it("does not follow redirected live MCP lease endpoints", async () => {
+    const mcp = await startRedirectingMcpJsonRpcServer();
+    try {
+      const status = await createHttpJsonRpcMcpLeaseClient({ endpointUrl: mcp.url, timeoutMs: 1_000, allowInsecureTestEndpoint: true }).status();
+
+      expect(status).toEqual(
+        expect.objectContaining({
+          name: "mcp_lease",
+          mode: "live",
+          ready: false,
+          reason: "lease MCP endpoint returned HTTP 302",
+        }),
+      );
     } finally {
       await mcp.close();
     }
@@ -8172,7 +9887,7 @@ describe("pactfuse-api P0", () => {
       expect(lease.json.data.status).toBe("blocked_mcp_execution_failed");
       expect(tokenRow.status).toBe("active");
       expect(succeededLeaseCount.count).toBe(0);
-      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/list"]);
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/list", "tools/list"]);
     } finally {
       await mcp.close();
     }
@@ -8246,7 +9961,7 @@ describe("pactfuse-api P0", () => {
       expect(second.status).toBe(422);
       expect(second.json.error.code).toBe("proof_blocked");
       expect(tokenRow.status).toBe("blocked");
-      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/list", "tools/call"]);
+      expect(mcp.calls.map((call) => call.method)).toEqual(["tools/list", "tools/list", "tools/list", "tools/call"]);
     } finally {
       await mcp.close();
     }
@@ -8504,12 +10219,12 @@ describe("pactfuse-api P0", () => {
     const releaseSignal = new Promise<void>((resolve) => {
       releaseLease = resolve;
     });
-    const fakeMcp = createFakeMcpLeaseClient();
+    const fakeMcp = createFakeMcpLeaseClient("pactfuse_code_scan", "live");
     const mcpLease: McpLeaseClient = {
       async status() {
         return {
           name: "mcp_lease",
-          mode: "fixture",
+          mode: "live",
           ready: true,
           reason: "barrier MCP lease client",
         };
@@ -8589,10 +10304,10 @@ describe("pactfuse-api P0", () => {
       const releaseSignal = new Promise<void>((resolve) => {
         releaseLease = resolve;
       });
-      const fakeMcp = createFakeMcpLeaseClient();
+      const fakeMcp = createFakeMcpLeaseClient("pactfuse_code_scan", "live");
       const mcpLease: McpLeaseClient = {
         async status() {
-          return { name: "mcp_lease", mode: "fixture", ready: true, reason: "barrier MCP lease client" };
+          return { name: "mcp_lease", mode: "live", ready: true, reason: "barrier MCP lease client" };
         },
         async executeCleanLease(input) {
           executeCalls += 1;
@@ -8626,7 +10341,7 @@ describe("pactfuse-api P0", () => {
       const second = makeApp(dbPath, {
       cawLive: createFakeCawLiveClient(),
       chain: createFakeIndexerChainClient({ currentBlockNumber: 101, logs, tokenBalances }),
-        mcpLease: createFakeMcpLeaseClient(),
+        mcpLease: createFakeMcpLeaseClient("pactfuse_code_scan", "live"),
       });
       const body = (idempotencyKey: string) => ({
         sessionId,
@@ -8829,9 +10544,40 @@ describe("pactfuse-api P0", () => {
     await expect(client.getWallet("wallet-sdk-1")).rejects.toThrow("not an official Cobo API host");
   });
 
+  it("trusts the current CAW Agentic Wallet production host for live SDK endpoints", async () => {
+    const client = createCoboAgenticWalletClient({
+      baseUrl: "https://api.agenticwallet.cobo.com",
+      apiKey: "",
+      walletId: "wallet-sdk-1",
+    });
+
+    const status = await client.status();
+
+    expect(status).toEqual(
+      expect.objectContaining({
+        name: "caw_live",
+        mode: "live",
+        ready: false,
+        endpoint: "https://api.agenticwallet.cobo.com",
+        reason: "CAW live API key is missing",
+      }),
+    );
+  });
+
   it("records live CAW pact, transfer, and audit interactions without storing pact API keys", async () => {
     const pactKeyHash = "0xe731d15044e2dac2b1cee3ea70e39cccc583c28ad1f42510b6a6dbc0b70b4adb";
-    const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
+    const { app } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient({
+        pactResponseExtras: {
+          debug_message: "proxy included pact-scoped-secret in a neutral field",
+          callback_url: "https://callback.example.test/hook?token=callback-secret#frag",
+          nested: {
+            note: "Authorization: Bearer neutral-bearer-secret",
+            details: "api_key=inline-secret password=password-secret",
+          },
+        },
+      }),
+    });
     const sessionId = await createSession(app, "sess-caw-live");
     const spendId = await registerSpend(app, sessionId);
 
@@ -8982,7 +10728,25 @@ describe("pactfuse-api P0", () => {
     const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
     const replayJson = await replay.json();
     expect(replayJson.data.cawLiveInteractions).toHaveLength(6);
-    expect(JSON.stringify(replayJson.data.cawLiveInteractions)).not.toContain("pact-scoped-secret");
+    const cawLiveInteractionsJson = JSON.stringify(replayJson.data.cawLiveInteractions);
+    expect(cawLiveInteractionsJson).not.toContain("pact-scoped-secret");
+    expect(cawLiveInteractionsJson).not.toContain("callback-secret");
+    expect(cawLiveInteractionsJson).not.toContain("neutral-bearer-secret");
+    expect(cawLiveInteractionsJson).not.toContain("inline-secret");
+    expect(cawLiveInteractionsJson).not.toContain("password-secret");
+    expect(cawLiveInteractionsJson).not.toContain("token=callback");
+    const pactSync = replayJson.data.cawLiveInteractions.find((row: { kind: string }) => row.kind === "pact_sync");
+    expect(pactSync?.response.result).toEqual(
+      expect.objectContaining({
+        debug_message: "proxy included [redacted] in a neutral field",
+        callback_url: "https://callback.example.test/",
+        nested: expect.objectContaining({
+          note: "Authorization: Bearer [redacted]",
+          details: "api_key=[redacted] password=[redacted]",
+        }),
+        api_key: { redacted: true, sha256: pactKeyHash },
+      }),
+    );
     expect(replayJson.data.cawLiveInteractions.find((row: { kind: string }) => row.kind === "transfer_submit")).toEqual(
       expect.objectContaining({
         request: expect.objectContaining({
@@ -9379,7 +11143,7 @@ describe("pactfuse-api P0", () => {
   });
 
   it("records a live CAW deny_probe for a wrong-target policy denial", async () => {
-    const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient() });
+    const { app } = makeApp(":memory:", { cawLive: createFakeCawLiveClient({ deniedResponseShape: "rejected-status-record" }) });
     const sessionId = await createSession(app, "sess-caw-live-deny-probe");
     const spendId = await registerSpend(app, sessionId);
     await post(app, "/api/v1/caw/live/pacts/submit", {
@@ -9444,6 +11208,190 @@ describe("pactfuse-api P0", () => {
     expect(readiness.status).toBe(200);
     expect(readinessJson.data.gates.find((gate: { gateId: string }) => gate.gateId === "caw_wrong_target_deny")).toEqual(
       expect.objectContaining({ status: "pass", evidenceEventId: usageEvent.eventId }),
+    );
+  });
+
+  it("matches CAW audit usage when request details are nested and audit omits tx and policy fields", async () => {
+    const { app } = makeApp(":memory:", {
+      cawLive: createFakeCawLiveClient({ auditShape: "nested-request-without-proof-fields" }),
+    });
+    const sessionId = await createSession(app, "sess-caw-live-nested-audit");
+    const spendId = await registerSpend(app, sessionId);
+    await post(app, "/api/v1/caw/live/pacts/submit", {
+      sessionId,
+      idempotencyKey: "nested-audit-pact-submit",
+      payload: { walletId: "wallet-live-1", intent: "nested audit", spec: { policies: [] } },
+    });
+    await post(app, "/api/v1/caw/live/pacts/sync", {
+      sessionId,
+      idempotencyKey: "nested-audit-pact-sync",
+      payload: { pactId: "pact-live-1" },
+    });
+    const approve = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "nested-audit-approve",
+        payload: {
+          spendId,
+          operationKind: "approve",
+          pactId: "pact-live-1",
+          walletId: "wallet-live-1",
+          chainId: "84532",
+          contractAddress: TEST_PAYMENT_TOKEN_ADDRESS,
+          procurementGateAddress: INDEXER_ADDRESS,
+          calldata: cawApproveCalldataForTest(INDEXER_ADDRESS, "1000"),
+          requestId: "nested-audit-approve",
+          sourceAddress: TEST_PAYER_ADDRESS,
+        },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const audit = await post(app, "/api/v1/caw/live/audit/sync", {
+      sessionId,
+      idempotencyKey: "nested-audit-sync",
+      payload: { walletId: "wallet-live-1", action: "contract_call.allowed", result: "allowed", limit: 20 },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const usageEvent = replayJson.data.events.find(
+      (event: { kind: string; payload: Record<string, unknown> }) =>
+        event.kind === "caw.live.audit.usage.verified" && event.payload.operationKind === "approve",
+    );
+
+    expect(approve.status).toBe(202);
+    expect(audit.status).toBe(202);
+    expect(usageEvent).toEqual(
+      expect.objectContaining({
+        authority: "proof",
+        payload: expect.objectContaining({
+          action: "contract_call.allowed",
+          result: "allowed",
+          cawRequestId: "nested-audit-approve",
+          policyDigest: hex32("pact-live-policy"),
+          pactPolicyDigest: hex32("pact-live-policy"),
+          txHash: hex32("caw-live-contract:nested-audit-approve"),
+          proofAuthority: true,
+        }),
+      }),
+    );
+  });
+
+  it("canonicalizes Cobo audit receipt rows by binding them to verified live CAW proof events", async () => {
+    const cawReceipts: Array<Record<string, unknown>> = [];
+    const { app } = makeApp(":memory:", {
+      caw: createFakeCawReceiptSource({ receipts: cawReceipts, mode: "live", preserveRawReceipts: true }),
+      cawLive: createFakeCawLiveClient({ auditShape: "nested-request-without-proof-fields" }),
+    });
+    const sessionId = await createSession(app, "sess-caw-live-audit-canonical-receipt");
+    const spendId = await registerSpend(app, sessionId);
+    await post(app, "/api/v1/caw/live/pacts/submit", {
+      sessionId,
+      idempotencyKey: "audit-canonical-pact-submit",
+      payload: { walletId: "wallet-live-1", intent: "audit canonical", spec: { policies: [] } },
+    });
+    await post(app, "/api/v1/caw/live/pacts/sync", {
+      sessionId,
+      idempotencyKey: "audit-canonical-pact-sync",
+      payload: { pactId: "pact-live-1" },
+    });
+    const operation = await post(app, "/api/v1/caw/operations/build", {
+      sessionId,
+      idempotencyKey: "audit-canonical-operation",
+      payload: {
+        spendId,
+        operationKind: "approve",
+        target: TEST_PAYMENT_TOKEN_ADDRESS,
+        selector: ERC20_APPROVE_SELECTOR,
+      },
+    });
+    const operationId = operation.json.data.operationId;
+    const approve = await post(
+      app,
+      "/api/v1/caw/live/contracts/call",
+      {
+        sessionId,
+        idempotencyKey: "audit-canonical-approve",
+        payload: {
+          spendId,
+          operationKind: "approve",
+          pactId: "pact-live-1",
+          walletId: "wallet-live-1",
+          chainId: "84532",
+          contractAddress: TEST_PAYMENT_TOKEN_ADDRESS,
+          procurementGateAddress: INDEXER_ADDRESS,
+          calldata: cawApproveCalldataForTest(INDEXER_ADDRESS, "1000"),
+          requestId: operationId,
+          sourceAddress: TEST_PAYER_ADDRESS,
+        },
+      },
+      { "x-pactfuse-caw-pact-api-key": "pact-scoped-secret" },
+    );
+    const audit = await post(app, "/api/v1/caw/live/audit/sync", {
+      sessionId,
+      idempotencyKey: "audit-canonical-sync",
+      payload: { walletId: "wallet-live-1", action: "contract_call.allowed", result: "allowed", limit: 20 },
+    });
+    cawReceipts.push({
+      id: "audit-canonical-row",
+      created_at: "2026-06-11T00:00:00.000Z",
+      wallet_id: "wallet-live-1",
+      action: "contract_call.allowed",
+      result: "allowed",
+      authz_details: {},
+      request: {
+        value: "0",
+        calldata: cawApproveCalldataForTest(INDEXER_ADDRESS, "1000"),
+        chain_id: "84532",
+        src_addr: TEST_PAYER_ADDRESS,
+        request_id: operationId,
+        function_id: ERC20_APPROVE_SELECTOR,
+        wallet_uuid: "wallet-live-1",
+        contract_addr: TEST_PAYMENT_TOKEN_ADDRESS,
+      },
+      error: null,
+    });
+    const ingest = await post(app, "/api/v1/caw/receipts/ingest", {
+      sessionId,
+      idempotencyKey: "audit-canonical-ingest",
+      payload: {
+        sourceLabel: "caw-api",
+        operationId,
+        receipts: [],
+        manual: false,
+      },
+    });
+    const replay = await app.request(`/api/v1/evidence/replay-bundle?sessionId=${sessionId}`);
+    const replayJson = await replay.json();
+    const canonical = replayJson.data.canonicalCawReceipts.find((receipt: { operationId: string }) => receipt.operationId === operationId);
+
+    expect(operation.status).toBe(201);
+    expect(approve.status).toBe(202);
+    expect(audit.status).toBe(202);
+    expect(ingest.status).toBe(202);
+    expect(canonical).toEqual(
+      expect.objectContaining({
+        operationId,
+        sourceLabel: "caw-api",
+        operationKind: "approve",
+        effect: "allow",
+        status: "succeeded",
+        requestId: operationId,
+        walletAddress: TEST_PAYER_ADDRESS,
+        target: TEST_PAYMENT_TOKEN_ADDRESS,
+        selector: ERC20_APPROVE_SELECTOR,
+        policyDigest: hex32("pact-live-policy"),
+        txHash: operationId,
+        txCount: "1",
+        expiry: "2026-06-12T00:00:00.000Z",
+      }),
+    );
+    expect(replayJson.data.rawCawReceiptBundles[0].rawBundle.receipts[0]).toEqual(
+      expect.objectContaining({
+        action: "contract_call.allowed",
+        request: expect.objectContaining({ request_id: operationId }),
+      }),
     );
   });
 
@@ -9554,15 +11502,21 @@ async function registerSource(
   app: ReturnType<typeof createApp>,
   sessionId: string,
   capabilityVector: Record<string, unknown> = defaultSourceCapabilityForTest(),
+  options: Partial<{
+    sourceId: string;
+    sourceHash: string;
+    manifestUrl: string;
+    manifestHash: string;
+  }> = {},
 ) {
   const res = await post(app, "/api/v1/sources/register", {
     sessionId,
-    idempotencyKey: "src-register",
+    idempotencyKey: `${options.sourceId ?? "src"}-register`,
     payload: {
-      sourceId: "clean-source",
-      sourceHash: hex32("source"),
-      manifestUrl: "https://example.com/manifest.json",
-      manifestHash: hex32("manifest"),
+      sourceId: options.sourceId ?? "clean-source",
+      sourceHash: options.sourceHash ?? hex32("source"),
+      manifestUrl: options.manifestUrl ?? "https://example.com/manifest.json",
+      manifestHash: options.manifestHash ?? hex32("manifest"),
       capabilityVector,
     },
   });
@@ -9675,21 +11629,29 @@ async function verifyArtifactPreflightForTest(
   artifactHash: string,
   artifactCid: string,
   seed: string,
+  verificationMode: "caller_hash_attestation" | "server_live_fetch" = "caller_hash_attestation",
 ) {
   const verify = await post(app, "/api/v1/artifacts/preflight/verify", {
     sessionId,
     idempotencyKey: `${seed}-preflight-verify`,
-    payload: {
-      preflightId,
-      artifactPayloadHash: artifactHash,
-      artifactCid,
-      manifestFetchHash: hex32(`${seed}-manifest-fetch`),
-      endpointResponseHash: hex32(`${seed}-endpoint-response`),
-      leaseDryRunHash: hex32(`${seed}-lease-dry-run`),
-    },
+    payload:
+      verificationMode === "server_live_fetch"
+        ? {
+            preflightId,
+            verificationMode,
+          }
+        : {
+            preflightId,
+            artifactPayloadHash: artifactHash,
+            artifactCid,
+            manifestFetchHash: hex32(`${seed}-manifest-fetch`),
+            endpointResponseHash: hex32(`${seed}-endpoint-response`),
+            leaseDryRunHash: hex32(`${seed}-lease-dry-run`),
+          },
   });
   expect(verify.status).toBe(202);
   expect(verify.json.data.status).toBe("passed_live_delivery");
+  expect(verify.json.data.deliveryVerificationAuthority).toBe(verificationMode);
   return verify;
 }
 
@@ -9702,7 +11664,13 @@ async function quoteArtifactForTest(
   sessionId: string,
   spendId: string,
   seed: string,
-  options: { artifactPayload?: Record<string, unknown>; priceAtomic?: string; validUntilBlock?: string; settlementMode?: "chain_settleable_after_preflight" } = {},
+  options: {
+    artifactPayload?: Record<string, unknown>;
+    priceAtomic?: string;
+    validUntilBlock?: string;
+    settlementMode?: "chain_settleable_after_preflight";
+    verificationMode?: "caller_hash_attestation" | "server_live_fetch";
+  } = {},
 ): Promise<{
   artifactPayload: Record<string, unknown>;
   artifactHash: `0x${string}`;
@@ -9726,7 +11694,7 @@ async function quoteArtifactForTest(
     },
   });
   expect(preflight.status).toBe(202);
-  await verifyArtifactPreflightForTest(app, sessionId, preflight.json.data.preflightId, artifactHash, artifactCid, seed);
+  await verifyArtifactPreflightForTest(app, sessionId, preflight.json.data.preflightId, artifactHash, artifactCid, seed, options.verificationMode);
   const quote = await post(app, "/api/v1/quotes", {
     sessionId,
     idempotencyKey: `${seed}-quote`,
@@ -9756,6 +11724,9 @@ const TEST_PAYMENT_TOKEN_ADDRESS = "0x4000000000000000000000000000000000000004";
 const TEST_PAYMENT_TOKEN_DEPLOYMENT_TX_HASH = hex32("test-payment-token-deploy");
 const TEST_PAYMENT_TOKEN_CODE = "0x6001600055" as const;
 const TEST_PAYMENT_TOKEN_CODE_HASH = keccak256(TEST_PAYMENT_TOKEN_CODE);
+const TEST_PROCUREMENT_GATE_DEPLOYMENT_TX_HASH = hex32("test-procurement-gate-deploy");
+const TEST_SOURCE_REGISTRY_DEPLOYMENT_TX_HASH = hex32("test-source-registry-deploy");
+const TEST_MARKET_DEPLOYMENT_TX_HASH = hex32("test-market-deploy");
 const TEST_MARKET_ADDRESS = "0x5000000000000000000000000000000000000005";
 const BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
 const TEST_PACT_ID = hex32("pact-c");
@@ -9783,6 +11754,30 @@ function testDeploymentRegistry(): NonNullable<ServiceCtx["deploymentRegistry"]>
         tokenMode: "mock-test-token",
         symbol: "MOCK",
         decimals: 18,
+      },
+      {
+        contractName: "ProcurementGate",
+        chainId: "84532",
+        address: INDEXER_ADDRESS,
+        deploymentTxHash: TEST_PROCUREMENT_GATE_DEPLOYMENT_TX_HASH,
+        explorerUrl: `https://sepolia.basescan.org/tx/${TEST_PROCUREMENT_GATE_DEPLOYMENT_TX_HASH}`,
+        codeHash: hex32("test-procurement-gate-code"),
+      },
+      {
+        contractName: "SourceStateRegistry",
+        chainId: "84532",
+        address: INDEXER_ADDRESS,
+        deploymentTxHash: TEST_SOURCE_REGISTRY_DEPLOYMENT_TX_HASH,
+        explorerUrl: `https://sepolia.basescan.org/tx/${TEST_SOURCE_REGISTRY_DEPLOYMENT_TX_HASH}`,
+        codeHash: hex32("test-source-registry-code"),
+      },
+      {
+        contractName: "PaidArtifactMarket",
+        chainId: "84532",
+        address: TEST_MARKET_ADDRESS,
+        deploymentTxHash: TEST_MARKET_DEPLOYMENT_TX_HASH,
+        explorerUrl: `https://sepolia.basescan.org/tx/${TEST_MARKET_DEPLOYMENT_TX_HASH}`,
+        codeHash: hex32("test-market-code"),
       },
     ],
   };
@@ -9842,6 +11837,7 @@ function createFakeIndexerChainClient(config: {
   mode?: "fixture" | "live";
   ready?: boolean;
   reason?: string;
+  endpoint?: string;
   getLogsError?: Error;
   readContractError?: Error;
   contractSpendStates?: Record<string, number>;
@@ -9870,6 +11866,7 @@ function createFakeIndexerChainClient(config: {
         ready: config.ready ?? true,
         reason: config.reason ?? "test chain indexer provider",
         chainId: config.chainId ?? "84532",
+        ...(config.endpoint ? { endpoint: config.endpoint } : {}),
       };
     },
     async getBlockNumber() {
@@ -10209,7 +12206,12 @@ function createFakeGateChainClient(currentBlockNumber = 101, chainId = "84532"):
   };
 }
 
-function createFakeCawReceiptSource(input: { receipts: Array<Record<string, unknown>>; source?: string; mode?: "fixture" | "live" }): CawReceiptSource {
+function createFakeCawReceiptSource(input: {
+  receipts: Array<Record<string, unknown>>;
+  source?: string;
+  mode?: "fixture" | "live";
+  preserveRawReceipts?: boolean;
+}): CawReceiptSource {
   return {
     async status() {
       return {
@@ -10226,11 +12228,13 @@ function createFakeCawReceiptSource(input: { receipts: Array<Record<string, unkn
         sessionId: request.sessionId,
         operationId: request.operationId,
         fetchedAt: "2026-06-11T00:00:00.000Z",
-        receipts: input.receipts.map((receipt) => ({
-          sessionId: request.sessionId,
-          operationId: request.operationId,
-          ...receipt,
-        })),
+        receipts: input.preserveRawReceipts
+          ? input.receipts
+          : input.receipts.map((receipt) => ({
+              sessionId: request.sessionId,
+              operationId: request.operationId,
+              ...receipt,
+            })),
       };
     },
   };
@@ -10868,6 +12872,145 @@ function cawReceiptFields(seed: string, overrides: Record<string, unknown> = {})
   };
 }
 
+function insertEarlierQuoteFillerRowsForTest(
+  ctx: ServiceCtx,
+  sessionId: string,
+  spendId: string,
+  preflightId: string,
+  artifactHash: string,
+): void {
+  const artifactCid = artifactCidForTest(artifactHash);
+  const stmt = ctx.db.sqlite.prepare(
+    `INSERT INTO quotes
+       (quote_id, session_id, spend_id, preflight_id, artifact_commitment, artifact_cid, price_disclosure_hash,
+        source_state_snapshot_hash, price_atomic, quote_nonce, valid_until_block, quote_hash, status, chain_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (let index = 0; index < 200; index += 1) {
+    const quoteId = hex32(`paged-filler-quote-${index}`);
+    const quoteNonce = `paged-filler-quote-${index}`;
+    const row = {
+      sessionId,
+      spendId,
+      preflightId,
+      artifactCommitment: artifactHash,
+      status: "mocked_after_preflight_not_chain_settleable",
+      chainId: null,
+      priceAtomic: "1000",
+      quoteNonce,
+      validUntilBlock: "1000000",
+      artifactCid,
+      priceDisclosureHash: hex32(`paged-filler-quote-price-${index}`),
+      sourceStateSnapshotHash: hex32(`paged-filler-quote-source-state-${index}`),
+      quoteSignedAfterPreflight: true,
+      modes: LOCKED_RUNTIME_MODES,
+    };
+    stmt.run(
+      quoteId,
+      sessionId,
+      spendId,
+      preflightId,
+      artifactHash,
+      artifactCid,
+      row.priceDisclosureHash,
+      row.sourceStateSnapshotHash,
+      row.priceAtomic,
+      quoteNonce,
+      row.validUntilBlock,
+      hashForTestJson(row),
+      row.status,
+      row.chainId,
+      `2026-01-01T00:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
+    );
+  }
+}
+
+function insertEarlierCawReceiptFillerRowsForTest(ctx: ServiceCtx, sessionId: string): void {
+  const rawStmt = ctx.db.sqlite.prepare(
+    `INSERT INTO caw_raw_receipt_bundles
+       (bundle_id, session_id, operation_id, source_label, fetched_at, raw_bundle_hash, raw_bundle_json, receipt_count, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const canonicalStmt = ctx.db.sqlite.prepare(
+    `INSERT INTO caw_canonical_receipts
+       (raw_receipt_hash, canonical_receipt_hash, bundle_id, session_id, operation_id, operation_kind, source_label,
+        wallet_address, target, selector, request_id, effect, status, policy_digest, params_digest, tx_hash, tx_count, expiry, fetched_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (let index = 0; index < 200; index += 1) {
+    const operationId = hex32(`paged-filler-caw-operation-${index}`);
+    const bundleId = hex32(`paged-filler-caw-bundle-${index}`);
+    const fetchedAt = `2026-01-01T01:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`;
+    const createdAt = fetchedAt;
+    const rawReceipt = cawReceiptFields(`paged-filler-caw-${index}`, {
+      operationId,
+      operationKind: "deny_probe",
+      effect: "allow",
+      status: "succeeded",
+      target: null,
+      selector: null,
+      txHash: null,
+    });
+    const rawBundle = {
+      source: "caw-api",
+      sourceLabel: "caw-api",
+      sessionId,
+      operationId,
+      operationKind: "deny_probe",
+      walletId: "paged-filler-wallet",
+      fetchedAt,
+      receipts: [rawReceipt],
+      raw: { receipts: [rawReceipt] },
+    };
+    const rawBundleHash = hashForTestJson(rawBundle);
+    const rawReceiptHash = hashForTestJson(rawReceipt);
+    const canonicalBase = {
+      bundleId,
+      sessionId,
+      operationId,
+      operationKind: "deny_probe",
+      sourceLabel: "caw-api",
+      walletAddress: rawReceipt.walletAddress,
+      target: null,
+      selector: null,
+      requestId: rawReceipt.requestId,
+      effect: "allow",
+      status: "succeeded",
+      policyDigest: rawReceipt.policyDigest,
+      paramsDigest: rawReceipt.paramsDigest,
+      txHash: null,
+      txCount: rawReceipt.txCount,
+      expiry: rawReceipt.expiry,
+      fetchedAt,
+      createdAt,
+    };
+    const canonicalReceiptHash = hashForTestJson(canonicalBase);
+    rawStmt.run(bundleId, sessionId, operationId, "caw-api", fetchedAt, rawBundleHash, canonicalizeJson(rawBundle), 1, createdAt);
+    canonicalStmt.run(
+      rawReceiptHash,
+      canonicalReceiptHash,
+      bundleId,
+      sessionId,
+      operationId,
+      "deny_probe",
+      "caw-api",
+      rawReceipt.walletAddress,
+      null,
+      null,
+      rawReceipt.requestId,
+      "allow",
+      "succeeded",
+      rawReceipt.policyDigest,
+      rawReceipt.paramsDigest,
+      null,
+      rawReceipt.txCount,
+      rawReceipt.expiry,
+      fetchedAt,
+      createdAt,
+    );
+  }
+}
+
 async function buildAndIngestCawReceiptForTest(
   app: ReturnType<typeof createApp>,
   sessionId: string,
@@ -10910,6 +13053,9 @@ function createFakeCawLiveClient(
     auditPolicyDigest: `0x${string}`;
     policyRequestLimit: string;
     policy: Record<string, unknown>;
+    pactResponseExtras: Record<string, unknown>;
+    auditShape: "flat" | "nested-request-without-proof-fields";
+    deniedResponseShape: "policy-denied" | "rejected-status-record";
   }> = {},
 ): CawLiveClient {
   const contractCalls: Array<{ input: Parameters<CawLiveClient["contractCall"]>[0]; txHash: `0x${string}` | null }> = [];
@@ -10929,6 +13075,19 @@ function createFakeCawLiveClient(
     },
     async getWallet(walletId) {
       return { success: true, result: { id: walletId, status: "active", wallet_address: TEST_PAYER_ADDRESS } };
+    },
+    async listWalletAddresses(walletId) {
+      return {
+        success: true,
+        result: [
+          {
+            wallet_id: walletId,
+            chain_type: "ETH",
+            address: TEST_PAYER_ADDRESS,
+            compatible_chains: ["SETH", "BASE_ETH"],
+          },
+        ],
+      };
     },
     async submitPact(input) {
       return {
@@ -10956,6 +13115,7 @@ function createFakeCawLiveClient(
       return {
         success: true,
         result: {
+          ...options.pactResponseExtras,
           pact_id: pactId,
           wallet_id: "wallet-live-1",
           status: "ACTIVE",
@@ -10982,6 +13142,19 @@ function createFakeCawLiveClient(
         : hex32(`caw-live-contract:${input.requestId ?? "default"}`);
       const denied = input.operationKind === "deny_probe";
       contractCalls.push({ input, txHash: denied ? null : txHash });
+      if (denied && options.deniedResponseShape === "rejected-status-record") {
+        return {
+          success: true,
+          result: {
+            id: "contract-live-1",
+            wallet_id: input.walletId,
+            request_id: input.requestId,
+            status: 902,
+            status_display: "Rejected",
+            transaction_hash: null,
+          },
+        };
+      }
       return {
         success: true,
         result: {
@@ -10997,16 +13170,40 @@ function createFakeCawLiveClient(
     async listAuditLogs(input) {
       const items = contractCalls
         .filter((call) => !input.walletId || call.input.walletId === input.walletId)
-        .map((call) => ({
-          id: `audit-${call.input.requestId ?? call.txHash}`,
-          wallet_id: call.input.walletId,
-          pact_id: call.input.pactId,
-          action: input.action ?? `contract_call.${call.input.operationKind}`,
-          result: input.result ?? (call.input.operationKind === "deny_probe" ? "denied" : "allowed"),
-          request_id: call.input.requestId,
-          ...(call.txHash ? { transaction_hash: call.txHash } : {}),
-          policy_digest: auditPolicyDigest,
-        }));
+        .map((call) => {
+          const result = input.result ?? (call.input.operationKind === "deny_probe" ? "denied" : "allowed");
+          const action = input.action ?? `contract_call.${result}`;
+          if (options.auditShape === "nested-request-without-proof-fields") {
+            return {
+              id: `audit-${call.input.requestId ?? call.txHash}`,
+              wallet_id: call.input.walletId,
+              pact_id: call.input.pactId,
+              action,
+              result,
+              authz_details: {
+                policy_id: "policy-live-1",
+              },
+              request: {
+                request_id: call.input.requestId,
+                chain_id: call.input.chainId,
+                contract_addr: call.input.contractAddress,
+                function_id: call.input.calldata.slice(0, 10),
+                src_addr: call.input.sourceAddress ?? TEST_PAYER_ADDRESS,
+              },
+              error: null,
+            };
+          }
+          return {
+            id: `audit-${call.input.requestId ?? call.txHash}`,
+            wallet_id: call.input.walletId,
+            pact_id: call.input.pactId,
+            action,
+            result,
+            request_id: call.input.requestId,
+            ...(call.txHash ? { transaction_hash: call.txHash } : {}),
+            policy_digest: auditPolicyDigest,
+          };
+        });
       return {
         success: true,
         result: {
@@ -11019,6 +13216,91 @@ function createFakeCawLiveClient(
 
 function hashForTestJson(value: unknown): `0x${string}` {
   return `0x${createHash("sha256").update(canonicalizeJson(value)).digest("hex")}`;
+}
+
+function hashForTestText(value: string): `0x${string}` {
+  return `0x${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function tokenSettlementClaimForTest(tokenMode: unknown): string | null {
+  if (tokenMode === "official-testnet-usdc") {
+    return "official-testnet-usdc";
+  }
+  if (tokenMode === "mock-test-token") {
+    return "live-mock-erc20-fallback";
+  }
+  return null;
+}
+
+function makeTestProofBundleSigner(keyId = "test-proof-key"): ProofBundleSigner {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+  const publicKeyHash = hashForTestText(publicKeyPem);
+  return {
+    scheme: "ed25519",
+    keyId,
+    publicKeyPem,
+    publicKeyHash,
+    signPayloadHash(payloadHash) {
+      return cryptoSign(null, Buffer.from(payloadHash.slice(2), "hex"), privateKey).toString("base64");
+    },
+  };
+}
+
+type ProofBundleAttestationFieldsForTest = {
+  sessionId: string;
+  publicClaimHash: string;
+  publicClaimEventSeq: number;
+  authorizedAt: string;
+  asOfEventSeq: number;
+  claimInputReplayBundleHash: string;
+  replayBundleHash: string;
+  verifierRunHash: string;
+  providerStatusHash: string;
+  deploymentRegistryHash: string | null;
+  serverHash: string;
+};
+
+function signProofBundleVerifierAttestationForTest(
+  signer: ProofBundleSigner,
+  fields: ProofBundleAttestationFieldsForTest,
+): Record<string, unknown> {
+  const signedPayloadHash = hashForTestJson(proofBundleVerifierAttestationInputForTest(signer, fields));
+  return {
+    scheme: signer.scheme,
+    keyId: signer.keyId,
+    publicKeyPem: signer.publicKeyPem,
+    publicKeyHash: signer.publicKeyHash,
+    signedPayloadHash,
+    signature: signer.signPayloadHash(signedPayloadHash),
+  };
+}
+
+function proofBundleVerifierAttestationInputForTest(
+  signer: ProofBundleSigner,
+  fields: ProofBundleAttestationFieldsForTest,
+): Record<string, unknown> {
+  return {
+    attestationType: "PACTFUSE_PUBLIC_PROOF_VERIFIER_ATTESTATION_V1",
+    scheme: signer.scheme,
+    keyId: signer.keyId,
+    publicKeyHash: signer.publicKeyHash,
+    bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+    sessionId: fields.sessionId,
+    publicClaimHash: fields.publicClaimHash,
+    publicClaimEventSeq: fields.publicClaimEventSeq,
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt: fields.authorizedAt,
+    asOfEventSeq: fields.asOfEventSeq,
+    claimInputReplayBundleHash: fields.claimInputReplayBundleHash,
+    replayBundleHash: fields.replayBundleHash,
+    verifierRunHash: fields.verifierRunHash,
+    providerStatusHash: fields.providerStatusHash,
+    deploymentRegistryHash: fields.deploymentRegistryHash,
+    serverHash: fields.serverHash,
+    winnerClaimAllowed: true,
+  };
 }
 
 function restoreEnv(name: string, value: string | undefined): void {
@@ -11105,6 +13387,52 @@ function createFakeMcpLeaseClient(toolName = "pactfuse_code_scan", mode: "fixtur
   };
 }
 
+function createFakeArtifactDeliveryVerifier(
+  overrides: Partial<Awaited<ReturnType<ArtifactDeliveryVerifier["verify"]>>> = {},
+  onVerify: (input: Parameters<ArtifactDeliveryVerifier["verify"]>[0]) => void | Promise<void> = () => {},
+): ArtifactDeliveryVerifier {
+  return {
+    async verify(input) {
+      await onVerify(input);
+      const artifactPayloadHash = overrides.artifactPayloadHash ?? input.artifactHashPreview.toLowerCase();
+      const artifactCid = overrides.artifactCid ?? input.artifactCid.toLowerCase();
+      const manifestFetchHash = overrides.manifestFetchHash ?? hashForTestJson({
+        mode: "server_live_fetch",
+        preflightId: input.preflightId,
+        sourceManifests: input.sourceManifests,
+      });
+      const endpointResponseHash = overrides.endpointResponseHash ?? hashForTestJson({
+        mode: "server_live_fetch",
+        endpointUrl: input.endpointUrl,
+        artifactPayloadHash,
+      });
+      const leaseDryRunHash = overrides.leaseDryRunHash ?? hashForTestJson({
+        mode: "server_live_fetch",
+        endpointUrl: input.endpointUrl,
+        artifactPayloadHash,
+        leaseDryRun: { ok: true },
+      });
+      return {
+        artifactPayloadHash,
+        artifactCid,
+        manifestFetchHash,
+        endpointResponseHash,
+        leaseDryRunHash,
+        evidenceHash:
+          overrides.evidenceHash ??
+          hashForTestJson({
+            mode: "server_live_fetch",
+            artifactPayloadHash,
+            artifactCid,
+            manifestFetchHash,
+            endpointResponseHash,
+            leaseDryRunHash,
+          }),
+      };
+    },
+  };
+}
+
 function leaseToolDefinitionForTest(name = "pactfuse_code_scan"): Record<string, unknown> {
   const properties = Object.fromEntries(
     ["sessionId", "leaseRunId", "spendId", "payer", "artifactHash", "artifactPayloadHash", "artifactPayload", "targetRepo", "targetCommit"].map((field) => [
@@ -11156,6 +13484,100 @@ async function startMcpJsonRpcServer(respond: (request: Record<string, unknown>)
   return {
     url: `http://127.0.0.1:${address.port}`,
     calls,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+    }),
+  };
+}
+
+async function startRedirectingMcpJsonRpcServer(): Promise<{
+  url: string;
+  close: () => Promise<void>;
+}> {
+  const server = createServer((_req, res) => {
+    res.statusCode = 302;
+    res.setHeader("location", "/rpc");
+    res.end();
+  });
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("test redirecting MCP server did not bind to a TCP port");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}/redirect`,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      }),
+  };
+}
+
+async function startArtifactDeliveryServerForTest(input: {
+  artifactPayload: Record<string, unknown>;
+  manifestBody: string;
+  redirectArtifact?: boolean;
+}): Promise<{
+  artifactUrl: string;
+  manifestUrl: string;
+  close: () => Promise<void>;
+}> {
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (url.pathname === "/artifact.json") {
+      if (input.redirectArtifact) {
+        res.statusCode = 302;
+        res.setHeader("location", "/artifact-target.json");
+        res.end();
+        return;
+      }
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ artifactPayload: input.artifactPayload, leaseDryRun: { ok: true } }));
+      return;
+    }
+    if (url.pathname === "/artifact-target.json") {
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ artifactPayload: input.artifactPayload, leaseDryRun: { ok: true } }));
+      return;
+    }
+    if (url.pathname === "/manifest.json") {
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(input.manifestBody);
+      return;
+    }
+    res.statusCode = 404;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ error: "not_found" }));
+  });
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("test artifact delivery server did not bind to a TCP port");
+  }
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  return {
+    artifactUrl: `${baseUrl}/artifact.json`,
+    manifestUrl: `${baseUrl}/manifest.json`,
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.close((error) => {
@@ -11221,6 +13643,9 @@ async function runLiveSmokeAgainstStub(
         PACTFUSE_OPERATOR_TOKEN: "operator-test-token",
         PACTFUSE_LIVE_SMOKE_SESSION_ID: fixture.sessionId,
         PACTFUSE_LIVE_SMOKE_REQUIRED_PROVIDERS: "chain,caw_live,caw,mcp_lease",
+        PACTFUSE_TRUSTED_PROOF_KEY_HASHES: String(
+          (fixture.proofBundle.verifierAttestation as Record<string, unknown>).publicKeyHash,
+        ),
         ...extraEnv,
       },
     });
@@ -11242,6 +13667,42 @@ function readJsonFile(path: string): Record<string, unknown> {
   return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
 }
 
+function writeLiveSmokeArtifactForTest(path: string, value: Record<string, unknown>): void {
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function resealLiveSmokeManifestForTest(dir: string): void {
+  const manifestPath = join(dir, "manifest.json");
+  const manifest = readJsonFile(manifestPath);
+  const artifactNames = ((manifest.artifacts as Array<Record<string, unknown>>) ?? []).map((artifact) => String(artifact.name));
+  const artifacts = artifactNames.map((name) => {
+    const path = join(dir, name);
+    const value = readJsonFile(path);
+    const bytes = readFileSync(path);
+    return {
+      name,
+      canonicalHash: hashForTestJson(value),
+      byteSha256: `0x${createHash("sha256").update(bytes).digest("hex")}`,
+      bytes: bytes.length,
+    };
+  });
+  const publicClaim = artifactNames.includes("public-claim.json") ? readJsonFile(join(dir, "public-claim.json")) : null;
+  const proofBundle = artifactNames.includes("proof-bundle.json") ? readJsonFile(join(dir, "proof-bundle.json")) : null;
+  const manifestBase = {
+    ...manifest,
+    publicClaimHash: publicClaim?.publicClaimHash ?? null,
+    proofBundleHash: proofBundle?.proofBundleHash ?? null,
+    replayBundleHash: proofBundle?.replayBundleHash ?? publicClaim?.replayBundleHash ?? null,
+    publicClaimEventHash: proofBundle?.publicClaimEventHash ?? null,
+    providerStatusHash: proofBundle?.providerStatusHash ?? publicClaim?.providerStatusHash ?? null,
+    deploymentRegistryHash: proofBundle?.deploymentRegistryHash ?? publicClaim?.deploymentRegistryHash ?? null,
+    serverHash: proofBundle?.serverHash ?? publicClaim?.serverHash ?? null,
+    artifacts,
+  };
+  delete (manifestBase as { manifestHash?: unknown }).manifestHash;
+  writeLiveSmokeArtifactForTest(manifestPath, { ...manifestBase, manifestHash: hashForTestJson(manifestBase) });
+}
+
 function resealLiveSmokeProofBundleForTest(proofBundle: Record<string, unknown>): void {
   const publicClaim = proofBundle.publicClaim as Record<string, unknown>;
   const verifierRun = publicClaim.verifierRun as Record<string, unknown>;
@@ -11255,6 +13716,7 @@ function resealLiveSmokeProofBundleForTest(proofBundle: Record<string, unknown>)
   publicClaim.providerStatusHash = proofBundle.providerStatusHash;
   publicClaim.deploymentRegistryHash = proofBundle.deploymentRegistryHash;
   publicClaim.serverHash = proofBundle.serverHash;
+  publicClaim.tokenSettlementClaim = tokenSettlementClaimForTest(publicClaim.tokenMode);
   proofBundle.snapshotScope = publicClaim.snapshotScope;
   proofBundle.providerSnapshotOnly = publicClaim.providerSnapshotOnly;
   proofBundle.authorizedAt = publicClaim.authorizedAt;
@@ -11269,12 +13731,17 @@ function resealLiveSmokeProofBundleForTest(proofBundle: Record<string, unknown>)
     claimMode: publicClaim.claimMode,
     paymentMode: publicClaim.paymentMode,
     tokenMode: publicClaim.tokenMode,
+    tokenSettlementClaim: publicClaim.tokenSettlementClaim,
     identityMode: publicClaim.identityMode,
     replayBundleHash: publicClaim.replayBundleHash,
     providerStatusHash: publicClaim.providerStatusHash,
     deploymentRegistryHash: publicClaim.deploymentRegistryHash,
     serverHash: publicClaim.serverHash,
     verifierRun: {
+      claimMode: verifierRun.claimMode,
+      paymentMode: verifierRun.paymentMode,
+      tokenMode: verifierRun.tokenMode,
+      identityMode: verifierRun.identityMode,
       proofLevel: verifierRun.proofLevel,
       proofChipAllowed: verifierRun.proofChipAllowed,
       finalVerifierComplete: verifierRun.finalVerifierComplete,
@@ -11283,16 +13750,28 @@ function resealLiveSmokeProofBundleForTest(proofBundle: Record<string, unknown>)
   });
   proofBundle.publicClaimHash = publicClaim.publicClaimHash;
   proofBundle.verifierRunHash = hashForTestJson(publicClaim.verifierRun);
-  const replayBundle = proofBundle.replayBundle as { events?: Array<Record<string, unknown>> };
-  const previousProofEventHash =
-    replayBundle.events
-      ?.filter((event) => event.authority === "proof" && typeof event.eventHash === "string")
-      .at(-1)?.eventHash ?? null;
+  proofBundle.verifierAttestation = signProofBundleVerifierAttestationForTest(LIVE_SMOKE_TEST_PROOF_SIGNER, {
+    sessionId: String(proofBundle.sessionId),
+    publicClaimHash: String(proofBundle.publicClaimHash),
+    publicClaimEventSeq: Number(proofBundle.publicClaimEventSeq),
+    authorizedAt: String(proofBundle.authorizedAt),
+    asOfEventSeq: Number(proofBundle.asOfEventSeq),
+    claimInputReplayBundleHash: String(proofBundle.claimInputReplayBundleHash),
+    replayBundleHash: String(proofBundle.replayBundleHash),
+    verifierRunHash: String(proofBundle.verifierRunHash),
+    providerStatusHash: String(proofBundle.providerStatusHash),
+    deploymentRegistryHash: proofBundle.deploymentRegistryHash === null ? null : String(proofBundle.deploymentRegistryHash),
+    serverHash: String(proofBundle.serverHash),
+  });
+  const replayBundle = proofBundle.replayBundle as Record<string, unknown>;
+  const previousProofEventHash = lastReplayProofEventHashForTest(replayBundle);
   const payloadHash = hashForTestJson({
     claim: proofBundle.publicClaim,
     publicClaimHash: proofBundle.publicClaimHash,
+    replayBundle,
     replayBundleHash: proofBundle.claimInputReplayBundleHash,
     verifierRunHash: proofBundle.verifierRunHash,
+    verifierAttestation: proofBundle.verifierAttestation,
     asOfEventSeq: publicClaim.asOfEventSeq,
     providerStatuses: proofBundle.providerStatuses,
     providerStatusHash: proofBundle.providerStatusHash,
@@ -11316,6 +13795,58 @@ function resealLiveSmokeProofBundleForTest(proofBundle: Record<string, unknown>)
   const bundleBase = { ...proofBundle };
   delete (bundleBase as { proofBundleHash?: unknown }).proofBundleHash;
   proofBundle.proofBundleHash = hashForTestJson(bundleBase);
+}
+
+function lastReplayProofEventHashForTest(replayBundle: Record<string, unknown>): string | null {
+  const hash = replayRowsForTest(replayBundle, "events")
+    .filter((event) => event.authority === "proof" && typeof event.eventHash === "string")
+    .sort((left, right) => Number(left.eventSeq) - Number(right.eventSeq))
+    .at(-1)?.eventHash;
+  return typeof hash === "string" ? hash : null;
+}
+
+function replayRowsForTest(replayBundle: Record<string, unknown>, collection: string): Array<Record<string, unknown>> {
+  const replayPages = replayBundle.replayPages as Record<string, unknown> | undefined;
+  const pages = replayPages?.[collection];
+  if (Array.isArray(pages)) {
+    return pages.flatMap((page) => {
+      const rows = page && typeof page === "object" ? (page as { rows?: unknown }).rows : undefined;
+      return Array.isArray(rows) ? (rows as Array<Record<string, unknown>>) : [];
+    });
+  }
+  const rows = replayBundle[collection];
+  return Array.isArray(rows) ? (rows as Array<Record<string, unknown>>) : [];
+}
+
+function moveLiveSmokeReplayRowsToPagesOnlyForTest(
+  fixture: ReturnType<typeof liveSmokeFixture>,
+  collections: Array<"quotes" | "spends">,
+): void {
+  const proofBundle = fixture.proofBundle;
+  const replayBundle = proofBundle.replayBundle as Record<string, unknown>;
+  const replayPages = (replayBundle.replayPages ?? {}) as Record<string, unknown>;
+  for (const collection of collections) {
+    const rows = Array.isArray(replayBundle[collection]) ? (replayBundle[collection] as Array<Record<string, unknown>>) : [];
+    replayPages[collection] = rows.length === 0 ? [] : [{ rows: deepClone(rows) }];
+    replayBundle[collection] = [];
+  }
+  replayBundle.replayPages = replayPages;
+  const replayBundleHash = hashForTestJson(replayBundle);
+  proofBundle.replayBundleHash = replayBundleHash;
+  proofBundle.claimInputReplayBundleHash = replayBundleHash;
+  (proofBundle.publicClaim as Record<string, unknown>).replayBundleHash = replayBundleHash;
+  resealLiveSmokeProofBundleForTest(proofBundle);
+  fixture.claim = proofBundle.publicClaim as Record<string, unknown>;
+}
+
+function scriptTestEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of ["HOME", "PATH", "TMPDIR", "TEMP", "TMP", "NODE_OPTIONS"]) {
+    if (process.env[key]) {
+      env[key] = process.env[key];
+    }
+  }
+  return { ...env, ...overrides };
 }
 
 function runNodeScript(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }): Promise<{
@@ -11363,7 +13894,7 @@ function liveSmokeFixture(): {
 } {
   const sessionId = hex32("live-smoke-stub-session");
   const providerStatuses = [
-    { name: "chain", mode: "live", ready: true, reason: "stub chain", chainId: "84532", endpoint: null },
+    { name: "chain", mode: "live", ready: true, reason: "stub chain", chainId: "84532", endpoint: "https://base-sepolia-rpc.public.example/" },
     { name: "caw_live", mode: "live", ready: true, reason: "stub caw live", endpoint: "https://api.agenticwallet.cobo.test/" },
     { name: "caw", mode: "live", ready: true, reason: "stub caw receipts", endpoint: null },
     { name: "mcp_lease", mode: "live", ready: true, reason: "stub mcp lease", endpoint: null },
@@ -11395,7 +13926,9 @@ function liveSmokeFixture(): {
   const spendId = hex32("live-smoke-spend");
   const quoteId = hex32("live-smoke-quote");
   const paymentToken = "0x4000000000000000000000000000000000000004";
+  const market = "0x5000000000000000000000000000000000000005";
   const deploymentTxHash = hex32("live-smoke-payment-token-deploy");
+  const marketDeploymentTxHash = hex32("live-smoke-market-deploy");
   const deploymentRegistry = {
     mode: "live",
     chainId: "84532",
@@ -11415,6 +13948,14 @@ function liveSmokeFixture(): {
         symbol: "MOCK",
         decimals: 18,
       },
+      {
+        contractName: "PaidArtifactMarket",
+        chainId: "84532",
+        address: market,
+        deploymentTxHash: marketDeploymentTxHash,
+        explorerUrl: `https://sepolia.basescan.org/tx/${marketDeploymentTxHash}`,
+        codeHash: hex32("live-smoke-market-code"),
+      },
     ],
   };
   const replayBundle = {
@@ -11431,6 +13972,7 @@ function liveSmokeFixture(): {
       {
         spendId,
         paymentToken,
+        market,
       },
     ],
     quotes: [
@@ -11483,18 +14025,23 @@ function liveSmokeFixture(): {
       claimMode: "caw-target-real",
       paymentMode: "gate-paid-artifact-real",
       tokenMode: "mock-test-token",
+      tokenSettlementClaim: "live-mock-erc20-fallback",
       identityMode: "p0-floor-one-wallet",
       replayBundleHash,
       providerStatusHash,
       deploymentRegistryHash,
       serverHash,
       verifierRun: {
+        claimMode: verifierRun.claimMode,
+        paymentMode: verifierRun.paymentMode,
+        tokenMode: verifierRun.tokenMode,
+        identityMode: verifierRun.identityMode,
         proofLevel: verifierRun.proofLevel,
         proofChipAllowed: verifierRun.proofChipAllowed,
-      finalVerifierComplete: verifierRun.finalVerifierComplete,
-      winnerClaimAllowed: verifierRun.winnerClaimAllowed,
-    },
-  });
+        finalVerifierComplete: verifierRun.finalVerifierComplete,
+        winnerClaimAllowed: verifierRun.winnerClaimAllowed,
+      },
+    });
     const claim = {
       sessionId,
       claimStatus: "authorized_public_claim",
@@ -11506,6 +14053,7 @@ function liveSmokeFixture(): {
       claimMode: "caw-target-real",
       paymentMode: "gate-paid-artifact-real",
       tokenMode: "mock-test-token",
+      tokenSettlementClaim: "live-mock-erc20-fallback",
       identityMode: "p0-floor-one-wallet",
       replayBundleHash,
       providerStatusHash,
@@ -11517,6 +14065,20 @@ function liveSmokeFixture(): {
       finalVerifierComplete: true,
       winnerClaimAllowed: true,
     };
+    const verifierRunHash = hashForTestJson(verifierRun);
+    const verifierAttestation = signProofBundleVerifierAttestationForTest(LIVE_SMOKE_TEST_PROOF_SIGNER, {
+      sessionId,
+      publicClaimHash,
+      publicClaimEventSeq: authorizedEventSeq,
+      authorizedAt,
+      asOfEventSeq,
+      claimInputReplayBundleHash: replayBundleHash,
+      replayBundleHash,
+      verifierRunHash,
+      providerStatusHash,
+      deploymentRegistryHash,
+      serverHash,
+    });
     const proofBundleBase = {
       bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
       sessionId,
@@ -11528,7 +14090,7 @@ function liveSmokeFixture(): {
       asOfEventSeq,
       claimInputReplayBundleHash: replayBundleHash,
       replayBundleHash,
-      verifierRunHash: hashForTestJson(verifierRun),
+      verifierRunHash,
       providerStatusHash,
       deploymentRegistryHash,
       serverHash,
@@ -11537,13 +14099,16 @@ function liveSmokeFixture(): {
     providerStatuses,
     deploymentRegistry,
     server,
+    verifierAttestation,
     winnerClaimAllowed: true,
   };
   const publicClaimPayloadHash = hashForTestJson({
     claim,
+      replayBundle,
       publicClaimHash,
       replayBundleHash,
       verifierRunHash: proofBundleBase.verifierRunHash,
+      verifierAttestation,
       asOfEventSeq,
       providerStatuses,
     providerStatusHash: proofBundleBase.providerStatusHash,
@@ -11575,6 +14140,10 @@ function liveSmokeFixture(): {
       apiSecurity: { operatorTokenConfigured: true, allowInsecureMissingRoleTokens: false },
       mcpAudit: { configured: true },
       gateIngest: { configured: true },
+      proofBundleSigning: {
+        configured: true,
+        publicKeyHash: verifierAttestation.publicKeyHash,
+      },
       proofProviders: providerStatuses,
     },
     preflight: {

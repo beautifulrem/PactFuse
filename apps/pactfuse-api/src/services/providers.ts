@@ -7,6 +7,8 @@ import type {
   TransferCreate,
 } from "@cobo/agentic-wallet";
 import type {
+  ArtifactDeliveryVerifier,
+  ArtifactDeliveryVerificationInput,
   CawLiveAuditInput,
   CawLiveClient,
   CawLiveContractCallInput,
@@ -21,12 +23,13 @@ import type {
   PactTemplateRegistry,
   ProofProviderStatus,
 } from "../types.js";
-import { hashJson } from "../util.js";
+import { hashJson, sha256Hex } from "../util.js";
 
 const DEFAULT_TEMPLATES: Array<{ mode: PactTemplateBinding["mode"]; path: string }> = [
   { mode: "gate-paid-artifact-real", path: "../../../../pact-template/gate-paid-artifact-real.json" },
   { mode: "permit-payment-real", path: "../../../../pact-template/permit-payment-real.appendix.json" },
 ];
+const MAX_ARTIFACT_DELIVERY_RESPONSE_BYTES = 512 * 1024;
 export const PACTFUSE_CHAIN_EVENT_ABI = [
   {
     type: "event",
@@ -55,7 +58,7 @@ export const PACTFUSE_CHAIN_EVENT_ABI = [
   },
 ] as const;
 const MAX_MCP_RESPONSE_BYTES = 512 * 1024;
-const OFFICIAL_COBO_API_HOSTS = ["api.cobo.com", "api.dev.cobo.com"] as const;
+const OFFICIAL_COBO_API_HOSTS = ["api.cobo.com", "api.dev.cobo.com", "api.agenticwallet.cobo.com"] as const;
 const REQUIRED_LEASE_TOOL_ARGUMENTS = [
   "sessionId",
   "leaseRunId",
@@ -144,7 +147,7 @@ export function createViemChainClient(input: { rpcUrl: string; chainId?: string 
       return String(await client.getCode({ address: address as `0x${string}` }));
     },
     async getLogs(query: Record<string, unknown>) {
-      if (configuredChainId !== undefined && typeof query.chainId === "string" && query.chainId !== configuredChainId) {
+      if (configuredChainId !== undefined && typeof query.chainId === "string" && !sameChainId(query.chainId, configuredChainId)) {
         throw new Error(`requested chainId ${query.chainId} does not match configured chainId ${configuredChainId}`);
       }
       const fromBlock = toBigIntBlock(query.fromBlock ?? query.blockNumber);
@@ -326,12 +329,15 @@ export function createHttpsCawReceiptSource(input: {
       if (!input.apiKey) {
         throw new Error("CAW export API key is missing");
       }
+      const auditFilter = cawAuditFilterForOperationKind(optionalString(request.operationKind) ?? null);
       const url = cawExportUrl(input.exportUrl, input.walletId, {
         limit,
         session_id: optionalString(request.sessionId),
         operation_id: optionalString(request.operationId),
         source_label: optionalString(request.sourceLabel),
         operation_kind: optionalString(request.operationKind),
+        action: auditFilter.action,
+        result: auditFilter.result,
       });
       const response = await fetch(url, {
         method: "GET",
@@ -362,6 +368,9 @@ export function createUnconfiguredCawLiveClient(): CawLiveClient {
     },
     async getWallet() {
       throw new Error("CAW live API is unconfigured; cannot read wallet");
+    },
+    async listWalletAddresses() {
+      throw new Error("CAW live API is unconfigured; cannot list wallet addresses");
     },
     async submitPact() {
       throw new Error("CAW live API is unconfigured; cannot submit pact");
@@ -456,6 +465,15 @@ export function createCoboAgenticWalletClient(input: {
         label: "CAW live API endpoint",
       });
       return cawSdkData((await walletsApi.getWallet(walletId, true, input.apiKey, requestOptions)).data);
+    },
+    async listWalletAddresses(walletId: string) {
+      assertTrustedCawEndpoint({
+        endpoint: baseUrl,
+        trustedHosts: input.trustedHosts,
+        allowInsecureTestEndpoint: input.allowInsecureTestEndpoint,
+        label: "CAW live API endpoint",
+      });
+      return cawSdkData((await walletsApi.listWalletAddresses(walletId, input.apiKey, requestOptions)).data);
     },
     async submitPact(pact) {
       assertTrustedCawEndpoint({
@@ -565,6 +583,16 @@ export function createCoboAgenticWalletClient(input: {
   };
 }
 
+function cawAuditFilterForOperationKind(operationKind: string | null): { action?: string; result?: string } {
+  if (operationKind === "deny_probe") {
+    return { action: "contract_call.denied", result: "denied" };
+  }
+  if (operationKind === "approve" || operationKind === "activate_tool") {
+    return { action: "contract_call.allowed", result: "allowed" };
+  }
+  return {};
+}
+
 function cawLiveTransferBody(transfer: CawLiveTransferInput): TransferCreate {
   const body: Record<string, unknown> = {
     dst_addr: transfer.destinationAddress,
@@ -588,6 +616,7 @@ function cawLiveContractCallBody(call: CawLiveContractCallInput): ContractCallCr
     calldata: call.calldata,
     value: call.valueAtomic ?? "0",
     ...(call.requestId ? { request_id: call.requestId } : {}),
+    ...(call.sourceAddress ? { src_addr: call.sourceAddress } : {}),
     ...(call.sponsor !== undefined ? { sponsor: call.sponsor } : {}),
     ...(call.gasProvider ? { gas_provider: call.gasProvider } : {}),
     ...(call.description ? { description: call.description } : {}),
@@ -684,6 +713,91 @@ export function createUnconfiguredMcpLeaseClient(): McpLeaseClient {
     },
     async executeCleanLease() {
       throw new Error("lease MCP endpoint is unconfigured; cannot execute tools/list or tools/call");
+    },
+  };
+}
+
+export function createUnconfiguredArtifactDeliveryVerifier(): ArtifactDeliveryVerifier {
+  return {
+    async verify() {
+      throw new Error("artifact delivery verifier is unconfigured; cannot perform server-owned live preflight");
+    },
+  };
+}
+
+export function createHttpArtifactDeliveryVerifier(input: { timeoutMs?: number; allowInsecureTestEndpoint?: boolean } = {}): ArtifactDeliveryVerifier {
+  const timeoutMs = input.timeoutMs ?? 10_000;
+  return {
+    async verify(preflight) {
+      assertTrustedArtifactDeliveryEndpoint(preflight.endpointUrl, input.allowInsecureTestEndpoint);
+      const endpoint = await fetchJsonWithHash(preflight.endpointUrl, timeoutMs, "artifact delivery endpoint");
+      const artifactPayload = jsonObjectChild(endpoint.json, "artifactPayload");
+      if (!artifactPayload) {
+        throw new Error("artifact delivery endpoint must return artifactPayload object");
+      }
+      const artifactPayloadHash = hashJson(artifactPayload);
+      const artifactCid = `sha256:${artifactPayloadHash}`;
+      if (artifactPayloadHash.toLowerCase() !== preflight.artifactHashPreview.toLowerCase()) {
+        throw new Error("artifact delivery endpoint artifactPayload hash does not match preflight artifactHashPreview");
+      }
+      if (artifactCid.toLowerCase() !== preflight.artifactCid.toLowerCase()) {
+        throw new Error("artifact delivery endpoint artifact CID does not match preflight artifactCid");
+      }
+      const manifestFetches = [];
+      for (const manifest of preflight.sourceManifests) {
+        assertTrustedArtifactDeliveryEndpoint(manifest.manifestUrl, input.allowInsecureTestEndpoint);
+        const fetched = await fetchTextWithHash(manifest.manifestUrl, timeoutMs, "source manifest endpoint");
+        if (fetched.bodyHash.toLowerCase() !== manifest.manifestHash.toLowerCase()) {
+          throw new Error(`source manifest ${manifest.sourceHash} fetched hash does not match registered manifestHash`);
+        }
+        manifestFetches.push({
+          sourceHash: manifest.sourceHash.toLowerCase(),
+          manifestUrl: manifest.manifestUrl,
+          manifestHash: manifest.manifestHash.toLowerCase(),
+          status: fetched.status,
+          contentType: fetched.contentType,
+          bodyHash: fetched.bodyHash,
+        });
+      }
+      const leaseDryRun = jsonObjectChild(endpoint.json, "leaseDryRun");
+      if (!leaseDryRun || leaseDryRun.ok !== true) {
+        throw new Error("artifact delivery endpoint must return leaseDryRun.ok=true");
+      }
+      const manifestFetchHash = hashJson({
+        mode: "server_live_fetch",
+        sessionId: preflight.sessionId,
+        preflightId: preflight.preflightId,
+        sourceManifests: manifestFetches,
+      });
+      const endpointResponseHash = hashJson({
+        mode: "server_live_fetch",
+        endpointUrl: preflight.endpointUrl,
+        status: endpoint.status,
+        contentType: endpoint.contentType,
+        bodyHash: endpoint.bodyHash,
+        artifactPayloadHash,
+      });
+      const leaseDryRunHash = hashJson({
+        mode: "server_live_fetch",
+        endpointUrl: preflight.endpointUrl,
+        artifactPayloadHash,
+        leaseDryRun,
+      });
+      return {
+        artifactPayloadHash,
+        artifactCid,
+        manifestFetchHash,
+        endpointResponseHash,
+        leaseDryRunHash,
+        evidenceHash: hashJson({
+          mode: "server_live_fetch",
+          artifactPayloadHash,
+          artifactCid,
+          manifestFetchHash,
+          endpointResponseHash,
+          leaseDryRunHash,
+        }),
+      };
     },
   };
 }
@@ -809,11 +923,15 @@ async function postJsonRpc(endpointUrl: string, request: Record<string, unknown>
         "content-type": "application/json",
       },
       body: JSON.stringify(request),
+      redirect: "manual",
       signal: controller.signal,
     });
     const text = await response.text();
     if (Buffer.byteLength(text, "utf8") > MAX_MCP_RESPONSE_BYTES) {
       throw new Error("lease MCP endpoint response exceeded 512 KiB");
+    }
+    if (!response.ok) {
+      throw new Error(`lease MCP endpoint returned HTTP ${response.status}`);
     }
     let parsed: unknown = {};
     if (text.length > 0) {
@@ -822,9 +940,6 @@ async function postJsonRpc(endpointUrl: string, request: Record<string, unknown>
       } catch {
         throw new Error("lease MCP endpoint returned non-JSON response");
       }
-    }
-    if (!response.ok) {
-      throw new Error(`lease MCP endpoint returned HTTP ${response.status}`);
     }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("lease MCP endpoint must return a JSON-RPC object");
@@ -985,6 +1100,13 @@ function assertTrustedMcpEndpoint(endpointUrl: string, allowInsecureTestEndpoint
   }
 }
 
+function assertTrustedArtifactDeliveryEndpoint(endpointUrl: string, allowInsecureTestEndpoint?: boolean): void {
+  const trust = mcpEndpointTrust(endpointUrl, allowInsecureTestEndpoint);
+  if (!trust.ok) {
+    throw new Error(`artifact delivery ${trust.reason}`);
+  }
+}
+
 function mcpEndpointTrust(endpointUrl: string, allowInsecureTestEndpoint?: boolean): { ok: true } | { ok: false; reason: string } {
   let url: URL;
   try {
@@ -1026,6 +1148,63 @@ function isPublicHostname(hostname: string): boolean {
     return false;
   }
   return host.includes(".");
+}
+
+async function fetchJsonWithHash(endpointUrl: string, timeoutMs: number, label: string): Promise<{
+  json: Record<string, unknown>;
+  status: number;
+  contentType: string | null;
+  bodyHash: `0x${string}`;
+}> {
+  const fetched = await fetchTextWithHash(endpointUrl, timeoutMs, label);
+  let json: unknown;
+  try {
+    json = fetched.text.length > 0 ? JSON.parse(fetched.text) : {};
+  } catch {
+    throw new Error(`${label} returned non-JSON response`);
+  }
+  if (!json || typeof json !== "object" || Array.isArray(json)) {
+    throw new Error(`${label} must return a JSON object`);
+  }
+  return { json: json as Record<string, unknown>, status: fetched.status, contentType: fetched.contentType, bodyHash: fetched.bodyHash };
+}
+
+async function fetchTextWithHash(endpointUrl: string, timeoutMs: number, label: string): Promise<{
+  text: string;
+  status: number;
+  contentType: string | null;
+  bodyHash: `0x${string}`;
+}> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(endpointUrl, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      redirect: "manual",
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > MAX_ARTIFACT_DELIVERY_RESPONSE_BYTES) {
+      throw new Error(`${label} response exceeded 512 KiB`);
+    }
+    if (!response.ok) {
+      throw new Error(`${label} returned HTTP ${response.status}`);
+    }
+    return {
+      text,
+      status: response.status,
+      contentType: response.headers.get("content-type"),
+      bodyHash: sha256Hex(text),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function jsonObjectChild(record: Record<string, unknown>, key: string): Record<string, unknown> | null {
+  const value = record[key];
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
 function isPrivateIpv4(host: string): boolean {
@@ -1073,6 +1252,7 @@ function cawExportUrl(base: string, walletId: string | undefined, params: Record
 function cawHeaders(apiKey: string | undefined): Headers {
   const headers = new Headers({ accept: "application/json" });
   if (apiKey) {
+    headers.set("X-API-Key", apiKey);
     headers.set("authorization", `Bearer ${apiKey}`);
   }
   return headers;
@@ -1140,6 +1320,18 @@ function toBigIntBlock(value: unknown): bigint {
     return BigInt(value);
   }
   throw new Error("chain log query requires a decimal blockNumber");
+}
+
+function sameChainId(left: string, right: string): boolean {
+  return canonicalChainId(left) === canonicalChainId(right);
+}
+
+function canonicalChainId(chainId: string): string {
+  const normalized = chainId.trim().toUpperCase();
+  if (normalized === "TBASE_SETH") {
+    return "84532";
+  }
+  return normalized;
 }
 
 function normalizeChainValue(value: unknown): unknown {

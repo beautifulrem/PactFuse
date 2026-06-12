@@ -58,6 +58,7 @@ import {
   VerifyEvidencePayloadSchema,
   canonicalizeJson,
   type CreateSessionInput,
+  type ArtifactPreflightVerifyPayload,
   type CawOperationBuildPayload,
   type ClaimReadinessView,
   type EvidenceEvent,
@@ -66,11 +67,13 @@ import {
   type LiveProofPreflightView,
   type QuoteStatus,
   type ProofBundleAuthorizationSnapshot,
+  type ProofBundleVerifierAttestation,
   type PublicClaimView,
   type ProofBundleView,
   type ReplayBundleView,
   type SessionScopedEnvelope,
   type SessionView,
+  type TokenSettlementClaim,
   type ChainIndexerBackfillInput,
   type CawLiveAuditSyncPayload,
   type CawAllowanceVerifyPayload,
@@ -82,6 +85,7 @@ import {
   type TokenBalanceDeltaVerifyPayload,
   type VerifierRunView,
 } from "@pactfuse/evidence-schema";
+import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { encodeAbiParameters, encodeFunctionData, keccak256, recoverMessageAddress } from "viem";
 import type { CawLiveAuditInput, McpLeaseExecutionResult, ProofProviderStatus, ServiceCtx, ServiceResult } from "../types.js";
 import {
@@ -129,11 +133,14 @@ type AuthorizedPublicClaimRecord = {
   eventId: string;
   eventHash: string;
   asOfEventSeq: number;
+  replayBundle?: ReplayBundleView;
   snapshot: ProofBundleAuthorizationSnapshot;
+  verifierAttestation: ProofBundleVerifierAttestation;
 };
 type ReplaySnapshotOptions = {
   asOfEventSeq?: number;
   deploymentRegistry?: ProofBundleAuthorizationSnapshot["deploymentRegistry"];
+  redactArtifactPayloads?: boolean;
 };
 const REPLAY_SUMMARY_LIMIT = 200;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -153,6 +160,8 @@ const REPLAY_COLLECTION_NAMES: ReplayCollectionName[] = [
 ];
 const ARTIFACT_PAYLOAD_REPLAY_MAX_BYTES = 256 * 1024;
 const ARTIFACT_TOKEN_LEASE_CLAIM_TTL_MS = 5 * 60 * 1000;
+const ARTIFACT_PAYLOAD_REDACTION_REASON = "artifact_bearer_required";
+const IDEMPOTENCY_PENDING_STALE_MS = 5 * 60 * 1000;
 const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const ERC20_APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 type ChainIndexerBackfillPayload = ChainIndexerBackfillInput["payload"];
@@ -436,6 +445,7 @@ export async function registerSignedSource(
   const payload = parseStrict(SourceRegisterPayloadSchema, envelope.payload);
   return withIdempotency(ctx, scoped("sources:register", envelope.sessionId), envelope.idempotencyKey, envelope, async (requestId) => {
     assertSession(ctx, envelope.sessionId, requestId);
+    assertPublicReplayUrl(payload.manifestUrl, requestId, "source manifestUrl", ctx.publicEvidence);
     const sourceHash = payload.sourceHash.toLowerCase();
     const sourceIdentity = await verifyOptionalSourceIdentity(payload, sourceHash, requestId);
     const createdAt = ctx.clock.now().toISOString();
@@ -981,6 +991,7 @@ export async function ingestCawReceiptBundle(
     const rawReceiptBundleHash = hashJson(rawBundle.bundle);
     const rawBundleId = hashJson({ sessionId: envelope.sessionId, operationId, rawReceiptBundleHash });
     const canonicalReceipts = buildCanonicalCawReceipts({
+      ctx,
       bundleId: rawBundleId,
       sessionId: envelope.sessionId,
       operationId,
@@ -1118,8 +1129,9 @@ export async function probeCawLiveIdentity(input: SessionScopedEnvelope, ctx: Se
     await requireCawLiveReady(ctx, requestId);
     const request = { wallet_id: payload.walletId, include_spend_summary: false };
     const response = await ctx.cawLive.getWallet(payload.walletId);
+    const addressResponse = await ctx.cawLive.listWalletAddresses(payload.walletId);
     const wallet = cawWalletRecord(response);
-    const walletAddress = cawWalletAddress(wallet);
+    const walletAddress = cawWalletAddress(wallet) ?? cawWalletAddressFromAddressList(addressResponse, payload.expectedWalletAddress);
     const status = String(wallet.status ?? wallet.state ?? "").toLowerCase();
     const active = ["active", "enabled", "ready", "available"].includes(status) || wallet.active === true;
     const expectedWalletAddress = payload.expectedWalletAddress?.toLowerCase() ?? null;
@@ -1139,7 +1151,7 @@ export async function probeCawLiveIdentity(input: SessionScopedEnvelope, ctx: Se
         walletStatus: status || null,
         identityMode: payload.identityMode,
         requestHash: hashJson(request),
-        responseHash: hashJson(redactCawLiveSecrets(response)),
+        responseHash: hashJson(redactCawLiveSecrets({ wallet: response, addresses: addressResponse })),
         proofAuthority: pass,
         winnerClaimAllowed: false,
       },
@@ -1531,13 +1543,18 @@ export async function submitCawLiveContractCall(
         valueAtomic: normalized.valueAtomic,
         pactApiKey,
         ...(normalized.requestId ? { requestId: normalized.requestId } : {}),
+        ...(normalized.sourceAddress ? { sourceAddress: normalized.sourceAddress } : {}),
         ...(normalized.sponsor !== undefined ? { sponsor: normalized.sponsor } : {}),
         ...(normalized.gasProvider ? { gasProvider: normalized.gasProvider } : {}),
         ...(normalized.description ? { description: normalized.description } : {}),
         ...(normalized.fee !== undefined ? { fee: normalized.fee } : {}),
       });
       const cawRequestId = normalized.requestId ?? optionalStringFromCaw(response, ["request_id", "requestId"]);
-      const status = normalizeCawLiveTransferStatus(response);
+      const normalizedStatus = normalizeCawLiveTransferStatus(response);
+      const status =
+        normalized.operationKind === "deny_probe" && normalizedStatus === "live_failed" && cawLiveResponseRejected(response)
+          ? "live_denied"
+          : normalizedStatus;
       const saved = recordCawLiveInteraction(ctx, {
         sessionId: envelope.sessionId,
         kind: "contract_call",
@@ -1646,6 +1663,7 @@ export async function verifyCawAllowance(input: SessionScopedEnvelope, ctx: Serv
         requestId,
       });
       const chainProvider = await requireChainReadyForBalanceDelta(ctx, approve.chainId, requestId);
+      const chainProviderEndpoint = redactEndpoint(chainProvider.endpoint);
       const blockNumber = await requireTransactionReceiptBlock(ctx, approve.txHash, requestId, "CAW approve");
       if (blockNumber <= 0) {
         throw Object.assign(new Error("CAW allowance proof requires a non-genesis approve block"), {
@@ -1682,9 +1700,10 @@ export async function verifyCawAllowance(input: SessionScopedEnvelope, ctx: Serv
           auditInteractionId: auditUsage.auditInteractionId,
           auditPolicyDigest: auditUsage.policyDigest,
           auditLogHash: auditUsage.auditLogHash,
-          chainId: approve.chainId,
+          chainId: chainProvider.chainId ?? approve.chainId,
+          cawChainId: approve.chainId,
           chainProviderMode: chainProvider.mode,
-          chainProviderEndpoint: chainProvider.endpoint ?? null,
+          chainProviderEndpoint,
           blockNumber,
           preBlockNumber: blockNumber - 1,
           approvalLogIndex: approvalLog.logIndex,
@@ -1891,6 +1910,7 @@ type NormalizedCawLiveContractCallPayload = Omit<
   valueAtomic: string;
   selector: string;
   procurementGateAddress?: `0x${string}` | undefined;
+  sourceAddress?: string | undefined;
   decodedSpenderAddress?: `0x${string}`;
   decodedAmountAtomic?: string;
   decodedPaymentAuth?: "0x";
@@ -2030,6 +2050,7 @@ function cawLiveContractCallRequest(payload: NormalizedCawLiveContractCallPayloa
     calldata: payload.calldata,
     selector: payload.selector,
     value: payload.valueAtomic,
+    src_addr: payload.sourceAddress,
     procurement_gate_addr: payload.procurementGateAddress,
     spender_addr: payload.decodedSpenderAddress,
     amount: payload.decodedAmountAtomic,
@@ -2062,7 +2083,7 @@ type CawLiveAuditUsageCandidate = {
   auditLogId: string | null;
   action: string;
   result: "allowed" | "denied";
-  policyDigest: `0x${string}`;
+  policyDigest: `0x${string}` | null;
   txHash: `0x${string}` | null;
   cawRequestId: string;
 };
@@ -2090,7 +2111,7 @@ function appendCawLiveAuditUsageEvents(
        ORDER BY created_at ASC, interaction_id ASC`,
     )
     .all(input.sessionId) as Row[];
-  const contractEvents = listEvents(ctx, input.sessionId, 0, 200).filter((event) => event.kind === "caw.live.contract_call.submitted");
+  const contractEvents = listAllEvents(ctx, input.sessionId).filter((event) => event.kind === "caw.live.contract_call.submitted");
   const contractEventsByInteractionId = new Map(
     contractEvents
       .map((event) => {
@@ -2126,7 +2147,15 @@ function appendCawLiveAuditUsageEvents(
       ) {
         continue;
       }
-      if (!pactPolicyDigest || pactPolicyDigest.toLowerCase() !== candidate.policyDigest.toLowerCase()) {
+      if (!pactPolicyDigest) {
+        continue;
+      }
+      if (candidate.policyDigest && pactPolicyDigest.toLowerCase() !== candidate.policyDigest.toLowerCase()) {
+        continue;
+      }
+      const effectivePolicyDigest = candidate.policyDigest ?? pactPolicyDigest;
+      const effectiveTxHash = candidate.txHash ?? eventTxHash;
+      if (candidate.result === "allowed" && !effectiveTxHash) {
         continue;
       }
       const operationKind = String(request.operation_kind ?? "");
@@ -2150,11 +2179,11 @@ function appendCawLiveAuditUsageEvents(
             operationKind,
             action: candidate.action,
             result: candidate.result,
-            policyDigest: candidate.policyDigest,
+            policyDigest: effectivePolicyDigest,
             pactPolicyDigest,
             pactSyncInteractionId: typeof event.payload.pactSyncInteractionId === "string" ? event.payload.pactSyncInteractionId : null,
             pactSyncEventId: typeof event.payload.pactSyncEventId === "string" ? event.payload.pactSyncEventId : null,
-            txHash: candidate.txHash,
+            txHash: effectiveTxHash,
             auditLogHash: candidate.auditLogHash,
             auditLogIndex: candidate.auditLogIndex,
             auditLogId: candidate.auditLogId,
@@ -2198,11 +2227,26 @@ function cawLiveAuditItems(response: Record<string, unknown>): Record<string, un
 }
 
 function cawLiveAuditUsageCandidate(item: Record<string, unknown>, index: number): CawLiveAuditUsageCandidate | null {
-  const cawRequestId = optionalStringFromRecord(item, ["request_id", "requestId", "caw_request_id", "cawRequestId"]);
-  const txHash = optionalHex32(optionalStringFromRecord(item, ["tx_hash", "txHash", "transaction_hash", "transactionHash", "hash"]));
-  const policyDigest = optionalHex32(optionalStringFromRecord(item, ["policy_digest", "policyDigest", "policy_hash", "policyHash"]));
+  const request = objectChild(item, "request");
+  const authzDetails =
+    objectChild(item, "authz_details") ??
+    objectChild(item, "authzDetails") ??
+    objectChild(item, "authorization") ??
+    objectChild(item, "authz") ??
+    objectChild(item, "policy");
+  const cawRequestId =
+    optionalStringFromRecord(item, ["request_id", "requestId", "caw_request_id", "cawRequestId"]) ??
+    (request ? optionalStringFromRecord(request, ["request_id", "requestId", "caw_request_id", "cawRequestId"]) : null);
+  const txHash = optionalHex32(
+    optionalStringFromRecord(item, ["tx_hash", "txHash", "transaction_hash", "transactionHash", "hash"]) ??
+      (request ? optionalStringFromRecord(request, ["tx_hash", "txHash", "transaction_hash", "transactionHash", "hash"]) : null),
+  );
+  const policyDigest = optionalHex32(
+    optionalStringFromRecord(item, ["policy_digest", "policyDigest", "policy_hash", "policyHash"]) ??
+      (authzDetails ? optionalStringFromRecord(authzDetails, ["policy_digest", "policyDigest", "policy_hash", "policyHash"]) : null),
+  );
   const result = cawLiveAuditResult(item);
-  if (!cawRequestId || !policyDigest || !result || (result === "allowed" && !txHash)) {
+  if (!cawRequestId || !result) {
     return null;
   }
   const action = optionalStringFromRecord(item, ["action", "operation", "operation_kind", "operationKind", "type"]) ?? "contract_call";
@@ -2274,7 +2318,7 @@ function recordCawLiveInteraction(
   });
   ctx.db.sqlite
     .prepare(
-      `INSERT INTO caw_live_interactions
+      `INSERT OR IGNORE INTO caw_live_interactions
         (interaction_id, session_id, kind, wallet_id, pact_id, caw_request_id, request_hash, request_json,
          response_hash, response_json, status, auth_key_hash, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -2326,17 +2370,20 @@ type CawPactPolicyRule = {
   selectors: `0x${string}`[];
 };
 
-const CAW_POLICY_CHAIN_KEYS = ["chain_ids", "chainIds", "allowed_chain_ids", "allowedChainIds", "chains"];
+const CAW_POLICY_CHAIN_KEYS = ["chain_ids", "chainIds", "allowed_chain_ids", "allowedChainIds", "chains", "chain_in", "chain_id", "chainId"];
 const CAW_POLICY_CONTRACT_KEYS = [
   "contract_addresses",
   "contractAddresses",
   "target_addresses",
   "targetAddresses",
   "targets",
+  "target_in",
+  "contract_addr",
+  "contractAddress",
   "allowed_contracts",
   "allowedContracts",
 ];
-const CAW_POLICY_SELECTOR_KEYS = ["selectors", "function_selectors", "functionSelectors", "allowed_selectors", "allowedSelectors"];
+const CAW_POLICY_SELECTOR_KEYS = ["selectors", "function_selectors", "functionSelectors", "function_id", "functionId", "allowed_selectors", "allowedSelectors"];
 
 function requireActiveCawLivePact(
   ctx: ServiceCtx,
@@ -2403,7 +2450,7 @@ function requireActiveCawLivePact(
       }),
     });
   }
-  const event = listEvents(ctx, sessionId, 0, 200).find(
+  const event = listAllEvents(ctx, sessionId).find(
     (candidate) => candidate.kind === "caw.live.pact.synced" && candidate.payload.interactionId === String(row.interaction_id),
   );
   if (!event || event.authority !== "proof" || event.payload.proofAuthority !== true || event.payload.winnerClaimAllowed !== false) {
@@ -2429,12 +2476,11 @@ function requireActiveCawLivePact(
 }
 
 function cawActivePactPolicyBindingFromResponse(response: Record<string, unknown>): Omit<CawActivePactBinding, "pactSyncInteractionId" | "pactSyncEventId"> | null {
-  const policyDigest = optionalHex32(optionalStringFromCaw(response, ["policy_digest", "policyDigest", "policy_hash", "policyHash", "pact_digest", "pactDigest"]));
-  if (!policyDigest) {
-    return null;
-  }
   const policyRoot = cawPactPolicyRoot(response);
   const policySnapshotHash = hashJson(normalizeChainJson(policyRoot));
+  const policyDigest =
+    optionalHex32(optionalStringFromCaw(response, ["policy_digest", "policyDigest", "policy_hash", "policyHash", "pact_digest", "pactDigest"])) ??
+    policySnapshotHash;
   const policyChainIds = policyStringArray(policyRoot, CAW_POLICY_CHAIN_KEYS);
   const policyContractAddresses = policyStringArray(policyRoot, CAW_POLICY_CONTRACT_KEYS)
     .map((value) => value.toLowerCase())
@@ -2443,8 +2489,11 @@ function cawActivePactPolicyBindingFromResponse(response: Record<string, unknown
     .map((value) => value.toLowerCase())
     .filter((value): value is `0x${string}` => /^0x[0-9a-f]{8}$/.test(value));
   const policyRules = cawPactPolicyRules(policyRoot);
-  const policyRequestLimit = policyLimitString(policyRoot, ["request_limit", "requestLimit", "max_requests", "maxRequests", "tx_count", "txCount"]);
-  const policyExpiry = policyText(policyRoot, ["expiry", "expires_at", "expiresAt", "valid_until", "validUntil"]);
+  const policyRequestLimit =
+    policyLimitString(policyRoot, ["request_limit", "requestLimit", "max_requests", "maxRequests", "tx_count", "txCount"]) ??
+    cawPactTxCountCompletionLimit(policyRoot);
+  const policyExpiry = policyText(policyRoot, ["expiry", "expires_at", "expiresAt", "valid_until", "validUntil"]) ??
+    optionalStringFromCaw(response, ["expires_at", "expiresAt"]);
   if (
     policyChainIds.length === 0 ||
     policyContractAddresses.length === 0 ||
@@ -2516,6 +2565,37 @@ function policyText(root: Record<string, unknown>, keys: string[]): string | nul
 function policyLimitString(root: Record<string, unknown>, keys: string[]): string | null {
   const value = policyText(root, keys);
   return value && /^(0|[1-9][0-9]*)$/.test(value) ? value : null;
+}
+
+function cawPactTxCountCompletionLimit(root: Record<string, unknown>): string | null {
+  const visit = (value: unknown): string | null => {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const nested = visit(item);
+        if (nested) {
+          return nested;
+        }
+      }
+      return null;
+    }
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+    const record = value as Record<string, unknown>;
+    const type = typeof record.type === "string" ? record.type : null;
+    const threshold = typeof record.threshold === "string" || typeof record.threshold === "number" ? String(record.threshold) : null;
+    if (type === "tx_count" && threshold && /^(0|[1-9][0-9]*)$/.test(threshold)) {
+      return threshold;
+    }
+    for (const child of Object.values(record)) {
+      const nested = visit(child);
+      if (nested) {
+        return nested;
+      }
+    }
+    return null;
+  };
+  return visit(root);
 }
 
 function policyStringArray(root: Record<string, unknown>, keys: string[]): string[] {
@@ -2745,6 +2825,42 @@ function cawWalletAddress(wallet: Record<string, unknown>): string | null {
   return null;
 }
 
+function cawWalletAddressFromAddressList(response: Record<string, unknown>, expected?: string): string | null {
+  const expectedLower = expected?.toLowerCase();
+  for (const record of cawAddressRecords(response)) {
+    const address = optionalStringFromCaw(record, ["address", "wallet_address", "walletAddress", "evm_address", "evmAddress"]);
+    if (!address || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+      continue;
+    }
+    const normalized = address.toLowerCase();
+    if (!expectedLower || normalized === expectedLower) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+function cawAddressRecords(response: Record<string, unknown>): Array<Record<string, unknown>> {
+  const result = response.result;
+  const resultRecord = result && typeof result === "object" && !Array.isArray(result) ? (result as Record<string, unknown>) : null;
+  const data = response.data;
+  const dataRecord = data && typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>) : null;
+  const candidates = [
+    result,
+    resultRecord?.addresses,
+    response.addresses,
+    data,
+    dataRecord?.addresses,
+  ];
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate)) {
+      continue;
+    }
+    return candidate.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+  }
+  return [];
+}
+
 function optionalStringFromCaw(response: Record<string, unknown>, keys: string[]): string | null {
   const roots = [
     response,
@@ -2809,6 +2925,11 @@ function normalizeCawLiveTransferStatus(response: Record<string, unknown>): "liv
   return "live_submitted";
 }
 
+function cawLiveResponseRejected(response: Record<string, unknown>): boolean {
+  const status = optionalStringFromCaw(response, ["status", "status_display"]);
+  return Boolean(status && /deny|denied|rejected|blocked/.test(status.toLowerCase()));
+}
+
 function redactCawLiveSecrets(value: unknown): Record<string, unknown> {
   return redactCawLiveSecretsValue(value) as Record<string, unknown>;
 }
@@ -2821,14 +2942,34 @@ function redactCawLiveSecretsValue(value: unknown): unknown {
     const output: Record<string, unknown> = {};
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
       if (/api[_-]?key|token|secret|authorization/i.test(key)) {
-        output[key] = typeof child === "string" && child.length > 0 ? { redacted: true, sha256: sha256Hex(child) } : { redacted: true };
+        output[key] = redactCawLiveSecretField(child);
       } else {
         output[key] = redactCawLiveSecretsValue(child);
       }
     }
     return output;
   }
+  if (typeof value === "string") {
+    return redactCawLiveSecretText(value);
+  }
   return value;
+}
+
+function redactCawLiveSecretField(value: unknown): Record<string, unknown> {
+  if (typeof value === "string" && value.length > 0) {
+    return { redacted: true, sha256: sha256Hex(value) };
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (record.redacted === true && typeof record.sha256 === "string" && /^0x[0-9a-f]{64}$/i.test(record.sha256)) {
+      return { redacted: true, sha256: record.sha256.toLowerCase() };
+    }
+  }
+  return { redacted: true };
+}
+
+function redactCawLiveSecretText(input: string): string {
+  return redactPublicEvidenceText(input).replace(/\b[^\s,;:"'<>]*secret[^\s,;:"'<>]*\b/gi, "[redacted]");
 }
 
 function cawLiveFailureMessage(message: string, error: unknown): string {
@@ -3051,6 +3192,7 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
         });
       }
       const chainProvider = await requireChainReadyForBalanceDelta(ctx, settlement.chainId, requestId);
+      const chainProviderEndpoint = redactEndpoint(chainProvider.endpoint);
       if (settlement.blockNumber <= 0) {
         throw Object.assign(new Error("token balance delta proof requires a non-genesis settlement block"), {
           apiError: proofBlockedError(requestId, "token balance delta proof requires a non-genesis settlement block", {
@@ -3076,6 +3218,37 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
         });
       }
       const transferLog = await requireErc20TransferLogForBalanceDelta(ctx, settlement, spend, amount, requestId);
+      const transferLogBindingHash = erc20TransferLogBindingHash({
+        chainId: settlement.chainId,
+        txHash: settlement.txHash,
+        blockNumber: settlement.blockNumber,
+        logIndex: transferLog.logIndex,
+        paymentToken: spend.paymentToken,
+        transferRawLogHash: transferLog.rawLogHash,
+        transferTopics: transferLog.topics,
+        transferData: transferLog.data,
+      });
+      const balanceReadHash = tokenBalanceReadHash({
+        chainId: settlement.chainId,
+        blockNumber: settlement.blockNumber,
+        preBlockNumber: settlement.blockNumber - 1,
+        paymentToken: spend.paymentToken,
+        agentWallet: spend.agentWallet,
+        market: spend.market,
+        amountAtomic: amount.toString(),
+        agentWalletBefore: agentWalletBefore.toString(),
+        agentWalletAfter: agentWalletAfter.toString(),
+        marketBefore: marketBefore.toString(),
+        marketAfter: marketAfter.toString(),
+      });
+      const chainReadProofHash = tokenBalanceDeltaChainReadProofHash({
+        chainProviderMode: chainProvider.mode,
+        chainProviderEndpoint,
+        settlementEventId: settlement.finalizedEventId,
+        gateEventId: settlement.gateEventId,
+        transferLogBindingHash,
+        balanceReadHash,
+      });
       const activationEvent = appendEvidenceEvent(ctx, {
         sessionId: envelope.sessionId,
         authority: "proof",
@@ -3097,7 +3270,7 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
           procurementGateAddress: activation.procurementGateAddress,
           chainId: activation.chainId,
           chainProviderMode: chainProvider.mode,
-          chainProviderEndpoint: chainProvider.endpoint ?? null,
+          chainProviderEndpoint,
           requestHash: activation.requestHash,
           responseHash: activation.responseHash,
           proofAuthority: true,
@@ -3121,13 +3294,16 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
           txHash: settlement.txHash,
           chainId: settlement.chainId,
           chainProviderMode: chainProvider.mode,
-          chainProviderEndpoint: chainProvider.endpoint ?? null,
+          chainProviderEndpoint,
           blockNumber: settlement.blockNumber,
           preBlockNumber: settlement.blockNumber - 1,
           transferLogIndex: transferLog.logIndex,
           transferRawLogHash: transferLog.rawLogHash,
+          transferLogBindingHash,
           transferTopics: transferLog.topics,
           transferData: transferLog.data,
+          balanceReadHash,
+          chainReadProofHash,
           paymentToken: spend.paymentToken,
           payer: spend.payer,
           agentWallet: spend.agentWallet,
@@ -3167,13 +3343,16 @@ export async function verifyTokenBalanceDelta(input: SessionScopedEnvelope, ctx:
           txHash: settlement.txHash,
           chainId: settlement.chainId,
           chainProviderMode: chainProvider.mode,
-          chainProviderEndpoint: chainProvider.endpoint ?? null,
+          chainProviderEndpoint,
           blockNumber: settlement.blockNumber,
           preBlockNumber: settlement.blockNumber - 1,
           transferLogIndex: transferLog.logIndex,
           transferRawLogHash: transferLog.rawLogHash,
+          transferLogBindingHash,
           transferTopics: transferLog.topics,
           transferData: transferLog.data,
+          balanceReadHash,
+          chainReadProofHash,
           paymentToken: spend.paymentToken,
           payer: spend.payer,
           agentWallet: spend.agentWallet,
@@ -3383,6 +3562,7 @@ export async function runArtifactPreflight(input: SessionScopedEnvelope, ctx: Se
     const artifactCid = payload.artifactCid.toLowerCase();
     const createdAt = ctx.clock.now().toISOString();
     const preflightId = hashJson({ sessionId: envelope.sessionId, payload, requestId });
+    assertPublicReplayUrl(payload.endpointUrl, requestId, "artifact preflight endpointUrl", ctx.publicEvidence);
     assertSpendArtifactHash(spend, artifactHashPreview, "artifact preflight", requestId);
     assertArtifactCidMatchesHash(artifactCid, artifactHashPreview, requestId);
     ctx.db.sqlite
@@ -3455,38 +3635,41 @@ export async function verifyArtifactPreflight(input: SessionScopedEnvelope, ctx:
         }),
       });
     }
-    if (String(preflight.artifact_hash_preview).toLowerCase() !== payload.artifactPayloadHash.toLowerCase()) {
+    const deliveryEvidence = await resolveArtifactPreflightDeliveryEvidence(ctx, envelope.sessionId, preflight, payload, requestId);
+    if (String(preflight.artifact_hash_preview).toLowerCase() !== deliveryEvidence.artifactPayloadHash) {
       throw Object.assign(new Error("artifact delivery payload hash does not match preflight preview"), {
         apiError: proofBlockedError(requestId, "artifact delivery payload hash does not match preflight preview", {
           expected: String(preflight.artifact_hash_preview).toLowerCase(),
-          actual: payload.artifactPayloadHash.toLowerCase(),
+          actual: deliveryEvidence.artifactPayloadHash,
         }),
       });
     }
-    if (String(preflight.artifact_cid).toLowerCase() !== payload.artifactCid.toLowerCase()) {
+    if (String(preflight.artifact_cid).toLowerCase() !== deliveryEvidence.artifactCid) {
       throw Object.assign(new Error("artifact delivery CID does not match preflight CID"), {
         apiError: proofBlockedError(requestId, "artifact delivery CID does not match preflight CID", {
           expected: String(preflight.artifact_cid).toLowerCase(),
-          actual: payload.artifactCid.toLowerCase(),
+          actual: deliveryEvidence.artifactCid,
         }),
       });
     }
     const verifiedAt = ctx.clock.now().toISOString();
-    const manifestFetchHash = payload.manifestFetchHash.toLowerCase();
-    const endpointResponseHash = payload.endpointResponseHash.toLowerCase();
-    const leaseDryRunHash = payload.leaseDryRunHash.toLowerCase();
+    const manifestFetchHash = deliveryEvidence.manifestFetchHash;
+    const endpointResponseHash = deliveryEvidence.endpointResponseHash;
+    const leaseDryRunHash = deliveryEvidence.leaseDryRunHash;
     const deliveryProofHash = hashJson({
       sessionId: envelope.sessionId,
       preflightId: payload.preflightId,
       spendId: String(preflight.spend_id),
-      artifactPayloadHash: payload.artifactPayloadHash.toLowerCase(),
-      artifactCid: payload.artifactCid.toLowerCase(),
+      artifactPayloadHash: deliveryEvidence.artifactPayloadHash,
+      artifactCid: deliveryEvidence.artifactCid,
       endpointUrl: String(preflight.endpoint_url),
       priceDisclosureHash: String(preflight.price_disclosure_hash),
       sourceStateSnapshotHash: String(preflight.source_state_snapshot_hash),
       manifestFetchHash,
       endpointResponseHash,
       leaseDryRunHash,
+      deliveryVerificationAuthority: deliveryEvidence.deliveryVerificationAuthority,
+      artifactDeliveryEvidenceHash: deliveryEvidence.artifactDeliveryEvidenceHash,
     });
     const event = withImmediateTransaction(ctx, () => {
       const writtenEvent = appendEvidenceEvent(ctx, {
@@ -3496,8 +3679,8 @@ export async function verifyArtifactPreflight(input: SessionScopedEnvelope, ctx:
         payload: {
           preflightId: payload.preflightId,
           spendId: String(preflight.spend_id),
-          artifactPayloadHash: payload.artifactPayloadHash.toLowerCase(),
-          artifactCid: payload.artifactCid.toLowerCase(),
+          artifactPayloadHash: deliveryEvidence.artifactPayloadHash,
+          artifactCid: deliveryEvidence.artifactCid,
           endpointUrl: String(preflight.endpoint_url),
           priceDisclosureHash: String(preflight.price_disclosure_hash),
           sourceStateSnapshotHash: String(preflight.source_state_snapshot_hash),
@@ -3505,6 +3688,8 @@ export async function verifyArtifactPreflight(input: SessionScopedEnvelope, ctx:
           endpointResponseHash,
           leaseDryRunHash,
           deliveryProofHash,
+          deliveryVerificationAuthority: deliveryEvidence.deliveryVerificationAuthority,
+          artifactDeliveryEvidenceHash: deliveryEvidence.artifactDeliveryEvidenceHash,
           status: "passed_live_delivery",
           proofAuthority: false,
           winnerClaimAllowed: false,
@@ -3555,9 +3740,115 @@ export async function verifyArtifactPreflight(input: SessionScopedEnvelope, ctx:
         manifestFetchHash,
         endpointResponseHash,
         leaseDryRunHash,
+        deliveryVerificationAuthority: deliveryEvidence.deliveryVerificationAuthority,
+        artifactDeliveryEvidenceHash: deliveryEvidence.artifactDeliveryEvidenceHash,
         status: "passed_live_delivery",
         winnerClaimAllowed: false,
       },
+    };
+  });
+}
+
+async function resolveArtifactPreflightDeliveryEvidence(
+  ctx: ServiceCtx,
+  sessionId: string,
+  preflight: Row,
+  payload: ArtifactPreflightVerifyPayload,
+  requestId: string,
+): Promise<{
+  artifactPayloadHash: string;
+  artifactCid: string;
+  manifestFetchHash: string;
+  endpointResponseHash: string;
+  leaseDryRunHash: string;
+  deliveryVerificationAuthority: "caller_hash_attestation" | "server_live_fetch";
+  artifactDeliveryEvidenceHash: string;
+}> {
+  if (payload.verificationMode === "server_live_fetch") {
+    try {
+      const result = await ctx.artifactDelivery.verify({
+        sessionId,
+        preflightId: payload.preflightId,
+        spendId: String(preflight.spend_id),
+        artifactHashPreview: String(preflight.artifact_hash_preview).toLowerCase(),
+        artifactCid: String(preflight.artifact_cid).toLowerCase(),
+        endpointUrl: String(preflight.endpoint_url),
+        priceDisclosureHash: String(preflight.price_disclosure_hash),
+        sourceStateSnapshotHash: String(preflight.source_state_snapshot_hash),
+        sourceManifests: sourceManifestsForSpend(ctx, sessionId, String(preflight.spend_id), requestId),
+      });
+      return {
+        artifactPayloadHash: result.artifactPayloadHash.toLowerCase(),
+        artifactCid: result.artifactCid.toLowerCase(),
+        manifestFetchHash: result.manifestFetchHash.toLowerCase(),
+        endpointResponseHash: result.endpointResponseHash.toLowerCase(),
+        leaseDryRunHash: result.leaseDryRunHash.toLowerCase(),
+        deliveryVerificationAuthority: "server_live_fetch",
+        artifactDeliveryEvidenceHash: result.evidenceHash.toLowerCase(),
+      };
+    } catch (error) {
+      throw Object.assign(new Error("server-owned artifact delivery preflight failed"), {
+        apiError: proofPendingError(
+          requestId,
+          error instanceof Error ? `server-owned artifact delivery preflight failed: ${error.message}` : "server-owned artifact delivery preflight failed",
+        ),
+      });
+    }
+  }
+  if (!payload.artifactPayloadHash || !payload.artifactCid || !payload.manifestFetchHash || !payload.endpointResponseHash || !payload.leaseDryRunHash) {
+    throw Object.assign(new Error("caller artifact preflight attestation is incomplete"), {
+      apiError: proofBlockedError(requestId, "caller artifact preflight attestation is incomplete"),
+    });
+  }
+  const artifactPayloadHash = payload.artifactPayloadHash.toLowerCase();
+  const artifactCid = payload.artifactCid.toLowerCase();
+  const manifestFetchHash = payload.manifestFetchHash.toLowerCase();
+  const endpointResponseHash = payload.endpointResponseHash.toLowerCase();
+  const leaseDryRunHash = payload.leaseDryRunHash.toLowerCase();
+  return {
+    artifactPayloadHash,
+    artifactCid,
+    manifestFetchHash,
+    endpointResponseHash,
+    leaseDryRunHash,
+    deliveryVerificationAuthority: "caller_hash_attestation",
+    artifactDeliveryEvidenceHash: hashJson({
+      mode: "caller_hash_attestation",
+      sessionId,
+      preflightId: payload.preflightId,
+      artifactPayloadHash,
+      artifactCid,
+      manifestFetchHash,
+      endpointResponseHash,
+      leaseDryRunHash,
+    }),
+  };
+}
+
+function sourceManifestsForSpend(ctx: ServiceCtx, sessionId: string, spendId: string, requestId: string) {
+  const spend = assertSpend(ctx, sessionId, spendId, requestId);
+  const sourceHashes = JSON.parse(String(spend.source_hashes_json)) as string[];
+  if (!Array.isArray(sourceHashes) || sourceHashes.length === 0) {
+    return [];
+  }
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT source_hash, manifest_url, manifest_hash
+       FROM sources
+       WHERE session_id = ? AND source_hash IN (${sourceHashes.map(() => "?").join(",")})
+       ORDER BY created_at ASC, source_hash ASC`,
+    )
+    .all(sessionId, ...sourceHashes) as Row[];
+  const rowsByHash = new Map(rows.map((row) => [String(row.source_hash).toLowerCase(), row]));
+  return sourceHashes.map((sourceHash) => {
+    const row = rowsByHash.get(String(sourceHash).toLowerCase());
+    if (!row) {
+      throw new Error(`source manifest ${sourceHash} is missing`);
+    }
+    return {
+      sourceHash: String(row.source_hash).toLowerCase(),
+      manifestUrl: String(row.manifest_url),
+      manifestHash: String(row.manifest_hash).toLowerCase(),
     };
   });
 }
@@ -3578,6 +3869,9 @@ export async function signArtifactQuote(input: SessionScopedEnvelope, ctx: Servi
     const status = payload.settlementMode;
     const chainStatus =
       status === CHAIN_SETTLEABLE_QUOTE_STATUS ? await requireLiveChainSettleableQuoteProvider(ctx, payload.validUntilBlock, requestId) : null;
+    if (status === CHAIN_SETTLEABLE_QUOTE_STATUS) {
+      assertServerLiveFetchPreflight(ctx, envelope.sessionId, preflight, requestId);
+    }
     const modes = quoteRuntimeModes(status, String(spend.payment_token));
     const chainId = chainStatus?.chainId ?? null;
     const payer = String(spend.payer).toLowerCase();
@@ -3978,6 +4272,27 @@ export async function executeLease(
           },
           requestId,
         );
+        const mcpProvider = await mcpLeaseExecutionReadiness(ctx);
+        if (!mcpProvider.ready) {
+          blockArtifactTokenLeaseClaim(ctx, envelope.sessionId, artifactTokenId, requestId);
+          return recordBlockedLeaseExecution(ctx, {
+            requestId,
+            sessionId: envelope.sessionId,
+            spendId: payload.spendId,
+            payer,
+            artifactHash,
+            consumedArtifactPayloadHash,
+            targetRepo: payload.targetRepo,
+            targetCommit: payload.targetCommit,
+            leaseRunId,
+            settlementEventId: settlement.tokenBalanceEventId,
+            artifactTokenId,
+            status: mcpProvider.status,
+            reason: mcpProvider.reason,
+          });
+        }
+        const mcpProviderStatus = mcpProvider.provider;
+        const mcpProviderStatusHash = hashJson(redactProofProviderStatus(mcpProviderStatus));
         let leaseExecution: McpLeaseExecutionResult;
         try {
           leaseExecution = await ctx.mcpLease.executeCleanLease({
@@ -4130,6 +4445,9 @@ export async function executeLease(
               pinnedManifestHashes: pinnedManifest.manifestHashes,
               manifestBindingHash,
               bearerBound: true,
+              mcpProviderMode: mcpProviderStatus.mode,
+              mcpProviderReady: mcpProviderStatus.ready,
+              mcpProviderStatusHash,
               status: "succeeded_live_mcp_transcript",
               proofAuthority: false,
               winnerClaimAllowed: false,
@@ -4354,6 +4672,7 @@ async function buildVerifierRunView(
           cliMode: payload.schemaOnly ? "schema-only" : "proof-chip",
           proofProviders,
           proofProviderAuthority: "server-runtime",
+          trustedProofKeyHashes: [...ctx.trustedProofKeyHashes],
           pactTemplates: ctx.templates.list(),
         })
       : {
@@ -4379,7 +4698,7 @@ async function buildVerifierRunView(
     ...verifyArtifactAccessTokenIntegrity(ctx, sessionId),
     ...verifyLeaseRunIntegrity(ctx, sessionId),
     ...(await verifyIndexerCursorIntegrity(ctx, proofProviders)),
-    ...verifyReplayBundleBindings(ctx, sessionId, payload),
+    ...verifyVerifierInputSnapshotBindings(ctx, sessionId, payload),
   ];
   const rawErrors = verifierErrorStrings(raw);
   const rawSchemaErrors = toStringArray((raw as Record<string, unknown>).schemaErrors);
@@ -4425,7 +4744,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
     schemaOnly: false,
   });
   const judgeCheck = readJudgeCheckData(parsedSessionId, ctx);
-  const events = listEvents(ctx, parsedSessionId, 0, REPLAY_SUMMARY_LIMIT);
+  const events = listEventsThroughSeq(ctx, parsedSessionId, replayBundle.asOfEventSeq);
   const rowsById = new Map(judgeCheck.rows.map((row) => [String(row.rowId), row]));
   const latest = (predicate: (event: EvidenceEvent) => boolean) => [...events].reverse().find(predicate) ?? null;
   const latestKind = (kind: string) => latest((event) => event.kind === kind);
@@ -4433,6 +4752,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
     const payload = eventPayload(event);
     return event.kind === "caw.identity.probed" && payload.mode === "real" && payload.pass === true && payload.proofAuthority === true;
   });
+  const cawIdentityLiveRecheck = await cawIdentityLiveRecheckGate(ctx, cawIdentityProbe);
   const cawDeny = latest((event) => {
     const payload = eventPayload(event);
     return (
@@ -4448,8 +4768,27 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
     const payload = eventPayload(event);
     return event.kind === "caw.receipt.ingested.raw" && payload.proofAuthority === true;
   });
-  const cawAllowance = latestKind("caw.allowance.verified");
-  const cawActivation = latestKind("caw.activation.verified");
+  const cawRawReceiptsLiveRecheck = await cawRawReceiptsLiveRecheckGate(ctx, parsedSessionId, replayBundle, cawRawReceiptEvent, requestId);
+  const cawAllowance = latest((event) => {
+    const payload = eventPayload(event);
+    return (
+      event.kind === "caw.allowance.verified" &&
+      event.authority === "proof" &&
+      payload.proofAuthority === true &&
+      payload.winnerClaimAllowed === false &&
+      isLiveChainProofPayload(payload)
+    );
+  });
+  const cawActivation = latest((event) => {
+    const payload = eventPayload(event);
+    return (
+      event.kind === "caw.activation.verified" &&
+      event.authority === "proof" &&
+      payload.proofAuthority === true &&
+      payload.winnerClaimAllowed === false &&
+      isLiveChainProofPayload(payload)
+    );
+  });
   const tokenDelta = latest((event) => event.kind === "token.balance_delta.verified" && isLiveChainProofPayload(eventPayload(event)));
   const tokenDeployment = await tokenDeploymentRegistryGate(ctx, tokenDelta);
   const liveArtifactQuote = hasLiveArtifactQuote(replayBundle);
@@ -4469,6 +4808,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
       "live CAW wallet identity probe proves real same-wallet semantics",
       "missing live CAW identity probe with mode=real, pass=true, proofAuthority=true",
     ),
+    cawIdentityLiveRecheck,
     judgeGate(rowsById, "caw_boundary", ["claimMode", "paymentMode", "winnerClaimAllowed"]),
     eventGate(
       "caw_wrong_target_deny",
@@ -4488,6 +4828,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
       "raw and canonical CAW receipts cover deny_probe, approve, and activate_tool",
       cawReceiptCoverage.reason,
     ),
+    cawRawReceiptsLiveRecheck,
     eventGate(
       "caw_allowance_proof",
       "CAW approve allowance proof",
@@ -4495,7 +4836,7 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
       ["paymentMode", "winnerClaimAllowed"],
       cawAllowance,
       "approve tx, ERC20 Approval log, allowance state, and active Pact policy are bound",
-      "missing caw.allowance.verified proof event",
+      "missing live caw.allowance.verified proof event",
     ),
     eventGate(
       "caw_activation_proof",
@@ -4560,13 +4901,15 @@ export async function readClaimReadiness(sessionId: string, ctx: ServiceCtx): Pr
   const gatePassed = (id: string) => gates.find((gate) => gate.gateId === id)?.status === "pass";
   const cawTargetReady =
     gatePassed("caw_identity_probe") &&
+    gatePassed("caw_identity_live_recheck") &&
     gatePassed("caw_wrong_target_deny") &&
     gatePassed("caw_raw_receipts") &&
+    gatePassed("caw_raw_receipts_live_recheck") &&
     gatePassed("caw_allowance_proof") &&
     gatePassed("caw_activation_proof") &&
-    ["caw_boundary", "source_challenge", "ab_trip"].every((id) => rowsById.get(id)?.status === "pass");
+    ["judge_caw_boundary", "judge_source_challenge", "judge_ab_trip"].every(gatePassed);
   const gatePaidReady =
-    cawTargetReady && gatePassed("artifact_quote_live") && gatePassed("token_balance_delta") && rowsById.get("c_settlement")?.status === "pass";
+    cawTargetReady && gatePassed("artifact_quote_live") && gatePassed("token_balance_delta") && gatePassed("judge_c_settlement");
   const tokenMode = tokenTargetMode(tokenDelta);
   const targetIdentityMode = cawIdentityProbe ? identityTargetMode(cawIdentityProbe) : null;
   const winnerClaimAllowed = gates.every((gate) => gate.status === "pass");
@@ -4606,6 +4949,7 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
     return readiness;
   }
   const data = readiness.data;
+  const tokenSettlementClaim = tokenSettlementClaimForTokenMode(data.targetTokenMode);
   const blockers = [
     ...data.blockers,
     ...(data.targetClaimMode !== "caw-target-real" ? ["targetClaimMode is not caw-target-real"] : []),
@@ -4613,6 +4957,7 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
     ...(data.targetTokenMode !== "mock-test-token" && data.targetTokenMode !== "official-testnet-usdc"
       ? ["targetTokenMode is not a live payment token mode"]
       : []),
+    ...(tokenSettlementClaim ? [] : ["targetTokenMode does not map to a public token settlement claim"]),
     ...(data.targetIdentityMode !== "p0-floor-one-wallet" && data.targetIdentityMode !== "p0-win-separate-identities"
       ? ["targetIdentityMode is not a proven CAW identity mode"]
       : []),
@@ -4624,6 +4969,8 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
     ...(data.proofChipAllowed ? [] : ["claim readiness proofChipAllowed is false"]),
     ...(data.finalVerifierComplete ? [] : ["claim readiness finalVerifierComplete is false"]),
     ...(data.winnerClaimAllowed ? [] : ["claim readiness winnerClaimAllowed is false"]),
+    ...(ctx.proofBundleSigner ? [] : ["proof bundle verifier attestation signing key is not configured"]),
+    ...(proofBundleSignerTrusted(ctx) ? [] : ["proof bundle verifier attestation signing key is not trusted"]),
   ];
   if (blockers.length > 0) {
     return {
@@ -4659,28 +5006,46 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
     };
   }
   const snapshot = proofBundleAuthorizationSnapshot(ctx, providerStatuses, authorizedAt);
-  const publicClaimHash = hashJson({
-    sessionId: parsedSessionId,
-    snapshotScope: "authorization_event",
-    providerSnapshotOnly: true,
-    authorizedAt,
-    authorizedEventSeq,
+  const replayBundleSnapshot = finalClaimReplayBundleData(parsedSessionId, ctx, {
     asOfEventSeq,
+    deploymentRegistry: snapshot.deploymentRegistry,
+  });
+  const replayBundleHash = hashJson(replayBundleSnapshot);
+  if (replayBundleHash !== data.replayBundleHash) {
+    return {
+      ok: false,
+      requestId,
+      error: proofBlockedError(requestId, "public claim replay snapshot changed before authorization", {
+        expectedReplayBundleHash: data.replayBundleHash,
+        actualReplayBundleHash: replayBundleHash,
+      }),
+    };
+  }
+  const publicVerifierRun = publicClaimVerifierRun(data.verifierRun, {
     claimMode: data.targetClaimMode,
     paymentMode: data.targetPaymentMode,
     tokenMode: data.targetTokenMode,
     identityMode: data.targetIdentityMode,
-    replayBundleHash: data.replayBundleHash,
-    providerStatusHash: snapshot.providerStatusHash,
-    deploymentRegistryHash: snapshot.deploymentRegistryHash,
-    serverHash: snapshot.serverHash,
-    verifierRun: {
-      proofLevel: data.verifierRun.proofLevel,
-      proofChipAllowed: data.verifierRun.proofChipAllowed,
-      finalVerifierComplete: data.verifierRun.finalVerifierComplete,
-      winnerClaimAllowed: data.verifierRun.winnerClaimAllowed,
-    },
   });
+  const verifierRunHash = hashJson(publicVerifierRun);
+  const publicClaimHash = hashJson(
+    publicClaimHashInput({
+      sessionId: parsedSessionId,
+      authorizedAt,
+      authorizedEventSeq,
+      asOfEventSeq,
+      claimMode: data.targetClaimMode,
+      paymentMode: data.targetPaymentMode,
+      tokenMode: data.targetTokenMode,
+      tokenSettlementClaim,
+      identityMode: data.targetIdentityMode,
+      replayBundleHash,
+      providerStatusHash: snapshot.providerStatusHash,
+      deploymentRegistryHash: snapshot.deploymentRegistryHash,
+      serverHash: snapshot.serverHash,
+      verifierRun: publicVerifierRun,
+    }),
+  );
   const claim = PublicClaimViewSchema.parse({
     sessionId: parsedSessionId,
     claimStatus: "authorized_public_claim",
@@ -4692,18 +5057,32 @@ export async function authorizePublicClaim(sessionId: string, ctx: ServiceCtx): 
     claimMode: data.targetClaimMode,
     paymentMode: data.targetPaymentMode,
     tokenMode: data.targetTokenMode,
+    tokenSettlementClaim,
     identityMode: data.targetIdentityMode,
-    replayBundleHash: data.replayBundleHash,
+    replayBundleHash,
     providerStatusHash: snapshot.providerStatusHash,
     deploymentRegistryHash: snapshot.deploymentRegistryHash,
     serverHash: snapshot.serverHash,
-    verifierRun: data.verifierRun,
+    verifierRun: publicVerifierRun,
     proofChipAllowed: true,
     finalVerifierComplete: true,
     winnerClaimAllowed: true,
     publicClaimHash,
   });
-  appendPublicClaimAuthorizedEvent(ctx, parsedSessionId, claim, snapshot);
+  const verifierAttestation = proofBundleVerifierAttestation(ctx, {
+    sessionId: parsedSessionId,
+    publicClaimHash,
+    publicClaimEventSeq: authorizedEventSeq,
+    authorizedAt,
+    asOfEventSeq,
+    claimInputReplayBundleHash: claim.replayBundleHash,
+    replayBundleHash: claim.replayBundleHash,
+    verifierRunHash,
+    providerStatusHash: snapshot.providerStatusHash,
+    deploymentRegistryHash: snapshot.deploymentRegistryHash,
+    serverHash: snapshot.serverHash,
+  });
+  appendPublicClaimAuthorizedEvent(ctx, parsedSessionId, claim, replayBundleSnapshot, snapshot, verifierAttestation);
   return { ok: true, requestId, data: claim };
 }
 
@@ -4728,7 +5107,37 @@ function latestAuthorizedPublicClaimRecord(
        LIMIT 1`,
     )
     .get(sessionId) as Row | undefined;
-  if (!row || Number(row.event_seq) !== Number(session.latest_event_seq)) {
+  return authorizedPublicClaimRecordFromRow(ctx, sessionId, session, row, { requireLatestSessionEvent: true });
+}
+
+function authorizedPublicClaimRecordByEventId(
+  ctx: ServiceCtx,
+  sessionId: string,
+  publicClaimEventId: string,
+): AuthorizedPublicClaimRecord | null {
+  const session = getSessionRow(ctx, sessionId);
+  if (!session) {
+    return null;
+  }
+  const row = ctx.db.sqlite
+    .prepare(
+      `SELECT event_id, event_seq, event_hash, prev_proof_event_hash, authority, kind, payload_hash, payload_json, created_at
+       FROM evidence_events
+       WHERE session_id = ? AND event_id = ? AND kind = 'public.claim.authorized'
+       LIMIT 1`,
+    )
+    .get(sessionId, publicClaimEventId) as Row | undefined;
+  return authorizedPublicClaimRecordFromRow(ctx, sessionId, session, row, { requireLatestSessionEvent: false });
+}
+
+function authorizedPublicClaimRecordFromRow(
+  ctx: ServiceCtx,
+  sessionId: string,
+  session: Row,
+  row: Row | undefined,
+  options: { requireLatestSessionEvent: boolean },
+): AuthorizedPublicClaimRecord | null {
+  if (!row || (options.requireLatestSessionEvent && Number(row.event_seq) !== Number(session.latest_event_seq))) {
     return null;
   }
   try {
@@ -4753,10 +5162,24 @@ function latestAuthorizedPublicClaimRecord(
       payloadHash,
       prevProofEventHash,
     });
-    if (eventHash !== row.event_hash || eventHash !== row.event_id || eventHash !== session.latest_proof_event_hash) {
+    if (eventHash !== row.event_hash || eventHash !== row.event_id) {
+      return null;
+    }
+    if (options.requireLatestSessionEvent && eventHash !== session.latest_proof_event_hash) {
       return null;
     }
     if (parsed.claim.publicClaimHash !== parsed.publicClaimHash || parsed.claim.replayBundleHash !== parsed.replayBundleHash) {
+      return null;
+    }
+    if (
+      parsed.replayBundle &&
+      (parsed.replayBundle.sessionId !== sessionId ||
+        parsed.replayBundle.asOfEventSeq !== parsed.asOfEventSeq ||
+        hashJson(parsed.replayBundle) !== parsed.replayBundleHash)
+    ) {
+      return null;
+    }
+    if (parsed.publicClaimHash !== hashJson(publicClaimHashInput(parsed.claim))) {
       return null;
     }
     if (parsed.verifierRunHash !== hashJson(parsed.claim.verifierRun)) {
@@ -4790,12 +5213,40 @@ function latestAuthorizedPublicClaimRecord(
     if (parsed.server.generatedAt !== String(row.created_at) || parsed.serverHash !== hashJson(parsed.server)) {
       return null;
     }
+    const signedPayloadHash = hashJson(
+      proofBundleVerifierAttestationInput({
+        signer: {
+          scheme: parsed.verifierAttestation.scheme,
+          keyId: parsed.verifierAttestation.keyId,
+          publicKeyHash: parsed.verifierAttestation.publicKeyHash,
+        },
+        sessionId,
+        publicClaimHash: parsed.publicClaimHash,
+        publicClaimEventSeq: Number(row.event_seq),
+        authorizedAt: String(row.created_at),
+        asOfEventSeq: parsed.asOfEventSeq,
+        claimInputReplayBundleHash: parsed.replayBundleHash,
+        replayBundleHash: parsed.replayBundleHash,
+        verifierRunHash: parsed.verifierRunHash,
+        providerStatusHash: parsed.providerStatusHash,
+        deploymentRegistryHash: parsed.deploymentRegistryHash,
+        serverHash: parsed.serverHash,
+      }),
+    );
+    if (parsed.verifierAttestation.signedPayloadHash !== signedPayloadHash) {
+      return null;
+    }
+    if (!verifyProofBundleVerifierAttestation(ctx, parsed.verifierAttestation, signedPayloadHash)) {
+      return null;
+    }
     return {
       claim: parsed.claim,
       eventSeq: Number(row.event_seq),
       eventId: String(row.event_id),
       eventHash: String(row.event_hash),
       asOfEventSeq: parsed.asOfEventSeq,
+      ...(parsed.replayBundle ? { replayBundle: parsed.replayBundle } : {}),
+      verifierAttestation: parsed.verifierAttestation,
       snapshot: {
         providerStatuses: parsed.providerStatuses,
         providerStatusHash: parsed.providerStatusHash,
@@ -4810,11 +5261,117 @@ function latestAuthorizedPublicClaimRecord(
   }
 }
 
+function proofBundleSignerTrusted(ctx: ServiceCtx): boolean {
+  return Boolean(ctx.proofBundleSigner && ctx.trustedProofKeyHashes.has(ctx.proofBundleSigner.publicKeyHash.toLowerCase()));
+}
+
+function publicClaimVerifierRun(
+  verifierRun: VerifierRunView,
+  modes: {
+    claimMode: ClaimReadinessView["targetClaimMode"];
+    paymentMode: ClaimReadinessView["targetPaymentMode"];
+    tokenMode: ClaimReadinessView["targetTokenMode"];
+    identityMode: ClaimReadinessView["targetIdentityMode"];
+  },
+): VerifierRunView {
+  return VerifierRunViewSchema.parse({
+    ...verifierRun,
+    claimMode: modes.claimMode,
+    paymentMode: modes.paymentMode,
+    tokenMode: modes.tokenMode,
+    identityMode: modes.identityMode,
+  });
+}
+
+function publicClaimHashInput(fields: {
+  sessionId: string;
+  authorizedAt: string;
+  authorizedEventSeq: number;
+  asOfEventSeq: number;
+  claimMode: unknown;
+  paymentMode: unknown;
+  tokenMode: unknown;
+  tokenSettlementClaim: unknown;
+  identityMode: unknown;
+  replayBundleHash: unknown;
+  providerStatusHash: string;
+  deploymentRegistryHash: string | null;
+  serverHash: string;
+  verifierRun: Pick<
+    VerifierRunView,
+    | "claimMode"
+    | "paymentMode"
+    | "tokenMode"
+    | "identityMode"
+    | "proofLevel"
+    | "proofChipAllowed"
+    | "finalVerifierComplete"
+    | "winnerClaimAllowed"
+  >;
+}): Record<string, unknown> {
+  return {
+    sessionId: fields.sessionId,
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt: fields.authorizedAt,
+    authorizedEventSeq: fields.authorizedEventSeq,
+    asOfEventSeq: fields.asOfEventSeq,
+    claimMode: fields.claimMode,
+    paymentMode: fields.paymentMode,
+    tokenMode: fields.tokenMode,
+    tokenSettlementClaim: fields.tokenSettlementClaim,
+    identityMode: fields.identityMode,
+    replayBundleHash: fields.replayBundleHash,
+    providerStatusHash: fields.providerStatusHash,
+    deploymentRegistryHash: fields.deploymentRegistryHash,
+    serverHash: fields.serverHash,
+    verifierRun: {
+      claimMode: fields.verifierRun.claimMode,
+      paymentMode: fields.verifierRun.paymentMode,
+      tokenMode: fields.verifierRun.tokenMode,
+      identityMode: fields.verifierRun.identityMode,
+      proofLevel: fields.verifierRun.proofLevel,
+      proofChipAllowed: fields.verifierRun.proofChipAllowed,
+      finalVerifierComplete: fields.verifierRun.finalVerifierComplete,
+      winnerClaimAllowed: fields.verifierRun.winnerClaimAllowed,
+    },
+  };
+}
+
+function verifyProofBundleVerifierAttestation(
+  ctx: ServiceCtx,
+  attestation: ProofBundleVerifierAttestation,
+  signedPayloadHash: `0x${string}`,
+): boolean {
+  if (attestation.scheme !== "ed25519" || attestation.signedPayloadHash !== signedPayloadHash) {
+    return false;
+  }
+  if (attestation.publicKeyHash.toLowerCase() !== sha256Hex(attestation.publicKeyPem)) {
+    return false;
+  }
+  if (!ctx.trustedProofKeyHashes.has(attestation.publicKeyHash.toLowerCase())) {
+    return false;
+  }
+  try {
+    const publicKey = createPublicKey(attestation.publicKeyPem);
+    return cryptoVerify(
+      null,
+      Buffer.from(attestation.signedPayloadHash.slice(2), "hex"),
+      publicKey,
+      Buffer.from(attestation.signature, "base64"),
+    );
+  } catch {
+    return false;
+  }
+}
+
 function appendPublicClaimAuthorizedEvent(
   ctx: ServiceCtx,
   sessionId: string,
   claim: PublicClaimView,
+  replayBundle: ReplayBundleView,
   snapshot: ProofBundleAuthorizationSnapshot,
+  verifierAttestation: ProofBundleVerifierAttestation,
 ): EvidenceEvent {
   return appendEvidenceEvent(ctx, {
     sessionId,
@@ -4824,8 +5381,10 @@ function appendPublicClaimAuthorizedEvent(
     payload: jsonRecord({
       claim,
       publicClaimHash: claim.publicClaimHash,
+      replayBundle,
       replayBundleHash: claim.replayBundleHash,
       verifierRunHash: hashJson(claim.verifierRun),
+      verifierAttestation,
       asOfEventSeq: claim.asOfEventSeq,
       ...snapshot,
       proofAuthority: true,
@@ -4861,6 +5420,75 @@ function proofBundleAuthorizationSnapshot(
     server,
     serverHash: hashJson(server),
   });
+}
+
+type ProofBundleVerifierAttestationSignerFields = Pick<
+  ProofBundleVerifierAttestation,
+  "scheme" | "keyId" | "publicKeyHash"
+>;
+
+type ProofBundleVerifierAttestationInputFields = {
+  sessionId: string;
+  publicClaimHash: string;
+  publicClaimEventSeq: number;
+  authorizedAt: string;
+  asOfEventSeq: number;
+  claimInputReplayBundleHash: string;
+  replayBundleHash: string;
+  verifierRunHash: string;
+  providerStatusHash: string;
+  deploymentRegistryHash: string | null;
+  serverHash: string;
+};
+
+function proofBundleVerifierAttestation(
+  ctx: ServiceCtx,
+  fields: ProofBundleVerifierAttestationInputFields,
+): ProofBundleVerifierAttestation {
+  const signer = ctx.proofBundleSigner;
+  if (!signer) {
+    throw new Error("proof bundle verifier attestation signing key is not configured");
+  }
+  const signedPayloadHash = hashJson(
+    proofBundleVerifierAttestationInput({
+      signer,
+      ...fields,
+    }),
+  );
+  return {
+    scheme: signer.scheme,
+    keyId: signer.keyId,
+    publicKeyPem: signer.publicKeyPem,
+    publicKeyHash: signer.publicKeyHash,
+    signedPayloadHash,
+    signature: signer.signPayloadHash(signedPayloadHash),
+  };
+}
+
+function proofBundleVerifierAttestationInput(
+  fields: ProofBundleVerifierAttestationInputFields & { signer: ProofBundleVerifierAttestationSignerFields },
+): Record<string, unknown> {
+  return {
+    attestationType: "PACTFUSE_PUBLIC_PROOF_VERIFIER_ATTESTATION_V1",
+    scheme: fields.signer.scheme,
+    keyId: fields.signer.keyId,
+    publicKeyHash: fields.signer.publicKeyHash,
+    bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+    sessionId: fields.sessionId,
+    publicClaimHash: fields.publicClaimHash,
+    publicClaimEventSeq: fields.publicClaimEventSeq,
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt: fields.authorizedAt,
+    asOfEventSeq: fields.asOfEventSeq,
+    claimInputReplayBundleHash: fields.claimInputReplayBundleHash,
+    replayBundleHash: fields.replayBundleHash,
+    verifierRunHash: fields.verifierRunHash,
+    providerStatusHash: fields.providerStatusHash,
+    deploymentRegistryHash: fields.deploymentRegistryHash,
+    serverHash: fields.serverHash,
+    winnerClaimAllowed: true,
+  };
 }
 
 export async function readLiveProofPreflight(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<LiveProofPreflightView>> {
@@ -4920,22 +5548,36 @@ export async function readLiveProofPreflight(sessionId: string, ctx: ServiceCtx)
   return { ok: true, requestId, data };
 }
 
-export async function readProofBundle(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<ProofBundleView>> {
+export async function readProofBundle(
+  sessionId: string,
+  ctx: ServiceCtx,
+  options: { publicClaimEventId?: string | null } = {},
+): Promise<ServiceResult<ProofBundleView>> {
   const requestId = newRequestId("proof_bundle");
   const parsedSessionId = parseStrict(Hex32Schema, sessionId);
   assertSession(ctx, parsedSessionId, requestId);
-  const latestClaim = latestAuthorizedPublicClaimRecord(ctx, parsedSessionId);
+  const parsedPublicClaimEventId = options.publicClaimEventId ? parseStrict(Hex32Schema, options.publicClaimEventId) : null;
+  const latestClaim = parsedPublicClaimEventId
+    ? authorizedPublicClaimRecordByEventId(ctx, parsedSessionId, parsedPublicClaimEventId)
+    : latestAuthorizedPublicClaimRecord(ctx, parsedSessionId);
   if (!latestClaim) {
     return {
       ok: false,
       requestId,
-      error: proofPendingError(requestId, "proof bundle export requires the latest event to be public.claim.authorized"),
+      error: proofPendingError(
+        requestId,
+        parsedPublicClaimEventId
+          ? "proof bundle export requires publicClaimEventId to reference a proof-authorized public.claim.authorized event"
+          : "proof bundle export requires the latest event to be public.claim.authorized",
+      ),
     };
   }
-  const replayBundle = finalClaimReplayBundleData(parsedSessionId, ctx, {
-    asOfEventSeq: latestClaim.asOfEventSeq,
-    deploymentRegistry: latestClaim.snapshot.deploymentRegistry,
-  });
+  const replayBundle =
+    latestClaim.replayBundle ??
+    finalClaimReplayBundleData(parsedSessionId, ctx, {
+      asOfEventSeq: latestClaim.asOfEventSeq,
+      deploymentRegistry: latestClaim.snapshot.deploymentRegistry,
+    });
   const replayBundleHash = hashJson(replayBundle);
   if (replayBundleHash !== latestClaim.claim.replayBundleHash) {
     return {
@@ -4971,6 +5613,7 @@ export async function readProofBundle(sessionId: string, ctx: ServiceCtx): Promi
     providerStatuses,
     deploymentRegistry,
     server,
+    verifierAttestation: latestClaim.verifierAttestation,
     winnerClaimAllowed: true,
   };
   return {
@@ -5013,6 +5656,7 @@ function livePreflightSecurityFromContext(ctx: ServiceCtx): LivePreflightSecurit
       ctx.apiSecurity.operatorToken && (!ctx.apiSecurity.challengeSubmitterToken || !ctx.apiSecurity.artifactSignerToken),
     ),
     allowInsecureMissingRoleTokens: ctx.apiSecurity.allowInsecureMissingRoleTokens,
+    allowInsecurePublicEvidenceUrls: ctx.publicEvidence.allowInsecureTestUrls,
     cawIngestTokenConfigured: Boolean(ctx.cawIngestToken),
     mcpAuditSecretConfigured: Boolean(ctx.mcpAuditSecret),
     gateIngestSecretConfigured: Boolean(ctx.gateIngestSecret),
@@ -5050,6 +5694,16 @@ function securityLivePreflightChecks(security: LivePreflightSecurity): LivePrefl
         !security.allowInsecureMissingRoleTokens && roleTokenReady
           ? []
           : ["PACTFUSE_OPERATOR_TOKEN plus challenge/artifact role tokens or an intentional operator-token fallback"],
+      evidenceEventId: null,
+    },
+    {
+      checkId: "security_public_evidence_urls",
+      label: "Public evidence URLs",
+      status: security.allowInsecurePublicEvidenceUrls ? "blocked" : "pass",
+      reason: security.allowInsecurePublicEvidenceUrls
+        ? "insecure public-evidence URL test bypass is enabled"
+        : "public replay URLs must use public hostnames",
+      requiredExternalInputs: security.allowInsecurePublicEvidenceUrls ? ["PACTFUSE_ALLOW_INSECURE_PUBLIC_EVIDENCE_URLS=false"] : [],
       evidenceEventId: null,
     },
     {
@@ -5135,11 +5789,17 @@ function livePreflightInputsForClaimGate(gateId: string, fallback: string[]): st
   if (gateId === "caw_identity_probe") {
     return ["live CAW identity probe evidence with mode=real and same-wallet semantics"];
   }
+  if (gateId === "caw_identity_live_recheck") {
+    return ["CAW live wallet recheck matching the stored identity response hash"];
+  }
   if (gateId === "caw_wrong_target_deny") {
     return ["real CAW wrong-target deny request id or audit receipt"];
   }
   if (gateId === "caw_raw_receipts") {
     return ["raw CAW API/export receipts canonicalized for deny_probe, approve, and activate_tool"];
+  }
+  if (gateId === "caw_raw_receipts_live_recheck") {
+    return ["current CAW API/export source still returning the stored deny_probe, approve, and activate_tool receipt rows"];
   }
   if (gateId === "token_balance_delta") {
     return ["public ERC20 token tx/log/balance evidence for the finalized settlement"];
@@ -5149,11 +5809,11 @@ function livePreflightInputsForClaimGate(gateId: string, fallback: string[]): st
   }
   if (gateId === "production_security") {
     return [
-      "PACTFUSE_OPERATOR_TOKEN, PACTFUSE_CAW_INGEST_TOKEN, PACTFUSE_MCP_AUDIT_TOKEN, PACTFUSE_GATE_INGEST_TOKEN, and PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=false",
+      "PACTFUSE_OPERATOR_TOKEN, PACTFUSE_CAW_INGEST_TOKEN, PACTFUSE_MCP_AUDIT_TOKEN, PACTFUSE_GATE_INGEST_TOKEN, PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM/PATH, PACTFUSE_TRUSTED_PROOF_KEY_HASHES, PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=false, and PACTFUSE_ALLOW_INSECURE_PUBLIC_EVIDENCE_URLS=false",
     ];
   }
-  if (gateId === "replay_summary_cap") {
-    return ["full paged replay verifier support or a new live session whose proof collections fit the current summary cap"];
+  if (gateId === "replay_paged_integrity") {
+    return ["valid paged replay index and embedded replay pages covering every proof collection"];
   }
   if (gateId === "final_verifier_complete" || gateId === "proof_chip_allowed" || gateId === "verifier_winner_claim") {
     return ["full chain/signature/hash verifier that can set finalVerifierComplete=true"];
@@ -5189,47 +5849,65 @@ function productionSecurityReadinessGate(ctx: ServiceCtx): ClaimReadinessGate {
     (security.challengeSubmitterTokenConfigured || security.roleTokenFallbackToOperator) &&
     (security.artifactSignerTokenConfigured || security.roleTokenFallbackToOperator);
   const hmacReady = security.cawIngestTokenConfigured && security.mcpAuditSecretConfigured && security.gateIngestSecretConfigured;
-  const pass = !security.allowInsecureMissingRoleTokens && roleTokenReady && hmacReady;
+  const proofSigningReady = proofBundleSignerTrusted(ctx);
+  const publicEvidenceReady = !security.allowInsecurePublicEvidenceUrls;
+  const pass = !security.allowInsecureMissingRoleTokens && publicEvidenceReady && roleTokenReady && hmacReady && proofSigningReady;
   return {
     gateId: "production_security",
     label: "Production proof-surface security",
-    status: pass ? "pass" : security.allowInsecureMissingRoleTokens ? "blocked" : "pending",
+    status: pass ? "pass" : security.allowInsecureMissingRoleTokens || !publicEvidenceReady ? "blocked" : "pending",
     blocks: ["winnerClaimAllowed"],
     reason: pass
-      ? "role tokens and evidence ingest secrets are production-configured"
+      ? "role tokens, evidence ingest secrets, and proof bundle signing key are production-configured"
       : security.allowInsecureMissingRoleTokens
         ? "insecure missing-role-token bypass is enabled"
-        : "role tokens or evidence ingest secrets are not fully configured",
+        : !publicEvidenceReady
+          ? "insecure public-evidence URL test bypass is enabled"
+          : !ctx.proofBundleSigner
+            ? "proof bundle verifier attestation signing key is not configured"
+            : !proofSigningReady
+              ? "proof bundle verifier attestation signing key is not trusted"
+              : "role tokens or evidence ingest secrets are not fully configured",
     evidenceEventId: null,
   };
 }
 
 function replaySummaryCapGate(ctx: ServiceCtx, sessionId: string): ClaimReadinessGate {
-  const errors = replaySummaryCapErrors(ctx, sessionId);
+  const errors = replayPagedIntegrityErrors(ctx, sessionId);
   return {
-    gateId: "replay_summary_cap",
-    label: "Replay summary cap",
+    gateId: "replay_paged_integrity",
+    label: "Paged replay integrity",
     status: errors.length === 0 ? "pass" : "blocked",
     blocks: ["winnerClaimAllowed"],
     reason:
       errors.length === 0
-        ? "replay summary collections fit the current verifier cap"
-        : `replay summary exceeds verifier cap: ${errors.join("; ")}`,
+        ? "replay page index covers all replay collections"
+        : `replay page integrity failed: ${errors.join("; ")}`,
     evidenceEventId: null,
   };
 }
 
 function judgeGate(rowsById: Map<string, JudgeCheckView["rows"][number]>, rowId: string, blocks: ClaimGateBlock[]): ClaimReadinessGate {
   const row = rowsById.get(rowId);
-  const pass = row?.status === "pass" && (row.authority === "proof" || row.authority === "delivery");
+  const allowedAuthorities = judgeRowAllowedAuthorities(rowId);
+  const pass = row?.status === "pass" && allowedAuthorities.has(row.authority);
+  const allowedAuthorityText = [...allowedAuthorities].join(" or ");
   return {
     gateId: `judge_${rowId}`,
     label: row?.label ?? rowId,
     status: pass ? "pass" : row?.status === "blocked" ? "blocked" : "pending",
     blocks,
-    reason: pass ? `${rowId} Judge Check row passes with ${row.authority} authority` : row?.reason ?? `${rowId} Judge Check row is missing`,
+    reason: pass
+      ? `${rowId} Judge Check row passes with ${row.authority} authority`
+      : row?.status === "pass"
+        ? `${rowId} Judge Check row must pass with ${allowedAuthorityText} authority`
+        : row?.reason ?? `${rowId} Judge Check row is missing`,
     evidenceEventId: row?.evidenceEventId ?? null,
   };
+}
+
+function judgeRowAllowedAuthorities(rowId: string): Set<string> {
+  return rowId === "artifact_access" || rowId === "lease_execution" ? new Set(["delivery", "proof"]) : new Set(["proof"]);
 }
 
 function eventGate(
@@ -5251,6 +5929,208 @@ function eventGate(
   };
 }
 
+async function cawIdentityLiveRecheckGate(ctx: ServiceCtx, event: EvidenceEvent | null): Promise<ClaimReadinessGate> {
+  const blocks: ClaimGateBlock[] = ["identityMode", "winnerClaimAllowed"];
+  if (!event) {
+    return {
+      gateId: "caw_identity_live_recheck",
+      label: "CAW identity live recheck",
+      status: "pending",
+      blocks,
+      reason: "CAW identity live recheck waits for a passing identity probe",
+      evidenceEventId: null,
+    };
+  }
+  const payload = eventPayload(event);
+  const walletId = typeof payload.walletId === "string" ? payload.walletId : "";
+  const expectedResponseHash = optionalHex32(payload.responseHash);
+  if (!walletId || !expectedResponseHash) {
+    return {
+      gateId: "caw_identity_live_recheck",
+      label: "CAW identity live recheck",
+      status: "blocked",
+      blocks,
+      reason: "CAW identity proof is missing walletId or responseHash",
+      evidenceEventId: event.eventId,
+    };
+  }
+  try {
+    const response = await ctx.cawLive.getWallet(walletId);
+    const addressResponse = await ctx.cawLive.listWalletAddresses(walletId);
+    const wallet = cawWalletRecord(response);
+    const expectedWalletAddress = typeof payload.walletAddress === "string" ? payload.walletAddress.toLowerCase() : null;
+    const walletAddress = cawWalletAddress(wallet) ?? cawWalletAddressFromAddressList(addressResponse, expectedWalletAddress ?? undefined);
+    const status = String(wallet.status ?? wallet.state ?? "").toLowerCase();
+    const active = ["active", "enabled", "ready", "available"].includes(status) || wallet.active === true;
+    const currentWalletId = String(wallet.id ?? wallet.wallet_id ?? walletId);
+    const walletIdMatches = currentWalletId === walletId;
+    const addressMatches =
+      !expectedWalletAddress || (typeof walletAddress === "string" && walletAddress.toLowerCase() === expectedWalletAddress);
+    const pass = active && walletIdMatches && addressMatches;
+    return {
+      gateId: "caw_identity_live_recheck",
+      label: "CAW identity live recheck",
+      status: pass ? "pass" : "blocked",
+      blocks,
+      reason: pass
+        ? "CAW live wallet identity still matches the stored wallet proof"
+        : "CAW live wallet identity no longer matches the stored proof",
+      evidenceEventId: event.eventId,
+    };
+  } catch (error) {
+    return {
+      gateId: "caw_identity_live_recheck",
+      label: "CAW identity live recheck",
+      status: "pending",
+      blocks,
+      reason: cawLiveFailureMessage("CAW identity live recheck failed", error),
+      evidenceEventId: event.eventId,
+    };
+  }
+}
+
+async function cawRawReceiptsLiveRecheckGate(
+  ctx: ServiceCtx,
+  sessionId: string,
+  bundle: ReplayBundleView,
+  event: EvidenceEvent | null,
+  requestId: string,
+): Promise<ClaimReadinessGate> {
+  const blocks: ClaimGateBlock[] = ["claimMode", "paymentMode", "winnerClaimAllowed"];
+  if (!event) {
+    return {
+      gateId: "caw_raw_receipts_live_recheck",
+      label: "CAW raw receipts live recheck",
+      status: "pending",
+      blocks,
+      reason: "CAW raw receipt live recheck waits for raw CAW receipt ingest",
+      evidenceEventId: null,
+    };
+  }
+  const targets = cawRawReceiptLiveRecheckTargets(ctx, sessionId, bundle);
+  if (targets.missing.length > 0) {
+    return {
+      gateId: "caw_raw_receipts_live_recheck",
+      label: "CAW raw receipts live recheck",
+      status: "pending",
+      blocks,
+      reason: `CAW raw receipt live recheck waits for ${targets.missing.join(", ")}`,
+      evidenceEventId: event.eventId,
+    };
+  }
+  for (const target of targets.targets) {
+    try {
+      await fetchAndValidateCawRawBundle(ctx, {
+        requestId,
+        sessionId,
+        sourceLabel: target.receipt.sourceLabel,
+        operationId: target.receipt.operationId,
+        expectedReceipts: [target.rawReceipt],
+        operation: target.operation,
+      });
+    } catch (error) {
+      const apiError = toApiError(error, requestId);
+      const blocked = apiError.code !== "proof_pending";
+      return {
+        gateId: "caw_raw_receipts_live_recheck",
+        label: "CAW raw receipts live recheck",
+        status: blocked ? "blocked" : "pending",
+        blocks,
+        reason: blocked
+          ? `CAW current raw receipt export no longer contains the stored ${target.label} receipt`
+          : cawFailureMessage("CAW raw receipt live recheck failed", error),
+        evidenceEventId: event.eventId,
+      };
+    }
+  }
+  return {
+    gateId: "caw_raw_receipts_live_recheck",
+    label: "CAW raw receipts live recheck",
+    status: "pass",
+    blocks,
+    reason: "current CAW export still contains the stored deny_probe, approve, and activate_tool raw receipts",
+    evidenceEventId: event.eventId,
+  };
+}
+
+function cawRawReceiptLiveRecheckTargets(
+  ctx: ServiceCtx,
+  sessionId: string,
+  bundle: ReplayBundleView,
+): {
+  targets: Array<{
+    label: string;
+    receipt: ReplayBundleView["canonicalCawReceipts"][number];
+    rawReceipt: Record<string, JsonValue>;
+    operation: Row;
+  }>;
+  missing: string[];
+} {
+  const canonicalReceipts = replayBundleRowsForCollection<ReplayBundleView["canonicalCawReceipts"][number]>(bundle, "canonicalCawReceipts");
+  const rawBundles = replayBundleRowsForCollection<ReplayBundleView["rawCawReceiptBundles"][number]>(bundle, "rawCawReceiptBundles");
+  const required: Array<{
+    label: string;
+    operationKind: "deny_probe" | "approve" | "activate_tool";
+    effect: "allow" | "deny";
+  }> = [
+    { label: "deny_probe deny", operationKind: "deny_probe", effect: "deny" },
+    { label: "approve allow", operationKind: "approve", effect: "allow" },
+    { label: "activate_tool allow", operationKind: "activate_tool", effect: "allow" },
+  ];
+  const targets: Array<{
+    label: string;
+    receipt: ReplayBundleView["canonicalCawReceipts"][number];
+    rawReceipt: Record<string, JsonValue>;
+    operation: Row;
+  }> = [];
+  const missing: string[] = [];
+  for (const spec of required) {
+    const receipt = canonicalReceipts.find(
+      (candidate) =>
+        candidate.operationKind === spec.operationKind &&
+        candidate.effect === spec.effect &&
+        (candidate.sourceLabel === "caw-api" || candidate.sourceLabel === "caw-export") &&
+        (spec.effect !== "allow" || Boolean(candidate.txHash)),
+    );
+    if (!receipt) {
+      missing.push(`${spec.label} canonical receipt`);
+      continue;
+    }
+    const rawBundle = rawBundles.find(
+      (candidate) =>
+        candidate.bundleId === receipt.bundleId &&
+        candidate.operationId === receipt.operationId &&
+        candidate.sourceLabel === receipt.sourceLabel,
+    );
+    if (!rawBundle) {
+      missing.push(`${spec.label} raw bundle`);
+      continue;
+    }
+    const rawReceipt = cawBundleReceipts(rawBundle.rawBundle).find((candidate) => hashJson(candidate) === receipt.rawReceiptHash.toLowerCase());
+    if (!rawReceipt) {
+      missing.push(`${spec.label} raw receipt`);
+      continue;
+    }
+    const operation = ctx.db.sqlite
+      .prepare(
+        `SELECT operation_id, session_id, operation_kind, target, selector, request_json, receipt_bundle_hash, status
+         FROM caw_receipt_operations
+         WHERE session_id = ? AND operation_id = ?`,
+      )
+      .get(sessionId, receipt.operationId) as Row | undefined;
+    if (!operation) {
+      missing.push(`${spec.label} operation`);
+      continue;
+    }
+    if (operation.status !== CAW_STRUCTURAL_AUTHORITY_STATUS || operation.receipt_bundle_hash !== rawBundle.rawBundleHash) {
+      missing.push(`${spec.label} structurally verified operation`);
+      continue;
+    }
+    targets.push({ label: spec.label, receipt, rawReceipt, operation });
+  }
+  return { targets, missing };
+}
+
 function verifierGate(gateId: string, label: string, pass: boolean, blocks: ClaimGateBlock[], reason: string): ClaimReadinessGate {
   return {
     gateId,
@@ -5269,13 +6149,30 @@ function isWrongTargetDenyPayload(payload: Record<string, unknown>): boolean {
 }
 
 function hasLiveArtifactQuote(replayBundle: unknown): boolean {
-  const quotes = Array.isArray((replayBundle as { quotes?: unknown })?.quotes) ? (replayBundle as { quotes: unknown[] }).quotes : [];
+  const quotes = replayBundleRowsForCollection<unknown>(replayBundle, "quotes");
   return quotes.some((quote) => {
     if (!quote || typeof quote !== "object" || Array.isArray(quote)) {
       return false;
     }
     return (quote as { status?: unknown }).status === CHAIN_SETTLEABLE_QUOTE_STATUS;
   });
+}
+
+function replayBundleRowsForCollection<T>(bundle: unknown, collection: ReplayCollectionName): T[] {
+  const record = bundle && typeof bundle === "object" && !Array.isArray(bundle) ? (bundle as Record<string, unknown>) : {};
+  const pagesRecord =
+    record.replayPages && typeof record.replayPages === "object" && !Array.isArray(record.replayPages)
+      ? (record.replayPages as Record<string, unknown>)
+      : {};
+  const pages = pagesRecord[collection];
+  if (Array.isArray(pages)) {
+    return pages.flatMap((page) => {
+      const rows = page && typeof page === "object" && !Array.isArray(page) ? (page as { rows?: unknown }).rows : undefined;
+      return Array.isArray(rows) ? (rows as T[]) : [];
+    });
+  }
+  const rows = record[collection];
+  return Array.isArray(rows) ? (rows as T[]) : [];
 }
 
 function tokenTargetMode(event: EvidenceEvent | null): "official-testnet-usdc" | "mock-test-token" | null {
@@ -5291,6 +6188,16 @@ function tokenModeForPaymentToken(paymentToken: string): "official-testnet-usdc"
     return "official-testnet-usdc";
   }
   return normalized ? "mock-test-token" : null;
+}
+
+function tokenSettlementClaimForTokenMode(tokenMode: unknown): TokenSettlementClaim | null {
+  if (tokenMode === "official-testnet-usdc") {
+    return "official-testnet-usdc";
+  }
+  if (tokenMode === "mock-test-token") {
+    return "live-mock-erc20-fallback";
+  }
+  return null;
 }
 
 async function tokenDeploymentRegistryGate(ctx: ServiceCtx, tokenDelta: EvidenceEvent | null): Promise<ClaimReadinessGate> {
@@ -5495,14 +6402,15 @@ function isLiveChainProofPayload(payload: Record<string, unknown>): boolean {
 }
 
 function cawRawReceiptCoverage(bundle: ReplayBundleView): { pass: boolean; reason: string } {
-  const rawBundles = bundle.rawCawReceiptBundles.filter(
+  const rawBundles = replayBundleRowsForCollection<ReplayBundleView["rawCawReceiptBundles"][number]>(bundle, "rawCawReceiptBundles").filter(
     (row) => (row.sourceLabel === "caw-api" || row.sourceLabel === "caw-export") && row.receiptCount > 0,
   );
-  if (rawBundles.length === 0 || bundle.canonicalCawReceipts.length === 0) {
+  const canonicalReceipts = replayBundleRowsForCollection<ReplayBundleView["canonicalCawReceipts"][number]>(bundle, "canonicalCawReceipts");
+  if (rawBundles.length === 0 || canonicalReceipts.length === 0) {
     return { pass: false, reason: "missing raw and canonical CAW receipts for deny_probe, approve, and activate_tool" };
   }
   const hasReceipt = (operationKind: "deny_probe" | "approve" | "activate_tool", effect: "allow" | "deny") =>
-    bundle.canonicalCawReceipts.some(
+    canonicalReceipts.some(
       (receipt) =>
         receipt.operationKind === operationKind &&
         receipt.effect === effect &&
@@ -5542,11 +6450,17 @@ function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: C
     if (gate.gateId === "caw_identity_probe") {
       inputs.add("live CAW identity probe evidence with mode=real and same-wallet semantics");
     }
+    if (gate.gateId === "caw_identity_live_recheck") {
+      inputs.add("CAW live wallet recheck matching the stored identity response hash");
+    }
     if (gate.gateId === "caw_wrong_target_deny") {
       inputs.add("real CAW wrong-target deny request id or audit receipt");
     }
     if (gate.gateId === "caw_raw_receipts") {
       inputs.add("raw CAW API/export receipts canonicalized for deny_probe, approve, and activate_tool");
+    }
+    if (gate.gateId === "caw_raw_receipts_live_recheck") {
+      inputs.add("current CAW API/export source still returning the stored deny_probe, approve, and activate_tool receipt rows");
     }
     if (gate.gateId === "token_balance_delta") {
       inputs.add("public ERC20 token tx/log/balance evidence for the finalized settlement");
@@ -5559,11 +6473,11 @@ function claimReadinessExternalInputs(providers: ProofProviderStatus[], gates: C
     }
     if (gate.gateId === "production_security") {
       inputs.add(
-        "PACTFUSE_OPERATOR_TOKEN, PACTFUSE_CAW_INGEST_TOKEN, PACTFUSE_MCP_AUDIT_TOKEN, PACTFUSE_GATE_INGEST_TOKEN, and PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=false",
+        "PACTFUSE_OPERATOR_TOKEN, PACTFUSE_CAW_INGEST_TOKEN, PACTFUSE_MCP_AUDIT_TOKEN, PACTFUSE_GATE_INGEST_TOKEN, PACTFUSE_PROOF_SIGNING_PRIVATE_KEY_PEM/PATH, PACTFUSE_TRUSTED_PROOF_KEY_HASHES, PACTFUSE_ALLOW_INSECURE_MISSING_ROLE_TOKENS=false, and PACTFUSE_ALLOW_INSECURE_PUBLIC_EVIDENCE_URLS=false",
       );
     }
-    if (gate.gateId === "replay_summary_cap") {
-      inputs.add("full paged replay verifier support or a new live session whose proof collections fit the current summary cap");
+    if (gate.gateId === "replay_paged_integrity") {
+      inputs.add("valid paged replay index and embedded replay pages covering every proof collection");
     }
     if (gate.gateId === "final_verifier_complete" || gate.gateId === "proof_chip_allowed" || gate.gateId === "verifier_winner_claim") {
       inputs.add("full chain/signature/hash verifier that can set finalVerifierComplete=true");
@@ -5579,7 +6493,7 @@ export async function readProofProviderStatus(ctx: ServiceCtx): Promise<ProofPro
     proofProviderStatusOrBlocked("caw_live", () => ctx.cawLive.status()),
     proofProviderStatusOrBlocked("mcp_lease", () => ctx.mcpLease.status()),
   ]);
-  return [chain, caw, cawLive, mcpLease];
+  return [chain, caw, cawLive, mcpLease].map(sanitizeProofProviderStatus);
 }
 
 async function proofProviderStatusOrBlocked(
@@ -5601,8 +6515,23 @@ async function proofProviderStatusOrBlocked(
 function redactProofProviderStatus(provider: ProofProviderStatus): ProofBundleProviderStatusView {
   return {
     ...provider,
+    reason: redactPublicEvidenceText(provider.reason),
     endpoint: redactEndpoint(provider.endpoint),
   };
+}
+
+function sanitizeProofProviderStatus(provider: ProofProviderStatus): ProofProviderStatus {
+  const sanitized: ProofProviderStatus = {
+    ...provider,
+    reason: redactPublicEvidenceText(provider.reason),
+  };
+  const endpoint = redactEndpoint(provider.endpoint);
+  if (endpoint) {
+    sanitized.endpoint = endpoint;
+  } else {
+    delete sanitized.endpoint;
+  }
+  return sanitized;
 }
 
 function redactEndpoint(endpoint: string | undefined): string | null {
@@ -5615,11 +6544,102 @@ function redactEndpoint(endpoint: string | undefined): string | null {
     url.password = "";
     url.search = "";
     url.hash = "";
+    url.pathname = "/";
     return url.toString();
   } catch {
-    const [redacted] = endpoint.split(/[?#]/);
-    return redacted || endpoint;
+    return "[redacted-endpoint]";
   }
+}
+
+function redactPublicEvidenceText(input: string): string {
+  return input
+    .replace(/https?:\/\/[^\s"'<>]+/gi, (match) => redactEndpoint(match) ?? "[redacted-endpoint]")
+    .replace(/\b(authorization\s*:\s*bearer\s+)[^\s,;]+/gi, "$1[redacted]")
+    .replace(/\b(bearer\s+)[^\s,;]+/gi, "$1[redacted]")
+    .replace(/\b(api[-_ ]?key|token|secret|password|passwd)(\s*[=:]\s*)[^\s,;]+/gi, "$1$2[redacted]");
+}
+
+function assertPublicReplayUrl(
+  value: string,
+  requestId: string,
+  label: string,
+  options: { allowInsecureTestUrls?: boolean } = {},
+): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw Object.assign(new Error(`${label} must be a valid URL`), {
+      apiError: proofBlockedError(requestId, `${label} must be a valid URL`),
+    });
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw Object.assign(new Error(`${label} must use HTTP or HTTPS`), {
+      apiError: proofBlockedError(requestId, `${label} must use HTTP or HTTPS`),
+    });
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw Object.assign(new Error(`${label} must not contain credentials, query strings, or fragments`), {
+      apiError: proofBlockedError(requestId, `${label} must not contain credentials, query strings, or fragments`, {
+        reason: "this URL is published in replay/proof-bundle evidence",
+      }),
+    });
+  }
+  if (!options.allowInsecureTestUrls && !isPublicReplayHostname(url.hostname)) {
+    throw Object.assign(new Error(`${label} must use a public hostname`), {
+      apiError: proofBlockedError(requestId, `${label} must use a public hostname`, {
+        reason: "public replay/proof-bundle evidence must not contain localhost, private, reserved, or internal hostnames",
+      }),
+    });
+  }
+}
+
+function isPublicReplayHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".test") ||
+    host.endsWith(".local") ||
+    host.endsWith(".lan") ||
+    host.endsWith(".internal")
+  ) {
+    return false;
+  }
+  if (host.includes(":")) {
+    return false;
+  }
+  if (isPrivateOrReservedIpv4(host)) {
+    return false;
+  }
+  return host.includes(".");
+}
+
+function isPrivateOrReservedIpv4(host: string): boolean {
+  const parts = host.split(".");
+  if (parts.length !== 4) {
+    return false;
+  }
+  const octets = parts.map((part) => Number(part));
+  if (octets.some((octet, index) => !Number.isInteger(octet) || octet < 0 || octet > 255 || String(octet) !== parts[index])) {
+    return false;
+  }
+  const a = octets[0] ?? -1;
+  const b = octets[1] ?? -1;
+  const c = octets[2] ?? -1;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && c === 2) ||
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113) ||
+    a >= 224
+  );
 }
 
 export async function readJudgeCheck(sessionId: string, ctx: ServiceCtx): Promise<ServiceResult<JudgeCheckView>> {
@@ -5652,29 +6672,32 @@ export async function assembleReplayBundle(sessionId: string, ctx: ServiceCtx): 
 }
 
 function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx, options: ReplaySnapshotOptions = {}): ReplayBundleView {
+  const snapshotOptions: ReplaySnapshotOptions = { redactArtifactPayloads: true, ...options };
   const events = listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT).filter((event) =>
-    options.asOfEventSeq === undefined ? true : event.eventSeq <= options.asOfEventSeq,
+    snapshotOptions.asOfEventSeq === undefined ? true : event.eventSeq <= snapshotOptions.asOfEventSeq,
   );
-  const mcpAdapterCalls = listMcpAdapterCalls(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const mcpAdapterCalls = listMcpAdapterCalls(ctx, sessionId, REPLAY_SUMMARY_LIMIT, 0, snapshotOptions);
   const sources = listSources(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const spends = listSpends(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const artifactPreflights = listArtifactPreflights(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const quotes = listQuotes(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
-  const artifactAccessTokens = listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
+  const artifactAccessTokens = listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT, 0, snapshotOptions);
   const cawReceiptOperations = listCawReceiptOperations(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const cawLiveInteractions = listCawLiveInteractions(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const rawCawReceiptBundles = listRawCawReceiptBundles(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const canonicalCawReceipts = listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
   const leaseRuns = listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT);
-  const agentTranscript = buildAgentTranscriptData(sessionId, ctx, mcpAdapterCalls.length);
-  const deploymentRegistry = options.deploymentRegistry ?? ctx.deploymentRegistry ?? null;
-  const replayPageIndex = replayPageIndexFor(ctx, sessionId, options);
+  const asOfMcpAdapterCallCount = replayCollectionRowCount(ctx, sessionId, "mcpAdapterCalls", snapshotOptions);
+  const agentTranscript = buildAgentTranscriptData(sessionId, ctx, asOfMcpAdapterCallCount, snapshotOptions);
+  const deploymentRegistry = snapshotOptions.deploymentRegistry ?? ctx.deploymentRegistry ?? null;
+  const replayPageIndex = replayPageIndexFor(ctx, sessionId, snapshotOptions);
+  const asOfEventSeq = snapshotOptions.asOfEventSeq ?? latestEventSeqForReplay(ctx, sessionId);
   return ReplayBundleViewSchema.parse({
     bundleType: "PACTFUSE_EVIDENCE_V1",
     sessionId,
     summaryMode: true,
-    asOfEventSeq: events.at(-1)?.eventSeq ?? 0,
-    asOfMcpAdapterCallCount: mcpAdapterCalls.length,
+    asOfEventSeq,
+    asOfMcpAdapterCallCount,
     winnerClaimAllowed: false,
     eventRoot: hashJson(events.map((event) => event.eventHash)),
     agentTranscriptHash: hashJson(agentTranscript),
@@ -5695,7 +6718,7 @@ function assembleReplayBundleData(sessionId: string, ctx: ServiceCtx, options: R
     leaseRuns,
     judgeCheck: readJudgeCheckData(sessionId, ctx),
     replayPageIndex,
-    replayPages: replayPagesFor(ctx, sessionId, replayPageIndex, options),
+    replayPages: replayPagesFor(ctx, sessionId, replayPageIndex, snapshotOptions),
   });
 }
 
@@ -5745,8 +6768,13 @@ export async function readAgentTranscript(sessionId: string, ctx: ServiceCtx): P
   };
 }
 
-function buildAgentTranscriptData(sessionId: string, ctx: ServiceCtx, callLimit = 200): unknown {
-  const calls = listMcpAdapterCalls(ctx, sessionId, Math.min(callLimit, 200));
+function buildAgentTranscriptData(
+  sessionId: string,
+  ctx: ServiceCtx,
+  callLimit = replayCollectionRowCount(ctx, sessionId, "mcpAdapterCalls"),
+  options: ReplaySnapshotOptions = {},
+): unknown {
+  const calls = callLimit > 0 ? listMcpAdapterCalls(ctx, sessionId, callLimit, 0, options) : [];
   const callSummaries = calls.map((call) => ({
     callId: call.callId,
     auditNonce: call.auditNonce,
@@ -5789,7 +6817,7 @@ function agentTranscriptBoundedToPinnedManifest(
   sessionId: string,
   calls: ReturnType<typeof listMcpAdapterCalls>,
 ): boolean {
-  const successfulLeases = listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT).filter((lease) => lease.status === "succeeded_live_mcp_transcript");
+  const successfulLeases = listAllLeaseRuns(ctx, sessionId).filter((lease) => lease.status === "succeeded_live_mcp_transcript");
   const successfulLeaseCount = countRows(ctx, "lease_runs", "session_id = ? AND status = 'succeeded_live_mcp_transcript'", [sessionId]);
   if (successfulLeaseCount === 0) {
     return false;
@@ -5903,12 +6931,13 @@ export async function readReplayPage(
   if (!Number.isInteger(pageIndex) || pageIndex < 0) {
     return { ok: false, requestId, error: badRequestError(requestId, "replay page must be a non-negative integer") };
   }
-  const totalRows = replayCollectionRowCount(ctx, sessionId, input.collection);
+  const snapshotOptions: ReplaySnapshotOptions = { redactArtifactPayloads: true };
+  const totalRows = replayCollectionRowCount(ctx, sessionId, input.collection, snapshotOptions);
   const pageCount = Math.ceil(totalRows / REPLAY_SUMMARY_LIMIT);
   if (pageIndex >= pageCount) {
     return { ok: false, requestId, error: badRequestError(requestId, "replay page is out of range") };
   }
-  const data = replayPageData(ctx, sessionId, input.collection, pageIndex);
+  const data = replayPageData(ctx, sessionId, input.collection, pageIndex, snapshotOptions);
   return { ok: true, requestId, data };
 }
 
@@ -5931,6 +6960,11 @@ function replayPageHash(sessionId: string, collection: ReplayCollectionName, pag
   return hashJson({ sessionId, collection, pageIndex, pageSize: REPLAY_SUMMARY_LIMIT, orderBy, rows });
 }
 
+function latestEventSeqForReplay(ctx: ServiceCtx, sessionId: string): number {
+  const row = ctx.db.sqlite.prepare("SELECT latest_event_seq FROM sessions WHERE session_id = ?").get(sessionId) as Row | undefined;
+  return row ? Number(row.latest_event_seq ?? 0) : 0;
+}
+
 function isReplayCollectionName(value: string): value is ReplayCollectionName {
   return (REPLAY_COLLECTION_NAMES as string[]).includes(value);
 }
@@ -5951,9 +6985,9 @@ function replayCollectionRows(ctx: ServiceCtx, sessionId: string, collection: Re
     case "quotes":
       return listQuotes(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
     case "artifactAccessTokens":
-      return listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+      return listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset, options);
     case "mcpAdapterCalls":
-      return listMcpAdapterCalls(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
+      return listMcpAdapterCalls(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset, options);
     case "cawReceiptOperations":
       return listCawReceiptOperations(ctx, sessionId, REPLAY_SUMMARY_LIMIT, offset);
     case "cawLiveInteractions":
@@ -6428,48 +7462,70 @@ async function withIdempotencyUnlocked<T>(
     transactionOpen = true;
     const existing = ctx.db.sqlite
       .prepare(
-        `SELECT request_id, request_hash, response_json, status
+        `SELECT request_id, request_hash, response_json, status, created_at
          FROM api_requests
          WHERE action_scope = ? AND idempotency_key = ?`,
       )
       .get(actionScope, idempotencyKey) as Row | undefined;
     if (existing) {
+      const sameRequest = existing.request_hash === requestHash;
+      const status = String(existing.status ?? "completed");
+      if (sameRequest && status !== "completed" && idempotencyPendingStale(existing, ctx.clock.now())) {
+        ctx.db.sqlite
+          .prepare(
+            `UPDATE api_requests
+             SET request_id = ?, response_json = ?, status = 'pending', created_at = ?
+             WHERE action_scope = ? AND idempotency_key = ? AND request_hash = ? AND status != 'completed'`,
+          )
+          .run(
+            requestId,
+            JSON.stringify(pendingIdempotencyResponse(requestId)),
+            ctx.clock.now().toISOString(),
+            actionScope,
+            idempotencyKey,
+            requestHash,
+          );
+        ctx.db.sqlite.exec("COMMIT");
+        transactionOpen = false;
+      } else {
+        ctx.db.sqlite.exec("COMMIT");
+        transactionOpen = false;
+        if (sameRequest && status === "completed") {
+          return JSON.parse(String(existing.response_json)) as ServiceResult<T>;
+        }
+        if (sameRequest) {
+          const completed = await waitForCompletedIdempotency<T>(ctx, actionScope, idempotencyKey, requestHash);
+          if (completed) {
+            return completed;
+          }
+          const pendingRequestId = newRequestId("idem_pending");
+          return {
+            ok: false,
+            requestId: pendingRequestId,
+            error: proofPendingError(pendingRequestId, "matching idempotent request is still running"),
+          };
+        }
+        const conflictRequestId = newRequestId("idem_conflict");
+        return { ok: false, requestId: conflictRequestId, error: conflictError(conflictRequestId) };
+      }
+    } else {
+      ctx.db.sqlite
+        .prepare(
+          `INSERT INTO api_requests
+            (request_id, action_scope, idempotency_key, request_hash, response_json, status, created_at)
+           VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+        )
+        .run(
+          requestId,
+          actionScope,
+          idempotencyKey,
+          requestHash,
+          JSON.stringify(pendingIdempotencyResponse(requestId)),
+          ctx.clock.now().toISOString(),
+        );
       ctx.db.sqlite.exec("COMMIT");
       transactionOpen = false;
-      if (existing.request_hash === requestHash && String(existing.status ?? "completed") === "completed") {
-        return JSON.parse(String(existing.response_json)) as ServiceResult<T>;
-      }
-      if (existing.request_hash === requestHash) {
-        const completed = await waitForCompletedIdempotency<T>(ctx, actionScope, idempotencyKey, requestHash);
-        if (completed) {
-          return completed;
-        }
-        const pendingRequestId = newRequestId("idem_pending");
-        return {
-          ok: false,
-          requestId: pendingRequestId,
-          error: proofPendingError(pendingRequestId, "matching idempotent request is still running"),
-        };
-      }
-      const conflictRequestId = newRequestId("idem_conflict");
-      return { ok: false, requestId: conflictRequestId, error: conflictError(conflictRequestId) };
     }
-    ctx.db.sqlite
-      .prepare(
-        `INSERT INTO api_requests
-          (request_id, action_scope, idempotency_key, request_hash, response_json, status, created_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
-      )
-      .run(
-        requestId,
-        actionScope,
-        idempotencyKey,
-        requestHash,
-        JSON.stringify(pendingIdempotencyResponse(requestId)),
-        ctx.clock.now().toISOString(),
-      );
-    ctx.db.sqlite.exec("COMMIT");
-    transactionOpen = false;
   } catch (error) {
     if (transactionOpen) {
       ctx.db.sqlite.exec("ROLLBACK");
@@ -6484,9 +7540,10 @@ async function withIdempotencyUnlocked<T>(
     result = { ok: false, requestId, error: toApiError(error, requestId) };
   }
   if (shouldPersistIdempotencyResult(result)) {
+    const persistedResult = persistedIdempotencyResult(actionScope, result);
     ctx.db.sqlite
       .prepare("UPDATE api_requests SET response_json = ?, status = 'completed' WHERE request_id = ? AND status = 'pending'")
-      .run(JSON.stringify(result), requestId);
+      .run(JSON.stringify(persistedResult), requestId);
   } else {
     ctx.db.sqlite.prepare("DELETE FROM api_requests WHERE request_id = ? AND status = 'pending'").run(requestId);
   }
@@ -6528,6 +7585,30 @@ function pendingIdempotencyResponse(requestId: string): ServiceResult<never> {
 
 function shouldPersistIdempotencyResult<T>(result: ServiceResult<T>): boolean {
   return result.ok || (!result.error.retryable && result.error.code !== "internal_error");
+}
+
+function idempotencyPendingStale(row: Row, now: Date): boolean {
+  if (String(row.status ?? "completed") === "completed") {
+    return false;
+  }
+  const createdAt = typeof row.created_at === "string" ? Date.parse(row.created_at) : Number.NaN;
+  return Number.isFinite(createdAt) && now.getTime() - createdAt >= IDEMPOTENCY_PENDING_STALE_MS;
+}
+
+function persistedIdempotencyResult<T>(actionScope: string, result: ServiceResult<T>): ServiceResult<T> {
+  if (!result.ok || !actionScope.includes("artifacts:access-token:issue")) {
+    return result;
+  }
+  if (!result.data || typeof result.data !== "object" || Array.isArray(result.data) || !("accessToken" in result.data)) {
+    return result;
+  }
+  return {
+    ...result,
+    data: {
+      ...(result.data as Record<string, unknown>),
+      accessToken: null,
+    },
+  } as ServiceResult<T>;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -6601,7 +7682,7 @@ function assertProviderChainMatchesPayload(status: ProofProviderStatus, expected
       apiError: proofPendingError(requestId, `${purpose} provider did not report a chainId`),
     });
   }
-  if (status.chainId !== expectedChainId) {
+  if (!sameChainId(status.chainId, expectedChainId)) {
     throw Object.assign(new Error(`${purpose} chainId mismatch`), {
       apiError: proofBlockedError(requestId, `${purpose} chainId mismatch`, {
         expected: expectedChainId,
@@ -6609,6 +7690,18 @@ function assertProviderChainMatchesPayload(status: ProofProviderStatus, expected
       }),
     });
   }
+}
+
+function sameChainId(left: string, right: string): boolean {
+  return canonicalChainId(left) === canonicalChainId(right);
+}
+
+function canonicalChainId(chainId: string): string {
+  const normalized = chainId.trim().toUpperCase();
+  if (normalized === "TBASE_SETH") {
+    return "84532";
+  }
+  return normalized;
 }
 
 function assertIndexerCursorMatchesPayload(cursor: Row | undefined, payload: ChainIndexerBackfillPayload, requestId: string): void {
@@ -7133,30 +8226,232 @@ function cawReceiptMatchesOperation(
   receipt: Record<string, JsonValue>,
   input: { sessionId: string; operationId: string; operation: Row | undefined },
 ): boolean {
-  const operationId = asOptionalString(receipt.operationId ?? receipt.cawOperationId ?? receipt.requestId);
+  const operationId = cawReceiptRequestId(receipt);
   if (!operationId || operationId !== input.operationId) {
     return false;
   }
+  const coboAuditRow = cawReceiptIsCoboAuditRow(receipt);
   const sessionId = asOptionalString(receipt.sessionId);
-  if (!sessionId || sessionId !== input.sessionId) {
+  if ((!sessionId && !coboAuditRow) || (sessionId && sessionId !== input.sessionId)) {
     return false;
   }
-  const operationKind = asOptionalString(receipt.operationKind ?? receipt.kind);
-  if (!operationKind || operationKind !== String(input.operation?.operation_kind)) {
+  const operationKind = cawReceiptOperationKind(receipt, input.operation);
+  if ((!operationKind && !coboAuditRow) || (operationKind && operationKind !== String(input.operation?.operation_kind))) {
     return false;
   }
-  const target = asOptionalString(receipt.target);
+  const target = cawReceiptTarget(receipt);
   if (input.operation?.target && (!target || target.toLowerCase() !== String(input.operation.target).toLowerCase())) {
     return false;
   }
-  const selector = asOptionalString(receipt.selector);
+  const selector = cawReceiptSelector(receipt);
   if (input.operation?.selector && (!selector || selector.toLowerCase() !== String(input.operation.selector).toLowerCase())) {
     return false;
   }
   return true;
 }
 
+function cawReceiptRequest(receipt: Record<string, JsonValue>): Record<string, unknown> | null {
+  return objectChild(receipt as Record<string, unknown>, "request");
+}
+
+function cawReceiptAuthzDetails(receipt: Record<string, JsonValue>): Record<string, unknown> | null {
+  return (
+    objectChild(receipt as Record<string, unknown>, "authz_details") ??
+    objectChild(receipt as Record<string, unknown>, "authzDetails") ??
+    objectChild(receipt as Record<string, unknown>, "authorization") ??
+    objectChild(receipt as Record<string, unknown>, "authz")
+  );
+}
+
+function cawReceiptIsCoboAuditRow(receipt: Record<string, JsonValue>): boolean {
+  const action = asOptionalString(receipt.action)?.toLowerCase() ?? "";
+  return action.startsWith("contract_call.") && Boolean(cawReceiptRequest(receipt));
+}
+
+function cawReceiptRequestId(receipt: Record<string, JsonValue>): string | null {
+  const request = cawReceiptRequest(receipt);
+  return (
+    asOptionalString(receipt.operationId ?? receipt.cawOperationId ?? receipt.cawRequestId ?? receipt.requestId ?? receipt.request_id) ??
+    (request ? optionalStringFromRecord(request, ["request_id", "requestId", "caw_request_id", "cawRequestId"]) : null)
+  );
+}
+
+function cawReceiptOperationKind(receipt: Record<string, JsonValue>, operation: Row | undefined): string | null {
+  const raw = asOptionalString(receipt.operationKind ?? receipt.operation_kind ?? receipt.kind);
+  if (raw) {
+    return raw;
+  }
+  const action = asOptionalString(receipt.action)?.toLowerCase() ?? "";
+  if (action.includes("contract_call")) {
+    return operation ? String(operation.operation_kind) : null;
+  }
+  return null;
+}
+
+function cawReceiptTarget(receipt: Record<string, JsonValue>): string | null {
+  const request = cawReceiptRequest(receipt);
+  return (
+    asOptionalString(receipt.target ?? receipt.contractAddress ?? receipt.contract_addr) ??
+    (request ? optionalStringFromRecord(request, ["contract_addr", "contractAddress", "target", "targetAddress"]) : null)
+  );
+}
+
+function cawReceiptSelector(receipt: Record<string, JsonValue>): string | null {
+  const request = cawReceiptRequest(receipt);
+  const direct =
+    asOptionalString(receipt.selector ?? receipt.function_id ?? receipt.functionId) ??
+    (request ? optionalStringFromRecord(request, ["function_id", "functionId", "selector"]) : null);
+  if (direct) {
+    return direct.toLowerCase();
+  }
+  const calldata = request ? optionalStringFromRecord(request, ["calldata", "data"]) : null;
+  return calldata && /^0x[0-9a-fA-F]{8}/.test(calldata) ? calldata.slice(0, 10).toLowerCase() : null;
+}
+
+function cawReceiptWalletAddress(receipt: Record<string, JsonValue>): string | null {
+  const request = cawReceiptRequest(receipt);
+  return (
+    asOptionalString(receipt.walletAddress ?? receipt.wallet_address ?? receipt.wallet ?? receipt.owner ?? receipt.payer ?? receipt.agentWallet) ??
+    (request ? optionalStringFromRecord(request, ["src_addr", "sourceAddress", "wallet_address", "walletAddress", "owner"]) : null)
+  );
+}
+
+function cawReceiptCanonicalFallback(
+  receipt: Record<string, JsonValue>,
+  input: {
+    ctx: ServiceCtx;
+    sessionId: string;
+    operationId: string;
+    operation: Row | undefined;
+    requestId: string;
+  },
+  effect: "allow" | "deny",
+): {
+  walletAddress: string | null;
+  policyDigest: `0x${string}` | null;
+  paramsDigest: `0x${string}` | null;
+  requestId: string | null;
+  txHash: `0x${string}` | null;
+  txCount: string | null;
+  expiry: string | null;
+  target: string | null;
+  selector: string | null;
+} {
+  const operationKind = String(input.operation?.operation_kind ?? "");
+  if (!cawReceiptIsCoboAuditRow(receipt)) {
+    return {
+      walletAddress: null,
+      policyDigest: null,
+      paramsDigest: null,
+      requestId: null,
+      txHash: null,
+      txCount: null,
+      expiry: null,
+      target: null,
+      selector: null,
+    };
+  }
+  const request = cawReceiptRequest(receipt);
+  const authzDetails = cawReceiptAuthzDetails(receipt);
+  const requestId = cawReceiptRequestId(receipt);
+  const target = cawReceiptTarget(receipt) ?? asOptionalString(input.operation?.target);
+  const selector = cawReceiptSelector(receipt) ?? asOptionalString(input.operation?.selector);
+  const walletAddress = cawReceiptWalletAddress(receipt);
+  const events = listAllEvents(input.ctx, input.sessionId);
+  const auditUsage = latestCawAuditUsageEvent(events, requestId, operationKind);
+  const allowance = latestEventPayload(events, "caw.allowance.verified", (payload) => payload.cawRequestId === requestId);
+  const activation = latestEventPayload(events, "caw.activation.verified", (payload) => payload.cawRequestId === requestId);
+  const policyDigest =
+    optionalHex32(receipt.policyDigest) ??
+    optionalHex32(receipt.policy_digest) ??
+    optionalHex32(authzDetails?.policy_digest) ??
+    optionalHex32(auditUsage?.policyDigest) ??
+    optionalHex32(allowance?.auditPolicyDigest) ??
+    optionalHex32(activation?.auditPolicyDigest);
+  const txHash =
+    optionalHex32(receipt.txHash) ??
+    optionalHex32(receipt.tx_hash) ??
+    optionalHex32(receipt.transactionHash) ??
+    optionalHex32(receipt.transaction_hash) ??
+    optionalHex32(auditUsage?.txHash) ??
+    optionalHex32(allowance?.approveTxHash) ??
+    optionalHex32(activation?.activateTxHash);
+  const expiry =
+    asOptionalString(receipt.expiry ?? receipt.expiresAt ?? receipt.expires_at ?? receipt.expiration) ??
+    cawReceiptPolicyExpiry(events, auditUsage?.pactSyncEventId, policyDigest);
+  const txCount = asOptionalString(receipt.txCount ?? receipt.tx_count ?? receipt.policyTxCount ?? receipt.policy_tx_count) ?? (effect === "allow" ? "1" : "0");
+  const paramsDigest =
+    optionalHex32(receipt.paramsDigest) ??
+    optionalHex32(receipt.params_digest) ??
+    hashJson({
+      operationId: input.operationId,
+      operationKind,
+      request: normalizeChainJson(request ?? parseCawOperationRequest(input.operation as Row, input.requestId)),
+      target,
+      selector,
+    });
+  return {
+    walletAddress,
+    policyDigest,
+    paramsDigest,
+    requestId,
+    txHash,
+    txCount,
+    expiry,
+    target,
+    selector,
+  };
+}
+
+function latestCawAuditUsageEvent(events: EvidenceEvent[], requestId: string | null, operationKind: string): Record<string, unknown> | null {
+  if (!requestId || !operationKind) {
+    return null;
+  }
+  return latestEventPayload(
+    events,
+    "caw.live.audit.usage.verified",
+    (payload) => payload.cawRequestId === requestId && payload.operationKind === operationKind,
+  );
+}
+
+function latestEventPayload(
+  events: EvidenceEvent[],
+  kind: string,
+  predicate: (payload: Record<string, unknown>) => boolean,
+): Record<string, unknown> | null {
+  for (const event of [...events].reverse()) {
+    const payload = event.payload && typeof event.payload === "object" && !Array.isArray(event.payload) ? event.payload : null;
+    if (event.kind === kind && payload && predicate(payload as Record<string, unknown>)) {
+      return payload as Record<string, unknown>;
+    }
+  }
+  return null;
+}
+
+function cawReceiptPolicyExpiry(events: EvidenceEvent[], pactSyncEventId: unknown, policyDigest: `0x${string}` | null): string | null {
+  const syncEventId = asOptionalString(pactSyncEventId);
+  for (const event of [...events].reverse()) {
+    const payload = event.payload && typeof event.payload === "object" && !Array.isArray(event.payload) ? (event.payload as Record<string, unknown>) : null;
+    if (event.kind !== "caw.live.pact.synced" || !payload) {
+      continue;
+    }
+    const expiry = asOptionalString(payload.policyExpiry);
+    if (!expiry) {
+      continue;
+    }
+    if (syncEventId && event.eventId === syncEventId) {
+      return expiry;
+    }
+    const eventPolicyDigest = optionalHex32(payload.policyDigest);
+    if (policyDigest && eventPolicyDigest && eventPolicyDigest.toLowerCase() === policyDigest.toLowerCase()) {
+      return expiry;
+    }
+  }
+  return null;
+}
+
 function buildCanonicalCawReceipts(input: {
+  ctx: ServiceCtx;
   bundleId: `0x${string}`;
   sessionId: string;
   operationId: string;
@@ -7189,6 +8484,7 @@ function buildCanonicalCawReceipts(input: {
 function canonicalizeCawReceipt(
   receipt: Record<string, JsonValue>,
   input: {
+    ctx: ServiceCtx;
     bundleId: `0x${string}`;
     sessionId: string;
     operationId: string;
@@ -7200,26 +8496,45 @@ function canonicalizeCawReceipt(
   },
 ): CanonicalCawReceiptData {
   const effect = cawReceiptEffect(receipt, input.requestId);
-  const status = cawRequiredText(receipt.status ?? receipt.statusDisplay ?? receipt.status_display ?? receipt.result ?? receipt.effect, "status", input.requestId);
+  const fallback = cawReceiptCanonicalFallback(receipt, input, effect);
+  const status = cawCanonicalReceiptStatus(receipt, effect, input.requestId);
   const walletAddress = cawRequiredHex(
-    receipt.walletAddress ?? receipt.wallet_address ?? receipt.wallet ?? receipt.owner ?? receipt.payer ?? receipt.agentWallet,
+    receipt.walletAddress ?? receipt.wallet_address ?? receipt.wallet ?? receipt.owner ?? receipt.payer ?? receipt.agentWallet ?? fallback.walletAddress,
     "walletAddress",
     input.requestId,
   );
-  const policyDigest = cawRequiredHex32(receipt.policyDigest ?? receipt.policy_digest ?? receipt.cawPolicyDigest, "policyDigest", input.requestId);
+  const policyDigest = cawRequiredHex32(
+    receipt.policyDigest ?? receipt.policy_digest ?? receipt.cawPolicyDigest ?? fallback.policyDigest,
+    "policyDigest",
+    input.requestId,
+  );
   const paramsDigest = cawRequiredHex32(
-    receipt.paramsDigest ?? receipt.params_digest ?? receipt.requestDigest ?? receipt.request_digest ?? receipt.typedDataHash,
+    receipt.paramsDigest ?? receipt.params_digest ?? receipt.requestDigest ?? receipt.request_digest ?? receipt.typedDataHash ?? fallback.paramsDigest,
     "paramsDigest",
     input.requestId,
   );
-  const requestId = cawRequiredText(receipt.cawRequestId ?? receipt.requestId ?? receipt.request_id ?? receipt.id, "requestId", input.requestId);
-  const txCount = cawRequiredDecimal(receipt.txCount ?? receipt.tx_count ?? receipt.policyTxCount ?? receipt.policy_tx_count, "txCount", input.requestId);
-  const expiry = cawRequiredIso(receipt.expiry ?? receipt.expiresAt ?? receipt.expires_at ?? receipt.expiration, "expiry", input.requestId);
-  const target = input.operation?.target ? cawRequiredHex(receipt.target, "target", input.requestId) : cawOptionalHex(receipt.target, "target", input.requestId);
+  const requestId = cawRequiredText(receipt.cawRequestId ?? receipt.requestId ?? receipt.request_id ?? fallback.requestId, "requestId", input.requestId);
+  const txCount = cawRequiredDecimal(
+    receipt.txCount ?? receipt.tx_count ?? receipt.policyTxCount ?? receipt.policy_tx_count ?? fallback.txCount,
+    "txCount",
+    input.requestId,
+  );
+  const expiry = cawRequiredIso(
+    receipt.expiry ?? receipt.expiresAt ?? receipt.expires_at ?? receipt.expiration ?? fallback.expiry,
+    "expiry",
+    input.requestId,
+  );
+  const rawTarget = receipt.target ?? fallback.target;
+  const target = input.operation?.target ? cawRequiredHex(rawTarget, "target", input.requestId) : cawOptionalHex(rawTarget, "target", input.requestId);
+  const rawSelector = receipt.selector ?? fallback.selector;
   const selector = input.operation?.selector
-    ? cawRequiredSelector(receipt.selector, "selector", input.requestId)
-    : cawOptionalSelector(receipt.selector, "selector", input.requestId);
-  const txHash = cawOptionalHex32(receipt.txHash ?? receipt.tx_hash ?? receipt.transactionHash ?? receipt.transaction_hash, "txHash", input.requestId);
+    ? cawRequiredSelector(rawSelector, "selector", input.requestId)
+    : cawOptionalSelector(rawSelector, "selector", input.requestId);
+  const txHash = cawOptionalHex32(
+    receipt.txHash ?? receipt.tx_hash ?? receipt.transactionHash ?? receipt.transaction_hash ?? fallback.txHash,
+    "txHash",
+    input.requestId,
+  );
   if (effect === "allow" && !txHash) {
     throw Object.assign(new Error("canonical CAW allow receipt requires txHash"), {
       apiError: proofBlockedError(input.requestId, "canonical CAW allow receipt requires txHash"),
@@ -7343,6 +8658,18 @@ function cawReceiptEffect(receipt: Record<string, JsonValue>, requestId: string)
   throw Object.assign(new Error("canonical CAW receipt requires effect/result/status allow or deny"), {
     apiError: proofBlockedError(requestId, "canonical CAW receipt requires effect/result/status allow or deny"),
   });
+}
+
+function cawCanonicalReceiptStatus(receipt: Record<string, JsonValue>, effect: "allow" | "deny", requestId: string): string {
+  const raw = asOptionalString(receipt.status ?? receipt.statusDisplay ?? receipt.status_display ?? receipt.result ?? receipt.effect);
+  const value = raw?.toLowerCase();
+  if (effect === "allow" && (!value || ["allow", "allowed", "success", "succeeded", "executed", "confirmed", "completed"].includes(value))) {
+    return "succeeded";
+  }
+  if (effect === "deny" && (!value || ["deny", "denied", "blocked", "rejected", "policy_denied", "policydenied", "failed"].includes(value))) {
+    return "denied";
+  }
+  return cawRequiredText(raw, "status", requestId);
 }
 
 function cawRequiredText(value: unknown, field: string, requestId: string): string {
@@ -7977,7 +9304,7 @@ function requireCawActivationForBalanceDelta(
        ORDER BY created_at DESC, interaction_id DESC`,
     )
     .all(sessionId) as Row[];
-  const events = listEvents(ctx, sessionId, 0, 200).filter((event) => event.kind === "caw.live.contract_call.submitted");
+  const events = listAllEvents(ctx, sessionId).filter((event) => event.kind === "caw.live.contract_call.submitted");
   const eventsByInteractionId = new Map(
     events
       .map((event) => {
@@ -8014,7 +9341,7 @@ function requireCawActivationForBalanceDelta(
       String(request.selector ?? "").toLowerCase() !== PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR ||
       String(request.value ?? "") !== "0" ||
       String(request.payment_auth ?? "") !== "0x" ||
-      String(request.chain_id ?? "") !== settlement.chainId
+      !sameChainId(String(request.chain_id ?? ""), settlement.chainId)
     ) {
       continue;
     }
@@ -8167,6 +9494,77 @@ async function requireErc20TransferLogForBalanceDelta(
     topics: chainLogTopics(log.topics, requestId).map((topic) => topic.toLowerCase()),
     data: (optionalHex(log.data) ?? "0x").toLowerCase(),
   };
+}
+
+function erc20TransferLogBindingHash(input: {
+  chainId: string;
+  txHash: string;
+  blockNumber: number;
+  logIndex: number;
+  paymentToken: string;
+  transferRawLogHash: string;
+  transferTopics: string[];
+  transferData: string;
+}): `0x${string}` {
+  return hashJson({
+    mode: "erc20_transfer_log_binding_v1",
+    chainId: input.chainId,
+    txHash: input.txHash.toLowerCase(),
+    blockNumber: input.blockNumber,
+    logIndex: input.logIndex,
+    address: input.paymentToken.toLowerCase(),
+    rawLogHash: input.transferRawLogHash.toLowerCase(),
+    topics: input.transferTopics.map((topic) => topic.toLowerCase()),
+    data: input.transferData.toLowerCase(),
+  });
+}
+
+function tokenBalanceReadHash(input: {
+  chainId: string;
+  blockNumber: number;
+  preBlockNumber: number;
+  paymentToken: string;
+  agentWallet: string;
+  market: string;
+  amountAtomic: string;
+  agentWalletBefore: string;
+  agentWalletAfter: string;
+  marketBefore: string;
+  marketAfter: string;
+}): `0x${string}` {
+  return hashJson({
+    mode: "erc20_balance_read_v1",
+    chainId: input.chainId,
+    blockNumber: input.blockNumber,
+    preBlockNumber: input.preBlockNumber,
+    paymentToken: input.paymentToken.toLowerCase(),
+    agentWallet: input.agentWallet.toLowerCase(),
+    market: input.market.toLowerCase(),
+    amountAtomic: input.amountAtomic,
+    agentWalletBefore: input.agentWalletBefore,
+    agentWalletAfter: input.agentWalletAfter,
+    marketBefore: input.marketBefore,
+    marketAfter: input.marketAfter,
+  });
+}
+
+function tokenBalanceDeltaChainReadProofHash(input: {
+  chainProviderMode: string;
+  chainProviderEndpoint: string | null;
+  settlementEventId: string;
+  gateEventId: string;
+  transferLogBindingHash: string;
+  balanceReadHash: string;
+}): `0x${string}` {
+  return hashJson({
+    mode: "token_balance_delta_chain_read_proof_v1",
+    chainProviderMode: input.chainProviderMode,
+    chainProviderEndpoint: input.chainProviderEndpoint,
+    settlementEventId: input.settlementEventId,
+    gateEventId: input.gateEventId,
+    transferLogBindingHash: input.transferLogBindingHash.toLowerCase(),
+    balanceReadHash: input.balanceReadHash.toLowerCase(),
+  });
 }
 
 async function requireErc20ApprovalLogForAllowance(
@@ -10225,6 +11623,46 @@ function mcpLeaseFailureStage(error: unknown): string | null {
     : null;
 }
 
+async function mcpLeaseExecutionReadiness(
+  ctx: ServiceCtx,
+): Promise<
+  | { ready: true; provider: ProofProviderStatus }
+  | { ready: false; status: "blocked_missing_runner_execution" | "blocked_mcp_execution_failed"; reason: string }
+> {
+  let provider: ProofProviderStatus;
+  try {
+    provider = await ctx.mcpLease.status();
+  } catch (error) {
+    return {
+      ready: false,
+      status: "blocked_missing_runner_execution",
+      reason: error instanceof Error ? `lease MCP provider status check failed: ${error.message}` : "lease MCP provider status check failed",
+    };
+  }
+  if (provider.name !== "mcp_lease") {
+    return {
+      ready: false,
+      status: "blocked_mcp_execution_failed",
+      reason: `lease MCP provider returned unexpected provider name ${provider.name}`,
+    };
+  }
+  if (provider.mode !== "live") {
+    return {
+      ready: false,
+      status: "blocked_missing_runner_execution",
+      reason: `lease MCP provider must be live before recording succeeded_live_mcp_transcript; got ${provider.mode}: ${provider.reason}`,
+    };
+  }
+  if (provider.ready !== true) {
+    return {
+      ready: false,
+      status: "blocked_mcp_execution_failed",
+      reason: `lease MCP provider is not live-ready: ${provider.reason}`,
+    };
+  }
+  return { ready: true, provider };
+}
+
 function assertArtifactTokenUnusedForLease(ctx: ServiceCtx, sessionId: string, artifactTokenId: string, requestId: string): void {
   const row = ctx.db.sqlite
     .prepare(
@@ -10277,6 +11715,34 @@ function requireQuotePreflight(
     });
   }
   return preflight;
+}
+
+function assertServerLiveFetchPreflight(ctx: ServiceCtx, sessionId: string, preflight: Row, requestId: string): void {
+  const verifiedEventId = typeof preflight.verified_event_id === "string" ? preflight.verified_event_id : null;
+  if (!verifiedEventId) {
+    throw Object.assign(new Error("chain-settleable quote requires server-owned artifact delivery preflight"), {
+      apiError: proofBlockedError(requestId, "chain-settleable quote requires server-owned artifact delivery preflight"),
+    });
+  }
+  const row = ctx.db.sqlite
+    .prepare("SELECT authority, kind, payload_json FROM evidence_events WHERE session_id = ? AND event_id = ?")
+    .get(sessionId, verifiedEventId) as Row | undefined;
+  const payload = row ? (JSON.parse(String(row.payload_json)) as Record<string, unknown>) : {};
+  const serverOwned =
+    row?.authority === "delivery" &&
+    row.kind === "artifact.preflight.verified" &&
+    payload.preflightId === preflight.preflight_id &&
+    payload.deliveryVerificationAuthority === "server_live_fetch" &&
+    payload.deliveryProofHash === preflight.delivery_proof_hash;
+  if (!serverOwned) {
+    throw Object.assign(new Error("chain-settleable quote requires server-owned artifact delivery preflight"), {
+      apiError: proofBlockedError(requestId, "chain-settleable quote requires server-owned artifact delivery preflight", {
+        preflightId: String(preflight.preflight_id),
+        deliveryVerificationAuthority:
+          typeof payload.deliveryVerificationAuthority === "string" ? payload.deliveryVerificationAuthority : "missing",
+      }),
+    });
+  }
 }
 
 async function requireLiveChainSettleableQuoteProvider(
@@ -10608,6 +12074,30 @@ function listEvents(ctx: ServiceCtx, sessionId: string, afterSeq: number, limit:
   return rows.map(evidenceEventFromRow);
 }
 
+function listEventsThroughSeq(ctx: ServiceCtx, sessionId: string, maxSeq: number): EvidenceEvent[] {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM evidence_events
+       WHERE session_id = ? AND event_seq <= ?
+       ORDER BY event_seq ASC`,
+    )
+    .all(sessionId, maxSeq) as Row[];
+  return rows.map(evidenceEventFromRow);
+}
+
+function listAllEvents(ctx: ServiceCtx, sessionId: string): EvidenceEvent[] {
+  const rows = ctx.db.sqlite
+    .prepare(
+      `SELECT *
+       FROM evidence_events
+       WHERE session_id = ?
+       ORDER BY event_seq ASC`,
+    )
+    .all(sessionId) as Row[];
+  return rows.map(evidenceEventFromRow);
+}
+
 function listSources(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
   const rows = ctx.db.sqlite
     .prepare(
@@ -10730,7 +12220,13 @@ function listQuotes(ctx: ServiceCtx, sessionId: string, limit: number, offset = 
   );
 }
 
-function listArtifactAccessTokens(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
+function listArtifactAccessTokens(
+  ctx: ServiceCtx,
+  sessionId: string,
+  limit: number,
+  offset = 0,
+  options: ReplaySnapshotOptions = {},
+) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
@@ -10751,7 +12247,9 @@ function listArtifactAccessTokens(ctx: ServiceCtx, sessionId: string, limit: num
       artifactHash: row.artifact_hash,
       artifactCid: row.artifact_cid,
       artifactPayloadHash: row.artifact_payload_hash,
-      artifactPayload: JSON.parse(String(row.artifact_payload_json)),
+      artifactPayload: options.redactArtifactPayloads
+        ? artifactPayloadRedaction(String(row.artifact_payload_hash))
+        : JSON.parse(String(row.artifact_payload_json)),
       tokenHash: row.token_hash,
       status: row.status,
       issuedByVerifierRunId: row.issued_by_verifier_run_id ?? null,
@@ -10761,7 +12259,9 @@ function listArtifactAccessTokens(ctx: ServiceCtx, sessionId: string, limit: num
   );
 }
 
-function mcpAdapterCallFromRow(row: Row) {
+function mcpAdapterCallFromRow(row: Row, options: ReplaySnapshotOptions = {}) {
+  const request = JSON.parse(String(row.request_json)) as Record<string, JsonValue>;
+  const redactedRequest = options.redactArtifactPayloads ? redactMcpArtifactPayload(request) : { request, redactedFields: [] };
   return McpAdapterCallViewSchema.parse({
     callId: row.call_id,
     sessionId: row.session_id,
@@ -10769,15 +12269,16 @@ function mcpAdapterCallFromRow(row: Row) {
     toolName: row.tool_name,
     requestHash: row.request_hash,
     responseHash: row.response_hash,
-    request: JSON.parse(String(row.request_json)),
+    request: redactedRequest.request,
     response: JSON.parse(String(row.response_json)),
     status: row.status,
     createdAt: row.created_at,
     proofAuthority: false,
+    ...(redactedRequest.redactedFields.length > 0 ? { redactedFields: redactedRequest.redactedFields } : {}),
   });
 }
 
-function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0) {
+function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number, offset = 0, options: ReplaySnapshotOptions = {}) {
   const rows = ctx.db.sqlite
     .prepare(
       `SELECT *
@@ -10793,7 +12294,37 @@ function listMcpAdapterCalls(ctx: ServiceCtx, sessionId: string, limit: number, 
        LIMIT ? OFFSET ?`,
     )
     .all(sessionId, limit, offset) as Row[];
-  return rows.map(mcpAdapterCallFromRow);
+  return rows.map((row) => mcpAdapterCallFromRow(row, options));
+}
+
+function artifactPayloadRedaction(artifactPayloadHash: string): Record<string, JsonValue> {
+  return {
+    redacted: true,
+    reason: ARTIFACT_PAYLOAD_REDACTION_REASON,
+    artifactPayloadHash: artifactPayloadHash.toLowerCase(),
+  };
+}
+
+function redactMcpArtifactPayload(request: Record<string, JsonValue>): { request: Record<string, JsonValue>; redactedFields: string[] } {
+  const params = jsonRecord(request.params);
+  const args = jsonRecord(params.arguments);
+  const artifactPayloadHash = typeof args.artifactPayloadHash === "string" ? args.artifactPayloadHash : null;
+  if (!artifactPayloadHash || !("artifactPayload" in args)) {
+    return { request, redactedFields: [] };
+  }
+  return {
+    request: {
+      ...request,
+      params: {
+        ...params,
+        arguments: {
+          ...args,
+          artifactPayload: artifactPayloadRedaction(artifactPayloadHash),
+        },
+      },
+    },
+    redactedFields: ["request.params.arguments.artifactPayload"],
+  };
 }
 
 function mcpCallByAuditNonce(ctx: ServiceCtx, auditNonce: string): ReturnType<typeof listMcpAdapterCalls>[number] | null {
@@ -10964,15 +12495,23 @@ function listLeaseRuns(ctx: ServiceCtx, sessionId: string, limit: number, offset
   );
 }
 
-function verifyReplaySummaryCapIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
-  replayPageIndexFor(ctx, sessionId);
-  return replaySummaryCapErrors(ctx, sessionId);
+function listAllLeaseRuns(ctx: ServiceCtx, sessionId: string) {
+  const totalRows = replayCollectionRowCount(ctx, sessionId, "leaseRuns");
+  return totalRows > 0 ? listLeaseRuns(ctx, sessionId, totalRows) : [];
 }
 
-function replaySummaryCapErrors(ctx: ServiceCtx, sessionId: string): string[] {
-  return Object.entries(replaySummaryCounts(ctx, sessionId))
-    .filter(([, count]) => count > REPLAY_SUMMARY_LIMIT)
-    .map(([name, count]) => `${name} has ${count} rows, above final verifier cap ${REPLAY_SUMMARY_LIMIT}`);
+function verifyReplaySummaryCapIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
+  return replayPagedIntegrityErrors(ctx, sessionId);
+}
+
+function replayPagedIntegrityErrors(ctx: ServiceCtx, sessionId: string): string[] {
+  try {
+    const index = replayPageIndexFor(ctx, sessionId);
+    replayPagesFor(ctx, sessionId, index);
+    return [];
+  } catch (error) {
+    return [error instanceof Error ? error.message : "replay page index failed"];
+  }
 }
 
 function assertReplaySummaryRoomForArtifactIssue(ctx: ServiceCtx, sessionId: string, requestId: string): void {
@@ -10998,30 +12537,13 @@ function assertArtifactPayloadReplaySize(artifactPayloadJson: string, requestId:
   }
 }
 
-function replaySummaryCounts(ctx: ServiceCtx, sessionId: string): Record<string, number> {
-  return {
-    "replayBundle.events": countRows(ctx, "evidence_events", "session_id = ?", [sessionId]),
-    "replayBundle.sources": countRows(ctx, "sources", "session_id = ?", [sessionId]),
-    "replayBundle.spends": countRows(ctx, "spends", "session_id = ?", [sessionId]),
-    "replayBundle.artifactPreflights": countRows(ctx, "artifact_preflights", "session_id = ?", [sessionId]),
-    "replayBundle.quotes": countRows(ctx, "quotes", "session_id = ?", [sessionId]),
-    "replayBundle.artifactAccessTokens": countRows(ctx, "artifact_access_tokens", "session_id = ?", [sessionId]),
-    "replayBundle.mcpAdapterCalls": countRows(ctx, "mcp_adapter_calls", "session_id = ?", [sessionId]),
-    "replayBundle.cawReceiptOperations": countRows(ctx, "caw_receipt_operations", "session_id = ?", [sessionId]),
-    "replayBundle.cawLiveInteractions": countRows(ctx, "caw_live_interactions", "session_id = ?", [sessionId]),
-    "replayBundle.rawCawReceiptBundles": countRows(ctx, "caw_raw_receipt_bundles", "session_id = ?", [sessionId]),
-    "replayBundle.canonicalCawReceipts": countRows(ctx, "caw_canonical_receipts", "session_id = ?", [sessionId]),
-    "replayBundle.leaseRuns": countRows(ctx, "lease_runs", "session_id = ?", [sessionId]),
-  };
-}
-
 function countRows(ctx: ServiceCtx, table: string, where: string, values: string[]): number {
   const row = ctx.db.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${where}`).get(...values) as Row;
   return Number(row.count ?? 0);
 }
 
 function verifyEventLogIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
-  const events = listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT);
+  const events = listAllEvents(ctx, sessionId);
   const errors: string[] = [];
   let expectedSeq = 1;
   let expectedPrevProofHash: string = ZERO_HASH;
@@ -11090,8 +12612,8 @@ function verifySpendBindingIntegrity(ctx: ServiceCtx, sessionId: string): string
 }
 
 function verifyMcpAdapterCallIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
-  const events = listEvents(ctx, sessionId, 0, 200).filter((event) => event.kind === "mcp.adapter.call");
-  const calls = new Map(listMcpAdapterCalls(ctx, sessionId, 200).map((call) => [call.callId, call]));
+  const events = listAllEvents(ctx, sessionId).filter((event) => event.kind === "mcp.adapter.call");
+  const calls = new Map(listMcpAdapterCalls(ctx, sessionId, replayCollectionRowCount(ctx, sessionId, "mcpAdapterCalls")).map((call) => [call.callId, call]));
   const errors: string[] = [];
   for (const event of events) {
     const payload = event.payload;
@@ -11128,7 +12650,7 @@ function verifyMcpAdapterCallIntegrity(ctx: ServiceCtx, sessionId: string): stri
 
 function verifyCawLiveAuditUsageIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   const errors: string[] = [];
-  const events = listEvents(ctx, sessionId, 0, 200);
+  const events = listAllEvents(ctx, sessionId);
   const eventsById = new Map(events.map((event) => [event.eventId, event]));
   for (const event of events.filter((candidate) => candidate.kind === "caw.live.audit.usage.verified")) {
     const payload = event.payload;
@@ -11229,7 +12751,7 @@ function verifyCawLiveAuditUsageIntegrity(ctx: ServiceCtx, sessionId: string): s
 
 function verifyCawAllowanceIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   const errors: string[] = [];
-  const events = listEvents(ctx, sessionId, 0, 200);
+  const events = listAllEvents(ctx, sessionId);
   const eventsById = new Map(events.map((event) => [event.eventId, event]));
   const cawEventsByInteractionId = new Map(
     events
@@ -11402,7 +12924,7 @@ function verifyCawAllowanceIntegrity(ctx: ServiceCtx, sessionId: string): string
 
 function verifyCawActivationIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   const errors: string[] = [];
-  const events = listEvents(ctx, sessionId, 0, 200);
+  const events = listAllEvents(ctx, sessionId);
   const eventsById = new Map(events.map((event) => [event.eventId, event]));
   for (const event of events.filter((candidate) => candidate.kind === "caw.activation.verified")) {
     const payload = event.payload;
@@ -11480,7 +13002,7 @@ function verifyCawLiveInteractionIntegrity(ctx: ServiceCtx, sessionId: string): 
        ORDER BY created_at ASC, interaction_id ASC`,
     )
     .all(sessionId) as Row[];
-  const allEvents = listEvents(ctx, sessionId, 0, 200);
+  const allEvents = listAllEvents(ctx, sessionId);
   const primaryLiveEventKinds = new Set([
     "caw.live.pact.submitted",
     "caw.live.pact.synced",
@@ -11949,7 +13471,7 @@ function verifyGateFinalityIntegrity(ctx: ServiceCtx, sessionId: string): string
 
 function verifyTokenBalanceDeltaIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
   const errors: string[] = [];
-  const allEvents = listEvents(ctx, sessionId, 0, 200);
+  const allEvents = listAllEvents(ctx, sessionId);
   const eventsById = new Map(allEvents.map((event) => [event.eventId, event]));
   const events = (
     ctx.db.sqlite
@@ -12150,7 +13672,7 @@ function verifyArtifactAccessTokenIntegrity(ctx: ServiceCtx, sessionId: string):
        ORDER BY created_at ASC`,
     )
     .all(sessionId) as Row[];
-  const issuedEvents = listEvents(ctx, sessionId, 0, 200).filter((event) => event.kind === "artifact.access_token.issued");
+  const issuedEvents = listAllEvents(ctx, sessionId).filter((event) => event.kind === "artifact.access_token.issued");
   const issuedByTokenId = new Map(
     issuedEvents
       .map((event) => {
@@ -12311,7 +13833,7 @@ function verifyLeaseRunIntegrity(ctx: ServiceCtx, sessionId: string): string[] {
        ORDER BY created_at ASC`,
     )
     .all(sessionId) as Row[];
-  const events = listEvents(ctx, sessionId, 0, 200);
+  const events = listAllEvents(ctx, sessionId);
   for (const row of rows) {
     const leaseRunId = String(row.lease_run_id);
     if (row.status !== "succeeded_live_mcp_transcript") {
@@ -12523,8 +14045,12 @@ function verifyReplayBundleBindings(
   }
   const asOfCount =
     typeof bundle.asOfMcpAdapterCallCount === "number" && Number.isInteger(bundle.asOfMcpAdapterCallCount)
-      ? Math.max(0, Math.min(bundle.asOfMcpAdapterCallCount, REPLAY_SUMMARY_LIMIT))
-      : REPLAY_SUMMARY_LIMIT;
+      ? Math.max(0, bundle.asOfMcpAdapterCallCount)
+      : replayCollectionRowCount(ctx, sessionId, "mcpAdapterCalls");
+  const serverMcpAdapterCallCount = replayCollectionRowCount(ctx, sessionId, "mcpAdapterCalls");
+  if (asOfCount > serverMcpAdapterCallCount) {
+    errors.push("replayBundle.asOfMcpAdapterCallCount is ahead of the server MCP adapter call count");
+  }
   const session = ctx.db.sqlite
     .prepare("SELECT latest_event_seq FROM sessions WHERE session_id = ?")
     .get(sessionId) as Row | undefined;
@@ -12537,10 +14063,7 @@ function verifyReplayBundleBindings(
   if (hasSuppliedAsOfEventSeq && suppliedAsOfEventSeq > latestEventSeq) {
     errors.push("replayBundle.asOfEventSeq is ahead of the server latest event sequence");
   }
-  if (hasSuppliedAsOfEventSeq && suppliedAsOfEventSeq > REPLAY_SUMMARY_LIMIT) {
-    errors.push(`replayBundle.asOfEventSeq is above final verifier cap ${REPLAY_SUMMARY_LIMIT}`);
-  }
-  const asOfEventSeq = hasSuppliedAsOfEventSeq ? suppliedAsOfEventSeq : Math.min(latestEventSeq, REPLAY_SUMMARY_LIMIT);
+  const asOfEventSeq = hasSuppliedAsOfEventSeq ? suppliedAsOfEventSeq : latestEventSeq;
   const expectedEvents = listEvents(ctx, sessionId, 0, REPLAY_SUMMARY_LIMIT).filter((event) => event.eventSeq <= asOfEventSeq);
   const expectedEventRoot = hashJson(expectedEvents.map((event) => event.eventHash));
   if (bundle.eventRoot !== expectedEventRoot) {
@@ -12562,18 +14085,65 @@ function verifyReplayBundleBindings(
   compareReplaySnapshot(errors, "replayBundle.spends", bundle.spends, listSpends(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.artifactPreflights", bundle.artifactPreflights, listArtifactPreflights(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.quotes", bundle.quotes, listQuotes(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
-  compareReplaySnapshot(errors, "replayBundle.artifactAccessTokens", bundle.artifactAccessTokens, listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
-  compareReplaySnapshot(errors, "replayBundle.mcpAdapterCalls", bundle.mcpAdapterCalls, listMcpAdapterCalls(ctx, sessionId, asOfCount));
+  const publicReplaySnapshotOptions: ReplaySnapshotOptions = { redactArtifactPayloads: true, asOfEventSeq };
+  compareReplaySnapshot(
+    errors,
+    "replayBundle.artifactAccessTokens",
+    bundle.artifactAccessTokens,
+    listArtifactAccessTokens(ctx, sessionId, REPLAY_SUMMARY_LIMIT, 0, publicReplaySnapshotOptions),
+  );
+  compareReplaySnapshot(
+    errors,
+    "replayBundle.mcpAdapterCalls",
+    bundle.mcpAdapterCalls,
+    listMcpAdapterCalls(ctx, sessionId, Math.min(asOfCount, REPLAY_SUMMARY_LIMIT), 0, publicReplaySnapshotOptions),
+  );
   compareReplaySnapshot(errors, "replayBundle.cawReceiptOperations", bundle.cawReceiptOperations, listCawReceiptOperations(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.cawLiveInteractions", bundle.cawLiveInteractions, listCawLiveInteractions(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.rawCawReceiptBundles", bundle.rawCawReceiptBundles, listRawCawReceiptBundles(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.canonicalCawReceipts", bundle.canonicalCawReceipts, listCanonicalCawReceipts(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.leaseRuns", bundle.leaseRuns, listLeaseRuns(ctx, sessionId, REPLAY_SUMMARY_LIMIT));
   compareReplaySnapshot(errors, "replayBundle.judgeCheck", bundle.judgeCheck, readJudgeCheckData(sessionId, ctx));
-  const replayPageIndex = replayPageIndexFor(ctx, sessionId);
+  const replayPageIndex = replayPageIndexFor(ctx, sessionId, publicReplaySnapshotOptions);
   compareReplaySnapshot(errors, "replayBundle.replayPageIndex", bundle.replayPageIndex, replayPageIndex);
-  compareReplaySnapshot(errors, "replayBundle.replayPages", bundle.replayPages, replayPagesFor(ctx, sessionId, replayPageIndex));
+  compareReplaySnapshot(errors, "replayBundle.replayPages", bundle.replayPages, replayPagesFor(ctx, sessionId, replayPageIndex, publicReplaySnapshotOptions));
   compareReplaySnapshot(errors, "replayBundle.fullReplayRoot", bundle.fullReplayRoot, replayPageIndex.pageRoot);
+  return errors;
+}
+
+function verifyVerifierInputSnapshotBindings(
+  ctx: ServiceCtx,
+  sessionId: string,
+  payload: {
+    receipt?: Record<string, JsonValue> | undefined;
+    replayBundle?: Record<string, JsonValue> | undefined;
+  },
+): string[] {
+  if (payload.receipt?.bundleType === "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1") {
+    return verifyPublicProofBundleEnvelopeBinding(sessionId, payload.receipt);
+  }
+  return verifyReplayBundleBindings(ctx, sessionId, payload);
+}
+
+function verifyPublicProofBundleEnvelopeBinding(sessionId: string, bundle: Record<string, JsonValue>): string[] {
+  const errors: string[] = [];
+  if (typeof bundle.sessionId === "string" && bundle.sessionId !== sessionId) {
+    errors.push("public proof bundle sessionId must match verifier sessionId");
+  }
+  const publicClaim = bundle.publicClaim;
+  if (publicClaim && typeof publicClaim === "object" && !Array.isArray(publicClaim)) {
+    const claimSessionId = (publicClaim as Record<string, JsonValue>).sessionId;
+    if (typeof claimSessionId === "string" && claimSessionId !== sessionId) {
+      errors.push("public proof bundle publicClaim.sessionId must match verifier sessionId");
+    }
+  }
+  const replayBundle = bundle.replayBundle;
+  if (replayBundle && typeof replayBundle === "object" && !Array.isArray(replayBundle)) {
+    const replaySessionId = (replayBundle as Record<string, JsonValue>).sessionId;
+    if (typeof replaySessionId === "string" && replaySessionId !== sessionId) {
+      errors.push("public proof bundle replayBundle.sessionId must match verifier sessionId");
+    }
+  }
   return errors;
 }
 

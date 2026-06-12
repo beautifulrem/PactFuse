@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { secp256k1 } from "@noble/curves/secp256k1";
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { hashMessage } from "viem";
@@ -18,6 +18,16 @@ const PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR = "0xb14620f9";
 const MOCK_QUOTE_STATUS = "mocked_after_preflight_not_chain_settleable";
 const CHAIN_SETTLEABLE_QUOTE_STATUS = "chain_settleable_after_preflight";
 const BASE_SEPOLIA_USDC = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
+const PUBLIC_EXPLORER_HOST_PATTERNS = [
+  /(^|\.)basescan\.org$/,
+  /(^|\.)etherscan\.io$/,
+  /(^|\.)etherscan\.org$/,
+  /(^|\.)arbiscan\.io$/,
+  /(^|\.)optimistic\.etherscan\.io$/,
+  /(^|\.)polygonscan\.com$/,
+  /(^|\.)blockscout\.com$/,
+  /(^|\.)routescan\.io$/,
+];
 const REQUIRED_LEASE_TOOL_ARGUMENTS = [
   "sessionId",
   "leaseRunId",
@@ -30,22 +40,27 @@ const REQUIRED_LEASE_TOOL_ARGUMENTS = [
   "targetCommit",
 ];
 const SERVER_RUNTIME_PROOF_PROVIDER_TOKENS = new WeakSet();
-const CAW_POLICY_CHAIN_KEYS = ["chain_ids", "chainIds", "allowed_chain_ids", "allowedChainIds", "chains"];
+const CAW_POLICY_CHAIN_KEYS = ["chain_ids", "chainIds", "allowed_chain_ids", "allowedChainIds", "chains", "chain_in", "chain_id", "chainId"];
 const CAW_POLICY_CONTRACT_KEYS = [
   "contract_addresses",
   "contractAddresses",
   "target_addresses",
   "targetAddresses",
   "targets",
+  "target_in",
+  "contract_addr",
+  "contractAddress",
   "allowed_contracts",
   "allowedContracts",
 ];
-const CAW_POLICY_SELECTOR_KEYS = ["selectors", "function_selectors", "functionSelectors", "allowed_selectors", "allowedSelectors"];
+const CAW_POLICY_SELECTOR_KEYS = ["selectors", "function_selectors", "functionSelectors", "function_id", "functionId", "allowed_selectors", "allowedSelectors"];
 const DANGEROUS_TOOL_NAME_PATTERN =
   /(write|edit|delete|remove|shell|exec|terminal|command|commit|push|deploy|transfer|send|apply|patch|modify|create|move|copy|rename|upload|download|file|fs|process|subprocess)/;
 
 function usage() {
-  console.error("Usage: node packages/verifier/pactfuse-verify-receipt.mjs [--schema-only] <receipt-pack.json>");
+  console.error(
+    "Usage: node packages/verifier/pactfuse-verify-receipt.mjs [--schema-only] [--trusted-proof-key-hash 0x...] <receipt-pack.json>",
+  );
 }
 
 function readJson(path) {
@@ -81,6 +96,10 @@ function canonicalizeJson(value) {
 
 function hashJson(value) {
   return `0x${createHash("sha256").update(canonicalizeJson(value)).digest("hex")}`;
+}
+
+function sha256Hex(value) {
+  return `0x${createHash("sha256").update(value).digest("hex")}`;
 }
 
 function safeHashJson(value, label, errors) {
@@ -162,6 +181,18 @@ function requireNull(root, path, errors) {
   }
 }
 
+function rejectUnexpectedKeys(value, allowedKeys, label, errors) {
+  if (!isObject(value)) {
+    return;
+  }
+  const allowed = new Set(allowedKeys);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      errors.push(`${label} has unexpected field: ${key}`);
+    }
+  }
+}
+
 function asText(value) {
   return value == null ? "" : String(value);
 }
@@ -174,8 +205,130 @@ function isHex32(value) {
   return typeof value === "string" && HEX32_RE.test(value);
 }
 
+function artifactPayloadRedactionHash(value) {
+  if (!isObject(value) || value.redacted !== true || value.reason !== "artifact_bearer_required") {
+    return null;
+  }
+  return isHex32(value.artifactPayloadHash) ? lowerHex(value.artifactPayloadHash) : null;
+}
+
+function hasRedactedField(value, field) {
+  return Array.isArray(value?.redactedFields) && value.redactedFields.includes(field);
+}
+
 function lowerHex(value) {
   return typeof value === "string" ? value.toLowerCase() : value;
+}
+
+function normalizedHex32List(values) {
+  return values
+    .flatMap((value) => (typeof value === "string" ? value.split(",") : []))
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => HEX32_RE.test(value));
+}
+
+function publicProofEndpoint(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  try {
+    const url = new URL(asText(value));
+    url.username = "";
+    url.password = "";
+    url.pathname = "/";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return "[redacted-endpoint]";
+  }
+}
+
+function verifyPublicChainProviderEndpoint(label, payload, errors) {
+  const endpoint = payload.chainProviderEndpoint ?? null;
+  if (endpoint !== null && endpoint !== publicProofEndpoint(endpoint)) {
+    errors.push(`${label} chainProviderEndpoint must be a redacted public origin`);
+  }
+}
+
+function verifyPublicReplayUrl(label, value, errors) {
+  if (typeof value !== "string" || value.length === 0) {
+    errors.push(`${label} must be a URL string`);
+    return;
+  }
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    errors.push(`${label} must be a valid URL`);
+    return;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    errors.push(`${label} must use HTTP or HTTPS`);
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    errors.push(`${label} must not contain credentials, query strings, or fragments`);
+  }
+  if (!isPublicReplayHostname(url.hostname)) {
+    errors.push(`${label} must use a public hostname`);
+  }
+}
+
+function isPublicReplayHostname(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".test") ||
+    host.endsWith(".local") ||
+    host.endsWith(".lan") ||
+    host.endsWith(".internal")
+  ) {
+    return false;
+  }
+  if (host.includes(":")) {
+    return false;
+  }
+  if (isPrivateOrReservedIpv4(host)) {
+    return false;
+  }
+  return host.includes(".");
+}
+
+function isPrivateOrReservedIpv4(host) {
+  const parts = host.split(".");
+  if (parts.length !== 4) {
+    return false;
+  }
+  const octets = parts.map((part) => Number(part));
+  if (octets.some((octet, index) => !Number.isInteger(octet) || octet < 0 || octet > 255 || String(octet) !== parts[index])) {
+    return false;
+  }
+  const a = octets[0] ?? -1;
+  const b = octets[1] ?? -1;
+  const c = octets[2] ?? -1;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && c === 2) ||
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113) ||
+    a >= 224
+  );
+}
+
+function trustedProofKeyHashes(options) {
+  return new Set(
+    normalizedHex32List([
+      options.trustedProofKeyHash,
+      ...(Array.isArray(options.trustedProofKeyHashes) ? options.trustedProofKeyHashes : []),
+    ]),
+  );
 }
 
 function decimal(value) {
@@ -726,13 +879,14 @@ function replayPageTotalRows(bundle, collectionName) {
 }
 
 function agentTranscriptBoundedToPinnedManifest(bundle, calls) {
-  const successfulLeases = (Array.isArray(bundle.leaseRuns) ? bundle.leaseRuns : []).filter(
+  const leaseRows = replayRowsForCollection(bundle, "leaseRuns");
+  const successfulLeases = leaseRows.filter(
     (lease) => isObject(lease) && lease.status === "succeeded_live_mcp_transcript",
   );
   if (successfulLeases.length === 0) {
     return false;
   }
-  if (replayPageTotalRows(bundle, "leaseRuns") !== (Array.isArray(bundle.leaseRuns) ? bundle.leaseRuns.length : 0)) {
+  if (replayPageTotalRows(bundle, "leaseRuns") !== leaseRows.length) {
     return false;
   }
   const expectedAuditNonces = new Set();
@@ -776,9 +930,12 @@ function verifyMcpAdapterCalls(bundle, calls, errors) {
     if (call.proofAuthority !== false) {
       errors.push(`MCP adapter call ${call.callId ?? "-"} must carry proofAuthority=false`);
     }
-    const requestHash = safeHashJson(call.request, `MCP adapter call ${call.callId ?? "-"} request`, errors);
+    const requestRedacted = hasRedactedField(call, "request.params.arguments.artifactPayload");
+    const requestHash = requestRedacted ? null : safeHashJson(call.request, `MCP adapter call ${call.callId ?? "-"} request`, errors);
     const responseHash = safeHashJson(call.response, `MCP adapter call ${call.callId ?? "-"} response`, errors);
-    if (requestHash && lowerHex(call.requestHash) !== requestHash) {
+    if (requestRedacted && !isHex32(call.requestHash)) {
+      errors.push(`MCP adapter call ${call.callId ?? "-"} redacted request requires a recorded requestHash`);
+    } else if (requestHash && lowerHex(call.requestHash) !== requestHash) {
       errors.push(`MCP adapter call ${call.callId ?? "-"} requestHash does not match request`);
     }
     if (responseHash && lowerHex(call.responseHash) !== responseHash) {
@@ -886,7 +1043,7 @@ function pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall, err
   if (!isObject(listCall) || !isObject(toolCall)) {
     return fail(`succeeded lease run ${lease?.leaseRunId ?? "-"} is missing bound MCP tools/list or tools/call transcript frames`);
   }
-  const spend = (Array.isArray(bundle.spends) ? bundle.spends : []).find((candidate) => isObject(candidate) && candidate.spendId === lease.spendId);
+  const spend = replayRowsForCollection(bundle, "spends").find((candidate) => isObject(candidate) && candidate.spendId === lease.spendId);
   if (!spend) {
     return fail(`succeeded lease run ${lease.leaseRunId} references a spend without pinned source manifest data`);
   }
@@ -902,7 +1059,7 @@ function pinnedMcpManifestBindingForLease(bundle, lease, listCall, toolCall, err
   }
   sourceHashes.sort();
   const sourcesByHash = new Map(
-    (Array.isArray(bundle.sources) ? bundle.sources : [])
+    replayRowsForCollection(bundle, "sources")
       .filter((source) => isObject(source) && typeof source.sourceHash === "string")
       .map((source) => [lowerHex(source.sourceHash), source]),
   );
@@ -987,7 +1144,9 @@ function verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors) {
       errors.push(`succeeded lease run ${lease.leaseRunId} tools/call argument ${field} does not match lease run`);
     }
   }
-  const argumentPayloadHash = safeHashJson(argumentsObject.artifactPayload, `lease run ${lease.leaseRunId} tools/call artifactPayload`, errors);
+  const redactedArtifactPayloadHash = artifactPayloadRedactionHash(argumentsObject.artifactPayload);
+  const argumentPayloadHash =
+    redactedArtifactPayloadHash ?? safeHashJson(argumentsObject.artifactPayload, `lease run ${lease.leaseRunId} tools/call artifactPayload`, errors);
   if (argumentPayloadHash && lowerHex(lease.consumedArtifactPayloadHash) !== argumentPayloadHash) {
     errors.push(`succeeded lease run ${lease.leaseRunId} tools/call artifactPayload hash does not match consumedArtifactPayloadHash`);
   }
@@ -996,12 +1155,13 @@ function verifyLeaseMcpCallBinding(lease, listCall, toolCall, bundle, errors) {
 
 function verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors) {
   const artifactTokensById = new Map(
-    (Array.isArray(bundle.artifactAccessTokens) ? bundle.artifactAccessTokens : []).filter(isObject).map((token) => [token.tokenId, token]),
+    replayRowsForCollection(bundle, "artifactAccessTokens").filter(isObject).map((token) => [token.tokenId, token]),
   );
   const spendsById = new Map(
-    (Array.isArray(bundle.spends) ? bundle.spends : []).filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]),
+    replayRowsForCollection(bundle, "spends").filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]),
   );
-  for (const lease of Array.isArray(bundle.leaseRuns) ? bundle.leaseRuns : []) {
+  const leaseRuns = replayRowsForCollection(bundle, "leaseRuns");
+  for (const lease of leaseRuns) {
     if (!isObject(lease)) {
       errors.push("leaseRuns entries must be objects");
       continue;
@@ -1357,6 +1517,7 @@ function verifyCawAllowanceEvents(eventsById, spendsById, interactionsById, erro
     if (payload.chainProviderMode !== "live") {
       errors.push(`${label} requires chainProviderMode=live`);
     }
+    verifyPublicChainProviderEndpoint(label, payload, errors);
     const spend = spendsById.get(lowerHex(payload.spendId));
     if (!spend) {
       errors.push(`${label} references missing registered spend`);
@@ -1504,6 +1665,7 @@ function verifyCawActivationEvents(eventsById, errors) {
     if (payload.chainProviderMode !== "live") {
       errors.push(`${label} requires chainProviderMode=live`);
     }
+    verifyPublicChainProviderEndpoint(label, payload, errors);
     if (!isHex32(payload.activateTxHash)) {
       errors.push(`${label} requires activateTxHash`);
     }
@@ -1580,6 +1742,7 @@ function verifyTokenBalanceDeltaEvents(eventsById, spendsById, errors) {
     if (payload.chainProviderMode !== "live") {
       errors.push(`${label} requires chainProviderMode=live`);
     }
+    verifyPublicChainProviderEndpoint(label, payload, errors);
     const spend = spendsById.get(lowerHex(payload.spendId));
     if (!spend) {
       errors.push(`${label} references missing registered spend`);
@@ -1707,15 +1870,71 @@ function verifyTokenBalanceDeltaEvents(eventsById, spendsById, errors) {
     if (!isHex32(payload.transferRawLogHash)) {
       errors.push(`${label} requires transferRawLogHash`);
     }
+    const expectedTransferLogBindingHash = tokenTransferLogBindingHash(payload);
+    if (!isHex32(payload.transferLogBindingHash) || lowerHex(payload.transferLogBindingHash) !== expectedTransferLogBindingHash) {
+      errors.push(`${label} transferLogBindingHash does not recompute`);
+    }
+    const expectedBalanceReadHash = tokenBalanceReadHash(payload);
+    if (!isHex32(payload.balanceReadHash) || lowerHex(payload.balanceReadHash) !== expectedBalanceReadHash) {
+      errors.push(`${label} balanceReadHash does not recompute`);
+    }
+    const expectedChainReadProofHash = tokenBalanceDeltaChainReadProofHash(payload);
+    if (!isHex32(payload.chainReadProofHash) || lowerHex(payload.chainReadProofHash) !== expectedChainReadProofHash) {
+      errors.push(`${label} chainReadProofHash does not recompute`);
+    }
   }
 }
 
+function tokenTransferLogBindingHash(payload) {
+  return hashJson({
+    mode: "erc20_transfer_log_binding_v1",
+    chainId: asText(payload.chainId),
+    txHash: lowerHex(payload.txHash),
+    blockNumber: Number(payload.blockNumber),
+    logIndex: Number(payload.transferLogIndex),
+    address: lowerHex(payload.paymentToken),
+    rawLogHash: lowerHex(payload.transferRawLogHash),
+    topics: Array.isArray(payload.transferTopics) ? payload.transferTopics.map((topic) => asText(topic).toLowerCase()) : [],
+    data: asText(payload.transferData).toLowerCase(),
+  });
+}
+
+function tokenBalanceReadHash(payload) {
+  return hashJson({
+    mode: "erc20_balance_read_v1",
+    chainId: asText(payload.chainId),
+    blockNumber: Number(payload.blockNumber),
+    preBlockNumber: Number(payload.preBlockNumber),
+    paymentToken: lowerHex(payload.paymentToken),
+    agentWallet: lowerHex(payload.agentWallet),
+    market: lowerHex(payload.market),
+    amountAtomic: asText(payload.amountAtomic),
+    agentWalletBefore: asText(payload.agentWalletBefore),
+    agentWalletAfter: asText(payload.agentWalletAfter),
+    marketBefore: asText(payload.marketBefore),
+    marketAfter: asText(payload.marketAfter),
+  });
+}
+
+function tokenBalanceDeltaChainReadProofHash(payload) {
+  return hashJson({
+    mode: "token_balance_delta_chain_read_proof_v1",
+    chainProviderMode: asText(payload.chainProviderMode),
+    chainProviderEndpoint: payload.chainProviderEndpoint === null || payload.chainProviderEndpoint === undefined ? null : asText(payload.chainProviderEndpoint),
+    settlementEventId: asText(payload.settlementEventId),
+    gateEventId: asText(payload.gateEventId),
+    transferLogBindingHash: lowerHex(payload.transferLogBindingHash),
+    balanceReadHash: lowerHex(payload.balanceReadHash),
+  });
+}
+
 function verifySourceIdentityBindings(bundle, errors) {
-  for (const source of Array.isArray(bundle.sources) ? bundle.sources : []) {
+  for (const source of replayRowsForCollection(bundle, "sources")) {
     if (!isObject(source)) {
       errors.push("sources entries must be objects");
       continue;
     }
+    verifyPublicReplayUrl(`source ${source.sourceHash ?? "-"} manifestUrl`, source.manifestUrl, errors);
     const hasIssuer = typeof source.issuer === "string" && source.issuer.length > 0;
     const hasSignature = typeof source.signature === "string" && source.signature.length > 0;
     if (hasIssuer !== hasSignature) {
@@ -1929,7 +2148,9 @@ function cawPactPolicyBindingFromInteraction(interaction, event, errors) {
   }
   const policyRoot = cawPactPolicyRoot(interaction.response);
   const policySnapshotHash = hashJson(policyRoot);
-  const policyDigest = cawOptionalString(interaction.response, ["policy_digest", "policyDigest", "policy_hash", "policyHash", "pact_digest", "pactDigest"]);
+  const policyDigest =
+    cawOptionalString(interaction.response, ["policy_digest", "policyDigest", "policy_hash", "policyHash", "pact_digest", "pactDigest"]) ??
+    policySnapshotHash;
   const policyChainIds = arrayText(event.payload?.policyChainIds);
   const policyContractAddresses = arrayText(event.payload?.policyContractAddresses).map((value) => value.toLowerCase()).filter(isEvmAddress);
   const policySelectors = arrayText(event.payload?.policySelectors).map((value) => value.toLowerCase()).filter((value) => /^0x[0-9a-f]{8}$/.test(value));
@@ -2236,11 +2457,39 @@ function verifyCawLiveActivateToolCall(interaction, spend, spendId, eventsById, 
     return;
   }
   const settledPayload = isObject(settled.payload) ? settled.payload : {};
-  if (!event || !isHex32(event.payload?.txHash)) {
+  const txEvent = cawLiveContractCallEventWithTxHash(eventsById, event, interaction);
+  if (!txEvent || !isHex32(txEvent.payload?.txHash)) {
     errors.push(`${label} requires CAW contract call event txHash`);
-  } else if (lowerHex(event.payload.txHash) !== lowerHex(settledPayload.txHash)) {
+  } else if (lowerHex(txEvent.payload.txHash) !== lowerHex(settledPayload.txHash)) {
     errors.push(`${label} txHash must match finalized SpendSettled txHash`);
   }
+}
+
+function cawLiveContractCallEventWithTxHash(eventsById, event, interaction) {
+  if (isObject(event) && isHex32(event.payload?.txHash)) {
+    return event;
+  }
+  const requestId = asText(interaction.request?.request_id ?? interaction.cawRequestId);
+  if (!requestId) {
+    return event;
+  }
+  const operationKind = asText(interaction.request?.operation_kind);
+  const contractAddress = asText(interaction.request?.contract_addr).toLowerCase();
+  const selector = asText(interaction.request?.selector).toLowerCase();
+  const candidates = [...eventsById.values()]
+    .filter((candidate) => {
+      const payload = isObject(candidate?.payload) ? candidate.payload : {};
+      return (
+        candidate?.kind === "caw.live.contract_call.submitted" &&
+        payload.cawRequestId === requestId &&
+        payload.operationKind === operationKind &&
+        asText(payload.contractAddress).toLowerCase() === contractAddress &&
+        asText(payload.selector).toLowerCase() === selector &&
+        isHex32(payload.txHash)
+      );
+    })
+    .sort((a, b) => Number(a.eventSeq ?? 0) - Number(b.eventSeq ?? 0));
+  return candidates.at(-1) ?? event;
 }
 
 function expectedApproveCalldata(spender, amount) {
@@ -2309,9 +2558,9 @@ function verifyGateContractStateProofEvent(bundle, event, errors) {
   if (!isHex32(payload.contractSourceSetHash)) {
     errors.push(`${label} requires contractSourceSetHash`);
   }
-  const spend = Array.isArray(bundle.spends)
-    ? bundle.spends.find((candidate) => isObject(candidate) && lowerHex(candidate.spendId) === lowerHex(payload.spendId))
-    : null;
+  const spend = replayRowsForCollection(bundle, "spends").find(
+    (candidate) => isObject(candidate) && lowerHex(candidate.spendId) === lowerHex(payload.spendId),
+  );
   if (!spend) {
     errors.push(`${label} requires a matching replay spend row`);
   } else {
@@ -2437,7 +2686,7 @@ function verifyCawReceiptSettlementBinding(canonical, operation, bundle, errors)
   if (lowerHex(canonical.selector) !== PROCUREMENT_GATE_ACTIVATE_TOOL_SELECTOR) {
     errors.push(`${label} activate_tool allow receipt selector must be ProcurementGate.activateTool(bytes32,bytes)`);
   }
-  const settled = (Array.isArray(bundle.events) ? bundle.events : []).find((event) => {
+  const settled = replayRowsForCollection(bundle, "events").find((event) => {
     const payload = isObject(event?.payload) ? event.payload : {};
     return (
       isObject(event) &&
@@ -2678,9 +2927,13 @@ function verifyReplayEvents(bundle, events, errors) {
   }
 }
 
-function replayProviderReady(options, name) {
+function replayProvider(options, name) {
   const providers = Array.isArray(options.proofProviders) ? options.proofProviders : [];
-  return providers.some((provider) => provider?.name === name && provider.ready === true && provider.mode === "live");
+  return providers.find((provider) => provider?.name === name && provider.ready === true && provider.mode === "live") ?? null;
+}
+
+function replayProviderReady(options, name) {
+  return Boolean(replayProvider(options, name));
 }
 
 function replayProviderAuthorityLocked(options) {
@@ -2701,7 +2954,7 @@ export function createServerRuntimeVerifierOptions(options = {}) {
   };
 }
 
-function deploymentRegistryEntryHasLiveFields(entry) {
+function deploymentRegistryEntryHasLiveFields(entry, options = {}) {
   return (
     isObject(entry) &&
     isHex32(entry.deploymentTxHash) &&
@@ -2710,12 +2963,22 @@ function deploymentRegistryEntryHasLiveFields(entry) {
     explorerUrlContainsTxHash(entry.explorerUrl, entry.deploymentTxHash) &&
     isHex32(entry.codeHash) &&
     entry.codeHash !== ZERO_HASH &&
-    Number.isInteger(entry.decimals)
+    (!options.requireErc20Metadata || Number.isInteger(entry.decimals))
   );
 }
 
 function explorerUrlContainsTxHash(explorerUrl, txHash) {
-  return typeof explorerUrl === "string" && typeof txHash === "string" && explorerUrl.toLowerCase().includes(txHash.toLowerCase());
+  if (typeof explorerUrl !== "string" || typeof txHash !== "string") {
+    return false;
+  }
+  try {
+    const url = new URL(explorerUrl);
+    const segments = url.pathname.toLowerCase().split("/").filter(Boolean);
+    const txIndex = segments.indexOf("tx");
+    return txIndex >= 0 && segments[txIndex + 1] === txHash.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 function isPublicExplorerUrl(value) {
@@ -2728,7 +2991,7 @@ function isPublicExplorerUrl(value) {
       return false;
     }
     const host = url.hostname.toLowerCase();
-    return host !== "example.com" && !host.endsWith(".example.com") && host !== "localhost" && !host.endsWith(".localhost");
+    return PUBLIC_EXPLORER_HOST_PATTERNS.some((pattern) => pattern.test(host));
   } catch {
     return false;
   }
@@ -2754,7 +3017,7 @@ function deploymentRegistryBlockersForPaymentToken(registry, paymentToken, chain
       lowerHex(candidate.address) === paymentTokenAddress &&
       candidate.tokenMode === tokenMode,
   );
-  if (!entry || !deploymentRegistryEntryHasLiveFields(entry)) {
+  if (!entry || !deploymentRegistryEntryHasLiveFields(entry, { requireErc20Metadata: true })) {
     return ["final verifier requires a live PaymentToken deployment registry entry for the chain-settleable payment token"];
   }
   const probeStatus = registry.officialUsdcProbe?.status;
@@ -2771,6 +3034,65 @@ function deploymentRegistryBlockersForPaymentToken(registry, paymentToken, chain
     return ["final verifier requires mock token fallback to include a failed official-USDC probe reason"];
   }
   return [];
+}
+
+function deploymentRegistryEntryForContract(registry, contractName, address, chainId) {
+  const entries = Array.isArray(registry?.entries) ? registry.entries : [];
+  const normalizedAddress = lowerHex(address);
+  return entries.find(
+    (candidate) =>
+      candidate?.contractName === contractName &&
+      asText(candidate.chainId) === asText(chainId) &&
+      lowerHex(candidate.address) === normalizedAddress,
+  );
+}
+
+function deploymentRegistryBlockersForLiveContracts(registry, bundle, eventsById) {
+  if (!isObject(registry) || registry.mode !== "live") {
+    return ["final verifier requires live deployment registry evidence for chain proof contracts"];
+  }
+  const requirements = new Map();
+  const addRequirement = (contractName, address, chainId) => {
+    if (!isEvmAddress(address) || asText(chainId).length === 0) {
+      return;
+    }
+    const key = `${contractName}:${asText(chainId)}:${lowerHex(address)}`;
+    requirements.set(key, { contractName, address: lowerHex(address), chainId: asText(chainId) });
+  };
+
+  for (const event of eventsById.values()) {
+    const payload = isObject(event?.payload) ? event.payload : {};
+    if ((event.kind === "gate.spend_tripped" || event.kind === "gate.spend_settled") && replayGateFinalized(event)) {
+      addRequirement("ProcurementGate", payload.contractAddress, payload.chainId);
+    }
+    if (event.kind === "source.challenge.confirmed" && replayGateFinalized(event)) {
+      addRequirement("SourceStateRegistry", payload.sourceRegistryAddress, payload.chainId);
+    }
+  }
+
+  const spendsById = new Map(replayRowsForCollection(bundle, "spends").filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]));
+  for (const quote of replayRowsForCollection(bundle, "quotes").filter(isObject)) {
+    if (quote.status !== CHAIN_SETTLEABLE_QUOTE_STATUS) {
+      continue;
+    }
+    const spend = spendsById.get(lowerHex(quote.spendId));
+    addRequirement("PaidArtifactMarket", spend?.market, quote.chainId);
+  }
+
+  const blockers = [];
+  for (const requirement of requirements.values()) {
+    if (asText(registry.chainId) !== requirement.chainId) {
+      blockers.push(`final verifier requires deployment registry chainId to match ${requirement.contractName} chain proof`);
+      continue;
+    }
+    const entry = deploymentRegistryEntryForContract(registry, requirement.contractName, requirement.address, requirement.chainId);
+    if (!entry || !deploymentRegistryEntryHasLiveFields(entry)) {
+      blockers.push(
+        `final verifier requires a live ${requirement.contractName} deployment registry entry for ${requirement.address} on chain ${requirement.chainId}`,
+      );
+    }
+  }
+  return blockers;
 }
 
 function latestReplayEvent(eventsById, kind, predicate = () => true) {
@@ -2811,6 +3133,48 @@ function replayGateFinalized(event) {
   return replayEventHasProofAuthority(event, false) && payload.finalityStatus === "finalized" && payload.contractStateVerified === true;
 }
 
+function replayChainProviderBindingBlockers(events, options) {
+  const blockers = [];
+  const chainProvider = replayProvider(options, "chain");
+  if (!chainProvider) {
+    return blockers;
+  }
+  const expectedChainId = typeof chainProvider.chainId === "string" ? chainProvider.chainId : null;
+  const expectedEndpoint = publicProofEndpoint(chainProvider.endpoint);
+  if (!expectedChainId || !expectedEndpoint) {
+    blockers.push("final verifier requires chain proof provider chainId and redacted endpoint");
+    return blockers;
+  }
+  const chainProofEventsByKey = latestChainProofEventsByKey(events);
+  for (const event of chainProofEventsByKey.values()) {
+    const payload = isObject(event.payload) ? event.payload : {};
+    const label = `event ${event.eventId ?? "-"} ${event.kind}`;
+    if (expectedChainId !== null && asText(payload.chainId) !== expectedChainId) {
+      blockers.push(`${label} chainId does not match trusted chain proof provider`);
+    }
+    if (expectedEndpoint !== null && publicProofEndpoint(payload.chainProviderEndpoint) !== expectedEndpoint) {
+      blockers.push(`${label} chainProviderEndpoint does not match trusted chain proof provider`);
+    }
+  }
+  return blockers;
+}
+
+function latestChainProofEventsByKey(events) {
+  const chainProofEventKinds = new Set(["caw.allowance.verified", "caw.activation.verified", "token.balance_delta.verified"]);
+  const byKey = new Map();
+  for (const event of events) {
+    if (!chainProofEventKinds.has(event?.kind) || !isObject(event.payload)) {
+      continue;
+    }
+    const key = `${event.kind}:${asText(event.payload.spendId) || asText(event.payload.txHash) || asText(event.eventId)}`;
+    const current = byKey.get(key);
+    if (!current || Number(event.eventSeq ?? 0) > Number(current.eventSeq ?? 0)) {
+      byKey.set(key, event);
+    }
+  }
+  return byKey;
+}
+
 function replayWrongTargetDenyPayload(payload) {
   const operationKind = asText(payload.operationKind).toLowerCase();
   const action = asText(payload.action).toLowerCase();
@@ -2823,6 +3187,16 @@ function tokenModeForPaymentToken(paymentToken) {
     return "official-testnet-usdc";
   }
   return normalized ? "mock-test-token" : "local-mocked";
+}
+
+function tokenSettlementClaimForTokenMode(tokenMode) {
+  if (tokenMode === "official-testnet-usdc") {
+    return "official-testnet-usdc";
+  }
+  if (tokenMode === "mock-test-token") {
+    return "live-mock-erc20-fallback";
+  }
+  return null;
 }
 
 function quoteRuntimeModesForStatus(status, spend) {
@@ -2869,6 +3243,7 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
 
   const rowsById = replayJudgeRowsById(bundle);
   const finalEvents = [...eventsById.values()];
+  blockers.push(...replayChainProviderBindingBlockers(finalEvents, options));
   if (finalEvents.some((event) => event.kind === "reorg.invalidated")) {
     blockers.push("final verifier refuses replay bundles containing reorg.invalidated events");
   }
@@ -2916,8 +3291,8 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
     blockers.push("final verifier requires denied caw.live.audit.usage.verified wrong-target proof");
   }
 
-  if (!latestReplayEvent(eventsById, "caw.allowance.verified", (event) => replayEventHasProofAuthority(event, false))) {
-    blockers.push("final verifier requires caw.allowance.verified proof event");
+  if (!latestReplayEvent(eventsById, "caw.allowance.verified", (event) => replayEventHasLiveChainProofAuthority(event, false))) {
+    blockers.push("final verifier requires caw.allowance.verified proof event from a live chain provider");
   }
   if (!latestReplayEvent(eventsById, "caw.activation.verified", (event) => replayEventHasLiveChainProofAuthority(event, false))) {
     blockers.push("final verifier requires caw.activation.verified proof event from a live chain provider");
@@ -2933,9 +3308,6 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
   }
   if (!latestReplayEvent(eventsById, "token.balance_delta.verified", (event) => replayEventHasLiveChainProofAuthority(event, false))) {
     blockers.push("final verifier requires token.balance_delta.verified proof event from a live chain provider");
-  }
-  if (!latestReplayEvent(eventsById, "artifact.preflight.verified", (event) => event.authority === "delivery")) {
-    blockers.push("final verifier requires artifact.preflight.verified delivery event");
   }
   if (!latestReplayEvent(eventsById, "artifact.access_token.issued", (event) => event.authority === "delivery")) {
     blockers.push("final verifier requires artifact.access_token.issued delivery event");
@@ -2954,11 +3326,26 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
     blockers.push("final verifier requires bearer-bound lease.execution.succeeded with a pinned MCP transcript");
   }
 
-  const quotes = Array.isArray(bundle.quotes) ? bundle.quotes : [];
+  const quotes = replayRowsForCollection(bundle, "quotes");
   const quotesById = new Map(quotes.filter(isObject).map((quote) => [quote.quoteId, quote]));
-  const spends = Array.isArray(bundle.spends) ? bundle.spends : [];
+  const spends = replayRowsForCollection(bundle, "spends");
   const spendsById = new Map(spends.filter(isObject).map((spend) => [spend.spendId, spend]));
-  const accessTokens = Array.isArray(bundle.artifactAccessTokens) ? bundle.artifactAccessTokens : [];
+  const accessTokens = replayRowsForCollection(bundle, "artifactAccessTokens");
+  const serverLiveFetchPreflightIds = new Set(
+    finalEvents
+      .filter((event) => {
+        const payload = isObject(event.payload) ? event.payload : {};
+        return (
+          event.kind === "artifact.preflight.verified" &&
+          event.authority === "delivery" &&
+          typeof payload.preflightId === "string" &&
+          payload.deliveryVerificationAuthority === "server_live_fetch" &&
+          isHex32(payload.artifactDeliveryEvidenceHash) &&
+          payload.winnerClaimAllowed === false
+        );
+      })
+      .map((event) => event.payload.preflightId),
+  );
   const liveTokenRegistryBlockerSet = new Set();
   for (const quote of quotes.filter((candidate) => candidate?.status === CHAIN_SETTLEABLE_QUOTE_STATUS)) {
     const spend = spendsById.get(quote.spendId);
@@ -2968,6 +3355,7 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
     }
   }
   blockers.push(...liveTokenRegistryBlockerSet);
+  blockers.push(...deploymentRegistryBlockersForLiveContracts(bundle.deploymentRegistry, bundle, eventsById));
   if (quotes.length === 0) {
     blockers.push("final verifier requires at least one artifact quote bound to the payment");
   } else if (quotes.some((quote) => quote?.status === MOCK_QUOTE_STATUS)) {
@@ -2978,11 +3366,24 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
   if (accessTokens.length === 0) {
     blockers.push("final verifier requires at least one artifact access token");
   }
+  const finalArtifactPreflightIds = new Set();
   for (const token of accessTokens) {
     const quote = quotesById.get(token?.quoteId);
     if (!quote || quote.status !== CHAIN_SETTLEABLE_QUOTE_STATUS) {
       blockers.push(`final verifier requires artifact access token ${token?.tokenId ?? "-"} to reference a chain-settleable quote`);
       break;
+    }
+    if (typeof quote.preflightId === "string") {
+      finalArtifactPreflightIds.add(quote.preflightId);
+    }
+    if (typeof token?.preflightId === "string" && typeof quote.preflightId === "string" && token.preflightId !== quote.preflightId) {
+      blockers.push(`final verifier requires artifact access token ${token.tokenId ?? "-"} preflightId to match its quote`);
+      break;
+    }
+  }
+  for (const preflightId of finalArtifactPreflightIds) {
+    if (!serverLiveFetchPreflightIds.has(preflightId)) {
+      blockers.push(`final verifier requires server_live_fetch artifact.preflight.verified delivery event for preflight ${preflightId}`);
     }
   }
   const finalizedTrips = finalEvents.filter((event) => event.kind === "gate.spend_tripped" && replayGateFinalized(event));
@@ -3046,8 +3447,8 @@ function verifyFinalReplayClaimGate(bundle, eventsById, options) {
 
 function finalCawReceiptCoverageBlockers(bundle) {
   const blockers = [];
-  const rawBundles = Array.isArray(bundle.rawCawReceiptBundles) ? bundle.rawCawReceiptBundles.filter(isObject) : [];
-  const canonicalReceipts = Array.isArray(bundle.canonicalCawReceipts) ? bundle.canonicalCawReceipts.filter(isObject) : [];
+  const rawBundles = replayRowsForCollection(bundle, "rawCawReceiptBundles").filter(isObject);
+  const canonicalReceipts = replayRowsForCollection(bundle, "canonicalCawReceipts").filter(isObject);
   if (rawBundles.length === 0 || canonicalReceipts.length === 0) {
     return ["final verifier requires raw and canonical CAW receipts for deny_probe, approve, and activate_tool"];
   }
@@ -3078,9 +3479,9 @@ function finalCawReceiptCoverageBlockers(bundle) {
 
 function finalCawReceiptLiveBindingBlockers(bundle, canonicalReceipts) {
   const blockers = [];
-  const events = Array.isArray(bundle.events) ? bundle.events.filter(isObject) : [];
+  const events = replayRowsForCollection(bundle, "events").filter(isObject);
   const eventsById = new Map(events.filter((event) => typeof event.eventId === "string").map((event) => [event.eventId, event]));
-  const spendsById = new Map((Array.isArray(bundle.spends) ? bundle.spends : []).filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]));
+  const spendsById = new Map(replayRowsForCollection(bundle, "spends").filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]));
   const receipts = canonicalReceipts.filter((receipt) => ["caw-api", "caw-export"].includes(asText(receipt.sourceLabel)));
 
   const receiptMatchesDeny = receipts.some((receipt) =>
@@ -3228,17 +3629,21 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   if (bundle.summaryMode !== true) {
     errors.push("summaryMode must be true");
   }
-  if (!Number.isInteger(bundle.asOfEventSeq) || bundle.asOfEventSeq < 0 || bundle.asOfEventSeq > 200) {
-    errors.push("asOfEventSeq must be an integer in [0,200]");
+  if (!Number.isInteger(bundle.asOfEventSeq) || bundle.asOfEventSeq < 0) {
+    errors.push("asOfEventSeq must be a non-negative integer");
   }
-  if (!Number.isInteger(bundle.asOfMcpAdapterCallCount) || bundle.asOfMcpAdapterCallCount < 0 || bundle.asOfMcpAdapterCallCount > 200) {
-    errors.push("asOfMcpAdapterCallCount must be an integer in [0,200]");
+  if (!Number.isInteger(bundle.asOfMcpAdapterCallCount) || bundle.asOfMcpAdapterCallCount < 0) {
+    errors.push("asOfMcpAdapterCallCount must be a non-negative integer");
   }
   const requestedWinnerClaimAllowed = bundle.winnerClaimAllowed === true;
   if (bundle.winnerClaimAllowed !== false && bundle.winnerClaimAllowed !== true) {
     errors.push("replay bundle winnerClaimAllowed must be boolean");
   }
   verifyReplayPageIndex(bundle, errors, warnings);
+  const eventRows = replayRowsForCollection(bundle, "events");
+  if (Array.isArray(bundle.events) && eventRows.length > bundle.events.length) {
+    verifyReplayEvents(bundle, eventRows, errors);
+  }
   let eventsById = new Map();
   if (!Array.isArray(bundle.events)) {
     errors.push("events must be an array");
@@ -3252,32 +3657,29 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     if (eventRoot && bundle.eventRoot !== eventRoot) {
       errors.push("eventRoot must equal the hash of ordered event hashes");
     }
-    eventsById = new Map(
-      bundle.events
-        .filter((event) => isObject(event) && typeof event.eventId === "string")
-        .map((event) => [event.eventId, event]),
-    );
+    eventsById = new Map(eventRows.filter((event) => isObject(event) && typeof event.eventId === "string").map((event) => [event.eventId, event]));
   }
-  const rawBundles = Array.isArray(bundle.rawCawReceiptBundles) ? bundle.rawCawReceiptBundles : [];
-  const canonicalReceipts = Array.isArray(bundle.canonicalCawReceipts) ? bundle.canonicalCawReceipts : [];
-  const cawReceiptOperations = Array.isArray(bundle.cawReceiptOperations) ? bundle.cawReceiptOperations : [];
-  const cawLiveInteractions = Array.isArray(bundle.cawLiveInteractions) ? bundle.cawLiveInteractions : [];
-  const preflights = Array.isArray(bundle.artifactPreflights) ? bundle.artifactPreflights : [];
-  const quotes = Array.isArray(bundle.quotes) ? bundle.quotes : [];
-  const accessTokens = Array.isArray(bundle.artifactAccessTokens) ? bundle.artifactAccessTokens : [];
-  const spends = Array.isArray(bundle.spends) ? bundle.spends : [];
+  const rawBundles = replayRowsForCollection(bundle, "rawCawReceiptBundles");
+  const canonicalReceipts = replayRowsForCollection(bundle, "canonicalCawReceipts");
+  const cawReceiptOperations = replayRowsForCollection(bundle, "cawReceiptOperations");
+  const cawLiveInteractions = replayRowsForCollection(bundle, "cawLiveInteractions");
+  const preflights = replayRowsForCollection(bundle, "artifactPreflights");
+  const quotes = replayRowsForCollection(bundle, "quotes");
+  const accessTokens = replayRowsForCollection(bundle, "artifactAccessTokens");
+  const spends = replayRowsForCollection(bundle, "spends");
   const cawOperationsById = new Map(cawReceiptOperations.filter(isObject).map((operation) => [operation.operationId, operation]));
-  const mcpCalls = Array.isArray(bundle.mcpAdapterCalls) ? bundle.mcpAdapterCalls : [];
+  const replayPageMcpCalls = replayRowsForCollection(bundle, "mcpAdapterCalls");
+  const mcpCalls = replayPageMcpCalls.length > 0 ? replayPageMcpCalls : Array.isArray(bundle.mcpAdapterCalls) ? bundle.mcpAdapterCalls : [];
   if (!Array.isArray(bundle.mcpAdapterCalls)) {
     errors.push("mcpAdapterCalls must be an array");
   }
-  if (Array.isArray(bundle.mcpAdapterCalls) && bundle.asOfMcpAdapterCallCount !== bundle.mcpAdapterCalls.length) {
-    errors.push("asOfMcpAdapterCallCount must equal mcpAdapterCalls.length in the replay summary");
+  if (Array.isArray(bundle.mcpAdapterCalls) && bundle.asOfMcpAdapterCallCount !== mcpCalls.length) {
+    errors.push("asOfMcpAdapterCallCount must equal the replay MCP adapter call count");
   }
   const callsByAuditNonce = verifyMcpAdapterCalls(bundle, mcpCalls, errors);
   verifyLeaseRuns(bundle, callsByAuditNonce, eventsById, errors);
   verifyJudgeCheck(bundle, eventsById, errors);
-  verifyContractStateProofEvents(bundle, Array.isArray(bundle.events) ? bundle.events : [], errors);
+  verifyContractStateProofEvents(bundle, eventRows, errors);
   verifySourceIdentityBindings(bundle, errors);
   const spendsById = new Map(spends.filter(isObject).map((spend) => [lowerHex(spend.spendId), spend]));
   const cawLiveInteractionsById = new Map(cawLiveInteractions.filter(isObject).map((interaction) => [interaction.interactionId, interaction]));
@@ -3296,6 +3698,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     if (lowerHex(preflight.artifactCid) !== `sha256:${asText(preflight.artifactHashPreview).toLowerCase()}`) {
       errors.push(`artifact preflight ${preflight.preflightId ?? "-"} artifactCid does not match artifactHashPreview`);
     }
+    verifyPublicReplayUrl(`artifact preflight ${preflight.preflightId ?? "-"} endpointUrl`, preflight.endpointUrl, errors);
     const spend = spendsById.get(lowerHex(preflight.spendId));
     if (!spend) {
       errors.push(`artifact preflight ${preflight.preflightId ?? "-"} references missing registered spend`);
@@ -3320,29 +3723,36 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
       if (typeof preflight.verifiedAt !== "string" || preflight.verifiedAt.length === 0) {
         errors.push(`artifact preflight ${preflight.preflightId ?? "-"} verifiedAt is required after delivery verification`);
       }
+      const verifiedEvent = [...eventsById.values()].find(
+        (event) => event.kind === "artifact.preflight.verified" && event.payload?.preflightId === preflight.preflightId,
+      );
+      const proofHashBody = {
+        sessionId: bundle.sessionId,
+        preflightId: preflight.preflightId,
+        spendId: preflight.spendId,
+        artifactPayloadHash: lowerHex(preflight.artifactHashPreview),
+        artifactCid: lowerHex(preflight.artifactCid),
+        endpointUrl: asText(preflight.endpointUrl),
+        priceDisclosureHash: asText(preflight.priceDisclosureHash),
+        sourceStateSnapshotHash: asText(preflight.sourceStateSnapshotHash),
+        manifestFetchHash: lowerHex(preflight.manifestFetchHash),
+        endpointResponseHash: lowerHex(preflight.endpointResponseHash),
+        leaseDryRunHash: lowerHex(preflight.leaseDryRunHash),
+        ...(typeof verifiedEvent?.payload?.deliveryVerificationAuthority === "string"
+          ? { deliveryVerificationAuthority: verifiedEvent.payload.deliveryVerificationAuthority }
+          : {}),
+        ...(isHex32(verifiedEvent?.payload?.artifactDeliveryEvidenceHash)
+          ? { artifactDeliveryEvidenceHash: lowerHex(verifiedEvent.payload.artifactDeliveryEvidenceHash) }
+          : {}),
+      };
       const expectedDeliveryProofHash = safeHashJson(
-        {
-          sessionId: bundle.sessionId,
-          preflightId: preflight.preflightId,
-          spendId: preflight.spendId,
-          artifactPayloadHash: lowerHex(preflight.artifactHashPreview),
-          artifactCid: lowerHex(preflight.artifactCid),
-          endpointUrl: asText(preflight.endpointUrl),
-          priceDisclosureHash: asText(preflight.priceDisclosureHash),
-          sourceStateSnapshotHash: asText(preflight.sourceStateSnapshotHash),
-          manifestFetchHash: lowerHex(preflight.manifestFetchHash),
-          endpointResponseHash: lowerHex(preflight.endpointResponseHash),
-          leaseDryRunHash: lowerHex(preflight.leaseDryRunHash),
-        },
+        proofHashBody,
         `artifact preflight ${preflight.preflightId ?? "-"} delivery proof hash body`,
         errors,
       );
       if (expectedDeliveryProofHash && lowerHex(preflight.deliveryProofHash) !== expectedDeliveryProofHash) {
         errors.push(`artifact preflight ${preflight.preflightId ?? "-"} deliveryProofHash does not recompute`);
       }
-      const verifiedEvent = [...eventsById.values()].find(
-        (event) => event.kind === "artifact.preflight.verified" && event.payload?.preflightId === preflight.preflightId,
-      );
       if (!verifiedEvent || verifiedEvent.authority !== "delivery") {
         errors.push(`artifact preflight ${preflight.preflightId ?? "-"} requires delivery-authority artifact.preflight.verified event`);
       } else {
@@ -3361,6 +3771,12 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
           ["leaseDryRunHash", lowerHex(preflight.leaseDryRunHash)],
           ["deliveryProofHash", lowerHex(preflight.deliveryProofHash)],
           ["status", "passed_live_delivery"],
+          ...(typeof verifiedEvent.payload?.deliveryVerificationAuthority === "string"
+            ? [["deliveryVerificationAuthority", verifiedEvent.payload.deliveryVerificationAuthority]]
+            : []),
+          ...(isHex32(verifiedEvent.payload?.artifactDeliveryEvidenceHash)
+            ? [["artifactDeliveryEvidenceHash", lowerHex(verifiedEvent.payload.artifactDeliveryEvidenceHash)]]
+            : []),
         ]) {
           if (lowerHex(verifiedEvent.payload?.[field]) !== lowerHex(expected)) {
             errors.push(`artifact preflight ${preflight.preflightId ?? "-"} verified event payload.${field} does not match preflight`);
@@ -3502,7 +3918,9 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
       errors.push("artifactAccessTokens entries must be objects");
       continue;
     }
-    const payloadHash = safeHashJson(token.artifactPayload, `artifact access token ${token.tokenId ?? "-"} payload`, errors);
+    const redactedPayloadHash = artifactPayloadRedactionHash(token.artifactPayload);
+    const payloadHash =
+      redactedPayloadHash ?? safeHashJson(token.artifactPayload, `artifact access token ${token.tokenId ?? "-"} payload`, errors);
     if (payloadHash && (payloadHash !== lowerHex(token.artifactPayloadHash) || payloadHash !== lowerHex(token.artifactHash))) {
       errors.push(`artifact access token ${token.tokenId ?? "-"} payload hash does not match artifactHash`);
     }
@@ -3557,7 +3975,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
 	      }
 	    }
 	  }
-  const rawReceiptsByHash = new Map();
+  const rawReceiptsByOperationAndHash = new Map();
   for (const rawBundle of rawBundles) {
     if (!isObject(rawBundle)) {
       errors.push("rawCawReceiptBundles entries must be objects");
@@ -3571,7 +3989,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
     for (const receipt of receipts) {
       const receiptHash = safeHashJson(receipt, "raw CAW receipt", errors);
       if (receiptHash) {
-        rawReceiptsByHash.set(receiptHash, { rawBundle, receipt });
+        rawReceiptsByOperationAndHash.set(`${asText(rawBundle.operationId)}:${receiptHash}`, { rawBundle, receipt });
       }
     }
   }
@@ -3580,7 +3998,7 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
       errors.push("canonicalCawReceipts entries must be objects");
       continue;
     }
-    const rawMatch = rawReceiptsByHash.get(canonical.rawReceiptHash);
+    const rawMatch = rawReceiptsByOperationAndHash.get(`${asText(canonical.operationId)}:${canonical.rawReceiptHash}`);
     if (!rawMatch) {
       errors.push(`canonical CAW receipt ${canonical.canonicalReceiptHash ?? "-"} does not match any raw receipt hash`);
       continue;
@@ -3633,7 +4051,411 @@ function verifyReplayBundleEvidence(bundle, options = {}) {
   };
 }
 
+function publicProofBundleVerifierAttestationInput(bundle, attestation) {
+  return {
+    attestationType: "PACTFUSE_PUBLIC_PROOF_VERIFIER_ATTESTATION_V1",
+    scheme: attestation.scheme,
+    keyId: attestation.keyId,
+    publicKeyHash: attestation.publicKeyHash,
+    bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+    sessionId: bundle.sessionId,
+    publicClaimHash: bundle.publicClaimHash,
+    publicClaimEventSeq: bundle.publicClaimEventSeq,
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt: bundle.authorizedAt,
+    asOfEventSeq: bundle.asOfEventSeq,
+    claimInputReplayBundleHash: bundle.claimInputReplayBundleHash,
+    replayBundleHash: bundle.replayBundleHash,
+    verifierRunHash: bundle.verifierRunHash,
+    providerStatusHash: bundle.providerStatusHash,
+    deploymentRegistryHash: bundle.deploymentRegistryHash,
+    serverHash: bundle.serverHash,
+    winnerClaimAllowed: true,
+  };
+}
+
+function verifyPublicProofBundleVerifierAttestation(bundle, errors) {
+  const attestation = isObject(bundle.verifierAttestation) ? bundle.verifierAttestation : null;
+  if (!attestation) {
+    errors.push("public proof bundle verifierAttestation must be an object");
+    return false;
+  }
+  for (const field of ["scheme", "keyId", "publicKeyPem", "publicKeyHash", "signedPayloadHash", "signature"]) {
+    requirePath(attestation, [field], errors);
+  }
+  if (attestation.scheme !== "ed25519") {
+    errors.push("public proof bundle verifierAttestation.scheme must be ed25519");
+  }
+  if (typeof attestation.keyId !== "string" || attestation.keyId.length < 1) {
+    errors.push("public proof bundle verifierAttestation.keyId must be a non-empty string");
+  }
+  if (typeof attestation.publicKeyPem !== "string" || attestation.publicKeyPem.length < 1) {
+    errors.push("public proof bundle verifierAttestation.publicKeyPem must be a PEM string");
+  }
+  if (!isHex32(attestation.publicKeyHash)) {
+    errors.push("public proof bundle verifierAttestation.publicKeyHash must be a 32-byte hash");
+  }
+  if (!isHex32(attestation.signedPayloadHash)) {
+    errors.push("public proof bundle verifierAttestation.signedPayloadHash must be a 32-byte hash");
+  }
+  if (typeof attestation.signature !== "string" || attestation.signature.length < 1) {
+    errors.push("public proof bundle verifierAttestation.signature must be a base64 signature");
+  }
+  const publicKeyHash = typeof attestation.publicKeyPem === "string" ? sha256Hex(attestation.publicKeyPem) : null;
+  if (publicKeyHash && isHex32(attestation.publicKeyHash) && lowerHex(attestation.publicKeyHash) !== publicKeyHash) {
+    errors.push("public proof bundle verifierAttestation.publicKeyHash does not match publicKeyPem");
+  }
+  const signedPayloadHash = safeHashJson(
+    publicProofBundleVerifierAttestationInput(bundle, attestation),
+    "public proof bundle verifierAttestation signed payload",
+    errors,
+  );
+  if (signedPayloadHash && isHex32(attestation.signedPayloadHash) && lowerHex(attestation.signedPayloadHash) !== signedPayloadHash) {
+    errors.push("public proof bundle verifierAttestation.signedPayloadHash does not recompute");
+  }
+  if (
+    attestation.scheme !== "ed25519" ||
+    !publicKeyHash ||
+    !signedPayloadHash ||
+    !isHex32(attestation.publicKeyHash) ||
+    !isHex32(attestation.signedPayloadHash) ||
+    typeof attestation.signature !== "string"
+  ) {
+    return false;
+  }
+  try {
+    const publicKey = createPublicKey(attestation.publicKeyPem);
+    const signature = Buffer.from(attestation.signature, "base64");
+    const ok = cryptoVerify(null, Buffer.from(attestation.signedPayloadHash.slice(2), "hex"), publicKey, signature);
+    if (!ok) {
+      errors.push("public proof bundle verifierAttestation signature is invalid");
+    }
+    return ok && lowerHex(attestation.signedPayloadHash) === signedPayloadHash && lowerHex(attestation.publicKeyHash) === publicKeyHash;
+  } catch (error) {
+    errors.push(`public proof bundle verifierAttestation signature cannot be verified: ${error instanceof Error ? error.message : "unknown error"}`);
+    return false;
+  }
+}
+
+function publicProofBundleAttestationTrustErrors(attestation, options) {
+  const trusted = trustedProofKeyHashes(options);
+  if (trusted.size === 0) {
+    return ["public proof bundle verifierAttestation trusted proof key hash is not configured"];
+  }
+  const keyHash = lowerHex(attestation?.publicKeyHash);
+  if (!trusted.has(keyHash)) {
+    return ["public proof bundle verifierAttestation publicKeyHash is not trusted"];
+  }
+  return [];
+}
+
+function verifyPublicProofBundleEvidence(bundle, options = {}) {
+  const schemaErrors = [];
+  const warnings = [];
+  const publicProofBundleFields = [
+    "bundleType",
+    "sessionId",
+    "proofBundleHash",
+    "publicClaimHash",
+    "publicClaimEventId",
+    "publicClaimEventHash",
+    "publicClaimEventSeq",
+    "snapshotScope",
+    "providerSnapshotOnly",
+    "authorizedAt",
+    "asOfEventSeq",
+    "claimInputReplayBundleHash",
+    "replayBundleHash",
+    "verifierRunHash",
+    "providerStatusHash",
+    "deploymentRegistryHash",
+    "serverHash",
+    "publicClaim",
+    "replayBundle",
+    "providerStatuses",
+    "deploymentRegistry",
+    "server",
+    "verifierAttestation",
+    "winnerClaimAllowed",
+  ];
+  rejectUnexpectedKeys(bundle, publicProofBundleFields, "public proof bundle", schemaErrors);
+  for (const field of publicProofBundleFields) {
+    requirePath(bundle, [field], schemaErrors);
+  }
+  if (bundle.bundleType !== "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1") {
+    schemaErrors.push("public proof bundle bundleType must be PACTFUSE_PUBLIC_PROOF_BUNDLE_V1");
+  }
+  if (!isHex32(bundle.sessionId)) {
+    schemaErrors.push("public proof bundle sessionId must be a 32-byte hex string");
+  }
+  for (const field of [
+    "proofBundleHash",
+    "publicClaimHash",
+    "publicClaimEventId",
+    "publicClaimEventHash",
+    "claimInputReplayBundleHash",
+    "replayBundleHash",
+    "verifierRunHash",
+    "providerStatusHash",
+    "serverHash",
+  ]) {
+    if (!isHex32(bundle[field])) {
+      schemaErrors.push(`public proof bundle ${field} must be a 32-byte hash`);
+    }
+  }
+  if (bundle.deploymentRegistryHash !== null && !isHex32(bundle.deploymentRegistryHash)) {
+    schemaErrors.push("public proof bundle deploymentRegistryHash must be a 32-byte hash or null");
+  }
+  if (bundle.snapshotScope !== "authorization_event" || bundle.providerSnapshotOnly !== true) {
+    schemaErrors.push("public proof bundle must use authorization_event provider snapshot");
+  }
+  if (bundle.winnerClaimAllowed !== true) {
+    schemaErrors.push("public proof bundle winnerClaimAllowed must be true");
+  }
+  if (!Number.isInteger(bundle.publicClaimEventSeq) || bundle.publicClaimEventSeq < 1) {
+    schemaErrors.push("public proof bundle publicClaimEventSeq must be a positive integer");
+  }
+  if (!Number.isInteger(bundle.asOfEventSeq) || bundle.asOfEventSeq < 0) {
+    schemaErrors.push("public proof bundle asOfEventSeq must be a non-negative integer");
+  }
+  if (Number.isInteger(bundle.publicClaimEventSeq) && Number.isInteger(bundle.asOfEventSeq) && bundle.asOfEventSeq !== bundle.publicClaimEventSeq - 1) {
+    schemaErrors.push("public proof bundle asOfEventSeq must immediately precede publicClaimEventSeq");
+  }
+  const replayBundle = isObject(bundle.replayBundle) ? bundle.replayBundle : null;
+  const publicClaim = isObject(bundle.publicClaim) ? bundle.publicClaim : null;
+  if (!replayBundle) {
+    schemaErrors.push("public proof bundle requires replayBundle object");
+  }
+  if (!publicClaim) {
+    schemaErrors.push("public proof bundle requires publicClaim object");
+  }
+  if (replayBundle && replayBundle.sessionId !== bundle.sessionId) {
+    schemaErrors.push("public proof bundle replayBundle.sessionId must match bundle.sessionId");
+  }
+  if (replayBundle && Number.isInteger(bundle.asOfEventSeq) && replayBundle.asOfEventSeq !== bundle.asOfEventSeq) {
+    schemaErrors.push("public proof bundle replayBundle.asOfEventSeq must match bundle.asOfEventSeq");
+  }
+  const replayBundleHash = replayBundle ? safeHashJson(replayBundle, "public proof bundle replayBundle", schemaErrors) : null;
+  if (replayBundleHash && lowerHex(bundle.replayBundleHash) !== replayBundleHash) {
+    schemaErrors.push("public proof bundle replayBundleHash does not recompute");
+  }
+  if (bundle.claimInputReplayBundleHash !== bundle.replayBundleHash) {
+    schemaErrors.push("public proof bundle claimInputReplayBundleHash must equal replayBundleHash");
+  }
+  const verifierRunHash = publicClaim?.verifierRun ? safeHashJson(publicClaim.verifierRun, "public proof bundle verifierRun", schemaErrors) : null;
+  if (verifierRunHash && lowerHex(bundle.verifierRunHash) !== verifierRunHash) {
+    schemaErrors.push("public proof bundle verifierRunHash does not recompute");
+  }
+  const providerStatusHash = Array.isArray(bundle.providerStatuses)
+    ? safeHashJson(bundle.providerStatuses, "public proof bundle providerStatuses", schemaErrors)
+    : null;
+  if (!Array.isArray(bundle.providerStatuses)) {
+    schemaErrors.push("public proof bundle providerStatuses must be an array");
+  } else if (providerStatusHash && lowerHex(bundle.providerStatusHash) !== providerStatusHash) {
+    schemaErrors.push("public proof bundle providerStatusHash does not recompute");
+  }
+  const deploymentRegistryHash = bundle.deploymentRegistry === null
+    ? null
+    : isObject(bundle.deploymentRegistry)
+      ? safeHashJson(bundle.deploymentRegistry, "public proof bundle deploymentRegistry", schemaErrors)
+      : undefined;
+  if (deploymentRegistryHash === undefined) {
+    schemaErrors.push("public proof bundle deploymentRegistry must be an object or null");
+  } else if (bundle.deploymentRegistryHash !== deploymentRegistryHash) {
+    schemaErrors.push("public proof bundle deploymentRegistryHash does not recompute");
+  }
+  const serverHash = isObject(bundle.server) ? safeHashJson(bundle.server, "public proof bundle server", schemaErrors) : null;
+  if (!isObject(bundle.server)) {
+    schemaErrors.push("public proof bundle server must be an object");
+  } else if (serverHash && lowerHex(bundle.serverHash) !== serverHash) {
+    schemaErrors.push("public proof bundle serverHash does not recompute");
+  }
+  if (publicClaim) {
+    verifyPublicClaimBinding(bundle, publicClaim, schemaErrors);
+  }
+  const verifierAttestationOk = verifyPublicProofBundleVerifierAttestation(bundle, schemaErrors);
+  const verifierAttestationTrustErrors = verifierAttestationOk
+    ? publicProofBundleAttestationTrustErrors(bundle.verifierAttestation, options)
+    : [];
+  if (replayBundle && publicClaim) {
+    const publicClaimPayload = {
+      claim: publicClaim,
+      publicClaimHash: bundle.publicClaimHash,
+      replayBundle,
+      replayBundleHash: bundle.claimInputReplayBundleHash,
+      verifierRunHash: bundle.verifierRunHash,
+      verifierAttestation: bundle.verifierAttestation,
+      asOfEventSeq: publicClaim.asOfEventSeq,
+      providerStatuses: bundle.providerStatuses,
+      providerStatusHash: bundle.providerStatusHash,
+      deploymentRegistry: bundle.deploymentRegistry,
+      deploymentRegistryHash: bundle.deploymentRegistryHash,
+      server: bundle.server,
+      serverHash: bundle.serverHash,
+      proofAuthority: true,
+      winnerClaimAllowed: true,
+    };
+    const publicClaimPayloadHash = safeHashJson(publicClaimPayload, "public proof bundle public claim event payload", schemaErrors);
+    const previousProofEventHash = latestProofEventHashForPublicClaim(replayBundle, bundle.asOfEventSeq);
+    const publicClaimEventHash = publicClaimPayloadHash
+      ? safeHashJson(
+          {
+            sessionId: bundle.sessionId,
+            eventSeq: bundle.publicClaimEventSeq,
+            authority: "proof",
+            kind: "public.claim.authorized",
+            payloadHash: publicClaimPayloadHash,
+            prevProofEventHash: previousProofEventHash,
+          },
+          "public proof bundle public claim event hash body",
+          schemaErrors,
+        )
+      : null;
+    if (publicClaimEventHash && lowerHex(bundle.publicClaimEventHash) !== publicClaimEventHash) {
+      schemaErrors.push("public proof bundle publicClaimEventHash does not recompute");
+    }
+    if (publicClaimEventHash && lowerHex(bundle.publicClaimEventId) !== publicClaimEventHash) {
+      schemaErrors.push("public proof bundle publicClaimEventId must equal publicClaimEventHash");
+    }
+  }
+  const proofBundleBase = { ...bundle };
+  delete proofBundleBase.proofBundleHash;
+  const proofBundleHash = safeHashJson(proofBundleBase, "public proof bundle body", schemaErrors);
+  if (proofBundleHash && lowerHex(bundle.proofBundleHash) !== proofBundleHash) {
+    schemaErrors.push("public proof bundle proofBundleHash does not recompute");
+  }
+
+  const replayOptions = verifierAttestationOk && verifierAttestationTrustErrors.length === 0
+    ? createServerRuntimeVerifierOptions({
+        ...options,
+        proofProviders: Array.isArray(bundle.providerStatuses) ? bundle.providerStatuses : [],
+      })
+    : { ...options, proofProviders: [] };
+  const replayResult = replayBundle ? verifyReplayBundleEvidence(replayBundle, replayOptions) : null;
+  if (replayResult) {
+    schemaErrors.push(...replayResult.schemaErrors.map((error) => `replayBundle: ${error}`));
+  }
+  const proofCompletenessErrors =
+    options.cliMode === "schema-only" || schemaErrors.length > 0 || !replayResult
+      ? []
+      : [
+          ...verifierAttestationTrustErrors,
+          ...replayResult.proofCompletenessErrors.map((error) => `replayBundle: ${error}`),
+          ...(replayResult.finalVerifierComplete ? [] : ["public proof bundle embedded replay did not pass final verifier"]),
+          ...(publicClaim?.verifierRun?.finalVerifierComplete === true &&
+          publicClaim?.verifierRun?.proofChipAllowed === true &&
+          publicClaim?.verifierRun?.winnerClaimAllowed === true
+            ? []
+            : ["public proof bundle embedded publicClaim verifierRun does not authorize winner claim"]),
+        ];
+  const finalVerifierComplete =
+    options.cliMode !== "schema-only" &&
+    schemaErrors.length === 0 &&
+    proofCompletenessErrors.length === 0 &&
+    Boolean(replayResult?.finalVerifierComplete);
+  const proofChipAllowed = finalVerifierComplete;
+  const requestedWinnerClaimAllowed = bundle.winnerClaimAllowed === true || publicClaim?.winnerClaimAllowed === true;
+  const winnerClaimAllowed = finalVerifierComplete && requestedWinnerClaimAllowed;
+  const allErrors = [...schemaErrors, ...proofCompletenessErrors];
+  return {
+    schemaOk: schemaErrors.length === 0,
+    proofChipAllowed,
+    winnerClaimAllowed,
+    requestedWinnerClaimAllowed,
+    finalVerifierComplete,
+    file: options.file ?? null,
+    cliMode: options.cliMode ?? null,
+    paymentProofMode: null,
+    warnings: [...warnings, ...(replayResult?.warnings ?? [])],
+    schemaErrors,
+    proofCompletenessErrors,
+    proofChipErrors: allErrors,
+    winnerClaimErrors: [],
+    errors: allErrors,
+  };
+}
+
+function verifyPublicClaimBinding(bundle, publicClaim, errors) {
+  const expectedTokenSettlementClaim = tokenSettlementClaimForTokenMode(publicClaim.tokenMode);
+  if (!expectedTokenSettlementClaim || publicClaim.tokenSettlementClaim !== expectedTokenSettlementClaim) {
+    errors.push("public proof bundle publicClaim.tokenSettlementClaim does not match tokenMode");
+  }
+  for (const field of ["claimMode", "paymentMode", "tokenMode", "identityMode"]) {
+    if (publicClaim.verifierRun?.[field] !== publicClaim[field]) {
+      errors.push(`public proof bundle publicClaim.verifierRun.${field} does not match publicClaim.${field}`);
+    }
+  }
+  for (const [field, expected] of [
+    ["sessionId", bundle.sessionId],
+    ["snapshotScope", "authorization_event"],
+    ["providerSnapshotOnly", true],
+    ["authorizedAt", bundle.authorizedAt],
+    ["authorizedEventSeq", bundle.publicClaimEventSeq],
+    ["asOfEventSeq", bundle.asOfEventSeq],
+    ["replayBundleHash", bundle.replayBundleHash],
+    ["providerStatusHash", bundle.providerStatusHash],
+    ["deploymentRegistryHash", bundle.deploymentRegistryHash],
+    ["serverHash", bundle.serverHash],
+    ["proofChipAllowed", true],
+    ["finalVerifierComplete", true],
+    ["winnerClaimAllowed", true],
+  ]) {
+    if (publicClaim[field] !== expected) {
+      errors.push(`public proof bundle publicClaim.${field} does not match bundle`);
+    }
+  }
+  const expectedPublicClaimHash = safeHashJson(
+    {
+      sessionId: publicClaim.sessionId,
+      snapshotScope: publicClaim.snapshotScope,
+      providerSnapshotOnly: publicClaim.providerSnapshotOnly,
+      authorizedAt: publicClaim.authorizedAt,
+      authorizedEventSeq: publicClaim.authorizedEventSeq,
+      asOfEventSeq: publicClaim.asOfEventSeq,
+      claimMode: publicClaim.claimMode,
+      paymentMode: publicClaim.paymentMode,
+      tokenMode: publicClaim.tokenMode,
+      tokenSettlementClaim: publicClaim.tokenSettlementClaim,
+      identityMode: publicClaim.identityMode,
+      replayBundleHash: publicClaim.replayBundleHash,
+      providerStatusHash: publicClaim.providerStatusHash,
+      deploymentRegistryHash: publicClaim.deploymentRegistryHash,
+      serverHash: publicClaim.serverHash,
+      verifierRun: {
+        claimMode: publicClaim.verifierRun?.claimMode,
+        paymentMode: publicClaim.verifierRun?.paymentMode,
+        tokenMode: publicClaim.verifierRun?.tokenMode,
+        identityMode: publicClaim.verifierRun?.identityMode,
+        proofLevel: publicClaim.verifierRun?.proofLevel,
+        proofChipAllowed: publicClaim.verifierRun?.proofChipAllowed,
+        finalVerifierComplete: publicClaim.verifierRun?.finalVerifierComplete,
+        winnerClaimAllowed: publicClaim.verifierRun?.winnerClaimAllowed,
+      },
+    },
+    "public proof bundle publicClaimHash body",
+    errors,
+  );
+  if (expectedPublicClaimHash && lowerHex(bundle.publicClaimHash) !== expectedPublicClaimHash) {
+    errors.push("public proof bundle publicClaimHash does not recompute");
+  }
+  if (lowerHex(publicClaim.publicClaimHash) !== lowerHex(bundle.publicClaimHash)) {
+    errors.push("public proof bundle publicClaim.publicClaimHash does not match bundle");
+  }
+}
+
+function latestProofEventHashForPublicClaim(replayBundle, asOfEventSeq) {
+  const events = replayRowsForCollection(replayBundle, "events");
+  const proofEvents = events
+    .filter((event) => isObject(event) && event.authority === "proof" && Number(event.eventSeq) <= Number(asOfEventSeq))
+    .sort((left, right) => Number(left.eventSeq) - Number(right.eventSeq));
+  return proofEvents.at(-1)?.eventHash ?? ZERO_HASH;
+}
+
 export function verifyEvidence(receipt, options = {}) {
+  if (isObject(receipt) && receipt.bundleType === "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1") {
+    return verifyPublicProofBundleEvidence(receipt, options);
+  }
   if (isObject(receipt) && receipt.bundleType === "PACTFUSE_EVIDENCE_V1") {
     return verifyReplayBundleEvidence(receipt, options);
   }
@@ -3732,9 +4554,41 @@ function main() {
     usage();
     process.exit(0);
   }
-  const schemaOnly = args.includes("--schema-only") || args.includes("--preflight");
-  const positional = args.filter((arg) => arg !== "--schema-only" && arg !== "--preflight");
-  const unknownFlags = positional.filter((arg) => arg.startsWith("-"));
+  const trustedProofKeyHashes = normalizedHex32List([process.env.PACTFUSE_TRUSTED_PROOF_KEY_HASHES]);
+  const positional = [];
+  let schemaOnly = false;
+  const unknownFlags = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--schema-only" || arg === "--preflight") {
+      schemaOnly = true;
+      continue;
+    }
+    if (arg === "--trusted-proof-key-hash") {
+      const value = args[index + 1];
+      if (!isHex32(value)) {
+        unknownFlags.push(`${arg} requires a 32-byte hex hash`);
+      } else {
+        trustedProofKeyHashes.push(lowerHex(value));
+      }
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--trusted-proof-key-hash=")) {
+      const value = arg.slice("--trusted-proof-key-hash=".length);
+      if (!isHex32(value)) {
+        unknownFlags.push("--trusted-proof-key-hash requires a 32-byte hex hash");
+      } else {
+        trustedProofKeyHashes.push(lowerHex(value));
+      }
+      continue;
+    }
+    if (arg.startsWith("-")) {
+      unknownFlags.push(arg);
+      continue;
+    }
+    positional.push(arg);
+  }
   const [receiptPath] = positional;
   if (unknownFlags.length > 0) {
     usage();
@@ -3754,7 +4608,11 @@ function main() {
     process.exit(1);
   }
 
-  const result = verifyEvidence(receipt, { file: receiptPath, cliMode: schemaOnly ? "schema-only" : "proof-chip" });
+  const result = verifyEvidence(receipt, {
+    file: receiptPath,
+    cliMode: schemaOnly ? "schema-only" : "proof-chip",
+    trustedProofKeyHashes,
+  });
   console.log(JSON.stringify(result, null, 2));
   if (schemaOnly) {
     process.exit(result.schemaOk && !result.requestedWinnerClaimAllowed ? 0 : 1);

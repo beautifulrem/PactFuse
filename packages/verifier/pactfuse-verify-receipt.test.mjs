@@ -1,5 +1,7 @@
-import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { createHash, generateKeyPairSync, sign as cryptoSign } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -21,7 +23,59 @@ function liveProofProvidersForTest() {
     mode: "live",
     ready: true,
     reason: "test live provider",
+    ...(name === "chain" ? { chainId: "84532", endpoint: "https://rpc.example.test/" } : {}),
   }));
+}
+
+function testProofBundleSigner(keyId = "test-proof-key") {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+  const publicKeyHash = `0x${createHash("sha256").update(publicKeyPem).digest("hex")}`;
+  return {
+    scheme: "ed25519",
+    keyId,
+    publicKeyPem,
+    publicKeyHash,
+    signPayloadHash(payloadHash) {
+      return cryptoSign(null, Buffer.from(payloadHash.slice(2), "hex"), privateKey).toString("base64");
+    },
+  };
+}
+
+function signPublicProofBundleVerifierAttestationForTest(signer, fields) {
+  const signedPayloadHash = hashJson(publicProofBundleVerifierAttestationInputForTest(signer, fields));
+  return {
+    scheme: signer.scheme,
+    keyId: signer.keyId,
+    publicKeyPem: signer.publicKeyPem,
+    publicKeyHash: signer.publicKeyHash,
+    signedPayloadHash,
+    signature: signer.signPayloadHash(signedPayloadHash),
+  };
+}
+
+function publicProofBundleVerifierAttestationInputForTest(signer, fields) {
+  return {
+    attestationType: "PACTFUSE_PUBLIC_PROOF_VERIFIER_ATTESTATION_V1",
+    scheme: signer.scheme,
+    keyId: signer.keyId,
+    publicKeyHash: signer.publicKeyHash,
+    bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+    sessionId: fields.sessionId,
+    publicClaimHash: fields.publicClaimHash,
+    publicClaimEventSeq: fields.publicClaimEventSeq,
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt: fields.authorizedAt,
+    asOfEventSeq: fields.asOfEventSeq,
+    claimInputReplayBundleHash: fields.claimInputReplayBundleHash,
+    replayBundleHash: fields.replayBundleHash,
+    verifierRunHash: fields.verifierRunHash,
+    providerStatusHash: fields.providerStatusHash,
+    deploymentRegistryHash: fields.deploymentRegistryHash,
+    serverHash: fields.serverHash,
+    winnerClaimAllowed: true,
+  };
 }
 
 describe("pactfuse receipt verifier contract", () => {
@@ -100,8 +154,298 @@ describe("pactfuse receipt verifier contract", () => {
   });
 
   it("opens final proof-chip authority only after every public winner gate is satisfied", () => {
+    const bundle = finalWinnerReplayBundleForTest();
+
+    const result = verifyEvidence(
+      bundle,
+      createServerRuntimeVerifierOptions({
+        cliMode: "proof-chip",
+        proofProviders: liveProofProvidersForTest(),
+      }),
+    );
+
+    expect(result.schemaErrors).toEqual([]);
+    expect(result.schemaOk).toBe(true);
+    expect(result.proofCompletenessErrors).toEqual([]);
+    expect(result.finalVerifierComplete).toBe(true);
+    expect(result.proofChipAllowed).toBe(true);
+    expect(result.winnerClaimAllowed).toBe(true);
+  });
+
+  it("keeps final authority closed when chain proof events do not match the trusted chain provider endpoint", () => {
+    const bundle = finalWinnerReplayBundleForTest();
+    const tokenEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
+    const proofProviders = liveProofProvidersForTest().map((provider) =>
+      provider.name === "chain" ? { ...provider, chainId: "84532", endpoint: "https://different-rpc.example.test/" } : provider,
+    );
+
+    const result = verifyEvidence(
+      bundle,
+      createServerRuntimeVerifierOptions({
+        cliMode: "proof-chip",
+        proofProviders,
+      }),
+    );
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofCompletenessErrors).toContain(
+      `event ${tokenEvent.eventId} token.balance_delta.verified chainProviderEndpoint does not match trusted chain proof provider`,
+    );
+  });
+
+  it("verifies public proof bundles as the published winner artifact", () => {
+    const proofBundle = publicProofBundleForTest();
+    const result = verifyEvidence(proofBundle, publicProofBundleVerifierOptionsForTest(proofBundle));
+
+    expect(result.schemaErrors).toEqual([]);
+    expect(result.schemaOk).toBe(true);
+    expect(result.proofCompletenessErrors).toEqual([]);
+    expect(result.finalVerifierComplete).toBe(true);
+    expect(result.proofChipAllowed).toBe(true);
+    expect(result.winnerClaimAllowed).toBe(true);
+  });
+
+  it("verifies public proof bundles whose latest proof event is on a later replay page", () => {
+    const signer = testProofBundleSigner();
+    const proofBundle = publicProofBundleForTest(signer);
+    addSecondReplayProofEventPageForTest(proofBundle.replayBundle);
+    const replayBundleHash = hashJson(proofBundle.replayBundle);
+    const publicClaimEventSeq = proofBundle.replayBundle.asOfEventSeq + 1;
+    proofBundle.replayBundleHash = replayBundleHash;
+    proofBundle.claimInputReplayBundleHash = replayBundleHash;
+    proofBundle.asOfEventSeq = proofBundle.replayBundle.asOfEventSeq;
+    proofBundle.publicClaimEventSeq = publicClaimEventSeq;
+    proofBundle.publicClaim.replayBundleHash = replayBundleHash;
+    proofBundle.publicClaim.asOfEventSeq = proofBundle.replayBundle.asOfEventSeq;
+    proofBundle.publicClaim.authorizedEventSeq = publicClaimEventSeq;
+    refreshPublicProofBundleForTest(proofBundle, signer);
+
+    const result = verifyEvidence(proofBundle, publicProofBundleVerifierOptionsForTest(proofBundle));
+
+    expect(result.schemaErrors).toEqual([]);
+    expect(result.schemaOk).toBe(true);
+    expect(result.proofCompletenessErrors).toEqual([]);
+    expect(result.finalVerifierComplete).toBe(true);
+    expect(result.proofChipAllowed).toBe(true);
+    expect(result.winnerClaimAllowed).toBe(true);
+  });
+
+  it("verifies public proof bundles whose non-event evidence rows are only in replay pages", () => {
+    const signer = testProofBundleSigner();
+    const proofBundle = publicProofBundleForTest(signer);
+    for (const collection of [
+      "artifactAccessTokens",
+      "artifactPreflights",
+      "canonicalCawReceipts",
+      "cawLiveInteractions",
+      "cawReceiptOperations",
+      "leaseRuns",
+      "mcpAdapterCalls",
+      "quotes",
+      "rawCawReceiptBundles",
+      "sources",
+      "spends",
+    ]) {
+      storeReplayCollectionOnlyInPagesForTest(proofBundle.replayBundle, collection);
+    }
+    const replayBundleHash = hashJson(proofBundle.replayBundle);
+    proofBundle.replayBundleHash = replayBundleHash;
+    proofBundle.claimInputReplayBundleHash = replayBundleHash;
+    proofBundle.publicClaim.replayBundleHash = replayBundleHash;
+    refreshPublicProofBundleForTest(proofBundle, signer);
+
+    const result = verifyEvidence(proofBundle, publicProofBundleVerifierOptionsForTest(proofBundle));
+
+    expect(result.schemaErrors).toEqual([]);
+    expect(result.schemaOk).toBe(true);
+    expect(result.proofCompletenessErrors).toEqual([]);
+    expect(result.finalVerifierComplete).toBe(true);
+    expect(result.proofChipAllowed).toBe(true);
+    expect(result.winnerClaimAllowed).toBe(true);
+  });
+
+  it("accepts replay bundles with more than 200 paged MCP adapter calls", () => {
+    const bundle = replayBundle();
+    addSecondReplayMcpCallPageForTest(bundle);
+
+    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaErrors).toEqual([]);
+    expect(result.schemaOk).toBe(true);
+    expect(result.errors).not.toContain("asOfMcpAdapterCallCount must be an integer in [0,200]");
+    expect(result.errors).not.toContain("asOfMcpAdapterCallCount must equal mcpAdapterCalls.length in the replay summary");
+  });
+
+  it("keeps public proof bundle authority closed without a trusted verifier key hash", () => {
+    const proofBundle = publicProofBundleForTest();
+    const result = verifyEvidence(proofBundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.winnerClaimAllowed).toBe(false);
+    expect(result.proofCompletenessErrors).toContain(
+      "public proof bundle verifierAttestation trusted proof key hash is not configured",
+    );
+  });
+
+  it("rejects public proof bundles with unexpected top-level fields", () => {
+    const proofBundle = publicProofBundleForTest();
+    proofBundle.debugArtifactPayload = { secret: "must-not-be-published" };
+    proofBundle.proofBundleHash = hashJson(proofBundleBodyForTest(proofBundle));
+
+    const result = verifyEvidence(proofBundle, publicProofBundleVerifierOptionsForTest(proofBundle));
+
+    expect(result.schemaOk).toBe(false);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.errors).toContain("public proof bundle has unexpected field: debugArtifactPayload");
+  });
+
+  it("rejects public proof bundles whose embedded replay asOfEventSeq drifts from the authorization snapshot", () => {
+    const signer = testProofBundleSigner();
+    const proofBundle = publicProofBundleForTest(signer);
+    proofBundle.replayBundle.asOfEventSeq = proofBundle.asOfEventSeq - 1;
+    const replayBundleHash = hashJson(proofBundle.replayBundle);
+    proofBundle.replayBundleHash = replayBundleHash;
+    proofBundle.claimInputReplayBundleHash = replayBundleHash;
+    proofBundle.publicClaim.replayBundleHash = replayBundleHash;
+    refreshPublicProofBundleForTest(proofBundle, signer);
+
+    const result = verifyEvidence(proofBundle, publicProofBundleVerifierOptionsForTest(proofBundle));
+
+    expect(result.schemaOk).toBe(false);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.errors).toContain("public proof bundle replayBundle.asOfEventSeq must match bundle.asOfEventSeq");
+  });
+
+  it("verifies public proof bundle files through the CLI", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-proof-bundle-"));
+    const proofBundlePath = join(dir, "proof-bundle.json");
+    try {
+      const proofBundle = publicProofBundleForTest();
+      writeFileSync(proofBundlePath, `${JSON.stringify(proofBundle, null, 2)}\n`, "utf8");
+      const cli = spawnSync(process.execPath, [verifierFile, proofBundlePath], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PACTFUSE_TRUSTED_PROOF_KEY_HASHES: proofBundle.verifierAttestation.publicKeyHash,
+        },
+      });
+      const stdout = JSON.parse(cli.stdout);
+
+      expect(cli.status).toBe(0);
+      expect(stdout.schemaOk).toBe(true);
+      expect(stdout.finalVerifierComplete).toBe(true);
+      expect(stdout.proofChipAllowed).toBe(true);
+      expect(stdout.winnerClaimAllowed).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps public proof bundle CLI authority closed without a trusted verifier key hash", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pactfuse-proof-bundle-untrusted-"));
+    const proofBundlePath = join(dir, "proof-bundle.json");
+    try {
+      writeFileSync(proofBundlePath, `${JSON.stringify(publicProofBundleForTest(), null, 2)}\n`, "utf8");
+      const cli = spawnSync(process.execPath, [verifierFile, proofBundlePath], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PACTFUSE_TRUSTED_PROOF_KEY_HASHES: "",
+        },
+      });
+      const stdout = JSON.parse(cli.stdout);
+
+      expect(cli.status).toBe(1);
+      expect(stdout.schemaOk).toBe(true);
+      expect(stdout.finalVerifierComplete).toBe(false);
+      expect(stdout.proofCompletenessErrors).toContain(
+        "public proof bundle verifierAttestation trusted proof key hash is not configured",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects public proof bundles whose outer replay hash drifts", () => {
+    const proofBundle = publicProofBundleForTest();
+    proofBundle.replayBundle.events[0].payload.tampered = true;
+
+    const result = verifyEvidence(proofBundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(false);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.errors).toContain("public proof bundle replayBundleHash does not recompute");
+  });
+
+  it("rejects public proof bundles whose bundle hash is tampered", () => {
+    const proofBundle = publicProofBundleForTest();
+    proofBundle.proofBundleHash = hex32("tampered-public-proof-bundle");
+
+    const result = verifyEvidence(proofBundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(false);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.errors).toContain("public proof bundle proofBundleHash does not recompute");
+  });
+
+  it("rejects public proof bundles without a verifier attestation signature", () => {
+    const proofBundle = publicProofBundleForTest();
+    delete proofBundle.verifierAttestation;
+    proofBundle.proofBundleHash = hashJson(proofBundleBodyForTest(proofBundle));
+
+    const result = verifyEvidence(proofBundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(false);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.errors).toContain("public proof bundle verifierAttestation must be an object");
+  });
+
+  it("rejects self-consistent public proof bundle drift after verifier attestation signing", () => {
+    const proofBundle = publicProofBundleForTest();
+    proofBundle.providerStatuses[0] = { ...proofBundle.providerStatuses[0], mode: "fixture", reason: "tampered after signing" };
+    proofBundle.providerStatusHash = hashJson(proofBundle.providerStatuses);
+    proofBundle.proofBundleHash = hashJson(proofBundleBodyForTest(proofBundle));
+
+    const result = verifyEvidence(proofBundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(false);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.errors).toContain("public proof bundle verifierAttestation.signedPayloadHash does not recompute");
+  });
+
+  it("rejects public proof bundles whose token settlement claim overstates the token mode", () => {
+    const proofBundle = publicProofBundleForTest();
+    proofBundle.publicClaim.tokenSettlementClaim = "official-testnet-usdc";
+    proofBundle.publicClaimHash = hashJson(publicClaimHashInputForTest(proofBundle.publicClaim));
+    proofBundle.proofBundleHash = hashJson(proofBundleBodyForTest(proofBundle));
+
+    const result = verifyEvidence(proofBundle, publicProofBundleVerifierOptionsForTest(proofBundle));
+
+    expect(result.schemaOk).toBe(false);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.errors).toContain("public proof bundle publicClaim.tokenSettlementClaim does not match tokenMode");
+  });
+
+  it("rejects public proof bundles whose verifierRun modes do not match the public claim", () => {
+    const signer = testProofBundleSigner();
+    const proofBundle = publicProofBundleForTest(signer);
+    proofBundle.publicClaim.verifierRun.tokenMode = "local-mocked";
+    refreshPublicProofBundleForTest(proofBundle, signer);
+
+    const result = verifyEvidence(proofBundle, publicProofBundleVerifierOptionsForTest(proofBundle));
+
+    expect(result.schemaOk).toBe(false);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.errors).toContain("public proof bundle publicClaim.verifierRun.tokenMode does not match publicClaim.tokenMode");
+  });
+
+  it("keeps final proof-chip authority closed when artifact delivery was only caller-attested", () => {
     const bundle = replayBundleWithLease();
     promoteFirstQuoteToChainSettleableForTest(bundle);
+    appendUnrelatedServerLiveFetchPreflightForTest(bundle);
     appendCawIdentityProbeForTest(bundle);
     const denyProbe = appendCawDenyProbeForTest(bundle);
     appendFinalCawReceiptCoverageForTest(bundle, denyProbe);
@@ -122,10 +466,42 @@ describe("pactfuse receipt verifier contract", () => {
     );
 
     expect(result.schemaOk).toBe(true);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.winnerClaimAllowed).toBe(false);
+    expect(result.proofCompletenessErrors).toContain(
+      `final verifier requires server_live_fetch artifact.preflight.verified delivery event for preflight ${bundle.artifactPreflights[0].preflightId}`,
+    );
+  });
+
+  it("accepts public replay bundles that redact bearer-only artifact payload bodies", () => {
+    const bundle = replayBundleWithLease();
+    promoteFirstQuoteToChainSettleableForTest(bundle);
+    markFirstArtifactPreflightServerLiveFetchForTest(bundle);
+    appendCawIdentityProbeForTest(bundle);
+    const denyProbe = appendCawDenyProbeForTest(bundle);
+    appendFinalCawReceiptCoverageForTest(bundle, denyProbe);
+    appendFinalTripProofsForTest(bundle);
+    const sourceEvent = appendFinalSourceChallengeForTest(bundle);
+    appendArtifactAccessEventForTest(bundle);
+    passJudgeRowForTest(bundle, "source_challenge", "proof", sourceEvent.eventId, "finalized source challenge proof");
+    passJudgeRowForTest(bundle, "c_settlement", "proof", latestEventForTest(bundle, "token.balance_delta.verified").eventId, "token balance delta settled");
+    redactArtifactPayloadsForTest(bundle);
+    bundle.winnerClaimAllowed = true;
+    refreshReplayPagingForTest(bundle);
+
+    const result = verifyEvidence(
+      bundle,
+      createServerRuntimeVerifierOptions({
+        cliMode: "proof-chip",
+        proofProviders: liveProofProvidersForTest(),
+      }),
+    );
+
+    expect(result.schemaOk).toBe(true);
     expect(result.schemaErrors).toEqual([]);
     expect(result.proofCompletenessErrors).toEqual([]);
     expect(result.finalVerifierComplete).toBe(true);
-    expect(result.proofChipAllowed).toBe(true);
     expect(result.winnerClaimAllowed).toBe(true);
   });
 
@@ -223,6 +599,77 @@ describe("pactfuse receipt verifier contract", () => {
     );
   });
 
+  it("keeps final authority closed when the token deployment registry explorer host is not allowlisted", () => {
+    const bundle = finalWinnerReplayBundleForTest();
+    const entry = bundle.deploymentRegistry.entries[0];
+    entry.explorerUrl = `https://attacker.example.org/tx/${entry.deploymentTxHash}`;
+    bundle.deploymentRegistryHash = hashJson(bundle.deploymentRegistry);
+
+    const result = verifyEvidence(
+      bundle,
+      createServerRuntimeVerifierOptions({
+        cliMode: "proof-chip",
+        proofProviders: liveProofProvidersForTest(),
+      }),
+    );
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.winnerClaimAllowed).toBe(false);
+    expect(result.proofCompletenessErrors).toContain(
+      "final verifier requires a live PaymentToken deployment registry entry for the chain-settleable payment token",
+    );
+  });
+
+  it("keeps final authority closed when the token deployment tx hash is not in the explorer tx path", () => {
+    const bundle = finalWinnerReplayBundleForTest();
+    const entry = bundle.deploymentRegistry.entries[0];
+    entry.explorerUrl = `https://sepolia.basescan.org/address/${entry.address}?tx=${entry.deploymentTxHash}`;
+    bundle.deploymentRegistryHash = hashJson(bundle.deploymentRegistry);
+
+    const result = verifyEvidence(
+      bundle,
+      createServerRuntimeVerifierOptions({
+        cliMode: "proof-chip",
+        proofProviders: liveProofProvidersForTest(),
+      }),
+    );
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.winnerClaimAllowed).toBe(false);
+    expect(result.proofCompletenessErrors).toContain(
+      "final verifier requires a live PaymentToken deployment registry entry for the chain-settleable payment token",
+    );
+  });
+
+  it.each([
+    ["ProcurementGate", "final verifier requires a live ProcurementGate deployment registry entry"],
+    ["SourceStateRegistry", "final verifier requires a live SourceStateRegistry deployment registry entry"],
+    ["PaidArtifactMarket", "final verifier requires a live PaidArtifactMarket deployment registry entry"],
+  ])("keeps final authority closed when the %s deployment registry entry is missing", (contractName, expectedError) => {
+    const bundle = finalWinnerReplayBundleForTest();
+    bundle.deploymentRegistry.entries = bundle.deploymentRegistry.entries.filter((entry) => entry.contractName !== contractName);
+    bundle.deploymentRegistryHash = hashJson(bundle.deploymentRegistry);
+    refreshReplayPagingForTest(bundle);
+
+    const result = verifyEvidence(
+      bundle,
+      createServerRuntimeVerifierOptions({
+        cliMode: "proof-chip",
+        proofProviders: liveProofProvidersForTest(),
+      }),
+    );
+
+    expect(result.schemaOk).toBe(true);
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.winnerClaimAllowed).toBe(false);
+    expect(result.proofCompletenessErrors.some((error) => error.includes(expectedError))).toBe(true);
+  });
+
   it("rejects caller-supplied live provider flags without server runtime authority", () => {
     const bundle = replayBundle();
     const result = verifyEvidence(bundle, {
@@ -239,6 +686,25 @@ describe("pactfuse receipt verifier contract", () => {
     );
   });
 
+  it("rejects final replay proof when the chain provider snapshot is live but unpinned", () => {
+    const bundle = finalWinnerReplayBundleForTest();
+    const result = verifyEvidence(
+      bundle,
+      createServerRuntimeVerifierOptions({
+        cliMode: "proof-chip",
+        proofProviders: liveProofProvidersForTest().map((provider) =>
+          provider.name === "chain"
+            ? { name: "chain", mode: "live", ready: true, reason: "unpinned test chain provider" }
+            : provider,
+        ),
+      }),
+    );
+
+    expect(result.finalVerifierComplete).toBe(false);
+    expect(result.winnerClaimAllowed).toBe(false);
+    expect(result.proofCompletenessErrors).toContain("final verifier requires chain proof provider chainId and redacted endpoint");
+  });
+
   it("rejects replay bundles missing a page beyond the summary rows", () => {
     const bundle = replayBundle();
     addSecondReplayEventPageForTest(bundle);
@@ -248,6 +714,26 @@ describe("pactfuse receipt verifier contract", () => {
     expect(result.schemaOk).toBe(false);
     expect(result.proofChipAllowed).toBe(false);
     expect(result.errors).toContain("replayPages.events must contain exactly 2 page(s)");
+  });
+
+  it("rejects self-consistent later replay pages whose event hash chain is invalid", () => {
+    const bundle = replayBundle();
+    addSecondReplayEventPageForTest(bundle);
+    const orderBy = replayCollectionOrderByForTest("events");
+    const lateEvent = bundle.replayPages.events[1].rows[0];
+    lateEvent.kind = "tampered.late.event";
+    bundle.replayPages.events[1].pageHash = replayPageHashForTest(bundle.sessionId, "events", 1, orderBy, bundle.replayPages.events[1].rows);
+    bundle.replayPageIndex.collections.events.pageHashes[1] = bundle.replayPages.events[1].pageHash;
+    bundle.replayPageIndex.collections.events.pageRoot = hashJson(bundle.replayPageIndex.collections.events.pageHashes);
+    bundle.replayPageIndex.pageRoot = hashJson(
+      Object.entries(bundle.replayPageIndex.collections).map(([name, collection]) => ({ name, pageRoot: collection.pageRoot })),
+    );
+    bundle.fullReplayRoot = bundle.replayPageIndex.pageRoot;
+    const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
+
+    expect(result.schemaOk).toBe(false);
+    expect(result.proofChipAllowed).toBe(false);
+    expect(result.errors).toContain(`event ${lateEvent.eventId} eventHash does not recompute`);
   });
 
   it("keeps final authority closed when a later replay page contains a reorg", () => {
@@ -433,6 +919,40 @@ describe("pactfuse receipt verifier contract", () => {
       },
       "artifactHashPreview does not match registered spend artifactHash",
     ],
+    [
+      "source manifest URL credential leak",
+      (bundle) => {
+        const source = appendSignedSourceForTest(bundle);
+        source.manifestUrl = "https://user:pass@example.com/source.json?token=secret#frag";
+        refreshReplayPagingForTest(bundle);
+      },
+      "manifestUrl must not contain credentials, query strings, or fragments",
+    ],
+    [
+      "source manifest URL private host",
+      (bundle) => {
+        const source = appendSignedSourceForTest(bundle);
+        source.manifestUrl = "http://127.0.0.1/manifest.json";
+        refreshReplayPagingForTest(bundle);
+      },
+      "manifestUrl must use a public hostname",
+    ],
+    [
+      "artifact preflight endpoint URL credential leak",
+      (bundle) => {
+        bundle.artifactPreflights[0].endpointUrl = "https://user:pass@example.com/artifact.json?token=secret#frag";
+        refreshReplayPagingForTest(bundle);
+      },
+      "endpointUrl must not contain credentials, query strings, or fragments",
+    ],
+    [
+      "artifact preflight endpoint URL internal host",
+      (bundle) => {
+        bundle.artifactPreflights[0].endpointUrl = "https://metadata.internal/artifact.json";
+        refreshReplayPagingForTest(bundle);
+      },
+      "endpointUrl must use a public hostname",
+    ],
 	    [
 	      "artifact token payload",
 	      (bundle) => {
@@ -576,6 +1096,25 @@ describe("pactfuse receipt verifier contract", () => {
       "transferData does not encode amountAtomic",
     ],
     [
+      "token balance chain read proof hash",
+      (bundle) => {
+        const tokenEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
+        tokenEvent.payload.chainReadProofHash = hex32("tampered-chain-read-proof");
+        resealTokenBalanceEventForTest(bundle);
+      },
+      "chainReadProofHash does not recompute",
+    ],
+    [
+      "token balance unredacted chain provider endpoint",
+      (bundle) => {
+        const tokenEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
+        tokenEvent.payload.chainProviderEndpoint = "https://rpc-user:rpc-pass@rpc.example.test/v3/super-secret?api_key=hidden#frag";
+        Object.assign(tokenEvent.payload, tokenBalanceProofHashesForTest(tokenEvent.payload));
+        resealTokenBalanceEventForTest(bundle);
+      },
+      "chainProviderEndpoint must be a redacted public origin",
+    ],
+    [
       "token balance settlement event link",
       (bundle) => {
         const tokenEvent = bundle.events.find((event) => event.kind === "token.balance_delta.verified");
@@ -679,6 +1218,7 @@ describe("pactfuse receipt verifier contract", () => {
 	  ])("rejects replay bundles with tampered %s", (_label, mutate, expected) => {
     const bundle = replayBundle();
     mutate(bundle);
+    refreshReplayPagingForTest(bundle);
     const result = verifyEvidence(bundle, { cliMode: "proof-chip" });
 
     expect(result.schemaOk).toBe(false);
@@ -786,24 +1326,27 @@ describe("pactfuse receipt verifier contract", () => {
 
 	  it.each([
 	    [
-	      "MCP response body",
-	      (bundle) => {
-	        bundle.mcpAdapterCalls[1].response.result.structuredContent.findingCount = 1;
-	      },
-	      "responseHash does not match response",
-	    ],
+      "MCP response body",
+      (bundle) => {
+        bundle.mcpAdapterCalls[1].response.result.structuredContent.findingCount = 1;
+        refreshReplayPagingForTest(bundle);
+      },
+      "responseHash does not match response",
+    ],
 	    [
-	      "lease transcript hash",
-	      (bundle) => {
-	        bundle.leaseRuns[0].transcriptHash = hex32("bad-lease-transcript");
-	      },
-	      "transcriptHash does not recompute from MCP transcript",
-	    ],
+      "lease transcript hash",
+      (bundle) => {
+        bundle.leaseRuns[0].transcriptHash = hex32("bad-lease-transcript");
+        refreshReplayPagingForTest(bundle);
+      },
+      "transcriptHash does not recompute from MCP transcript",
+    ],
 	    [
 	      "lease event payload",
 	      (bundle) => {
 	        const event = bundle.events.find((candidate) => candidate.kind === "lease.execution.succeeded");
 	        event.payload.outputHash = hex32("bad-event-output");
+        refreshReplayPagingForTest(bundle);
 	      },
 	      "payload.outputHash does not match lease run",
 	    ],
@@ -844,6 +1387,7 @@ describe("pactfuse receipt verifier contract", () => {
 	      "pinned source manifest tools",
 	      (bundle) => {
 	        bundle.sources[0].capabilityVector.mcpTools = [leaseToolDefinitionForTest("pactfuse_other_scan")];
+        refreshReplayPagingForTest(bundle);
 	      },
 	      "tools/list is not bounded to pinned source manifest",
 	    ],
@@ -1321,45 +1865,47 @@ function replayBundle() {
   const auditUsage = appendCawLiveAuditUsageEventsForTest(bundle, cawCalls);
   const allowanceEvent = appendCawAllowanceEventForTest(bundle, cawCalls.approve, auditUsage.approveUsage);
   const activationEvent = appendCawActivationEventForTest(bundle, cawCalls.activate, auditUsage.activateUsage, gateEvent);
+  const tokenBalancePayload = {
+    spendId,
+    allowanceEventId: allowanceEvent.eventId,
+    approveInteractionId: cawCalls.approve.interactionId,
+    approveTxHash: cawCalls.approve.response.result.transaction_hash,
+    activationEventId: activationEvent.eventId,
+    activateInteractionId: cawCalls.activate.interactionId,
+    activateTxHash: cawCalls.activate.response.result.transaction_hash,
+    settlementEventId: gateEvent.eventId,
+    gateEventId: gateEvent.payload.gateEventId,
+    txHash: gateEvent.payload.txHash,
+    chainId: gateEvent.payload.chainId,
+    chainProviderMode: "live",
+    chainProviderEndpoint: "https://rpc.example.test/",
+    blockNumber: gateEvent.payload.blockNumber,
+    preBlockNumber: gateEvent.payload.blockNumber - 1,
+    transferLogIndex: 2,
+    transferRawLogHash: hex32("base-token-transfer-log"),
+    transferTopics: [ERC20_TRANSFER_TOPIC, evmAddressTopic(agentWallet), evmAddressTopic(market)],
+    transferData: `0x${uint256Word("1000")}`,
+    paymentToken,
+    payer: agentWallet,
+    agentWallet,
+    payerAgentWalletSame: true,
+    market,
+    amountAtomic: "1000",
+    agentDeltaAtomic: "-1000",
+    marketDeltaAtomic: "1000",
+    agentWalletBefore: "5000",
+    agentWalletAfter: "4000",
+    marketBefore: "10",
+    marketAfter: "1010",
+    proofAuthority: true,
+    winnerClaimAllowed: false,
+  };
+  Object.assign(tokenBalancePayload, tokenBalanceProofHashesForTest(tokenBalancePayload));
   bundle.events.push({
     eventSeq: bundle.events.length + 1,
     authority: "proof",
     kind: "token.balance_delta.verified",
-    payload: {
-      spendId,
-      allowanceEventId: allowanceEvent.eventId,
-      approveInteractionId: cawCalls.approve.interactionId,
-      approveTxHash: cawCalls.approve.response.result.transaction_hash,
-      activationEventId: activationEvent.eventId,
-      activateInteractionId: cawCalls.activate.interactionId,
-      activateTxHash: cawCalls.activate.response.result.transaction_hash,
-      settlementEventId: gateEvent.eventId,
-      gateEventId: gateEvent.payload.gateEventId,
-      txHash: gateEvent.payload.txHash,
-      chainId: gateEvent.payload.chainId,
-      chainProviderMode: "live",
-      chainProviderEndpoint: "https://rpc.example.test",
-      blockNumber: gateEvent.payload.blockNumber,
-      preBlockNumber: gateEvent.payload.blockNumber - 1,
-      transferLogIndex: 2,
-      transferRawLogHash: hex32("base-token-transfer-log"),
-      transferTopics: [ERC20_TRANSFER_TOPIC, evmAddressTopic(agentWallet), evmAddressTopic(market)],
-      transferData: `0x${uint256Word("1000")}`,
-      paymentToken,
-      payer: agentWallet,
-      agentWallet,
-      payerAgentWalletSame: true,
-      market,
-      amountAtomic: "1000",
-      agentDeltaAtomic: "-1000",
-      marketDeltaAtomic: "1000",
-      agentWalletBefore: "5000",
-      agentWalletAfter: "4000",
-      marketBefore: "10",
-      marketAfter: "1010",
-      proofAuthority: true,
-      winnerClaimAllowed: false,
-    },
+    payload: tokenBalancePayload,
     createdAt,
   });
   sealReplayBundleForTest(bundle);
@@ -1489,6 +2035,401 @@ function retargetArtifactForTest(bundle, artifactPayload) {
   bundle.artifactAccessTokens[0].artifactPayloadHash = artifactHash;
   bundle.artifactAccessTokens[0].artifactPayload = artifactPayload;
   rehashFirstQuoteForTest(bundle);
+}
+
+function finalWinnerReplayBundleForTest() {
+  const bundle = replayBundleWithLease();
+  promoteFirstQuoteToChainSettleableForTest(bundle);
+  markFirstArtifactPreflightServerLiveFetchForTest(bundle);
+  appendCawIdentityProbeForTest(bundle);
+  const denyProbe = appendCawDenyProbeForTest(bundle);
+  appendFinalCawReceiptCoverageForTest(bundle, denyProbe);
+  appendFinalTripProofsForTest(bundle);
+  const sourceEvent = appendFinalSourceChallengeForTest(bundle);
+  appendArtifactAccessEventForTest(bundle);
+  passJudgeRowForTest(bundle, "source_challenge", "proof", sourceEvent.eventId, "finalized source challenge proof");
+  passJudgeRowForTest(bundle, "c_settlement", "proof", latestEventForTest(bundle, "token.balance_delta.verified").eventId, "token balance delta settled");
+  bundle.winnerClaimAllowed = true;
+  refreshReplayPagingForTest(bundle);
+  return bundle;
+}
+
+function publicProofBundleForTest(signer = testProofBundleSigner()) {
+  const replayBundle = finalWinnerReplayBundleForTest();
+  const providerStatuses = liveProofProvidersForTest();
+  const replayBundleHash = hashJson(replayBundle);
+  const verifierRunResult = verifyEvidence(
+    replayBundle,
+    createServerRuntimeVerifierOptions({
+      cliMode: "proof-chip",
+      proofProviders: providerStatuses,
+    }),
+  );
+  const verifierRun = {
+    sessionId: replayBundle.sessionId,
+    proofLevel: "final_replay_claim",
+    claimMode: "caw-target-real",
+    paymentMode: "gate-paid-artifact-real",
+    tokenMode: "mock-test-token",
+    identityMode: "p0-floor-one-wallet",
+    schemaOk: verifierRunResult.schemaOk,
+    proofChipAllowed: verifierRunResult.proofChipAllowed,
+    winnerClaimAllowed: verifierRunResult.winnerClaimAllowed,
+    requestedWinnerClaimAllowed: verifierRunResult.requestedWinnerClaimAllowed,
+    finalVerifierComplete: verifierRunResult.finalVerifierComplete,
+    errors: verifierRunResult.errors,
+    warnings: verifierRunResult.warnings,
+  };
+  const authorizedAt = "2026-06-11T00:10:00.000Z";
+  const publicClaimEventSeq = replayBundle.asOfEventSeq + 1;
+  const server = {
+    proofBundleVersion: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+    commit: "verifier-test-commit",
+    buildTime: "2026-06-11T00:00:00.000Z",
+    generatedAt: authorizedAt,
+  };
+  const deploymentRegistry = replayBundle.deploymentRegistry;
+  const providerStatusHash = hashJson(providerStatuses);
+  const deploymentRegistryHash = deploymentRegistry ? hashJson(deploymentRegistry) : null;
+  const serverHash = hashJson(server);
+  const publicClaimHash = hashJson({
+    sessionId: replayBundle.sessionId,
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt,
+    authorizedEventSeq: publicClaimEventSeq,
+    asOfEventSeq: replayBundle.asOfEventSeq,
+    claimMode: "caw-target-real",
+    paymentMode: "gate-paid-artifact-real",
+    tokenMode: "mock-test-token",
+    tokenSettlementClaim: "live-mock-erc20-fallback",
+    identityMode: "p0-floor-one-wallet",
+    replayBundleHash,
+    providerStatusHash,
+    deploymentRegistryHash,
+    serverHash,
+    verifierRun: {
+      claimMode: verifierRun.claimMode,
+      paymentMode: verifierRun.paymentMode,
+      tokenMode: verifierRun.tokenMode,
+      identityMode: verifierRun.identityMode,
+      proofLevel: verifierRun.proofLevel,
+      proofChipAllowed: verifierRun.proofChipAllowed,
+      finalVerifierComplete: verifierRun.finalVerifierComplete,
+      winnerClaimAllowed: verifierRun.winnerClaimAllowed,
+    },
+  });
+  const publicClaim = {
+    sessionId: replayBundle.sessionId,
+    claimStatus: "authorized_public_claim",
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt,
+    authorizedEventSeq: publicClaimEventSeq,
+    asOfEventSeq: replayBundle.asOfEventSeq,
+    claimMode: "caw-target-real",
+    paymentMode: "gate-paid-artifact-real",
+    tokenMode: "mock-test-token",
+    tokenSettlementClaim: "live-mock-erc20-fallback",
+    identityMode: "p0-floor-one-wallet",
+    replayBundleHash,
+    providerStatusHash,
+    deploymentRegistryHash,
+    serverHash,
+    verifierRun,
+    proofChipAllowed: true,
+    finalVerifierComplete: true,
+    winnerClaimAllowed: true,
+    publicClaimHash,
+  };
+  const verifierRunHash = hashJson(verifierRun);
+  const verifierAttestation = signPublicProofBundleVerifierAttestationForTest(signer, {
+    sessionId: replayBundle.sessionId,
+    publicClaimHash,
+    publicClaimEventSeq,
+    authorizedAt,
+    asOfEventSeq: replayBundle.asOfEventSeq,
+    claimInputReplayBundleHash: replayBundleHash,
+    replayBundleHash,
+    verifierRunHash,
+    providerStatusHash,
+    deploymentRegistryHash,
+    serverHash,
+  });
+  const publicClaimPayload = {
+    claim: publicClaim,
+    publicClaimHash,
+    replayBundle,
+    replayBundleHash,
+    verifierRunHash,
+    verifierAttestation,
+    asOfEventSeq: replayBundle.asOfEventSeq,
+    providerStatuses,
+    providerStatusHash,
+    deploymentRegistry,
+    deploymentRegistryHash,
+    server,
+    serverHash,
+    proofAuthority: true,
+    winnerClaimAllowed: true,
+  };
+  const lastProofEvent = lastReplayProofEventForTest(replayBundle);
+  const publicClaimEventHash = hashJson({
+    sessionId: replayBundle.sessionId,
+    eventSeq: publicClaimEventSeq,
+    authority: "proof",
+    kind: "public.claim.authorized",
+    payloadHash: hashJson(publicClaimPayload),
+    prevProofEventHash: lastProofEvent?.eventHash ?? ZERO_HASH,
+  });
+  const proofBundle = {
+    bundleType: "PACTFUSE_PUBLIC_PROOF_BUNDLE_V1",
+    sessionId: replayBundle.sessionId,
+    publicClaimHash,
+    publicClaimEventId: publicClaimEventHash,
+    publicClaimEventHash,
+    publicClaimEventSeq,
+    snapshotScope: "authorization_event",
+    providerSnapshotOnly: true,
+    authorizedAt,
+    asOfEventSeq: replayBundle.asOfEventSeq,
+    claimInputReplayBundleHash: replayBundleHash,
+    replayBundleHash,
+    verifierRunHash,
+    providerStatusHash,
+    deploymentRegistryHash,
+    serverHash,
+    publicClaim,
+    replayBundle,
+    providerStatuses,
+    deploymentRegistry,
+    server,
+    verifierAttestation,
+    winnerClaimAllowed: true,
+  };
+  return {
+    ...proofBundle,
+    proofBundleHash: hashJson(proofBundle),
+  };
+}
+
+function publicProofBundleVerifierOptionsForTest(proofBundle) {
+  return {
+    cliMode: "proof-chip",
+    trustedProofKeyHashes: [proofBundle.verifierAttestation.publicKeyHash],
+  };
+}
+
+function refreshPublicProofBundleForTest(proofBundle, signer) {
+  proofBundle.publicClaim.publicClaimHash = hashJson(publicClaimHashInputForTest(proofBundle.publicClaim));
+  proofBundle.publicClaimHash = proofBundle.publicClaim.publicClaimHash;
+  proofBundle.verifierRunHash = hashJson(proofBundle.publicClaim.verifierRun);
+  proofBundle.verifierAttestation = signPublicProofBundleVerifierAttestationForTest(signer, {
+    sessionId: proofBundle.sessionId,
+    publicClaimHash: proofBundle.publicClaimHash,
+    publicClaimEventSeq: proofBundle.publicClaimEventSeq,
+    authorizedAt: proofBundle.authorizedAt,
+    asOfEventSeq: proofBundle.asOfEventSeq,
+    claimInputReplayBundleHash: proofBundle.claimInputReplayBundleHash,
+    replayBundleHash: proofBundle.replayBundleHash,
+    verifierRunHash: proofBundle.verifierRunHash,
+    providerStatusHash: proofBundle.providerStatusHash,
+    deploymentRegistryHash: proofBundle.deploymentRegistryHash,
+    serverHash: proofBundle.serverHash,
+  });
+  const publicClaimPayload = {
+    claim: proofBundle.publicClaim,
+    publicClaimHash: proofBundle.publicClaimHash,
+    replayBundle: proofBundle.replayBundle,
+    replayBundleHash: proofBundle.replayBundleHash,
+    verifierRunHash: proofBundle.verifierRunHash,
+    verifierAttestation: proofBundle.verifierAttestation,
+    asOfEventSeq: proofBundle.asOfEventSeq,
+    providerStatuses: proofBundle.providerStatuses,
+    providerStatusHash: proofBundle.providerStatusHash,
+    deploymentRegistry: proofBundle.deploymentRegistry,
+    deploymentRegistryHash: proofBundle.deploymentRegistryHash,
+    server: proofBundle.server,
+    serverHash: proofBundle.serverHash,
+    proofAuthority: true,
+    winnerClaimAllowed: true,
+  };
+  const lastProofEvent = lastReplayProofEventForTest(proofBundle.replayBundle);
+  proofBundle.publicClaimEventHash = hashJson({
+    sessionId: proofBundle.sessionId,
+    eventSeq: proofBundle.publicClaimEventSeq,
+    authority: "proof",
+    kind: "public.claim.authorized",
+    payloadHash: hashJson(publicClaimPayload),
+    prevProofEventHash: lastProofEvent?.eventHash ?? ZERO_HASH,
+  });
+  proofBundle.publicClaimEventId = proofBundle.publicClaimEventHash;
+  proofBundle.proofBundleHash = hashJson(proofBundleBodyForTest(proofBundle));
+  return proofBundle;
+}
+
+function proofBundleBodyForTest(proofBundle) {
+  const body = { ...proofBundle };
+  delete body.proofBundleHash;
+  return body;
+}
+
+function lastReplayProofEventForTest(replayBundle) {
+  return replayRowsForCollectionForTest(replayBundle, "events")
+    .filter((event) => event.authority === "proof")
+    .sort((left, right) => Number(left.eventSeq) - Number(right.eventSeq))
+    .at(-1);
+}
+
+function replayRowsForCollectionForTest(replayBundle, collection) {
+  const pages = replayBundle?.replayPages?.[collection];
+  if (Array.isArray(pages)) {
+    return pages.flatMap((page) => (Array.isArray(page?.rows) ? page.rows : []));
+  }
+  return Array.isArray(replayBundle?.[collection]) ? replayBundle[collection] : [];
+}
+
+function publicClaimHashInputForTest(claim) {
+  return {
+    sessionId: claim.sessionId,
+    snapshotScope: claim.snapshotScope,
+    providerSnapshotOnly: claim.providerSnapshotOnly,
+    authorizedAt: claim.authorizedAt,
+    authorizedEventSeq: claim.authorizedEventSeq,
+    asOfEventSeq: claim.asOfEventSeq,
+    claimMode: claim.claimMode,
+    paymentMode: claim.paymentMode,
+    tokenMode: claim.tokenMode,
+    tokenSettlementClaim: claim.tokenSettlementClaim,
+    identityMode: claim.identityMode,
+    replayBundleHash: claim.replayBundleHash,
+    providerStatusHash: claim.providerStatusHash,
+    deploymentRegistryHash: claim.deploymentRegistryHash,
+    serverHash: claim.serverHash,
+    verifierRun: {
+      claimMode: claim.verifierRun.claimMode,
+      paymentMode: claim.verifierRun.paymentMode,
+      tokenMode: claim.verifierRun.tokenMode,
+      identityMode: claim.verifierRun.identityMode,
+      proofLevel: claim.verifierRun.proofLevel,
+      proofChipAllowed: claim.verifierRun.proofChipAllowed,
+      finalVerifierComplete: claim.verifierRun.finalVerifierComplete,
+      winnerClaimAllowed: claim.verifierRun.winnerClaimAllowed,
+    },
+  };
+}
+
+function redactArtifactPayloadsForTest(bundle) {
+  const artifactPayloadHash = bundle.artifactAccessTokens[0].artifactPayloadHash;
+  const redaction = {
+    redacted: true,
+    reason: "artifact_bearer_required",
+    artifactPayloadHash,
+  };
+  bundle.artifactAccessTokens[0].artifactPayload = redaction;
+  const toolCall = bundle.mcpAdapterCalls.find((call) => call.toolName === "tools/call");
+  toolCall.request.params.arguments.artifactPayload = redaction;
+  toolCall.redactedFields = ["request.params.arguments.artifactPayload"];
+  refreshReplayPagingForTest(bundle);
+}
+
+function markFirstArtifactPreflightServerLiveFetchForTest(bundle) {
+  const preflight = bundle.artifactPreflights[0];
+  const verifiedEvent = bundle.events.find(
+    (event) => event.kind === "artifact.preflight.verified" && event.payload?.preflightId === preflight.preflightId,
+  );
+  const artifactDeliveryEvidenceHash = hashJson({
+    mode: "server_live_fetch",
+    preflightId: preflight.preflightId,
+    artifactPayloadHash: preflight.artifactHashPreview.toLowerCase(),
+    artifactCid: preflight.artifactCid.toLowerCase(),
+    manifestFetchHash: preflight.manifestFetchHash.toLowerCase(),
+    endpointResponseHash: preflight.endpointResponseHash.toLowerCase(),
+    leaseDryRunHash: preflight.leaseDryRunHash.toLowerCase(),
+  });
+  const deliveryProofHash = hashJson({
+    sessionId: bundle.sessionId,
+    preflightId: preflight.preflightId,
+    spendId: preflight.spendId,
+    artifactPayloadHash: preflight.artifactHashPreview.toLowerCase(),
+    artifactCid: preflight.artifactCid.toLowerCase(),
+    endpointUrl: preflight.endpointUrl,
+    priceDisclosureHash: preflight.priceDisclosureHash,
+    sourceStateSnapshotHash: preflight.sourceStateSnapshotHash,
+    manifestFetchHash: preflight.manifestFetchHash.toLowerCase(),
+    endpointResponseHash: preflight.endpointResponseHash.toLowerCase(),
+    leaseDryRunHash: preflight.leaseDryRunHash.toLowerCase(),
+    deliveryVerificationAuthority: "server_live_fetch",
+    artifactDeliveryEvidenceHash,
+  });
+  preflight.deliveryProofHash = deliveryProofHash;
+  Object.assign(verifiedEvent.payload, {
+    deliveryProofHash,
+    deliveryVerificationAuthority: "server_live_fetch",
+    artifactDeliveryEvidenceHash,
+  });
+  sealReplayBundleForTest(bundle);
+  preflight.verifiedEventId = verifiedEvent.eventId;
+  refreshReplayPagingForTest(bundle);
+}
+
+function appendUnrelatedServerLiveFetchPreflightForTest(bundle) {
+  const preflightId = hex32("unrelated-server-live-fetch-preflight");
+  const spendId = hex32("unrelated-server-live-fetch-spend");
+  const artifactPayloadHash = hex32("unrelated-server-live-fetch-artifact");
+  const artifactCid = `sha256:${artifactPayloadHash}`;
+  const manifestFetchHash = hex32("unrelated-server-live-fetch-manifest");
+  const endpointResponseHash = hex32("unrelated-server-live-fetch-endpoint");
+  const leaseDryRunHash = hex32("unrelated-server-live-fetch-lease");
+  const artifactDeliveryEvidenceHash = hashJson({
+    mode: "server_live_fetch",
+    preflightId,
+    artifactPayloadHash,
+    artifactCid,
+    manifestFetchHash,
+    endpointResponseHash,
+    leaseDryRunHash,
+  });
+  const deliveryProofHash = hashJson({
+    sessionId: bundle.sessionId,
+    preflightId,
+    spendId,
+    artifactPayloadHash,
+    artifactCid,
+    endpointUrl: "https://example.com/unrelated-artifact.json",
+    priceDisclosureHash: hex32("unrelated-server-live-fetch-price"),
+    sourceStateSnapshotHash: hex32("unrelated-server-live-fetch-source-state"),
+    manifestFetchHash,
+    endpointResponseHash,
+    leaseDryRunHash,
+    deliveryVerificationAuthority: "server_live_fetch",
+    artifactDeliveryEvidenceHash,
+  });
+  bundle.events.push({
+    eventSeq: bundle.events.length + 1,
+    authority: "delivery",
+    kind: "artifact.preflight.verified",
+    payload: {
+      preflightId,
+      spendId,
+      artifactPayloadHash,
+      artifactCid,
+      endpointUrl: "https://example.com/unrelated-artifact.json",
+      priceDisclosureHash: hex32("unrelated-server-live-fetch-price"),
+      sourceStateSnapshotHash: hex32("unrelated-server-live-fetch-source-state"),
+      manifestFetchHash,
+      endpointResponseHash,
+      leaseDryRunHash,
+      deliveryProofHash,
+      deliveryVerificationAuthority: "server_live_fetch",
+      artifactDeliveryEvidenceHash,
+      status: "passed_live_delivery",
+      proofAuthority: false,
+      winnerClaimAllowed: false,
+    },
+    createdAt: "2026-06-11T00:00:02.075Z",
+  });
+  sealReplayBundleForTest(bundle);
 }
 
 function appendCawLiveTransferForTest(bundle) {
@@ -2141,7 +3082,7 @@ function appendCawAllowanceEventForTest(bundle, approve, auditUsage) {
       auditLogHash: auditUsage.payload.auditLogHash,
       chainId: approve.request.chain_id,
       chainProviderMode: "live",
-      chainProviderEndpoint: "https://rpc.example.test",
+      chainProviderEndpoint: "https://rpc.example.test/",
       blockNumber: 99,
       preBlockNumber: 98,
       approvalLogIndex: 1,
@@ -2199,7 +3140,7 @@ function appendCawActivationEventForTest(bundle, activate, auditUsage, gateEvent
       procurementGateAddress: activate.request.contract_addr,
       chainId: activate.request.chain_id,
       chainProviderMode: "live",
-      chainProviderEndpoint: "https://rpc.example.test",
+      chainProviderEndpoint: "https://rpc.example.test/",
       requestHash: activate.requestHash,
       responseHash: activate.responseHash,
       proofAuthority: true,
@@ -2909,6 +3850,142 @@ function addSecondReplayEventPageForTest(bundle) {
   bundle.fullReplayRoot = bundle.replayPageIndex.pageRoot;
 }
 
+function addSecondReplayProofEventPageForTest(bundle) {
+  while (bundle.events.length < 200) {
+    bundle.events.push({
+      authority: "operator",
+      kind: "overflow.summary.event",
+      payload: { i: bundle.events.length + 1, winnerClaimAllowed: false },
+      createdAt: "2026-06-11T00:05:00.000Z",
+    });
+  }
+  sealReplayBundleForTest(bundle);
+  const previousProofEventHash = lastReplayProofEventForTest(bundle)?.eventHash ?? ZERO_HASH;
+  const orderBy = replayCollectionOrderByForTest("events");
+  const extraEvent = replayProofEventForSeqTest(bundle.sessionId, 201, "overflow.page.proof", {
+    i: 201,
+    proofAuthority: true,
+    winnerClaimAllowed: false,
+  }, previousProofEventHash);
+  const extraPage = {
+    bundleType: "PACTFUSE_REPLAY_PAGE_V1",
+    sessionId: bundle.sessionId,
+    collection: "events",
+    pageIndex: 1,
+    pageSize: 200,
+    orderBy,
+    rows: [extraEvent],
+    pageHash: replayPageHashForTest(bundle.sessionId, "events", 1, orderBy, [extraEvent]),
+  };
+  const collection = bundle.replayPageIndex.collections.events;
+  collection.totalRows = 201;
+  collection.pageCount = 2;
+  collection.pageHashes = [bundle.replayPages.events[0].pageHash, extraPage.pageHash];
+  collection.firstPageHash = bundle.replayPages.events[0].pageHash;
+  collection.pageRoot = hashJson(collection.pageHashes);
+  bundle.replayPages.events.push(extraPage);
+  bundle.replayPageIndex.pageRoot = hashJson(
+    Object.entries(bundle.replayPageIndex.collections).map(([name, item]) => ({ name, pageRoot: item.pageRoot })),
+  );
+  bundle.fullReplayRoot = bundle.replayPageIndex.pageRoot;
+  bundle.asOfEventSeq = 201;
+}
+
+function addSecondReplayMcpCallPageForTest(bundle) {
+  const calls = [];
+  for (let index = 0; index < 201; index += 1) {
+    calls.push(
+      mcpCallForTest({
+        callId: hex32(`paged-mcp-call-${index}`),
+        sessionId: bundle.sessionId,
+        auditNonce: `paged-mcp-${index}`,
+        toolName: index % 2 === 0 ? "tools/list" : "tools/call",
+        request: { jsonrpc: "2.0", id: `paged-${index}`, method: index % 2 === 0 ? "tools/list" : "tools/call", params: {} },
+        response: { jsonrpc: "2.0", id: `paged-${index}`, result: { ok: true, index } },
+        createdAt: `2026-06-11T00:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
+      }),
+    );
+  }
+  bundle.mcpAdapterCalls = calls.slice(0, 200);
+  bundle.asOfMcpAdapterCallCount = calls.length;
+  bundle.agentTranscriptHash = hashJson(agentTranscriptForTest(bundle.sessionId, calls, false));
+  refreshReplayPagingForTest(bundle);
+  const orderBy = replayCollectionOrderByForTest("mcpAdapterCalls");
+  const page0Rows = calls.slice(0, 200);
+  const page1Rows = calls.slice(200);
+  const page0Hash = replayPageHashForTest(bundle.sessionId, "mcpAdapterCalls", 0, orderBy, page0Rows);
+  const page1Hash = replayPageHashForTest(bundle.sessionId, "mcpAdapterCalls", 1, orderBy, page1Rows);
+  const collection = bundle.replayPageIndex.collections.mcpAdapterCalls;
+  collection.totalRows = calls.length;
+  collection.pageCount = 2;
+  collection.pageHashes = [page0Hash, page1Hash];
+  collection.firstPageHash = page0Hash;
+  collection.pageRoot = hashJson(collection.pageHashes);
+  bundle.replayPages.mcpAdapterCalls = [
+    {
+      bundleType: "PACTFUSE_REPLAY_PAGE_V1",
+      sessionId: bundle.sessionId,
+      collection: "mcpAdapterCalls",
+      pageIndex: 0,
+      pageSize: 200,
+      orderBy,
+      rows: page0Rows,
+      pageHash: page0Hash,
+    },
+    {
+      bundleType: "PACTFUSE_REPLAY_PAGE_V1",
+      sessionId: bundle.sessionId,
+      collection: "mcpAdapterCalls",
+      pageIndex: 1,
+      pageSize: 200,
+      orderBy,
+      rows: page1Rows,
+      pageHash: page1Hash,
+    },
+  ];
+  bundle.replayPageIndex.pageRoot = hashJson(
+    Object.entries(bundle.replayPageIndex.collections).map(([name, item]) => ({ name, pageRoot: item.pageRoot })),
+  );
+  bundle.fullReplayRoot = bundle.replayPageIndex.pageRoot;
+}
+
+function storeReplayCollectionOnlyInPagesForTest(bundle, collectionName) {
+  const rows = cloneJsonForTest(replayRowsForCollectionForTest(bundle, collectionName));
+  const orderBy = replayCollectionOrderByForTest(collectionName);
+  const pageHashes = [];
+  const pages = [];
+  for (let offset = 0; offset < rows.length; offset += 200) {
+    const pageIndex = offset / 200;
+    const pageRows = rows.slice(offset, offset + 200);
+    const pageHash = replayPageHashForTest(bundle.sessionId, collectionName, pageIndex, orderBy, pageRows);
+    pageHashes.push(pageHash);
+    pages.push({
+      bundleType: "PACTFUSE_REPLAY_PAGE_V1",
+      sessionId: bundle.sessionId,
+      collection: collectionName,
+      pageIndex,
+      pageSize: 200,
+      orderBy,
+      rows: pageRows,
+      pageHash,
+    });
+  }
+  bundle[collectionName] = [];
+  bundle.replayPages[collectionName] = pages;
+  bundle.replayPageIndex.collections[collectionName] = {
+    totalRows: rows.length,
+    pageCount: pages.length,
+    orderBy,
+    firstPageHash: replayPageHashForTest(bundle.sessionId, collectionName, 0, orderBy, []),
+    pageRoot: hashJson(pageHashes),
+    pageHashes,
+  };
+  bundle.replayPageIndex.pageRoot = hashJson(
+    Object.entries(bundle.replayPageIndex.collections).map(([name, item]) => ({ name, pageRoot: item.pageRoot })),
+  );
+  bundle.fullReplayRoot = bundle.replayPageIndex.pageRoot;
+}
+
 function replayEventForSeqTest(sessionId, eventSeq, kind, payload) {
   const payloadHash = hashJson(payload);
   const eventHash = hashJson({
@@ -2926,6 +4003,30 @@ function replayEventForSeqTest(sessionId, eventSeq, kind, payload) {
     eventHash,
     prevProofEventHash: null,
     authority: "operator",
+    kind,
+    payloadHash,
+    payload,
+    createdAt: "2026-06-11T00:05:00.000Z",
+  };
+}
+
+function replayProofEventForSeqTest(sessionId, eventSeq, kind, payload, previousProofEventHash) {
+  const payloadHash = hashJson(payload);
+  const eventHash = hashJson({
+    sessionId,
+    eventSeq,
+    authority: "proof",
+    kind,
+    payloadHash,
+    prevProofEventHash: previousProofEventHash,
+  });
+  return {
+    eventId: eventHash,
+    sessionId,
+    eventSeq,
+    eventHash,
+    prevProofEventHash: previousProofEventHash,
+    authority: "proof",
     kind,
     payloadHash,
     payload,
@@ -3168,6 +4269,10 @@ function lockedRuntimeModes() {
 
 function deploymentRegistryForTest(paymentToken) {
   const deploymentTxHash = hex32("test-payment-token-deploy");
+  const gateDeploymentTxHash = hex32("test-procurement-gate-deploy");
+  const secondGateDeploymentTxHash = hex32("test-procurement-gate-2-deploy");
+  const sourceRegistryDeploymentTxHash = hex32("test-source-registry-deploy");
+  const marketDeploymentTxHash = hex32("test-paid-artifact-market-deploy");
   return {
     mode: "live",
     chainId: "84532",
@@ -3186,6 +4291,38 @@ function deploymentRegistryForTest(paymentToken) {
         tokenMode: "mock-test-token",
         symbol: "MOCK",
         decimals: 18,
+      },
+      {
+        contractName: "ProcurementGate",
+        chainId: "84532",
+        address: "0x1111111111111111111111111111111111111111",
+        deploymentTxHash: gateDeploymentTxHash,
+        explorerUrl: `https://sepolia.basescan.org/tx/${gateDeploymentTxHash}`,
+        codeHash: hex32("test-procurement-gate-code"),
+      },
+      {
+        contractName: "ProcurementGate",
+        chainId: "84532",
+        address: "0x2222222222222222222222222222222222222222",
+        deploymentTxHash: secondGateDeploymentTxHash,
+        explorerUrl: `https://sepolia.basescan.org/tx/${secondGateDeploymentTxHash}`,
+        codeHash: hex32("test-procurement-gate-2-code"),
+      },
+      {
+        contractName: "SourceStateRegistry",
+        chainId: "84532",
+        address: "0x1111111111111111111111111111111111111111",
+        deploymentTxHash: sourceRegistryDeploymentTxHash,
+        explorerUrl: `https://sepolia.basescan.org/tx/${sourceRegistryDeploymentTxHash}`,
+        codeHash: hex32("test-source-registry-code"),
+      },
+      {
+        contractName: "PaidArtifactMarket",
+        chainId: "84532",
+        address: "0x5000000000000000000000000000000000000005",
+        deploymentTxHash: marketDeploymentTxHash,
+        explorerUrl: `https://sepolia.basescan.org/tx/${marketDeploymentTxHash}`,
+        codeHash: hex32("test-paid-artifact-market-code"),
       },
     ],
   };
@@ -3210,6 +4347,47 @@ function canonicalizeJson(value) {
 
 function hashJson(value) {
   return `0x${createHash("sha256").update(canonicalizeJson(value)).digest("hex")}`;
+}
+
+function tokenBalanceProofHashesForTest(payload) {
+  const transferLogBindingHash = hashJson({
+    mode: "erc20_transfer_log_binding_v1",
+    chainId: String(payload.chainId),
+    txHash: String(payload.txHash).toLowerCase(),
+    blockNumber: Number(payload.blockNumber),
+    logIndex: Number(payload.transferLogIndex),
+    address: String(payload.paymentToken).toLowerCase(),
+    rawLogHash: String(payload.transferRawLogHash).toLowerCase(),
+    topics: payload.transferTopics.map((topic) => String(topic).toLowerCase()),
+    data: String(payload.transferData).toLowerCase(),
+  });
+  const balanceReadHash = hashJson({
+    mode: "erc20_balance_read_v1",
+    chainId: String(payload.chainId),
+    blockNumber: Number(payload.blockNumber),
+    preBlockNumber: Number(payload.preBlockNumber),
+    paymentToken: String(payload.paymentToken).toLowerCase(),
+    agentWallet: String(payload.agentWallet).toLowerCase(),
+    market: String(payload.market).toLowerCase(),
+    amountAtomic: String(payload.amountAtomic),
+    agentWalletBefore: String(payload.agentWalletBefore),
+    agentWalletAfter: String(payload.agentWalletAfter),
+    marketBefore: String(payload.marketBefore),
+    marketAfter: String(payload.marketAfter),
+  });
+  return {
+    transferLogBindingHash,
+    balanceReadHash,
+    chainReadProofHash: hashJson({
+      mode: "token_balance_delta_chain_read_proof_v1",
+      chainProviderMode: String(payload.chainProviderMode),
+      chainProviderEndpoint: payload.chainProviderEndpoint ?? null,
+      settlementEventId: String(payload.settlementEventId),
+      gateEventId: String(payload.gateEventId),
+      transferLogBindingHash,
+      balanceReadHash,
+    }),
+  };
 }
 
 function hex32(seed) {

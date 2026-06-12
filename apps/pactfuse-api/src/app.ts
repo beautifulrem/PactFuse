@@ -23,6 +23,7 @@ import {
   ingestGateEvent,
   ingestCawReceiptBundle,
   indexChainWindow,
+  reconcileIndexedEvents,
   issueArtifactAccessToken,
   listEventsAfterEventId,
   readAgentTranscript,
@@ -53,7 +54,7 @@ import {
   verifyTokenBalanceDelta,
   verifyEvidenceForSession,
 } from "./services/service.js";
-import { badRequestError, forbiddenError, newRequestId, rateLimitedError, toApiError, unauthorizedError } from "./util.js";
+import { badRequestError, forbiddenError, newRequestId, rateLimitedError, sha256Hex, toApiError, unauthorizedError } from "./util.js";
 
 const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
 type ApiRole = "operator" | "challenge_submitter" | "artifact_signer";
@@ -198,6 +199,9 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "txHash",
     "chainProviderMode",
     "chainProviderEndpoint",
+    "transferLogBindingHash",
+    "balanceReadHash",
+    "chainReadProofHash",
     "paymentToken",
     "agentWallet",
     "market",
@@ -217,6 +221,8 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "manifestFetchHash",
     "endpointResponseHash",
     "leaseDryRunHash",
+    "deliveryVerificationAuthority",
+    "artifactDeliveryEvidenceHash",
     "status",
     "winnerClaimAllowed",
   ],
@@ -270,6 +276,7 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "readyForPublicClaim",
     "providerStatuses.ready",
     "security.allowInsecureMissingRoleTokens",
+    "security.allowInsecurePublicEvidenceUrls",
     "indexer.status",
     "blockingReasons",
     "requiredExternalInputs",
@@ -310,6 +317,8 @@ const PROOF_FIELD_ROUTES: Record<string, string[]> = {
     "providerStatusHash",
     "deploymentRegistryHash",
     "serverHash",
+    "verifierAttestation.signedPayloadHash",
+    "verifierAttestation.publicKeyHash",
     "winnerClaimAllowed",
   ],
   "/api/v1/evidence/replay-bundle": [
@@ -345,7 +354,7 @@ export function createApp(ctx: ServiceCtx): Hono {
 
   app.use("*", async (c, next) => {
     const now = Date.now();
-    const client = c.req.header("x-forwarded-for") ?? c.req.header("cf-connecting-ip") ?? "local";
+    const client = rateLimitPrincipal(c, ctx);
     const key = `${client}:${c.req.method}:${c.req.path}`;
     const limit = rateLimitMaxFor(ctx, c.req.method, c.req.path);
     const bucket = rateBuckets.get(key);
@@ -402,6 +411,12 @@ export function createApp(ctx: ServiceCtx): Hono {
       gateIngest: {
         mode: "hmac-shared-secret",
         configured: Boolean(ctx.gateIngestSecret),
+      },
+      proofBundleSigning: {
+        mode: "ed25519",
+        configured: Boolean(ctx.proofBundleSigner),
+        publicKeyHash: ctx.proofBundleSigner?.publicKeyHash ?? null,
+        trusted: Boolean(ctx.proofBundleSigner && ctx.trustedProofKeyHashes.has(ctx.proofBundleSigner.publicKeyHash.toLowerCase())),
       },
       winnerClaimAllowed: false,
     });
@@ -494,7 +509,12 @@ export function createApp(ctx: ServiceCtx): Hono {
 
   app.post("/api/v1/indexer/backfill", async (c) => {
     authorizeApiRole(c, ctx, "operator");
-    return send(c, await indexChainWindow(ChainIndexerBackfillInputSchema.parse(await readJson(c)), ctx), 202);
+    const input = ChainIndexerBackfillInputSchema.parse(await readJson(c));
+    const result = await indexChainWindow(input, ctx);
+    if (result.ok) {
+      await reconcileIndexedEvents(ctx, { cursorId: input.payload.cursorId, requestId: result.requestId });
+    }
+    return send(c, result, 202);
   });
 
   app.post("/api/v1/artifacts/preflight", async (c) => {
@@ -571,7 +591,8 @@ export function createApp(ctx: ServiceCtx): Hono {
   app.get("/api/v1/evidence/proof-bundle", async (c) => {
     authorizeApiRole(c, ctx, "operator");
     const sessionId = requiredQuery(c, "sessionId");
-    return send(c, await readProofBundle(sessionId, ctx));
+    const publicClaimEventId = c.req.query("publicClaimEventId") ?? null;
+    return send(c, await readProofBundle(sessionId, ctx, { publicClaimEventId }));
   });
 
   app.get("/api/v1/evidence/replay-bundle", async (c) => {
@@ -670,6 +691,27 @@ function rateLimitMaxFor(ctx: ServiceCtx, method: string, path: string): number 
     return ctx.apiSecurity.sourceChallengeRateLimitMax;
   }
   return ctx.apiSecurity.defaultRateLimitMax;
+}
+
+function rateLimitPrincipal(c: Context, ctx: ServiceCtx): string {
+  const bearer = bearerTokenFor(c);
+  if (bearer) {
+    for (const token of configuredBearerTokens(ctx)) {
+      if (secureEqualText(bearer, token)) {
+        return `bearer:${sha256Hex(bearer)}`;
+      }
+    }
+  }
+  return "connection:local";
+}
+
+function configuredBearerTokens(ctx: ServiceCtx): string[] {
+  return [
+    ctx.apiSecurity.operatorToken,
+    ctx.apiSecurity.challengeSubmitterToken,
+    ctx.apiSecurity.artifactSignerToken,
+    ctx.cawIngestToken,
+  ].filter((token): token is string => Boolean(token));
 }
 
 function authorizeApiRole(c: Context, ctx: ServiceCtx, role: ApiRole): void {
@@ -1041,6 +1083,7 @@ function buildOpenApi(): Record<string, unknown> {
             valueAtomic: { type: "string", pattern: "^(0|[1-9][0-9]*)$", default: "0" },
             procurementGateAddress: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
             requestId: { type: "string", minLength: 1, maxLength: 160 },
+            sourceAddress: { type: "string", minLength: 1, maxLength: 160 },
             sponsor: { type: "boolean" },
             gasProvider: { type: "string", minLength: 1, maxLength: 120 },
             description: { type: "string", minLength: 1, maxLength: 240 },
@@ -1100,10 +1143,14 @@ function buildOpenApi(): Record<string, unknown> {
         ArtifactPreflightVerifyInput: sessionEnvelopeSchema("#/components/schemas/ArtifactPreflightVerifyPayload"),
         ArtifactPreflightVerifyPayload: {
           type: "object",
-          required: ["preflightId", "artifactPayloadHash", "artifactCid", "manifestFetchHash", "endpointResponseHash", "leaseDryRunHash"],
+          required: ["preflightId"],
           additionalProperties: false,
           properties: {
             preflightId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+            verificationMode: {
+              enum: ["caller_hash_attestation", "server_live_fetch"],
+              default: "caller_hash_attestation",
+            },
             artifactPayloadHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             artifactCid: { type: "string", pattern: "^sha256:0x[0-9a-fA-F]{64}$" },
             manifestFetchHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
@@ -1147,8 +1194,13 @@ function buildOpenApi(): Record<string, unknown> {
             spendId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             payer: { type: "string", pattern: "^0x[0-9a-fA-F]+$" },
             artifactHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
-            targetRepo: { type: "string", minLength: 1, maxLength: 500 },
-            targetCommit: { type: "string", minLength: 6, maxLength: 128 },
+            targetRepo: {
+              type: "string",
+              minLength: 1,
+              maxLength: 500,
+              pattern: "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\\.git)?$",
+            },
+            targetCommit: { type: "string", pattern: "^[0-9a-fA-F]{6,64}$" },
           },
         },
         GateEventIngestInput: {
@@ -1279,6 +1331,7 @@ function buildOpenApi(): Record<string, unknown> {
             "claimMode",
             "paymentMode",
             "tokenMode",
+            "tokenSettlementClaim",
             "identityMode",
             "proofChipAllowed",
             "winnerClaimAllowed",
@@ -1307,6 +1360,7 @@ function buildOpenApi(): Record<string, unknown> {
             "claimMode",
             "paymentMode",
             "tokenMode",
+            "tokenSettlementClaim",
             "identityMode",
             "targetClaimMode",
             "targetPaymentMode",
@@ -1401,6 +1455,7 @@ function buildOpenApi(): Record<string, unknown> {
                 "artifactSignerTokenConfigured",
                 "roleTokenFallbackToOperator",
                 "allowInsecureMissingRoleTokens",
+                "allowInsecurePublicEvidenceUrls",
                 "cawIngestTokenConfigured",
                 "mcpAuditSecretConfigured",
                 "gateIngestSecretConfigured",
@@ -1411,6 +1466,7 @@ function buildOpenApi(): Record<string, unknown> {
                 artifactSignerTokenConfigured: { type: "boolean" },
                 roleTokenFallbackToOperator: { type: "boolean" },
                 allowInsecureMissingRoleTokens: { type: "boolean" },
+                allowInsecurePublicEvidenceUrls: { type: "boolean" },
                 cawIngestTokenConfigured: { type: "boolean" },
                 mcpAuditSecretConfigured: { type: "boolean" },
                 gateIngestSecretConfigured: { type: "boolean" },
@@ -1471,6 +1527,7 @@ function buildOpenApi(): Record<string, unknown> {
             "claimMode",
             "paymentMode",
             "tokenMode",
+            "tokenSettlementClaim",
             "identityMode",
             "replayBundleHash",
             "providerStatusHash",
@@ -1493,6 +1550,7 @@ function buildOpenApi(): Record<string, unknown> {
             claimMode: { const: "caw-target-real" },
             paymentMode: { const: "gate-paid-artifact-real" },
             tokenMode: { enum: ["mock-test-token", "official-testnet-usdc"] },
+            tokenSettlementClaim: { enum: ["live-mock-erc20-fallback", "official-testnet-usdc"] },
             identityMode: { enum: ["p0-floor-one-wallet", "p0-win-separate-identities"] },
             replayBundleHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             providerStatusHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
@@ -1530,6 +1588,7 @@ function buildOpenApi(): Record<string, unknown> {
             "providerStatuses",
             "deploymentRegistry",
             "server",
+            "verifierAttestation",
             "winnerClaimAllowed",
           ],
           properties: {
@@ -1576,6 +1635,18 @@ function buildOpenApi(): Record<string, unknown> {
                 commit: { anyOf: [{ type: "string" }, { type: "null" }] },
                 buildTime: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
                 generatedAt: { type: "string", format: "date-time" },
+              },
+            },
+            verifierAttestation: {
+              type: "object",
+              required: ["scheme", "keyId", "publicKeyPem", "publicKeyHash", "signedPayloadHash", "signature"],
+              properties: {
+                scheme: { const: "ed25519" },
+                keyId: { type: "string" },
+                publicKeyPem: { type: "string" },
+                publicKeyHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                signedPayloadHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+                signature: { type: "string" },
               },
             },
             winnerClaimAllowed: { const: true },
@@ -1955,8 +2026,8 @@ function buildOpenApi(): Record<string, unknown> {
             bundleType: { const: "PACTFUSE_EVIDENCE_V1" },
             sessionId: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
             summaryMode: { const: true },
-            asOfEventSeq: { type: "integer", minimum: 0, maximum: 200 },
-            asOfMcpAdapterCallCount: { type: "integer", minimum: 0, maximum: 200 },
+            asOfEventSeq: { type: "integer", minimum: 0 },
+            asOfMcpAdapterCallCount: { type: "integer", minimum: 0 },
             winnerClaimAllowed: { const: false },
             eventRoot: { type: "string" },
             agentTranscriptHash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
@@ -2214,6 +2285,7 @@ function buildOpenApi(): Record<string, unknown> {
                   responseHash: { type: "string" },
                   request: { type: "object", additionalProperties: true },
                   response: { type: "object", additionalProperties: true },
+                  redactedFields: { type: "array", items: { type: "string" } },
                   status: { enum: ["succeeded", "failed", "blocked"] },
                   createdAt: { type: "string", format: "date-time" },
                   proofAuthority: { const: false },
@@ -2533,7 +2605,7 @@ function buildOpenApi(): Record<string, unknown> {
             toolsCallHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
             transcriptHash: { anyOf: [{ type: "string", pattern: "^0x[0-9a-fA-F]{64}$" }, { type: "null" }] },
             boundedToPinnedManifest: { type: "boolean" },
-            callCount: { type: "integer", minimum: 0, maximum: 200 },
+            callCount: { type: "integer", minimum: 0 },
             calls: {
               type: "array",
               items: {
@@ -2668,12 +2740,22 @@ function parameterSchemaFor(path: string): Record<string, unknown>[] {
       description: "Required for every raw/manual CAW receipt ingest write; configured by PACTFUSE_CAW_INGEST_TOKEN.",
     });
   }
+  if (path === "/api/v1/evidence/proof-bundle") {
+    parameters.push({
+      name: "publicClaimEventId",
+      in: "query",
+      required: false,
+      schema: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+      description:
+        "Optional proof-authorized public.claim.authorized event id for historical immutable proof-bundle reads after later session events.",
+    });
+  }
   const apiRole = apiRoleForPath(path);
   if (apiRole) {
     parameters.push({
       name: "authorization",
       in: "header",
-      required: false,
+      required: true,
       schema: { type: "string", pattern: "^Bearer .+" },
       description: apiRoleHeaderDescription(apiRole),
     });
