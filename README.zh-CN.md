@@ -17,7 +17,7 @@ PactFuse 是一个 fail-closed（默认拒绝）的链上采购闸门：让 AI a
 
 <br/>
 
-<img src="docs/assets/hero.svg" alt="PactFuse 花费线 —— 不安全来源在付款前触发链上采购闸门熔断;spend halted, 0 moved" width="840">
+<img src="docs/assets/hero.zh.svg" alt="PactFuse 花费线 —— 不安全来源在付款前触发链上采购闸门熔断;支付已熔断,0 移动" width="840">
 
 </div>
 

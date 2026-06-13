@@ -178,10 +178,25 @@ const STR = {
 };
 
 const LANGS = ["en", "zh"];
-let lang = "en";
+
+// First visit follows the browser's language (zh* → Chinese, else English);
+// an explicit choice persisted by setLang() always wins thereafter.
+function detectLang() {
+  try {
+    const cands = navigator.languages?.length ? navigator.languages : [navigator.language];
+    for (const c of cands) {
+      const v = (c || "").toLowerCase();
+      if (v.startsWith("zh")) return "zh";
+      if (v.startsWith("en")) return "en";
+    }
+  } catch { /* navigator unavailable */ }
+  return "en";
+}
+
+let lang = detectLang();
 try {
   const saved = localStorage.getItem("pactfuse-lang");
-  lang = LANGS.includes(saved) ? saved : "en";
+  if (LANGS.includes(saved)) lang = saved;
 } catch { /* localStorage may be blocked */ }
 
 export const getLang = () => lang;
