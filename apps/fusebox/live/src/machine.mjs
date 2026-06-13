@@ -74,7 +74,7 @@ export function createMachine() {
       const step = state.scenario.steps[i];
       if (step.fragile && state.failPending) {
         state.stage = STAGE.failed;
-        state.error = step.failReason ?? "simulated transport drop — retry clears it";
+        state.error = step.failReason ?? "simulated transport drop, retry clears it";
         state.activeStep = step;
         pushLog({ text: `step failed · ${state.error}`, meta: "driver" }, "danger");
         emit("stage");

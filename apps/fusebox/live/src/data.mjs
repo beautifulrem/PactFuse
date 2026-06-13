@@ -219,7 +219,7 @@ function deriveModel(pb) {
     const target = s.steps.find((x) => x.stage === STAGE.executing);
     if (target) {
       target.fragile = true;
-      target.failReason = "transport drop before the action completed — retry clears it";
+      target.failReason = "transport drop before the action completed, retry clears it";
     }
   }
 
@@ -280,7 +280,7 @@ export function fixtureModel() {
         lede: "A pinned source turns unsafe after quote. The gate must cut payment before funds move.",
         tone: "danger",
         flow: "trip",
-        outcome: { label: "protected · 0 moved (fixture)", tone: "danger", detail: "fixture outcome — no proof authority" },
+        outcome: { label: "protected · 0 moved (fixture)", tone: "danger", detail: "fixture outcome, no proof authority" },
         steps: [
           mkStep(STAGE.pending, "trip-challenge", "Issuer submits a source challenge", "fixture event", undefined),
           mkStep(STAGE.detected, "trip-detect", "SourceChallenged finalized", "fixture event", "warning"),
@@ -293,7 +293,7 @@ export function fixtureModel() {
         lede: "The source stays clean, so the gate settles the lease and releases the artifact.",
         tone: "success",
         flow: "settle",
-        outcome: { label: "settled (fixture)", tone: "success", detail: "fixture outcome — no proof authority" },
+        outcome: { label: "settled (fixture)", tone: "success", detail: "fixture outcome, no proof authority" },
         steps: [
           mkStep(STAGE.pending, "settle-approve", "Agent approves the gate through CAW", "fixture event", undefined),
           mkStep(STAGE.detected, "settle-allow", "Allowance verified on-chain", "fixture event", undefined),
@@ -307,7 +307,7 @@ export function fixtureModel() {
         lede: "The agent is pointed at a contract outside its Pact. CAW refuses before the chain.",
         tone: "warning",
         flow: "deny",
-        outcome: { label: "denied (fixture)", tone: "warning", detail: "fixture outcome — no proof authority" },
+        outcome: { label: "denied (fixture)", tone: "warning", detail: "fixture outcome, no proof authority" },
         steps: [
           mkStep(STAGE.pending, "deny-call", "Agent submits a wrong-target call", "fixture event", undefined),
           mkStep(STAGE.detected, "deny-check", "Pact policy mismatch detected", "fixture event", "warning"),
@@ -320,7 +320,7 @@ export function fixtureModel() {
     const t = s.steps.find((x) => x.stage === STAGE.executing);
     if (t) {
       t.fragile = true;
-      t.failReason = "transport drop before the action completed — retry clears it";
+      t.failReason = "transport drop before the action completed, retry clears it";
     }
   }
   return model;
