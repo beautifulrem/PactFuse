@@ -116,16 +116,17 @@ flowchart LR
 
 ## 🌍 Where this applies
 
-The pattern fits anywhere an autonomous payment depends on a source that some authority can flag unsafe between the decision and the settlement:
+Any autonomous executor that pays based on a fact that can go stale needs this gate, and LLM agents need it most: they decide from search results and citations that may already be wrong. Three concrete shapes:
 
-- **On-chain bots / DeFi:** a liquidation or arbitrage bot acts on a price oracle that gets manipulated right before settlement. Gate the spend on the oracle's freshness and it trips instead of executing on a poisoned price.
-- **AP automation / BEC fraud:** a vendor's bank details are swapped between invoice approval and payout. Bind the payout to the account's attestation and a flagged account stops the transfer.
-- **Software / AI supply chain:** a package or model is flagged malicious (a CVE, a backdoor) right after it was pulled in. Bind the purchase to the artifact issuer's attestation and a revoked source refuses payment.
-- **Agentic commerce / A2A:** an agent pays a merchant or another agent that gets flagged fraudulent between cart and checkout, or is steered (via prompt injection) at an off-allowlist target. The freshness gate trips the first; the Pact policy denies the second before it reaches the chain.
+- **An agent auto-allocates treasury into DeFi.** It read "this vault is audited, high APY, good reputation," but that can be a cached article, an old audit, or SEO spam. Bind the deposit to the vault / oracle / bridge source; if a monitor has challenged it (exploit alert, auditor revocation, abnormal TVL outflow, admin-key change), the deposit trips before any funds move.
+- **An agent procures an API, model, or dataset.** The vendor "looks fine," but before payment it may be breached, the model flagged malicious, the package poisoned, or the license revoked. Bind the spend to the artifact issuer's attestation; a revoked or challenged source refuses payment.
+- **An agent trades on news.** The "announcement" may be fake, a hijacked account, reposted old news, or a phishing contract address. Bind the trade to the token / contract source and an allowlisted target; a risk-challenged source or off-allowlist target never settles.
 
-**Why AI agents especially.** Of all executors, an LLM agent is the most likely to act on the stale or fabricated facts above, so it needs this gate most. PactFuse downgrades an LLM's "looks safe" from a permission into a mere *intent*, re-checked the instant money moves: detection stays pluggable (CVE feeds, risk monitors, auditors, oracle health raise the challenge), enforcement is guaranteed (challenged source → no payment). *Search is not settlement-grade truth; LLM citations are not execution permissions.*
+**Enforcement, not detection.** PactFuse does not scan CVEs or watch TVL itself. Detectors (CVE / OSV feeds, risk monitors, auditors, oracle-health watchers) raise the challenge on-chain; PactFuse guarantees a challenged source cannot be paid. Detection is pluggable; enforcement is the gate. The same primitive also serves non-AI executors: trading bots, cross-chain executors, treasury flows.
 
-The closest match to this repo's live demo is the supply-chain case: an agent buying a source-bound tool lease, where the source can be challenged before payment.
+> Search is not settlement-grade truth; LLM citations are not execution permissions.
+
+The closest match to this repo's live demo is procurement: an agent buying a source-bound tool lease, where the source can be challenged before payment.
 
 ---
 
