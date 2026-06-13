@@ -2,7 +2,7 @@
  * and hash drawers, footer provenance line, toast. */
 
 import { icon } from "../symbols.mjs";
-import { short, fmt } from "../data.mjs";
+import { short, fmt, txUrl } from "../data.mjs";
 import { t, getLang } from "../i18n.mjs";
 import { getHead, getTxBlock } from "../chain.mjs";
 
@@ -91,10 +91,30 @@ export function mountMetrics(host, model) {
 function claimStatementItem(model) {
   const c = model.claim;
   if (!c) return "";
-  return `<div class="hx-item"><p class="hx-k mono">authorized public claim</p><div class="hx-v"><code class="mono">${c.claimStatus} @ ${c.authorizedAt} · claimMode=${c.claimMode} · tokenSettlementClaim=${c.tokenSettlementClaim} · winnerClaimAllowed=${c.winnerClaimAllowed} (session-scoped)</code></div></div>`;
+  return `<div class="hx-item"><p class="hx-k mono">${t("hash.claim")}</p><div class="hx-v"><code class="mono">${c.claimStatus} @ ${c.authorizedAt} · claimMode=${c.claimMode} · tokenSettlementClaim=${c.tokenSettlementClaim} · winnerClaimAllowed=${c.winnerClaimAllowed} (session-scoped)</code></div></div>`;
 }
 
 export function mountDrawers(root, model, toast) {
+  // judge-row + hash labels translate; reasons fall back to bundle text for an
+  // unknown row; each on-chain proof row links to its real Base Sepolia tx.
+  const JR = new Set(["caw_boundary", "source_challenge", "ab_trip", "c_settlement", "artifact_access", "lease_execution"]);
+  const jLabel = (r) => (JR.has(r.rowId) ? t(`jr.${r.rowId}`) : r.label);
+  const jReason = (r) => (JR.has(r.rowId) ? t(`jr.${r.rowId}.reason`) : (r.reason ?? ""));
+  const aWord = (a) => { const v = t(`auth.${a}`); return v === `auth.${a}` ? a : v; };
+  const sWord = (s) => { const v = t(`jc.${s}`); return v === `jc.${s}` ? s : v; };
+  const onchainTx = (kind) => model.onchain?.txs?.find((x) => x.kind === kind)?.txHash;
+  const JUDGE_TX = {
+    caw_boundary: model.facts?.allowance?.approveTxHash,
+    source_challenge: onchainTx("SourceChallenged"),
+    ab_trip: onchainTx("SpendTripped"),
+    c_settlement: onchainTx("SpendSettled"),
+  };
+  const HASH_LABEL = {
+    "public claim": "hash.publicClaim", "proof bundle": "hash.proofBundle", "replay bundle": "hash.replayBundle",
+    "verifier run": "hash.verifierRun", "deployment registry": "hash.deployRegistry", "server metadata": "hash.serverMeta",
+    "attestation key": "hash.attestKey", "note": "hash.note",
+  };
+  const hashLabel = (k) => (HASH_LABEL[k] ? t(HASH_LABEL[k]) : k);
   root.innerHTML = `
     <div class="drawer" id="drawerJudge" role="dialog" aria-modal="true" aria-label="${t("drawer.judge")}" hidden>
       <header><h3>${t("drawer.judge")}</h3><span class="mono drawer-sub">${short(model.sessionId, 8, 6)}</span>
@@ -108,9 +128,9 @@ export function mountDrawers(root, model, toast) {
           <div class="jc-row" data-status="${r.status}">
             <i class="jc-dot" aria-hidden="true"></i>
             <div>
-              <p class="jc-label">${r.label} <span class="mono">${r.status} · ${r.authority}</span></p>
-              <p class="jc-reason">${r.reason ?? ""}</p>
-              <p class="jc-ev mono">evidence ${short(r.evidenceEventId ?? "", 12, 6)}</p>
+              <p class="jc-label">${jLabel(r)} <span class="mono">${sWord(r.status)} · ${aWord(r.authority)}</span></p>
+              <p class="jc-reason">${jReason(r)}</p>
+              <p class="jc-ev mono">${t("jc.evidence")} ${short(r.evidenceEventId ?? "", 12, 6)}${JUDGE_TX[r.rowId] ? ` · <a href="${txUrl(JUDGE_TX[r.rowId])}" target="_blank" rel="noopener">${t("jc.viewTx")} ↗</a>` : ""}</p>
             </div>
           </div>`,
                 )
@@ -128,13 +148,13 @@ export function mountDrawers(root, model, toast) {
           .map(
             ([k, v]) => `
           <div class="hx-item">
-            <p class="hx-k mono">${k}</p>
+            <p class="hx-k mono">${hashLabel(k)}</p>
             <div class="hx-v"><code class="mono">${v ?? "—"}</code>
             ${v && String(v).startsWith("0x") ? `<button class="btn btn-ghost" type="button" data-copy="${v}" aria-label="Copy ${k} hash">${icon("copy")}</button>` : ""}</div>
           </div>`,
           )
           .join("")}
-        ${model.attestation ? `<div class="hx-item"><p class="hx-k mono">ed25519 attestation</p><div class="hx-v"><code class="mono">sig ${short(model.attestation.signature, 16, 10)}</code></div></div>` : ""}
+        ${model.attestation ? `<div class="hx-item"><p class="hx-k mono">${t("hash.attest")}</p><div class="hx-v"><code class="mono">sig ${short(model.attestation.signature, 16, 10)}</code></div></div>` : ""}
       </div>
     </div>
     <div class="drawer" id="drawerSelfTest" role="dialog" aria-modal="true" aria-label="${t("drawer.selftest")}" hidden>
