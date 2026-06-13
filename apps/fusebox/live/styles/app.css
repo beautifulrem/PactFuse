@@ -105,7 +105,12 @@ a:hover { text-decoration: underline; }
   min-height: 560px;
 }
 .console-aside { border-right: 1px solid var(--border); padding: var(--s4); display: flex; flex-direction: column; gap: var(--s4); background: var(--surface-muted); }
-.console-stage { display: grid; grid-template-rows: minmax(300px, auto) 1fr; min-width: 0; }
+.console-stage { display: grid; grid-template-rows: auto minmax(300px, auto) 1fr; min-width: 0; }
+
+/* narrative spine: the stage rail (timeline) + status note sit directly above the map */
+.stage-head { display: flex; align-items: center; gap: var(--s4); flex-wrap: wrap; padding: var(--s4) var(--s5) var(--s3); border-bottom: 1px solid var(--border); }
+.stage-head .stage-rail { flex: 0 0 auto; width: min(440px, 100%); }
+.stage-head .stage-note { flex: 1 1 220px; margin-top: 0; }
 
 .panel-title {
   margin: 0; display: flex; align-items: center; justify-content: space-between; gap: var(--s2);

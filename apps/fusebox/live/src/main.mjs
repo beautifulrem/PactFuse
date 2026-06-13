@@ -4,7 +4,7 @@
 import { mountSymbolSprite } from "./symbols.mjs";
 import { createMachine } from "./machine.mjs";
 import { loadEvidence, fixtureModel, DEFAULT_SESSION } from "./data.mjs";
-import { mountScenarioPanel } from "./components/scenario.mjs";
+import { mountScenarioPanel, mountStageRail } from "./components/scenario.mjs";
 import { mountFlowMap } from "./components/flowmap.mjs";
 import { mountInspector, mountLog } from "./components/inspector.mjs";
 import { mountHeader, mountMetrics, mountDrawers, mountFooter, makeToast } from "./components/chrome.mjs";
@@ -49,12 +49,14 @@ async function boot() {
   mountFooter($("appFooter"), model);
 
   const scenarioPanel = mountScenarioPanel($("scenarioPanel"), { machine, scenarios: model.scenarios });
+  const stageRail = mountStageRail($("stageRail"));
   const flowMap = mountFlowMap($("flowMap"), model.facts);
   const inspector = mountInspector($("inspectorPanel"));
   const log = mountLog($("logPanel"), { machine });
 
   const applyAll = (ms, type) => {
     scenarioPanel.apply(ms);
+    stageRail.apply(ms);
     flowMap.apply(ms);
     inspector.apply(ms);
     log.apply(ms, type);

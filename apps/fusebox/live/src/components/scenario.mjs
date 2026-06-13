@@ -24,10 +24,6 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
       <span class="fail-track" aria-hidden="true"><span class="fail-knob"></span></span>
       <span>simulate transport drop</span>
     </button>
-    <ol class="stage-rail" aria-label="Demo stage">
-      ${RAIL.map((r) => `<li class="stage-pill" data-stage-id="${r.id}"><i class="stage-dot" aria-hidden="true"></i>${r.label}</li>`).join("")}
-    </ol>
-    <div class="stage-note" id="stageNote" role="status" aria-live="polite"></div>
   `;
 
   const list = host.querySelector(".scenario-list");
@@ -46,7 +42,6 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
 
   const runBtn = host.querySelector("#runBtn");
   const resetBtn = host.querySelector("#resetBtn");
-  const note = host.querySelector("#stageNote");
 
   const isRunning = () => [STAGE.pending, STAGE.detected, STAGE.executing].includes(machine.state.stage);
   const pick = (id) => machine.select(scenarios.find((s) => s.id === id));
@@ -105,30 +100,40 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
           ? `${icon("play")} Run again`
           : `${icon("play")} Run scenario`;
     host.dataset.stage = ms.stage;
+  }
 
+  return { apply };
+}
+
+const stageNote = (ms) => {
+  if (ms.stage === STAGE.failed) return { text: `failed — ${ms.error}`, tone: "danger" };
+  if (ms.stage === STAGE.success) return { text: ms.outcome?.label ?? "complete", tone: ms.outcome?.tone ?? "success" };
+  if (ms.activeStep) return { text: ms.activeStep.title, tone: ms.activeStep.tone ?? "info" };
+  if (ms.scenario) return { text: "armed — run to replay the evidence", tone: "info" };
+  return { text: "select a scenario to begin", tone: "muted" };
+};
+
+// The stage rail + status note — the timeline beat of the narrative spine. Lives
+// in the stage column directly above the flow map (it derives purely from machine
+// state, so it can mount anywhere). stageNote stays the single spoken channel.
+export function mountStageRail(host) {
+  host.innerHTML = `
+    <ol class="stage-rail" aria-label="Demo stage">
+      ${RAIL.map((r) => `<li class="stage-pill" data-stage-id="${r.id}"><i class="stage-dot" aria-hidden="true"></i>${r.label}</li>`).join("")}
+    </ol>
+    <div class="stage-note" id="stageNote" role="status" aria-live="polite"></div>
+  `;
+  const pills = [...host.querySelectorAll(".stage-pill")];
+  const note = host.querySelector("#stageNote");
+  function apply(ms) {
     const reached = { [STAGE.pending]: 1, [STAGE.detected]: 2, [STAGE.executing]: 3, [STAGE.success]: 4, [STAGE.failed]: 3 }[ms.stage] ?? 0;
-    host.querySelectorAll(".stage-pill").forEach((p, i) => {
+    pills.forEach((p, i) => {
       p.dataset.state = i < reached ? (i === reached - 1 && ms.stage === STAGE.failed ? "failed" : i === reached - 1 ? "active" : "done") : "wait";
       if (ms.stage === STAGE.success) p.dataset.state = "done";
     });
-
-    if (ms.stage === STAGE.failed) {
-      note.textContent = `failed — ${ms.error}`;
-      note.dataset.tone = "danger";
-    } else if (ms.stage === STAGE.success) {
-      note.textContent = ms.outcome?.label ?? "complete";
-      note.dataset.tone = ms.outcome?.tone ?? "success";
-    } else if (ms.activeStep) {
-      note.textContent = ms.activeStep.title;
-      note.dataset.tone = ms.activeStep.tone ?? "info";
-    } else if (ms.scenario) {
-      note.textContent = "armed — run to replay the evidence";
-      note.dataset.tone = "info";
-    } else {
-      note.textContent = "select a scenario to begin";
-      note.dataset.tone = "muted";
-    }
+    const n = stageNote(ms);
+    note.textContent = n.text;
+    note.dataset.tone = n.tone;
   }
-
   return { apply };
 }
