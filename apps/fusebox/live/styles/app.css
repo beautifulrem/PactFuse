@@ -309,16 +309,12 @@ body[data-evidence] .provenance   { animation: rise var(--dur-enter) var(--ease-
 .netstat-main small { color: var(--text-muted); font-family: var(--font-mono); font-size: var(--fs-micro); }
 @keyframes netpulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent); } 70% { box-shadow: 0 0 0 6px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
 body[data-motion="off"] .netstat[data-state="live"] .netstat-dot { animation: none; }
-.legend { margin-top: var(--s4); padding-top: var(--s4); border-top: 1px solid var(--border); display: grid; gap: var(--s3); }
-.legend-h { margin: 0; color: var(--text-muted); font-size: var(--fs-micro); letter-spacing: 0.16em; text-transform: uppercase; }
-.legend-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--s3); }
-.legend-row { display: grid; grid-template-columns: 8px 1fr; gap: var(--s3); align-items: start; }
-.legend-dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; background: var(--text-muted); }
-.legend-row[data-tone="success"] .legend-dot { background: var(--success); }
-.legend-row[data-tone="danger"] .legend-dot { background: var(--danger); }
-.legend-row[data-tone="warning"] .legend-dot { background: var(--warning); }
-.legend-txt b { display: block; color: var(--text-secondary); font-size: var(--fs-meta); font-weight: 600; }
-.legend-txt small { display: block; margin-top: 1px; color: var(--text-muted); font-size: var(--fs-micro); line-height: 1.4; }
+/* inline live on-chain state, grouped with the net indicator at the aside bottom */
+.livestate { margin-top: var(--s4); padding-top: var(--s4); border-top: 1px solid var(--border); }
+.livestate-h { margin: 0 0 var(--s2); display: flex; flex-wrap: wrap; gap: var(--s2); align-items: baseline; color: var(--text-muted); font-size: var(--fs-micro); letter-spacing: 0.14em; text-transform: uppercase; }
+.livestate-sub { letter-spacing: 0.04em; text-transform: none; }
+.livestate .cs-row { padding: var(--s2) 0; }
+.livestate .cs-row:last-child { border-bottom: 0; }
 
 /* failure-injection switch — exposes the failed/retry arc without a URL param */
 .fail-toggle {

@@ -5,7 +5,7 @@
 import { icon } from "../symbols.mjs";
 import { STAGE } from "../machine.mjs";
 import { t } from "../i18n.mjs";
-import { getHead } from "../chain.mjs";
+import { getHead, readSourceState, readSpendState } from "../chain.mjs";
 
 const RAIL = [
   { id: STAGE.pending, key: "stage.event" },
@@ -14,7 +14,11 @@ const RAIL = [
   { id: STAGE.success, key: "stage.done" },
 ];
 
-export function mountScenarioPanel(host, { machine, scenarios }) {
+const SRC_STATE = ["unknown", "active", "challenged", "revoked"];
+const SPEND_STATE = ["unknown", "registered", "tripped", "settled"];
+const stateTone = (name) => ({ active: "success", settled: "success", registered: "info", challenged: "danger", revoked: "danger", tripped: "warning" }[name] ?? "muted");
+
+export function mountScenarioPanel(host, { machine, scenarios, onchain }) {
   host.innerHTML = `
     <h2 class="panel-title">${t("panel.scenarios")} <span class="panel-hint">${t("panel.scenariosHint")}</span></h2>
     <div class="scenario-list" role="radiogroup" aria-label="${t("panel.scenarios")}"></div>
@@ -30,13 +34,9 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
       <span class="netstat-dot" aria-hidden="true"></span>
       <span class="netstat-main"><b>${t("net.chain")}</b><small id="netHead">${t("net.connecting")}</small></span>
     </div>
-    <div class="legend" aria-label="${t("legend.title")}">
-      <p class="legend-h mono">${t("legend.title")}</p>
-      <ul class="legend-list">
-        <li class="legend-row" data-tone="success"><i class="legend-dot" aria-hidden="true"></i><span class="legend-txt"><b>${t("verdict.delivered")}</b><small>${t("legend.settle")}</small></span></li>
-        <li class="legend-row" data-tone="danger"><i class="legend-dot" aria-hidden="true"></i><span class="legend-txt"><b>${t("verdict.spendHalted")}</b><small>${t("legend.trip")}</small></span></li>
-        <li class="legend-row" data-tone="warning"><i class="legend-dot" aria-hidden="true"></i><span class="legend-txt"><b>${t("verdict.denied")}</b><small>${t("legend.deny")}</small></span></li>
-      </ul>
+    <div class="livestate" id="liveState" hidden>
+      <p class="livestate-h mono">${t("drawer.chainState")} <span class="livestate-sub">${t("cs.sessionH")}</span></p>
+      <ol class="cs-list" id="asideState"></ol>
     </div>
   `;
 
@@ -103,6 +103,31 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
     (h) => { net.dataset.state = "live"; netHead.textContent = t("net.head", { n: h.toLocaleString("en-US") }); },
     () => { net.dataset.state = "down"; netHead.textContent = t("net.offline"); },
   );
+
+  // inline live on-chain state: read each source/spend's current state (keyless)
+  const oc = onchain ?? {};
+  const stateItems = [
+    ...(oc.sources ?? []).map((s) => ({ kind: "source", id: s.hash, label: t("as.source") })),
+    ...(oc.spends ?? []).map((s, i) => ({ kind: "spend", id: s.id, label: `${t("as.spend")} ${String.fromCharCode(65 + i)}` })),
+  ];
+  const stateList = host.querySelector("#asideState");
+  if (stateItems.length && oc.registry && oc.gate) {
+    host.querySelector("#liveState").hidden = false;
+    stateList.innerHTML = stateItems
+      .map((it) => `<li class="cs-row" data-tone="muted" data-id="${it.id}"><span class="cs-label">${it.label}</span><span class="cs-badge mono">${t("cs.reading")}</span></li>`)
+      .join("");
+    stateItems.forEach(async (it) => {
+      const row = stateList.querySelector(`[data-id="${it.id}"]`);
+      try {
+        const n = it.kind === "source" ? await readSourceState(oc.registry, it.id) : await readSpendState(oc.gate, it.id);
+        const name = (it.kind === "source" ? SRC_STATE : SPEND_STATE)[n] ?? "unknown";
+        row.dataset.tone = stateTone(name);
+        row.querySelector(".cs-badge").textContent = it.kind === "source" ? t(`cs.src.${name}`) : t(`cs.spend.${name}`);
+      } catch {
+        row.querySelector(".cs-badge").textContent = t("cs.rpcError");
+      }
+    });
+  }
 
   function apply(ms) {
     let anyChecked = false;

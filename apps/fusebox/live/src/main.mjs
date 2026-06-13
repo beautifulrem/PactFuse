@@ -51,7 +51,7 @@ async function boot() {
   const drawers = mountDrawers($("drawerRoot"), model, toast);
   mountFooter($("appFooter"), model);
 
-  const scenarioPanel = mountScenarioPanel($("scenarioPanel"), { machine, scenarios: model.scenarios });
+  const scenarioPanel = mountScenarioPanel($("scenarioPanel"), { machine, scenarios: model.scenarios, onchain: model.onchain });
   const stageRail = mountStageRail($("stageRail"));
   const flowMap = mountFlowMap($("flowMap"), model.facts);
   const inspector = mountInspector($("inspectorPanel"));
