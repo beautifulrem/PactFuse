@@ -1,6 +1,8 @@
 <div align="center">
 
-# ⚡ PactFuse
+<img src="./apps/fusebox/live/icons/icon-512.png" alt="PactFuse" width="112" height="112" />
+
+# PactFuse
 
 **A fail-closed circuit breaker for AI-agent spending.**
 

@@ -1,6 +1,8 @@
 <div align="center">
 
-# ⚡ PactFuse
+<img src="./apps/fusebox/live/icons/icon-512.png" alt="PactFuse" width="112" height="112" />
+
+# PactFuse
 
 **为 AI Agent 花钱装上一个 fail-closed 的"断路器"。**
 
