@@ -64,6 +64,10 @@ const STR = {
     "tip.registry": "Watches source freshness on-chain. A challenge raised here is what trips the gate.",
     "verdict.armed": "armed", "verdict.delivered": "delivered",
     "verdict.spendHalted": "spend halted", "verdict.denied": "denied", "verdict.failed": "failed",
+    "legend.title": "How to read the map",
+    "legend.settle": "clean source → settles at the market",
+    "legend.trip": "unsafe source → cut at the breaker, before payment",
+    "legend.deny": "wrong target → refused at policy, never on-chain",
 
     "insp.title": "Inspector", "insp.idle": "idle", "insp.noEvent": "no active event",
     "insp.armedSuffix": " · armed",
@@ -170,6 +174,10 @@ const STR = {
     "tip.registry": "在链上盯住来源新鲜度;这里发起的挑战会触发闸门熔断。",
     "verdict.armed": "已就绪", "verdict.delivered": "已交付",
     "verdict.spendHalted": "支付已熔断", "verdict.denied": "已拒绝", "verdict.failed": "失败",
+    "legend.title": "如何读这张图",
+    "legend.settle": "来源干净 → 在市场结算交付",
+    "legend.trip": "不安全来源 → 闸门在付款前切断",
+    "legend.deny": "错误目标 → 策略拒绝,不上链",
 
     "insp.title": "检查器", "insp.idle": "空闲", "insp.noEvent": "无活动事件",
     "insp.armedSuffix": " · 已就绪",

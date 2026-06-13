@@ -25,6 +25,14 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
       <span class="fail-track" aria-hidden="true"><span class="fail-knob"></span></span>
       <span>${t("toggle.fail")}</span>
     </button>
+    <div class="legend" aria-label="${t("legend.title")}">
+      <p class="legend-h mono">${t("legend.title")}</p>
+      <ul class="legend-list">
+        <li class="legend-row" data-tone="success"><i class="legend-dot" aria-hidden="true"></i><span class="legend-txt"><b>${t("verdict.delivered")}</b><small>${t("legend.settle")}</small></span></li>
+        <li class="legend-row" data-tone="danger"><i class="legend-dot" aria-hidden="true"></i><span class="legend-txt"><b>${t("verdict.spendHalted")}</b><small>${t("legend.trip")}</small></span></li>
+        <li class="legend-row" data-tone="warning"><i class="legend-dot" aria-hidden="true"></i><span class="legend-txt"><b>${t("verdict.denied")}</b><small>${t("legend.deny")}</small></span></li>
+      </ul>
+    </div>
   `;
 
   const list = host.querySelector(".scenario-list");
