@@ -69,6 +69,10 @@ One layer is soft and flexible (policy, off-chain, denies before the chain). The
 
 ### → **[pactfuse-console.vercel.app](https://pactfuse-console.vercel.app)**
 
+<div align="center">
+<img src="docs/assets/console-demo.gif" alt="PactFuse Console running the three risk scenarios: the spend halts before payment, settles and delivers, or is denied" width="860">
+</div>
+
 A zero-build, dependency-free console that replays the verified Base Sepolia session. Pick one of three risk scenarios and run it; every step binds to a real evidence row (tx hashes, block numbers, CAW audit evidence):
 
 | Scenario | What you watch | Outcome |
