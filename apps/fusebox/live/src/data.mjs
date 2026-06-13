@@ -85,7 +85,7 @@ function deriveModel(pb) {
           detail: "the indexer confirms the public-chain risk event",
           evidence: { tx: challenge.txHash, block: challenge.blockNumber },
           log: [
-            { text: `SourceChallenged · block ${challenge.blockNumber}`, meta: "chain" },
+            { text: `SourceChallenged · block ${challenge.blockNumber}`, meta: "chain", href: challenge.blockNumber ? blockUrl(challenge.blockNumber) : undefined },
             { text: `tx ${short(challenge.txHash, 12, 6)}`, meta: "chain", link: challenge.txHash },
           ],
         },
