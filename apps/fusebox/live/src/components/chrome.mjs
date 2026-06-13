@@ -4,7 +4,7 @@
 import { icon } from "../symbols.mjs";
 import { short, fmt, txUrl, addrUrl } from "../data.mjs";
 import { t, getLang } from "../i18n.mjs";
-import { getHead, getTxBlock } from "../chain.mjs";
+import { getHead, getTxBlock, readSourceState, readSpendState } from "../chain.mjs";
 
 export function mountHeader(host, model) {
   const claim = model.claim;
@@ -49,6 +49,7 @@ export function mountHeader(host, model) {
         <button class="btn btn-ghost" id="openJudge" type="button">${icon("check")} ${model.judgeRows.length ? t("link.judge", { p: passed, t: total }) : t("link.judgeEmpty")}</button>
         <button class="btn btn-ghost" id="openHashes" type="button">${icon("pulse")} ${t("link.hashes")}</button>
         <button class="btn btn-ghost" id="openSelfTest" type="button">${icon("shield")} ${t("link.selftest")}</button>
+        <button class="btn btn-ghost" id="openChainState" type="button">${icon("breaker")} ${t("link.chainState")}</button>
       </div>
       ${
         model.source === "fixture"
@@ -115,6 +116,9 @@ export function mountDrawers(root, model, toast) {
     "attestation key": "hash.attestKey", "note": "hash.note",
   };
   const hashLabel = (k) => (HASH_LABEL[k] ? t(HASH_LABEL[k]) : k);
+  const SRC_STATE = ["unknown", "active", "challenged", "revoked"];
+  const SPEND_STATE = ["unknown", "registered", "tripped", "settled"];
+  const stateTone = (name) => ({ active: "success", settled: "success", registered: "info", challenged: "danger", revoked: "danger", tripped: "warning" }[name] ?? "muted");
   root.innerHTML = `
     <div class="drawer" id="drawerJudge" role="dialog" aria-modal="true" aria-label="${t("drawer.judge")}" hidden>
       <header><h3>${t("drawer.judge")}</h3><span class="mono drawer-sub">${short(model.sessionId, 8, 6)}</span>
@@ -183,6 +187,22 @@ export function mountDrawers(root, model, toast) {
         </div>
       </div>
     </div>
+    <div class="drawer" id="drawerChainState" role="dialog" aria-modal="true" aria-label="${t("drawer.chainState")}" hidden>
+      <header><h3>${t("drawer.chainState")}</h3><span class="mono drawer-sub">${t("drawer.chainStateSub")}</span>
+        <button class="btn btn-ghost drawer-x" type="button" data-close aria-label="Close">${icon("close")}</button></header>
+      <div class="drawer-body">
+        <p class="cs-h mono">${t("cs.sessionH")}</p>
+        <ol class="cs-list" id="csList"></ol>
+        <div class="cs-probe">
+          <p class="cs-h mono">${t("cs.probeH")}</p>
+          <div class="cs-probe-row">
+            <input class="cs-input mono" id="csInput" type="text" spellcheck="false" autocomplete="off" placeholder="0x…" />
+            <button class="btn" id="csProbeBtn" type="button">${icon("shield")} ${t("cs.probeBtn")}</button>
+          </div>
+          <p class="cs-out mono" id="csOut" data-tone="muted"></p>
+        </div>
+      </div>
+    </div>
     <div class="scrim" id="scrim" hidden></div>
   `;
 
@@ -217,7 +237,7 @@ export function mountDrawers(root, model, toast) {
     if (e.key === "Tab") {
       const openDrawer = root.querySelector(".drawer.is-open");
       if (!openDrawer) return;
-      const focusables = [...openDrawer.querySelectorAll("button, a[href]")];
+      const focusables = [...openDrawer.querySelectorAll("button, a[href], input, select, textarea")];
       if (!focusables.length) return;
       const first = focusables[0];
       const last = focusables[focusables.length - 1];
@@ -319,10 +339,55 @@ export function mountDrawers(root, model, toast) {
     }));
   }
 
+  // Live on-chain state: read the deployed contracts' current view state on open
+  // (keyless eth_call) so the gate's verdict shows as live chain truth, plus an
+  // interactive source-freshness probe judges can run on any source hash.
+  async function runChainState() {
+    const oc = model.onchain ?? {};
+    const list = root.querySelector("#csList");
+    const inp = root.querySelector("#csInput");
+    if (inp && !inp.value && oc.sources?.[0]?.hash) inp.value = oc.sources[0].hash;
+    const items = [
+      ...(oc.sources ?? []).map((s) => ({ kind: "source", id: s.hash, label: s.label })),
+      ...(oc.spends ?? []).map((s) => ({ kind: "spend", id: s.id, label: s.label })),
+    ];
+    if (!items.length || !oc.registry || !oc.gate) {
+      list.innerHTML = `<li class="cs-row"><span class="cs-label">${t("cs.none")}</span></li>`;
+      return;
+    }
+    list.innerHTML = items
+      .map((it) => `<li class="cs-row" data-tone="muted" data-id="${it.id}"><span class="cs-label">${it.label} <span class="cs-id mono">${short(it.id, 8, 6)}</span></span><span class="cs-badge mono">${t("cs.reading")}</span></li>`)
+      .join("");
+    await Promise.all(items.map(async (it) => {
+      const row = list.querySelector(`[data-id="${it.id}"]`);
+      try {
+        const n = it.kind === "source" ? await readSourceState(oc.registry, it.id) : await readSpendState(oc.gate, it.id);
+        const name = (it.kind === "source" ? SRC_STATE : SPEND_STATE)[n] ?? "unknown";
+        row.dataset.tone = stateTone(name);
+        row.querySelector(".cs-badge").textContent = it.kind === "source" ? t(`cs.src.${name}`) : t(`cs.spend.${name}`);
+      } catch {
+        row.querySelector(".cs-badge").textContent = t("cs.rpcError");
+      }
+    }));
+  }
+  const csOut = root.querySelector("#csOut");
+  root.querySelector("#csProbeBtn")?.addEventListener("click", async () => {
+    const h = (root.querySelector("#csInput").value || "").trim();
+    if (!/^0x[0-9a-fA-F]{64}$/.test(h)) { csOut.dataset.tone = "muted"; csOut.textContent = t("cs.invalid"); return; }
+    if (!model.onchain?.registry) { csOut.dataset.tone = "muted"; csOut.textContent = t("cs.none"); return; }
+    csOut.dataset.tone = "muted"; csOut.textContent = t("cs.reading");
+    try {
+      const name = SRC_STATE[await readSourceState(model.onchain.registry, h)] ?? "unknown";
+      csOut.dataset.tone = stateTone(name);
+      csOut.textContent = `${short(h, 8, 6)} · ${t(`cs.src.${name}`)}`;
+    } catch { csOut.dataset.tone = "danger"; csOut.textContent = t("cs.rpcError"); }
+  });
+
   return {
     openJudge: () => open("#drawerJudge"),
     openHashes: () => open("#drawerHashes"),
     openSelfTest: () => { open("#drawerSelfTest"); runSelfTest(); },
+    openChainState: () => { open("#drawerChainState"); runChainState(); },
   };
 }
 

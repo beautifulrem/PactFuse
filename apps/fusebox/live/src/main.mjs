@@ -75,6 +75,7 @@ async function boot() {
     if (e.target.closest("#openJudge")) drawers.openJudge();
     if (e.target.closest("#openHashes")) drawers.openHashes();
     if (e.target.closest("#openSelfTest")) drawers.openSelfTest?.();
+    if (e.target.closest("#openChainState")) drawers.openChainState?.();
   });
 
   // ── judge-friendly keyboard shortcuts + help overlay ──────────────────────
@@ -97,6 +98,7 @@ async function boot() {
     else if (k === "j") { drawers.openJudge(); e.preventDefault(); }
     else if (k === "h") { drawers.openHashes(); e.preventDefault(); }
     else if (k === "t") { drawers.openSelfTest?.(); e.preventDefault(); }
+    else if (k === "g") { drawers.openChainState?.(); e.preventDefault(); }
   });
 
   machine.select(model.scenarios[0]);

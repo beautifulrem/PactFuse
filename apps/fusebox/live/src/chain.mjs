@@ -52,3 +52,30 @@ export async function getTxBlock(hash) {
   }
   return null;
 }
+
+// ── keyless eth_call: read deployed-contract view state ─────────────────────
+async function ethCall(to, data) {
+  let lastErr;
+  for (const url of RPCS) {
+    try {
+      const r = await rawCall(url, "eth_call", [{ to, data }, "latest"]);
+      if (typeof r === "string" && r.length >= 66) return r;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr ?? new Error("eth_call failed");
+}
+const noHex = (h) => String(h).replace(/^0x/, "");
+
+// SourceStateRegistry.sourceState(bytes32): 0 Unknown, 1 Active, 2 Challenged, 3 Revoked
+export async function readSourceState(registry, sourceHash) {
+  const out = await ethCall(registry, "0x447c24c0" + noHex(sourceHash));
+  return parseInt(out.slice(-2), 16);
+}
+// ProcurementGate.registeredSpend(bytes32): state is the last of 10 return words.
+// SpendState: 0 Unknown, 1 Registered, 2 Tripped, 3 Settled
+export async function readSpendState(gate, spendId) {
+  const out = await ethCall(gate, "0xef3bbc44" + noHex(spendId));
+  return parseInt(out.slice(-2), 16);
+}
