@@ -14,10 +14,20 @@ export function mountHeader(host, model) {
       <p class="head-kicker mono">${t("head.kicker")}</p>
       <h1 class="head-title">${t("head.titleHtml")}</h1>
       <p class="head-lede">${t("head.ledeHtml")}</p>
-      <div class="head-proofline" role="list" aria-label="${t("head.proof1b")}">
-        <span class="proof-step" role="listitem" data-tone="accent">${icon("wallet")}<span><b>${t("head.proof1b")}</b><small>${t("head.proof1s")}</small></span></span>
-        <span class="proof-step" role="listitem" data-tone="danger">${icon("breaker")}<span><b>${t("head.proof2b")}</b><small>${t("head.proof2s")}</small></span></span>
-        <span class="proof-step" role="listitem" data-tone="success">${icon("check")}<span><b>${t("head.proof3b")}</b><small>${total ? t("head.proof3s", { n: `${passed}/${total}` }) : t("head.proof3sFixture")}</small></span></span>
+      <p class="proof-eyebrow">${t("head.proofEyebrow")}</p>
+      <div class="head-proofline" role="list" aria-label="${t("head.proofEyebrow")}">
+        <span class="proof-step" role="listitem" data-tone="accent">
+          <span class="proof-lead"><span class="proof-n" aria-hidden="true">1</span>${icon("wallet")}</span>
+          <span class="proof-body"><b>${t("head.proof1b")}</b><small>${t("head.proof1s")}</small></span>
+        </span>
+        <span class="proof-step" role="listitem" data-tone="danger">
+          <span class="proof-lead"><span class="proof-n" aria-hidden="true">2</span>${icon("breaker")}</span>
+          <span class="proof-body"><b>${t("head.proof2b")}</b><small>${t("head.proof2s")}</small></span>
+        </span>
+        <span class="proof-step" role="listitem" data-tone="success">
+          <span class="proof-lead"><span class="proof-n" aria-hidden="true">3</span>${icon("check")}</span>
+          <span class="proof-body"><b>${t("head.proof3b")}</b><small>${total ? t("head.proof3s", { n: `${passed}/${total}` }) : t("head.proof3sFixture")}</small></span>
+        </span>
       </div>
     </div>
     <div class="head-side">
