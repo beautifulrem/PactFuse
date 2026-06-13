@@ -2,11 +2,11 @@
 
 # ⚡ PactFuse
 
-**为 AI Agent 花钱装上一个"断路器"。**
+**为 AI Agent 花钱装上一个 fail-closed 的"断路器"。**
 
-PactFuse 是一个 fail-closed（默认拒绝）的链上采购闸门：让 AI agent 用自己掌控的资金真实采购**与来源绑定**的工具租约，并在**任何代币转移之前**，于来源变得不安全的瞬间**熔断这笔支付**。每一条声明都由可重放、带密码学签名的链上证据支撑。
+PactFuse 在**付款的那一刻**于链上重新核验 Agent 要买的东西,一旦来源变得不安全,就在**任何代币转移之前**切断这笔支付。每一条声明都由可重放、带签名的链上证据支撑,而且你能实时复验。
 
-[**▶ 在线 Console**](https://pactfuse-console.vercel.app) · [自己验证证据](#-自己验证) · [工作原理](#-工作原理) · [English](./README.md)
+[**▶ 在线 Console**](https://pactfuse-console.vercel.app) · [自己验证](#-自己验证) · [工作原理](#-工作原理) · [English](./README.md)
 
 <br/>
 
@@ -17,32 +17,44 @@ PactFuse 是一个 fail-closed（默认拒绝）的链上采购闸门：让 AI a
 
 <br/>
 
-<img src="docs/assets/hero.zh.svg" alt="PactFuse 花费线 —— 不安全来源在付款前触发链上采购闸门熔断;支付已熔断,0 移动" width="840">
+<img src="docs/assets/hero.zh.svg" alt="PactFuse 花费线:不安全来源在付款前触发链上采购闸门熔断;支付已熔断,0 移动" width="840">
 
 </div>
 
 ---
 
-## 🧠 一句话
+## 🔥 痛点
 
-> Agent 通过 **Cobo Agentic Wallet (CAW)** 用自己掌控的资金购买一份工具租约。
-> 这笔 spend **与其数据来源的新鲜度绑定**：结算前来源被挑战 → 链上 `ProcurementGate` 在**付款之前熔断**，`0 moved`；来源保持干净 → 闸门**链上结算并交付**付费 artifact，agent 再通过**受审计的 MCP** 调用消费它。
-> 整个流程被导出为一份**可重放、Ed25519 签名的 proof bundle**，任何人都能**离线验证**——无需 API、无需链访问。
+AI Agent 开始自己花钱了(买数据、模型、工具、算力),用的是像 **Cobo Agentic Wallet (CAW)** 这样的钱包。但 Agent 买的东西,安全性取决于它的**来源**,而来源可能在"**决定买**"到"**真正付款**"之间变坏。
 
----
+这个间隙(决定时检查、付款时使用)是一个典型的 TOCTOU(检查与使用时间不一致)漏洞,也正是今天真金白银在损失的地方:
 
-## ✨ 为什么需要 PactFuse
+- 预言机价格刚被操纵,机器人就照着它执行;
+- 供应商银行账号在发票审批到打款之间被掉包(BEC 诈骗);
+- 某个依赖包或模型刚被拉进来,就被标记为恶意(CVE、后门)。
 
-Agent 钱包已经可以批准工具采购，但**一份工具租约的价值取决于它来源的状态**——一个在报价时安全的代码扫描 API，可能在 agent 付款*之前*获得写入/文件能力而变得不安全。PactFuse 把这条"新鲜度边界"变成了一个可强制执行的链上采购原语。
+只在决定时检查一次远远不够。**必须在钱要动的那一刻再查一次,有变化就拒绝。**
 
-|  | |
-|---|---|
-| 🔌 **付款前熔断** | 一个真正的链上断路器（`ProcurementGate`）会在**代币转移之前**（而非之后）切断每一笔绑定到被挑战来源的 spend 的付款路径。 |
-| 🔗 **来源绑定** | 每笔 spend 都钉在一份签名的来源清单上。来源过期 → 熔断；来源新鲜 → 结算并交付。 |
-| 🛡️ **CAW 是承重墙,不是装饰** | 每一次动资金的调用都**经由 CAW API、在已批准的 Pact 下**执行（目标白名单 + 函数选择器 + 限额）。错误目标的调用会被钱包侧拒绝，并记录为 `live_denied` 证据。应用从不持有裸私钥。 |
-| 🧾 **用证据,而非断言** | 每条声明都由原始 CAW 回执、已最终确定的链上日志、ERC-20 余额变化、MCP transcript 哈希与重放验证器支撑——并导出为签名 bundle。 |
-| 🚪 **处处 fail-closed** | 缺失、待定、fixture、人工或自相矛盾的证据都会让 `winnerClaimAllowed = false`。**没有人工 override**——通往公开声明的唯一路径,是在一个 session 内通过每一道实链闸门。 |
-| 🎛️ **10 秒就能读懂的 Demo** | [在线 Console](https://pactfuse-console.vercel.app) 把真实 session 重放成一条"花费线":钱包 → 策略 → 断路器 → 市场,而*花费最终停在哪里*就编码了结果。 |
+## ✅ PactFuse 做什么
+
+PactFuse 把每一笔 spend 在链上与它的来源绑定,然后在**付款瞬间**重新校验新鲜度:
+
+- **来源被挑战 → 熔断**:链上 `ProcurementGate` 在任何代币转移前切断付款(`0 moved`);
+- **来源干净 → 结算**:闸门在链上付款并释放付费 artifact,经受审计的 MCP 调用消费;
+- **错误目标 → 拒绝**:钱包策略层在调用到达链之前就拒绝它。
+
+每次运行都导出一份可重放、Ed25519 签名的 proof bundle,而[在线 console](https://pactfuse-console.vercel.app) 还会在你的浏览器里对公共链**实时复验**它。
+
+> **一句话核心:**别再信"我决定时它是安全的";让付款本身取决于来源**此刻**是否安全。
+
+## 🧱 两道执行层
+
+| 层 | 运行在哪 | 执行什么 | 失败时 |
+|---|---|---|---|
+| **Pact 策略**(CAW) | 链下,签名之前 | 准不准付:目标白名单、函数选择器、参数、用量限额 | 错误目标 → `live_denied`,从不产生交易 |
+| **采购闸门 + 来源登记表** | 链上,付款调用时 | 绑定的来源是否仍新鲜 | 来源被挑战 → 熔断,`0 moved` |
+
+一软一硬:一层灵活(策略、链下、上链前就拒),一层可验证(合约、链上、最后一刻兜底)。两者都 fail-closed:任何缺失或不安全,都等于"不付"。
 
 ---
 
@@ -50,7 +62,7 @@ Agent 钱包已经可以批准工具采购，但**一份工具租约的价值取
 
 ### → **[pactfuse-console.vercel.app](https://pactfuse-console.vercel.app)**
 
-**PactFuse Console** 是一个零构建、零依赖的 Demo,重放已验证的 Base Sepolia session。选择三个风险场景之一并运行——每一步都绑定到真实证据行(交易哈希、区块号、CAW 审计证据):
+一个零构建、零依赖的 console,重放已验证的 Base Sepolia session。选择三个风险场景之一并运行;每一步都绑定到真实证据行(交易哈希、区块号、CAW 审计证据):
 
 | 场景 | 你会看到 | 结果 |
 |---|---|---|
@@ -58,7 +70,12 @@ Agent 钱包已经可以批准工具采购，但**一份工具租约的价值取
 | 🟢 **新鲜来源 → 结算并交付** | 额度被验证,闸门结算,artifact 经 MCP 租约释放 | `DELIVERED` |
 | 🟡 **错误目标 → 策略拒绝** | Pact 白名单之外的调用被 CAW 服务端拒绝 | `DENIED`(从不产生交易) |
 
-`?fail=1` 演示传输失败 / 重试路径。完整支持 `prefers-reduced-motion`、键盘操作与移动端。
+**它不只是重放。** Console 会当着你的面、无需密钥地读取实时链:
+
+- **自检**(按 `T`)从公共 Base Sepolia RPC 重新拉取每一笔真实交易,显示它此刻**仍在链上确认**(数万个确认)。
+- **实时状态**(按 `G`)用 `eth_call` 直接读闸门和登记表:受挑战来源返回 `Challenged`、绑定它的支付返回 `Tripped`、干净支付返回 `Settled`。
+
+打开浏览器 Network 面板,就能看到真实的 RPC 调用。无后端、无密钥,除了链本身什么都不用信。(`?fail=1` 演示传输中断 / 重试;完整支持 `prefers-reduced-motion`、键盘与移动端。)
 
 ---
 
@@ -66,12 +83,13 @@ Agent 钱包已经可以批准工具采购，但**一份工具租约的价值取
 
 PactFuse 把一次采购建模为一份**来源绑定的租约**:
 
-1. 来源发行方注册一份**签名的来源清单**。
-2. 买方 agent 注册一笔**绑定到该来源集合的 spend**(经由 CAW)。
-3. **结算前来源被挑战** → `ProcurementGate` 在任何代币转移之前**熔断**这笔 spend。
-4. **来源保持新鲜** → 闸门**结算**这笔 spend 并解锁一份**付费 artifact**。
-5. 这份干净的租约通过一个**受审计的 MCP** 表面执行,严格限定在钉住的工具清单内。
-6. 每一步都导出为 `PACTFUSE_EVIDENCE_V1`,用于重放、验证与 Judge Check 审阅。
+1. 来源发行方在 `SourceStateRegistry` 注册一份**签名的来源清单**。
+2. 买方 agent 经由 CAW 注册一笔**绑定到该来源集合的 spend**。注册只是把条款钉上链,钱还没动。
+3. 在付款调用时,闸门重新核验绑定的来源:
+   - **结算前被挑战** → `ProcurementGate` 在任何代币转移前**熔断**这笔 spend;
+   - **仍然新鲜** → 闸门**结算**并解锁一份**付费 artifact**。
+4. 这份干净的租约通过一个**受审计的 MCP** 表面执行,严格限定在钉住的工具清单内。
+5. 每一步都导出为 `PACTFUSE_EVIDENCE_V1`,用于重放、离线验证与 Judge Check 审阅。
 
 ```mermaid
 flowchart LR
@@ -91,7 +109,7 @@ flowchart LR
 
 ## 🔐 已验证的链上证据
 
-下列数值均来自 Base Sepolia(chain id `84532`)上的**一个干净 live session**,并已对公共 RPC 重新核验。
+下列数值均来自 Base Sepolia(chain id `84532`)上的**一个干净 live session**,均可对公共 RPC 复验。
 
 Session `0x4686a9d093cce9159d3b38085b7dab31fcf394488d956850bbc533b478c1965c`
 
@@ -113,7 +131,11 @@ Session `0x4686a9d093cce9159d3b38085b7dab31fcf394488d956850bbc533b478c1965c`
 
 ## ✅ 自己验证
 
-**离线——无需 API、无需链访问。** 重算每一个哈希,并对照可信 key 哈希校验 Ed25519 验证器签名:
+三种相互独立的方式,严格程度递增:
+
+**1. 在浏览器里(实时链、无密钥)。** 打开 [console](https://pactfuse-console.vercel.app),按 `T`(自检)和 `G`(实时状态),在 Network 面板看真实的 Base Sepolia RPC 调用重新确认证据此刻仍在链上。
+
+**2. 离线(无需 API、无需链访问)。** 重算每一个哈希,并对照可信 key 哈希校验 Ed25519 验证器签名:
 
 ```sh
 PACTFUSE_TRUSTED_PROOF_KEY_HASHES=0x25b4b8faa1bc2ae3984f983f106c465ed607ce2eb5bf4356c000735f7002fec9 \
@@ -123,13 +145,13 @@ node scripts/verify-live-artifacts.mjs \
 
 期望:`"ok": true`,且 `publicClaimHash 0xd624…87c7`、`proofBundleHash 0x01e0…9668`。
 
-**运行完整测试**(233 API · 114 verifier · 7 schema · 5 MCP · 9 合约):
+**3. 运行完整测试**(233 API · 114 verifier · 7 schema · 5 MCP · 9 合约):
 
 ```sh
 pnpm install && pnpm build && pnpm test && pnpm test:contracts
 ```
 
-**亲眼看 fail-closed**——check-in 的待定回执会被完整验证器拒绝,只在结构上被接受:
+亲眼看 fail-closed:check-in 的待定回执会被完整验证器拒绝,只在结构上被接受:
 
 ```sh
 node packages/verifier/pactfuse-verify-receipt.mjs --schema-only docs/evidence/receipt-pack.pending.example.json
@@ -166,7 +188,7 @@ export PACTFUSE_CAW_INGEST_TOKEN=local-caw-ingest
 pnpm dev:api   # http://127.0.0.1:8787  ·  /healthz · /readyz · /api/v1/openapi.json
 ```
 
-评委一键脚本会尽量启动后端、打印证据链接,并在 proof 闸门仍关闭时**以非零码退出**——演示 fail-closed 默认:
+评委一键脚本会尽量启动后端、打印证据链接,并在 proof 闸门仍关闭时**以非零码退出**,以此演示 fail-closed 默认:
 
 ```sh
 ./demo/run-judge.sh
@@ -178,10 +200,10 @@ pnpm dev:api   # http://127.0.0.1:8787  ·  /healthz · /readyz · /api/v1/opena
 
 | 层 | 技术 |
 |---|---|
-| **钱包 / 托管** | Cobo Agentic Wallet(`@cobo/agentic-wallet`)——Pact 策略、合约调用、审计导出 |
+| **钱包 / 托管** | Cobo Agentic Wallet(`@cobo/agentic-wallet`):Pact 策略、合约调用、审计导出 |
 | **智能合约** | Solidity + Foundry,部署于 Base Sepolia |
 | **API** | Hono · Zod · viem · `@noble/curves` · `node:sqlite`(仅追加证据库)· pino |
-| **Agent 表面** | Model Context Protocol(`@modelcontextprotocol/sdk`)——受审计的工具租约 |
+| **Agent 表面** | Model Context Protocol(`@modelcontextprotocol/sdk`):受审计的工具租约 |
 | **证明** | 规范 JSON 哈希 + Ed25519 签名 · fail-closed 重放验证器 |
 | **Console** | 零构建原生 ES 模块 + CSS(无框架、无依赖) |
 | **工程** | Turborepo · pnpm workspaces · TypeScript · Vitest · GitHub Actions |
@@ -195,7 +217,7 @@ pnpm dev:api   # http://127.0.0.1:8787  ·  /healthz · /readyz · /api/v1/opena
 .
 ├── apps/
 │   ├── pactfuse-api/        # Hono API · 证据库 · indexer · CAW ingest · 验证器适配 · SSE
-│   └── fusebox/live/        # PactFuse Console —— 零构建、证据驱动的 Demo
+│   └── fusebox/live/        # PactFuse Console:零构建、证据驱动的 Demo
 ├── contracts/               # Foundry:SourceStateRegistry · ProcurementGate · PaidArtifactMarket · SourceFreshGuard
 ├── packages/
 │   ├── evidence-schema/     # 共享 Zod schema + 规范 JSON 哈希
@@ -209,33 +231,33 @@ pnpm dev:api   # http://127.0.0.1:8787  ·  /healthz · /readyz · /api/v1/opena
 
 ---
 
-## 🛡️ 安全与声明边界
+## 🛡️ 信任模型与声明边界
 
-PactFuse 的公开声明**只来自证据,绝不来自宣传偏好**。全新部署默认 fail-closed 启动(`claimMode=simulated`、`winnerClaimAllowed=false`)。
+PactFuse 的公开声明**只来自证据,绝不来自宣传偏好**。全新部署默认 fail-closed 启动(`claimMode=simulated`、`winnerClaimAllowed=false`)。**没有人工 override**:通往公开声明的唯一路径,是在一个 session 内通过每一道实链闸门。
 
 ### 声明台账
 
 | 能力 | 状态 |
 | --- | --- |
-| CAW 授权的支付 —— `approve` + `activate_tool` 在已批准 Pact 下经 CAW 结算 | ✅ 实链 · Base Sepolia |
+| CAW 授权的支付:`approve` + `activate_tool` 在已批准 Pact 下经 CAW 结算 | ✅ 实链 · Base Sepolia |
 | 付款前的来源绑定熔断(`ProcurementGate`) | ✅ 实链 |
 | 链上结算 + ERC-20 余额变化证明 | ✅ 实链 · mock ERC-20 |
 | 错误目标策略拒绝(CAW 服务端) | ✅ 实链 · `live_denied` |
 | 受审计的 MCP 租约执行 transcript | ✅ 实链 |
 | 签名 proof bundle + 离线复验 | ✅ 实链 |
-| 真实价值 / 官方 **USDC** 结算 | 🔴 未声明 —— mock-ERC20 回退 |
+| 真实价值 / 官方 **USDC** 结算 | 🔴 未声明 · mock-ERC20 回退 |
 | **主网** | 🔴 仅测试网(Base Sepolia) |
-| 多 agent(买卖方分离)身份 | 🔴 单 CAW 钱包 —— 记录的 floor |
+| 多 agent(买卖方分离)身份 | 🔴 单 CAW 钱包(记录的 floor) |
 | 独立第三方 MCP / artifact 工作负载 | ⏳ 团队自运营 Demo 基础设施 |
 
-**它是什么——以及明确不是什么:**
+**它是什么,以及明确不是什么:**
 
-- ✅ 真实的 CAW 授权 + 审计回执、真实的链上 `approve`/结算交易、真实的策略拒绝。
+- ✅ 真实的 CAW 授权 + 审计回执、真实的链上 `approve` / 结算交易、真实的策略拒绝。
 - ❌ **非主网。** 全部执行在 Base Sepolia 测试网。
 - ❌ **非官方 USDC、非真实价值结算。** 官方 USDC 探测在该环境失败;记录的回退是自部署的 mock ERC-20(mUSD),且 schema **拒绝**任何把它当作 USDC 呈现的企图(`live-mock-erc20-fallback`)。
 - ❌ **非多 agent 身份。** 一个 CAW owner 钱包、一份已批准 Pact。
-- ❌ **非第三方工作负载。** MCP/artifact 端点是团队自运营的 Demo 基础设施。
-- ❌ **不证明发行方诚实。** 发行方自声明的来源新鲜度是一条明确的信任边界。
+- ❌ **非第三方工作负载。** MCP / artifact 端点是团队自运营的 Demo 基础设施。
+- ❌ **不证明发行方诚实。** 发行方自声明的来源新鲜度是一条明确的信任边界(只有来源的注册发行方能挑战或吊销它;生产硬化方向是多挑战者 / 带质押的 watcher 网络)。
 
 应用从不持有裸私钥;资金只在已批准 Pact 下经由 CAW 移动。所有 Demo 价值仅限测试网。claim-mode 规则、托管边界与回执验证器规范见 [`docs/evidence/`](docs/evidence)。
 
@@ -245,15 +267,15 @@ PactFuse 的公开声明**只来自证据,绝不来自宣传偏好**。全新部
 
 按 hackathon 规则,所有外部依赖均如实声明。
 
-- **API / 服务**:Cobo Agentic Wallet API(`api.agenticwallet.cobo.com`);Base Sepolia 公共 JSON-RPC;团队自运营 Demo MCP/artifact 端点用的 Cloudflare quick tunnels;CI 用 GitHub Actions;Console 用 Vercel。
+- **API / 服务**:Cobo Agentic Wallet API(`api.agenticwallet.cobo.com`);Base Sepolia 公共 JSON-RPC;团队自运营 Demo MCP / artifact 端点用的 Cloudflare quick tunnels;CI 用 GitHub Actions;Console 用 Vercel。
 - **SDK / 库**:`@cobo/agentic-wallet`、Hono、Zod、viem、`@noble/curves`、`@modelcontextprotocol/sdk`、pino、Vitest、Turborepo、pnpm、tsx、TypeScript、Foundry。
-- **AI 工具**:本仓库的大部分代码是在**人类指导下**由 AI 编码 agent 编写的——OpenAI Codex(后端)与 Anthropic Claude Code(审查、发布验证、前端/Console、本 README)。所有行为声明都由上面那些机器可验证的证据支撑——测试套件、fail-closed 验证器与签名 proof bundle 才是事实来源,而非作者身份。
+- **AI 工具**:本仓库的大部分代码是在**人类指导下**由 AI 编码 agent 编写的:OpenAI Codex(后端)与 Anthropic Claude Code(审查、发布验证、前端 / Console、本 README)。所有行为声明都由上面那些机器可验证的证据支撑;测试套件、fail-closed 验证器与签名 proof bundle 才是事实来源,而非作者身份。
 
 ---
 
 ## 📄 许可证
 
-仓库尚未加入 license 文件——在添加 license 之前,请视为**保留所有权利(all-rights-reserved)**。
+仓库尚未加入 license 文件;在添加 license 之前,请视为**保留所有权利(all-rights-reserved)**。
 
 <div align="center">
 <br/>
