@@ -313,6 +313,7 @@ body[data-motion="off"] .netstat[data-state="live"] .netstat-dot { animation: no
 .livestate { margin-top: var(--s4); padding-top: var(--s4); border-top: 1px solid var(--border); }
 .livestate-h { margin: 0 0 var(--s2); display: flex; flex-wrap: wrap; gap: var(--s2); align-items: baseline; color: var(--text-muted); font-size: var(--fs-micro); letter-spacing: 0.14em; text-transform: uppercase; }
 .livestate-sub { letter-spacing: 0.04em; text-transform: none; }
+.livestate-intro, .cs-intro { margin: 0 0 var(--s2); color: var(--text-muted); font-size: var(--fs-micro); line-height: 1.5; }
 .livestate .cs-row { padding: var(--s2) 0; }
 .livestate .cs-row:last-child { border-bottom: 0; }
 

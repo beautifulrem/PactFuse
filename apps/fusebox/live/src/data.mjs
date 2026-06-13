@@ -66,10 +66,10 @@ function deriveModel(pb) {
     .sort((a, b) => (contractOrder.indexOf(a.name) + 1 || 99) - (contractOrder.indexOf(b.name) + 1 || 99));
   // live keyless state reads: registry address + this session's sources / spends
   const registryAddr = (rb.deploymentRegistry?.entries ?? []).find((e) => e.contractName === "SourceStateRegistry")?.address;
-  const onchainSources = challenge.sourceHash ? [{ hash: challenge.sourceHash, label: "challenged source" }] : [];
+  const onchainSources = challenge.sourceHash ? [{ hash: challenge.sourceHash }] : [];
   const onchainSpends = [
-    ...tripped.map((s, i) => (s.spendId ? { id: s.spendId, label: `tripped spend ${String.fromCharCode(65 + i)}` } : null)),
-    settledSpend?.spendId ? { id: settledSpend.spendId, label: "settled spend" } : null,
+    ...tripped.map((s, i) => (s.spendId ? { id: s.spendId, role: "bound", tag: String.fromCharCode(65 + i) } : null)),
+    settledSpend?.spendId ? { id: settledSpend.spendId, role: "clean", tag: "" } : null,
   ].filter(Boolean);
 
   const ev = (e) => ({ seq: e?.eventSeq, kind: e?.kind, at: e?.createdAt });

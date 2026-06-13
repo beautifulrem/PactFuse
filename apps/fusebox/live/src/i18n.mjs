@@ -65,7 +65,8 @@ const STR = {
     "verdict.armed": "armed", "verdict.delivered": "delivered",
     "verdict.spendHalted": "spend halted", "verdict.denied": "denied", "verdict.failed": "failed",
     "net.chain": "Base Sepolia", "net.connecting": "connecting…", "net.head": "block #{n} · live", "net.offline": "RPC unreachable",
-    "as.source": "source", "as.spend": "spend",
+    "cs.intro": "Challenged source → its bound spends trip; a clean-source spend settles. Live on-chain state:",
+    "cs.role.source": "pinned source", "cs.role.bound": "source-bound spend", "cs.role.clean": "clean-source spend",
 
     "insp.title": "Inspector", "insp.idle": "idle", "insp.noEvent": "no active event",
     "insp.armedSuffix": " · armed",
@@ -179,7 +180,8 @@ const STR = {
     "verdict.armed": "已就绪", "verdict.delivered": "已交付",
     "verdict.spendHalted": "支付已熔断", "verdict.denied": "已拒绝", "verdict.failed": "失败",
     "net.chain": "Base Sepolia", "net.connecting": "连接中…", "net.head": "区块 #{n} · 实时", "net.offline": "RPC 无法访问",
-    "as.source": "来源", "as.spend": "支付",
+    "cs.intro": "不安全来源被挑战 → 绑定它的支付被熔断;干净来源的支付结算。以下为链上实时状态:",
+    "cs.role.source": "钉住的来源", "cs.role.bound": "绑定该来源的支付", "cs.role.clean": "干净来源的支付",
 
     "insp.title": "检查器", "insp.idle": "空闲", "insp.noEvent": "无活动事件",
     "insp.armedSuffix": " · 已就绪",

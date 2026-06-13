@@ -36,6 +36,7 @@ export function mountScenarioPanel(host, { machine, scenarios, onchain }) {
     </div>
     <div class="livestate" id="liveState" hidden>
       <p class="livestate-h mono">${t("drawer.chainState")} <span class="livestate-sub">${t("cs.sessionH")}</span></p>
+      <p class="livestate-intro">${t("cs.intro")}</p>
       <ol class="cs-list" id="asideState"></ol>
     </div>
   `;
@@ -107,8 +108,8 @@ export function mountScenarioPanel(host, { machine, scenarios, onchain }) {
   // inline live on-chain state: read each source/spend's current state (keyless)
   const oc = onchain ?? {};
   const stateItems = [
-    ...(oc.sources ?? []).map((s) => ({ kind: "source", id: s.hash, label: t("as.source") })),
-    ...(oc.spends ?? []).map((s, i) => ({ kind: "spend", id: s.id, label: `${t("as.spend")} ${String.fromCharCode(65 + i)}` })),
+    ...(oc.sources ?? []).map((s) => ({ kind: "source", id: s.hash, label: t("cs.role.source") })),
+    ...(oc.spends ?? []).map((s) => ({ kind: "spend", id: s.id, label: s.role === "clean" ? t("cs.role.clean") : `${t("cs.role.bound")} ${s.tag}` })),
   ];
   const stateList = host.querySelector("#asideState");
   if (stateItems.length && oc.registry && oc.gate) {

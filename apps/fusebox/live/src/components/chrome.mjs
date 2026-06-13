@@ -192,6 +192,7 @@ export function mountDrawers(root, model, toast) {
         <button class="btn btn-ghost drawer-x" type="button" data-close aria-label="Close">${icon("close")}</button></header>
       <div class="drawer-body">
         <p class="cs-h mono">${t("cs.sessionH")}</p>
+        <p class="cs-intro">${t("cs.intro")}</p>
         <ol class="cs-list" id="csList"></ol>
         <div class="cs-probe">
           <p class="cs-h mono">${t("cs.probeH")}</p>
@@ -348,8 +349,8 @@ export function mountDrawers(root, model, toast) {
     const inp = root.querySelector("#csInput");
     if (inp && !inp.value && oc.sources?.[0]?.hash) inp.value = oc.sources[0].hash;
     const items = [
-      ...(oc.sources ?? []).map((s) => ({ kind: "source", id: s.hash, label: s.label })),
-      ...(oc.spends ?? []).map((s) => ({ kind: "spend", id: s.id, label: s.label })),
+      ...(oc.sources ?? []).map((s) => ({ kind: "source", id: s.hash, label: t("cs.role.source") })),
+      ...(oc.spends ?? []).map((s) => ({ kind: "spend", id: s.id, label: s.role === "clean" ? t("cs.role.clean") : `${t("cs.role.bound")} ${s.tag}` })),
     ];
     if (!items.length || !oc.registry || !oc.gate) {
       list.innerHTML = `<li class="cs-row"><span class="cs-label">${t("cs.none")}</span></li>`;
