@@ -27,15 +27,20 @@ PactFuse re-checks what an agent is buying at the **instant of payment**, on-cha
 
 ## 🔥 The problem
 
-AI agents are starting to spend money on their own (data, models, tools, compute) through wallets like the **Cobo Agentic Wallet (CAW)**. But what an agent buys is only as safe as its **source**, and a source can turn unsafe in the gap **between "decide to buy" and "actually pay."**
+AI agents are starting to spend money on their own (data, models, tools, compute) through wallets like the **Cobo Agentic Wallet (CAW)**. The hard part is **how an LLM agent decides what is safe to buy**, and that judgement is fragile in four ways:
 
-That gap (check at decision, use at payment) is a classic time-of-check / time-of-use hole, and it is exactly where real money is lost today:
+1. **Stale knowledge:** the model does not know the latest exploit, CVE, sanction, depeg, or dead price feed.
+2. **Lagging search:** web results can be old articles, SEO spam, mirror sites, or cached docs.
+3. **Unreliable citations:** an LLM can invent links, misattribute, or treat a second-hand source as first-hand.
+4. **A read-to-execute time gap:** the agent reads "this source is safe" at 10:00 and moves funds at 10:05, but it was exploited or flagged at 10:03.
 
-- a price oracle gets manipulated right before a bot acts on it,
+The deepest is #4, a classic time-of-check / time-of-use hole: an LLM treats a search result, a citation, or a web summary as an **executable fact** about a source, when it is only a snapshot that may already be wrong. This is exactly where real money is lost today:
+
+- a price oracle is manipulated right before a bot acts on it,
 - a vendor's bank details are swapped between invoice approval and payout (BEC fraud),
 - a package or model is flagged malicious (a CVE, a backdoor) right after it was pulled in.
 
-Checking once, at decision time, is not enough. **You have to re-check at the moment money moves, and refuse if anything changed.**
+Searching again does not fix it: the issue is not search count, it is whether there is a **forced state check at the moment money moves**. Checking once, at decision time, is not enough. **You have to re-check the instant money moves, and refuse if anything changed.**
 
 ## ✅ What PactFuse does
 
@@ -118,7 +123,7 @@ The pattern fits anywhere an autonomous payment depends on a source that some au
 - **Software / AI supply chain:** a package or model is flagged malicious (a CVE, a backdoor) right after it was pulled in. Bind the purchase to the artifact issuer's attestation and a revoked source refuses payment.
 - **Agentic commerce / A2A:** an agent pays a merchant or another agent that gets flagged fraudulent between cart and checkout, or is steered (via prompt injection) at an off-allowlist target. The freshness gate trips the first; the Pact policy denies the second before it reaches the chain.
 
-**Why AI agents especially.** An LLM agent is just the executor most likely to act on stale or fabricated facts: weak search, lagging knowledge, hallucinated citations, prompt injection. PactFuse downgrades an LLM's "looks safe" from a permission into a mere *intent*, and re-checks the source the instant money moves. Detection stays pluggable (CVE feeds, risk monitors, auditors, oracle health raise the challenge); enforcement is guaranteed (challenged source → no payment). *Search is not settlement-grade truth; LLM citations are not execution permissions.*
+**Why AI agents especially.** Of all executors, an LLM agent is the most likely to act on the stale or fabricated facts above, so it needs this gate most. PactFuse downgrades an LLM's "looks safe" from a permission into a mere *intent*, re-checked the instant money moves: detection stays pluggable (CVE feeds, risk monitors, auditors, oracle health raise the challenge), enforcement is guaranteed (challenged source → no payment). *Search is not settlement-grade truth; LLM citations are not execution permissions.*
 
 The closest match to this repo's live demo is the supply-chain case: an agent buying a source-bound tool lease, where the source can be challenged before payment.
 
