@@ -5,6 +5,7 @@
 import { icon } from "../symbols.mjs";
 import { STAGE } from "../machine.mjs";
 import { t } from "../i18n.mjs";
+import { getHead } from "../chain.mjs";
 
 const RAIL = [
   { id: STAGE.pending, key: "stage.event" },
@@ -25,6 +26,10 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
       <span class="fail-track" aria-hidden="true"><span class="fail-knob"></span></span>
       <span>${t("toggle.fail")}</span>
     </button>
+    <div class="netstat" id="netStat" data-state="loading">
+      <span class="netstat-dot" aria-hidden="true"></span>
+      <span class="netstat-main"><b>${t("net.chain")}</b><small id="netHead">${t("net.connecting")}</small></span>
+    </div>
     <div class="legend" aria-label="${t("legend.title")}">
       <p class="legend-h mono">${t("legend.title")}</p>
       <ul class="legend-list">
@@ -89,6 +94,15 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
     failToggle.setAttribute("aria-checked", String(on));
     machine.armFailure(on);
   });
+
+  // ambient live-chain indicator: ping the head block once so the console
+  // visibly shows it is talking to Base Sepolia right now (read-only, keyless)
+  const net = host.querySelector("#netStat");
+  const netHead = host.querySelector("#netHead");
+  getHead().then(
+    (h) => { net.dataset.state = "live"; netHead.textContent = t("net.head", { n: h.toLocaleString("en-US") }); },
+    () => { net.dataset.state = "down"; netHead.textContent = t("net.offline"); },
+  );
 
   function apply(ms) {
     let anyChecked = false;

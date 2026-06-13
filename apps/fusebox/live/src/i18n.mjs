@@ -68,6 +68,7 @@ const STR = {
     "legend.settle": "clean source → settles at the market",
     "legend.trip": "unsafe source → cut at the breaker, before payment",
     "legend.deny": "wrong target → refused at policy, never on-chain",
+    "net.chain": "Base Sepolia", "net.connecting": "connecting…", "net.head": "block #{n} · live", "net.offline": "RPC unreachable",
 
     "insp.title": "Inspector", "insp.idle": "idle", "insp.noEvent": "no active event",
     "insp.armedSuffix": " · armed",
@@ -184,6 +185,7 @@ const STR = {
     "legend.settle": "来源干净 → 在市场结算交付",
     "legend.trip": "不安全来源 → 闸门在付款前切断",
     "legend.deny": "错误目标 → 策略拒绝,不上链",
+    "net.chain": "Base Sepolia", "net.connecting": "连接中…", "net.head": "区块 #{n} · 实时", "net.offline": "RPC 无法访问",
 
     "insp.title": "检查器", "insp.idle": "空闲", "insp.noEvent": "无活动事件",
     "insp.armedSuffix": " · 已就绪",

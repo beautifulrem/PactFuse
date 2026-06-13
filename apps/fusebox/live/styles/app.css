@@ -299,7 +299,17 @@ body[data-evidence] .provenance   { animation: rise var(--dur-enter) var(--ease-
 
 /* map legend: pinned to the bottom of the aside so it fills the column and
    explains the three resting positions of the spend (the three outcomes) */
-.legend { margin-top: auto; padding-top: var(--s4); border-top: 1px solid var(--border); display: grid; gap: var(--s3); }
+/* ambient live-chain status, pinned with the legend to the bottom of the aside */
+.netstat { margin-top: auto; display: flex; align-items: center; gap: var(--s2); padding: var(--s3); border: 1px solid var(--border); border-radius: var(--r-md); background: color-mix(in srgb, var(--surface) 60%, transparent); }
+.netstat-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--text-muted); }
+.netstat[data-state="live"] .netstat-dot { background: var(--success); animation: netpulse 2.4s ease-out infinite; }
+.netstat[data-state="down"] .netstat-dot { background: var(--danger); }
+.netstat-main { display: flex; flex-direction: column; min-width: 0; }
+.netstat-main b { color: var(--text-secondary); font-size: var(--fs-meta); font-weight: 600; }
+.netstat-main small { color: var(--text-muted); font-family: var(--font-mono); font-size: var(--fs-micro); }
+@keyframes netpulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent); } 70% { box-shadow: 0 0 0 6px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+body[data-motion="off"] .netstat[data-state="live"] .netstat-dot { animation: none; }
+.legend { margin-top: var(--s4); padding-top: var(--s4); border-top: 1px solid var(--border); display: grid; gap: var(--s3); }
 .legend-h { margin: 0; color: var(--text-muted); font-size: var(--fs-micro); letter-spacing: 0.16em; text-transform: uppercase; }
 .legend-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--s3); }
 .legend-row { display: grid; grid-template-columns: 8px 1fr; gap: var(--s3); align-items: start; }
