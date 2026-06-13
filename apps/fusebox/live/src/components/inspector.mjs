@@ -64,10 +64,10 @@ export function mountInspector(host) {
     risk.dataset.tone = r.tone;
     risk.textContent = ms.stage === STAGE.failed ? r.label : (step.risk ?? r.label);
     title.textContent = step.title;
-    detail.textContent = ms.stage === STAGE.failed ? (ms.error ?? "failed") : step.detail;
+    detail.textContent = ms.stage === STAGE.failed ? t("fail.reason") : step.detail;
     if (ms.stage === STAGE.failed) {
       // don't show tx/block evidence under "execution failed" — the action never ran
-      kv.innerHTML = `<div><dt>evidence</dt><dd>${t("insp.notReached")}</dd></div>`;
+      kv.innerHTML = `<div><dt>${t("jc.evidence")}</dt><dd>${t("insp.notReached")}</dd></div>`;
       return;
     }
     const rows = Object.entries(step.evidence ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== "");

@@ -67,7 +67,7 @@ export function createMachine() {
     state.stage = STAGE.pending;
     state.log = [];
     emit("run-start");
-    pushLog({ text: `scenario armed · ${state.scenario.title}`, meta: "operator" }, "info");
+    pushLog({ text: `scenario armed · ${state.scenario.logTitle ?? state.scenario.title}`, meta: "operator" }, "info");
 
     for (let i = 0; i < state.scenario.steps.length; i++) {
       if (runId !== state.runId) return;
@@ -92,7 +92,7 @@ export function createMachine() {
     state.stage = STAGE.success;
     state.outcome = state.scenario.outcome;
     emit("stage");
-    pushLog({ text: `outcome · ${state.scenario.outcome.label}`, meta: "verifier" }, state.scenario.outcome.tone);
+    pushLog({ text: `outcome · ${state.scenario.outcome.logLabel ?? state.scenario.outcome.label}`, meta: "verifier" }, state.scenario.outcome.tone);
   }
 
   function reset() {

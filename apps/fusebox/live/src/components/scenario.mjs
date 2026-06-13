@@ -159,7 +159,7 @@ export function mountScenarioPanel(host, { machine, scenarios, onchain }) {
 }
 
 const stageNote = (ms) => {
-  if (ms.stage === STAGE.failed) return { text: `${t("note.failedPrefix")}${ms.error}`, tone: "danger" };
+  if (ms.stage === STAGE.failed) return { text: `${t("note.failedPrefix")}${t("fail.reason")}`, tone: "danger" };
   if (ms.stage === STAGE.success) return { text: ms.outcome?.label ?? "complete", tone: ms.outcome?.tone ?? "success" };
   if (ms.activeStep) return { text: ms.activeStep.title, tone: ms.activeStep.tone ?? "info" };
   if (ms.scenario) return { text: t("note.armed"), tone: "info" };

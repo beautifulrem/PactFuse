@@ -82,8 +82,10 @@ function deriveModel(pb) {
       lede: t("sc.trip.lede"),
       tone: "danger",
       flow: "trip",
+      logTitle: "Unsafe source → auto-interrupt",
       outcome: {
         label: t("sc.trip.outcome"),
+        logLabel: "protected · 0 moved on the challenged source",
         tone: "success",
         detail: `spends ${short(tripped[0]?.spendId, 6, 4)} and ${short(tripped[1]?.spendId, 6, 4)} tripped on-chain before settlement`,
       },
@@ -92,7 +94,7 @@ function deriveModel(pb) {
           stage: STAGE.pending,
           flow: "trip-challenge",
           title: t("sc.trip.s1"),
-          detail: "challenge evidence enters the session ledger",
+          detail: t("sc.trip.s1d"),
           evidence: { event: ev(challengePending), source: short(challenge.sourceHash, 8, 6) },
           log: [{ text: `source.challenge.pending · seq ${challengePending?.eventSeq}`, meta: "ledger" }],
         },
@@ -102,7 +104,7 @@ function deriveModel(pb) {
           tone: "warning",
           risk: "chain risk event",
           title: t("sc.trip.s2"),
-          detail: "the indexer confirms the public-chain risk event",
+          detail: t("sc.trip.s2d"),
           evidence: { tx: challenge.txHash, block: challenge.blockNumber },
           log: [
             { text: `SourceChallenged · block ${challenge.blockNumber}`, meta: "chain", href: challenge.blockNumber ? blockUrl(challenge.blockNumber) : undefined },
@@ -114,7 +116,7 @@ function deriveModel(pb) {
           flow: "trip-cut",
           tone: "danger",
           title: t("sc.trip.s3"),
-          detail: "the payment path for every spend pinned to that source is opened",
+          detail: t("sc.trip.s3d"),
           evidence: { gate }, // full ProcurementGate address → /address link in the inspector
           log: trips.map((t) => ({
             text: `SpendTripped · ${short(t.spendId, 8, 4)} · block ${t.blockNumber}`,
@@ -131,8 +133,10 @@ function deriveModel(pb) {
       lede: t("sc.settle.lede"),
       tone: "success",
       flow: "settle",
+      logTitle: "Fresh source → settle & deliver",
       outcome: {
         label: t("sc.settle.outcome", { n: fmt(settleAmount), sym: registry?.symbol ?? "mUSD" }),
+        logLabel: `settled · ${fmt(settleAmount)} ${registry?.symbol ?? "mUSD"}-atomic moved`,
         tone: "success",
         detail: `artifact unlocked and consumed through a bounded MCP lease run`,
       },
@@ -141,7 +145,7 @@ function deriveModel(pb) {
           stage: STAGE.pending,
           flow: "settle-approve",
           title: t("sc.settle.s1"),
-          detail: "ERC20 approval signed inside the Pact policy boundary",
+          detail: t("sc.settle.s1d"),
           evidence: { owner: allowance.owner, spender: allowance.spender }, // full addresses → /address links
           log: [{ text: `caw approve · owner ${short(allowance.owner, 10, 4)}`, meta: "caw", href: allowance.owner ? addrUrl(allowance.owner) : undefined }],
         },
@@ -150,7 +154,7 @@ function deriveModel(pb) {
           flow: "settle-allow",
           tone: "info",
           title: t("sc.settle.s2"),
-          detail: `allowance ${fmt(allowance.allowanceBefore)} → ${fmt(allowance.allowanceAfter)} at block ${allowance.blockNumber}`,
+          detail: t("sc.settle.s2d", { a: fmt(allowance.allowanceBefore), b: fmt(allowance.allowanceAfter), n: allowance.blockNumber }),
           evidence: { tx: allowance.approveTxHash, block: allowance.blockNumber },
           log: [
             { text: `Approval log + allowance state match policy digest`, meta: "verifier" },
@@ -162,7 +166,7 @@ function deriveModel(pb) {
           flow: "settle-pay",
           tone: "success",
           title: t("sc.settle.s3"),
-          detail: `SpendSettled finalized · market balance ${fmt(delta.marketBefore)} → ${fmt(delta.marketAfter)}`,
+          detail: t("sc.settle.s3d", { a: fmt(delta.marketBefore), b: fmt(delta.marketAfter) }),
           evidence: { tx: settled.txHash, block: settled.blockNumber },
           log: [
             { text: `SpendSettled · ${short(settled.spendId, 8, 4)} · block ${settled.blockNumber}`, meta: "gate", link: settled.txHash },
@@ -175,7 +179,7 @@ function deriveModel(pb) {
           flow: "settle-deliver",
           tone: "success",
           title: t("sc.settle.s4"),
-          detail: "bearer-bound access token; MCP transcript pinned to the bought artifact",
+          detail: t("sc.settle.s4d"),
           evidence: { artifact: short(lease?.artifactHash, 8, 6), run: short(lease?.leaseRunId, 8, 6) },
           log: [
             { text: `artifact ${short(lease?.artifactHash, 12, 6)} unlocked`, meta: "market" },
@@ -190,8 +194,10 @@ function deriveModel(pb) {
       lede: t("sc.deny.lede"),
       tone: "warning",
       flow: "deny",
+      logTitle: "Wrong target → policy denial",
       outcome: {
         label: t("sc.deny.outcome"),
+        logLabel: "denied · request never reached the chain",
         tone: "warning",
         detail: "structured live_denied evidence recorded against the Pact policy digest",
       },
@@ -200,7 +206,7 @@ function deriveModel(pb) {
           stage: STAGE.pending,
           flow: "deny-call",
           title: t("sc.deny.s1"),
-          detail: "target address is not in the Pact allowlist",
+          detail: t("sc.deny.s1d"),
           evidence: { wallet: identity.walletAddress }, // full CAW wallet address → /address link
           log: [{ text: `contract_call → unlisted target`, meta: "caw" }],
         },
@@ -209,7 +215,7 @@ function deriveModel(pb) {
           flow: "deny-check",
           tone: "warning",
           title: t("sc.deny.s2"),
-          detail: "CAW evaluates target, selector, and limits server-side",
+          detail: t("sc.deny.s2d"),
           evidence: { policy: short(pay(denyEvent).policyDigest ?? "", 10, 6) || "pact policy" },
           log: [{ text: `policy check · target ∉ allowlist`, meta: "caw" }],
         },
@@ -218,7 +224,7 @@ function deriveModel(pb) {
           flow: "deny-block",
           tone: "warning",
           title: t("sc.deny.s3"),
-          detail: "persisted as live_denied audit evidence; no transaction exists",
+          detail: t("sc.deny.s3d"),
           evidence: { op: short(pay(denyEvent).operationId ?? denyEvent?.eventId, 10, 6), event: ev(denyEvent) },
           log: [
             { text: `live_denied · op ${short(pay(denyEvent).operationId ?? "", 12, 6)}`, meta: "caw" },
