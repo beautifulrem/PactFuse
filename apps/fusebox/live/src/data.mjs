@@ -16,6 +16,7 @@ export const short = (hex, head = 10, tail = 4) =>
 export const fmt = (n) => Number(n ?? 0).toLocaleString("en-US");
 export const txUrl = (hash) => `${EXPLORER}/tx/${hash}`;
 export const addrUrl = (a) => `${EXPLORER}/address/${a}`;
+export const blockUrl = (n) => `${EXPLORER}/block/${n}`;
 
 export async function loadEvidence({ session, artifactsBase }) {
   const base = artifactsBase ?? new URL(`../../../../docs/evidence/live/${session}/`, import.meta.url).href;
@@ -94,7 +95,7 @@ function deriveModel(pb) {
           tone: "danger",
           title: "ProcurementGate interrupts the bound spends",
           detail: "the payment path for every spend pinned to that source is opened",
-          evidence: { gate: short(gate, 8, 4) },
+          evidence: { gate }, // full ProcurementGate address → /address link in the inspector
           log: trips.map((t) => ({
             text: `SpendTripped · ${short(t.spendId, 8, 4)} · block ${t.blockNumber}`,
             meta: "gate",
@@ -121,7 +122,7 @@ function deriveModel(pb) {
           flow: "settle-approve",
           title: "Agent approves the gate through CAW",
           detail: "ERC20 approval signed inside the Pact policy boundary",
-          evidence: { owner: short(allowance.owner, 8, 4), spender: short(allowance.spender, 8, 4) },
+          evidence: { owner: allowance.owner, spender: allowance.spender }, // full addresses → /address links
           log: [{ text: `caw approve · owner ${short(allowance.owner, 10, 4)}`, meta: "caw" }],
         },
         {
@@ -180,7 +181,7 @@ function deriveModel(pb) {
           flow: "deny-call",
           title: "Agent submits a wrong-target contract call",
           detail: "target address is not in the Pact allowlist",
-          evidence: { wallet: short(identity.walletAddress, 8, 4) },
+          evidence: { wallet: identity.walletAddress }, // full CAW wallet address → /address link
           log: [{ text: `contract_call → unlisted target`, meta: "caw" }],
         },
         {

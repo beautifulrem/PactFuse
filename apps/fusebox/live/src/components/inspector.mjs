@@ -2,7 +2,7 @@
  * payload (kind, seq, tx, block, risk); the log appends machine entries so
  * the process is visible, not just the result. */
 
-import { short, txUrl } from "../data.mjs";
+import { short, txUrl, addrUrl, blockUrl } from "../data.mjs";
 import { STAGE } from "../machine.mjs";
 
 // dimmed schematic of what a run WILL bind — fills the idle inspector well
@@ -16,6 +16,14 @@ const RISK = {
   success: { label: "clean path", tone: "success" },
   info: { label: "monitored", tone: "info" },
 };
+
+// Which evidence values are on-chain entities that deep-link to the explorer:
+// tx → /tx, these address fields → /address, numeric block → /block. Internal
+// ids (spendId, policyDigest, artifactHash, leaseRunId, operationId, sourceHash)
+// are NOT explorer entities, so they stay plain text (a link would 404).
+const ADDR_KEYS = new Set(["gate", "owner", "spender", "wallet"]);
+const exLink = (href, text) => `<a href="${href}" target="_blank" rel="noopener">${text}</a>`;
+const kvRow = (k, inner) => `<div><dt>${k}</dt><dd>${inner}</dd></div>`;
 
 export function mountInspector(host) {
   host.innerHTML = `
@@ -56,12 +64,18 @@ export function mountInspector(host) {
     kv.innerHTML = rows
       .map(([k, v]) => {
         if (k === "tx" && typeof v === "string") {
-          return `<div><dt>tx</dt><dd><a href="${txUrl(v)}" target="_blank" rel="noopener">${short(v, 12, 6)}</a></dd></div>`;
+          return kvRow("tx", exLink(txUrl(v), short(v, 12, 6)));
+        }
+        if (k === "block" && /^\d+$/.test(String(v))) {
+          return kvRow("block", exLink(blockUrl(v), v));
+        }
+        if (ADDR_KEYS.has(k) && typeof v === "string" && v.startsWith("0x")) {
+          return kvRow(k, exLink(addrUrl(v), short(v, 8, 4)));
         }
         if (k === "event" && typeof v === "object") {
-          return `<div><dt>event</dt><dd>#${v.seq ?? "—"} · ${v.kind ?? ""}</dd></div>`;
+          return kvRow("event", `#${v.seq ?? "—"} · ${v.kind ?? ""}`);
         }
-        return `<div><dt>${k}</dt><dd>${typeof v === "object" ? JSON.stringify(v) : v}</dd></div>`;
+        return kvRow(k, typeof v === "object" ? JSON.stringify(v) : v);
       })
       .join("");
   }
@@ -86,6 +100,10 @@ export function mountLog(host, { machine }) {
       list.innerHTML = "";
       rendered = 0;
     }
+    // Only auto-follow new lines if the reader is already pinned to the bottom.
+    // Otherwise a run that appends a line every ~1.5s would keep yanking them
+    // back down — so they could never scroll up to read an earlier evidence row.
+    const pinnedToBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 24;
     while (rendered < ms.log.length) {
       const item = ms.log[rendered++];
       const li = document.createElement("li");
@@ -96,8 +114,8 @@ export function mountLog(host, { machine }) {
         item.link ? `<a href="${txUrl(item.link)}" target="_blank" rel="noopener">${item.text}</a>` : item.text
       }</span>`;
       list.append(li);
-      list.scrollTop = list.scrollHeight;
     }
+    if (pinnedToBottom) list.scrollTop = list.scrollHeight;
     empty.hidden = ms.log.length > 0;
   }
   return { apply };
