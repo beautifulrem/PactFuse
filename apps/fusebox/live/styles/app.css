@@ -394,6 +394,10 @@ body[data-motion="off"] .netstat[data-state="live"] .netstat-dot { animation: no
 /* a block-number caption that resolves to an explorer link */
 .fm a[href] { cursor: pointer; }
 .fm a[href]:hover .fm-tag { text-decoration: underline; fill: var(--accent); }
+/* the deployed on-chain address under each node — a quiet mono link to /address */
+.fm-addr { font-size: var(--fs-tag); letter-spacing: 0.02em; text-anchor: middle; fill: var(--text-muted); transition: fill var(--dur-med); }
+.fm-addr-r { text-anchor: start; }
+.fm a[href]:hover .fm-addr { text-decoration: underline; fill: var(--accent); }
 .fm-out { font-size: var(--fs-out); font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; text-anchor: middle; fill: var(--text-muted); opacity: 0; transition: opacity var(--dur-med), fill var(--dur-med); }
 .fm-out:not(:empty) { opacity: 1; }
 /* a soft bloom on the verdict word at the climax — colour matches its fill */
@@ -473,6 +477,8 @@ body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-sig-pulse { animation: fm
 .fm-vicon { width: 44px; height: 44px; display: grid; place-items: center; border-radius: var(--r-md); border: 1.5px solid var(--border-strong); background: var(--surface-muted); color: inherit; position: relative; z-index: 1; transition: border-color var(--dur-med), background var(--dur-med); }
 .fm-vicon .icon { width: 22px; height: 22px; }
 .fm-vmain { min-width: 0; }
+.fm-vaddr { display: block; margin-top: 2px; font-size: var(--fs-micro); color: var(--text-muted); text-decoration: none; letter-spacing: normal; text-transform: none; }
+.fm-vaddr:hover { color: var(--accent); text-decoration: underline; }
 .fm-vname { display: block; font-family: var(--font-mono); font-size: var(--fs-meta); letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: color var(--dur-med); }
 .fm-vsub { display: block; font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .fm-vstate { font-family: var(--font-mono); font-size: var(--fs-micro); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: inherit; }

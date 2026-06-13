@@ -66,6 +66,7 @@ function deriveModel(pb) {
     .sort((a, b) => (contractOrder.indexOf(a.name) + 1 || 99) - (contractOrder.indexOf(b.name) + 1 || 99));
   // live keyless state reads: registry address + this session's sources / spends
   const registryAddr = (rb.deploymentRegistry?.entries ?? []).find((e) => e.contractName === "SourceStateRegistry")?.address;
+  const marketAddr = (rb.deploymentRegistry?.entries ?? []).find((e) => e.contractName === "PaidArtifactMarket")?.address;
   const onchainSources = challenge.sourceHash ? [{ hash: challenge.sourceHash }] : [];
   const onchainSpends = [
     ...tripped.map((s, i) => (s.spendId ? { id: s.spendId, role: "bound", tag: String.fromCharCode(65 + i) } : null)),
@@ -269,7 +270,11 @@ function deriveModel(pb) {
       { label: t("metric.ledgerSeq"), value: pb.asOfEventSeq ?? events.length },
       { label: t("metric.cawAudit"), value: auditCount },
     ],
-    facts: { identity, allowance, settled, delta, challenge, lease, registry, gate, blocks },
+    facts: {
+      identity, allowance, settled, delta, challenge, lease, registry, gate, blocks,
+      // real on-chain entities behind each flow-map node, for /address deep-links
+      nodeAddr: { wallet: identity.walletAddress, gate, market: marketAddr, registry: registryAddr },
+    },
     onchain: { chainId: 84532, txs: onchainTxs, contracts: onchainContracts, registry: registryAddr, gate, sources: onchainSources, spends: onchainSpends },
     scenarios,
   };

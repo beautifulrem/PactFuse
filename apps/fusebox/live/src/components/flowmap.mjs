@@ -17,13 +17,13 @@
  * is published to CSS as custom properties, so the packet never drifts from the
  * nodes it travels between. */
 
-import { short, fmt, blockUrl } from "../data.mjs";
+import { short, fmt, blockUrl, addrUrl } from "../data.mjs";
 import { STAGE } from "../machine.mjs";
 import { icon } from "../symbols.mjs";
 import { t } from "../i18n.mjs";
 
 // ── geometry (viewBox units) — single source of truth ──────────────────────
-const VB = { w: 920, h: 300 };
+const VB = { w: 920, h: 312 }; // extra bottom room for the on-chain address line under each node
 const LINE_Y = 196; // the spend line
 const X = { wallet: 132, policy: 340, gate: 548, market: 770 };
 const REG = { x: 548, y: 66 }; // source registry, above the gate
@@ -76,12 +76,17 @@ const VNODES = [
   { key: "market", glyph: "package", name: t("node.market"), sub: t("node.marketSub") },
 ];
 
-const node = (key, glyph, name, sub) => `
+// a node's deployed on-chain address, rendered as a clickable /address deep-link
+const addrLine = (addr, y, cls = "fm-addr") =>
+  addr ? `<a class="fm-addr-a" href="${addrUrl(addr)}" target="_blank" rel="noopener" aria-label="open ${short(addr, 6, 4)} on the block explorer"><text class="${cls}" y="${y}">${short(addr, 6, 4)}</text></a>` : "";
+
+const node = (key, glyph, name, sub, addr) => `
   <g class="fm-node" data-node="${key}" transform="translate(${X[key]},${LINE_Y})">
     <rect class="fm-tile" x="${-HALF}" y="${-HALF}" width="${HALF * 2}" height="${HALF * 2}" rx="14"/>
     <use class="fm-ic" href="#sym-${glyph}" x="-15" y="-15" width="30" height="30"/>
     <text class="fm-name" y="${HALF + 20}">${name}</text>
     ${sub ? `<text class="fm-sub" y="${HALF + 34}">${sub}</text>` : ""}
+    ${addrLine(addr, HALF + 50)}
   </g>`;
 
 export function mountFlowMap(host, facts = {}) {
@@ -109,11 +114,12 @@ export function mountFlowMap(host, facts = {}) {
       <rect class="fm-tile" x="${-HALF}" y="${-HALF}" width="${HALF * 2}" height="${HALF * 2}" rx="14"/>
       <use class="fm-ic" href="#sym-registry" x="-15" y="-15" width="30" height="30"/>
       <text class="fm-name" y="${-HALF - 12}">${t("node.registry")}</text>
+      ${facts.nodeAddr?.registry ? `<a class="fm-addr-a" href="${addrUrl(facts.nodeAddr.registry)}" target="_blank" rel="noopener" aria-label="open ${short(facts.nodeAddr.registry, 6, 4)} on the block explorer"><text class="fm-addr fm-addr-r" x="${HALF + 16}" y="4">${short(facts.nodeAddr.registry, 6, 4)}</text></a>` : ""}
     </g>
 
-    ${node("wallet", "wallet", t("node.wallet"), t("node.walletSub"))}
+    ${node("wallet", "wallet", t("node.wallet"), t("node.walletSub"), facts.nodeAddr?.wallet)}
     ${node("policy", "shield", t("node.policy"), t("node.policySub"))}
-    ${node("market", "package", t("node.market"), t("node.marketSub"))}
+    ${node("market", "package", t("node.market"), t("node.marketSub"), facts.nodeAddr?.market)}
 
 
     <!-- procurement gate — the breaker (hero) -->
@@ -127,6 +133,7 @@ export function mountFlowMap(host, facts = {}) {
       <path class="fm-arm" d="M-22 0 H 22"/>
       <text class="fm-name" y="${GHALF + 20}">${t("node.gate")}</text>
       <text class="fm-out" id="fm-out" y="${GHALF + 36}"></text>
+      ${addrLine(facts.nodeAddr?.gate, GHALF + 52)}
     </g>
 
     <!-- evidence tags, anchored to segments (computed, not magic) -->
@@ -158,7 +165,7 @@ export function mountFlowMap(host, facts = {}) {
     ${VNODES.map((n) => `
     <li class="fm-vnode" data-node="${n.key}">
       <span class="fm-vicon">${icon(n.glyph)}</span>
-      <span class="fm-vmain"><span class="fm-vname">${n.name}</span><span class="fm-vsub">${n.sub}</span></span>
+      <span class="fm-vmain"><span class="fm-vname">${n.name}</span><span class="fm-vsub">${n.sub}</span>${facts.nodeAddr?.[n.key] ? `<a class="fm-vaddr mono" href="${addrUrl(facts.nodeAddr[n.key])}" target="_blank" rel="noopener">${short(facts.nodeAddr[n.key], 6, 4)}</a>` : ""}</span>
       <span class="fm-vstate"></span>
       <span class="fm-vdesc" hidden>${t(`tip.${n.key}`)}</span>
     </li>`).join("")}
@@ -206,7 +213,8 @@ export function mountFlowMap(host, facts = {}) {
   host.querySelectorAll(".fm-vnode").forEach((li) => {
     const d = li.querySelector(".fm-vdesc");
     if (!d) return;
-    li.addEventListener("click", () => {
+    li.addEventListener("click", (e) => {
+      if (e.target.closest("a")) return; // tapping the address opens the explorer, not the tip
       const open = d.hidden;
       host.querySelectorAll(".fm-vdesc").forEach((o) => { if (o !== d) o.hidden = true; });
       d.hidden = !open;
