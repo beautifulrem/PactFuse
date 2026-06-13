@@ -19,6 +19,7 @@
 
 import { short, fmt } from "../data.mjs";
 import { STAGE } from "../machine.mjs";
+import { icon } from "../symbols.mjs";
 
 // ── geometry (viewBox units) — single source of truth ──────────────────────
 const VB = { w: 920, h: 300 };
@@ -46,6 +47,16 @@ const OUTCOME = {
   "trip-cut": "spend halted", "trip-done": "spend halted",
   "deny-block": "denied", "deny-done": "denied",
 };
+
+// Mobile (<560px) vertical re-stack of the same pipeline. Driven by the SAME
+// machine state, but index-based (reached/halt/tone) so it needs no per-flow CSS.
+const NODE_ORDER = ["wallet", "policy", "gate", "market"];
+const VNODES = [
+  { key: "wallet", glyph: "wallet", name: "agent wallet", sub: "cobo caw" },
+  { key: "policy", glyph: "shield", name: "pact policy", sub: "allowlist · limits" },
+  { key: "gate", glyph: "breaker", name: "procurement gate", sub: "source-bound breaker" },
+  { key: "market", glyph: "package", name: "artifact market", sub: "paid delivery" },
+];
 
 const node = (key, glyph, name, sub) => `
   <g class="fm-node" data-node="${key}" transform="translate(${X[key]},${LINE_Y})">
@@ -119,11 +130,35 @@ export function mountFlowMap(host, facts = {}) {
       <circle class="fm-packet-core" r="5.5"/>
     </g>
     <circle class="fm-sig-pulse" cx="${REG.x}" cy="${REG.y + HALF}" r="3.5" aria-hidden="true"/>
-  </svg>`;
+  </svg>
+  <ol class="fm-vlist" aria-hidden="true">
+    ${VNODES.map((n) => `
+    <li class="fm-vnode" data-node="${n.key}">
+      <span class="fm-vicon">${icon(n.glyph)}</span>
+      <span class="fm-vmain"><span class="fm-vname">${n.name}</span><span class="fm-vsub">${n.sub}</span></span>
+      <span class="fm-vstate"></span>
+    </li>`).join("")}
+  </ol>`;
 
   const svg = host.querySelector("svg");
   const out = host.querySelector("#fm-out");
   const tag = (id) => host.querySelector(`#fm-tag-${id}`);
+  const vnodes = [...host.querySelectorAll(".fm-vnode")];
+
+  // Mobile vertical list: each node's state derives from how far the spend
+  // reached, where it halted, and the tone — no per-flow rules.
+  function applyVList(reached, tone, haltNode, outcomeWord) {
+    vnodes.forEach((li) => {
+      const idx = NODE_ORDER.indexOf(li.dataset.node);
+      let state;
+      if (idx < reached) state = "done";
+      else if (idx === reached) state = li.dataset.node === haltNode ? "halt" : "active";
+      else state = haltNode ? "severed" : "idle";
+      li.dataset.state = state;
+      li.dataset.tone = state === "idle" || state === "severed" ? "" : tone;
+      li.querySelector(".fm-vstate").textContent = idx === reached ? (outcomeWord || "") : "";
+    });
+  }
 
   // On narrow viewports the map scrolls horizontally (min-width keeps labels
   // legible), so pan it to keep the active/resting node on-screen — otherwise the
@@ -163,6 +198,7 @@ export function mountFlowMap(host, facts = {}) {
       setTags({});
       svg.setAttribute("aria-label", `System map: protective action failed at the ${at} — retry available`);
       centerOn(at);
+      applyVList(NODE_ORDER.indexOf(at), "danger", at, "failed");
       return;
     }
     delete svg.dataset.failnode;
@@ -233,6 +269,8 @@ export function mountFlowMap(host, facts = {}) {
       labels[flow] ?? `System map: ${ms.activeStep?.title ?? ms.stage} — spend at ${at ?? "origin"}`,
     );
     centerOn(at || "gate"); // idle/armed: keep the hero breaker centred, not clipped
+    const vtone = flow === "trip-done" ? "success" : svg.dataset.tone; // resolved trip = protected (green), matching desktop
+    applyVList(NODE_ORDER.indexOf(at ?? ""), vtone, HALT_AT[flow] ?? null, OUTCOME[flow] ?? "");
   }
 
   return { apply };

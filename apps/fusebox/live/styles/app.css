@@ -267,6 +267,29 @@ body[data-motion="full"] .fm[data-flow="deny-check"] .fm-deny-ring { animation: 
 .fm-deny-badge { fill: none; stroke: var(--warning); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; opacity: 0; transition: opacity var(--dur-med); }
 .fm[data-flow^="deny"]:not([data-flow="deny-call"]) .fm-deny-badge { opacity: 1; }
 
+/* ── mobile vertical re-stack (shown <560px; same state, index-driven) ──── */
+.fm-vlist { display: none; margin: 0; padding: 0; }
+.fm-vnode { position: relative; list-style: none; min-height: 56px; display: grid; grid-template-columns: 44px 1fr auto; align-items: center; column-gap: var(--s3); color: var(--text-secondary); transition: color var(--dur-med), opacity var(--dur-med); }
+.fm-vnode::before { content: ""; position: absolute; left: 21px; top: -28px; height: 56px; width: 2px; background: var(--fm-wire); transition: background var(--dur-med); }
+.fm-vnode:first-child::before { display: none; }
+.fm-vicon { width: 44px; height: 44px; display: grid; place-items: center; border-radius: var(--r-md); border: 1.5px solid var(--border-strong); background: var(--surface-muted); color: inherit; position: relative; z-index: 1; transition: border-color var(--dur-med), background var(--dur-med); }
+.fm-vicon .icon { width: 22px; height: 22px; }
+.fm-vmain { min-width: 0; }
+.fm-vname { display: block; font-family: var(--font-mono); font-size: var(--fs-meta); letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: color var(--dur-med); }
+.fm-vsub { display: block; font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fm-vstate { font-family: var(--font-mono); font-size: var(--fs-micro); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: inherit; }
+.fm-vnode[data-state="idle"] { opacity: 0.5; }
+.fm-vnode[data-state="severed"] { color: var(--text-muted); opacity: 0.5; }
+.fm-vnode[data-state="severed"]::before { background: repeating-linear-gradient(180deg, var(--danger) 0 4px, transparent 4px 9px); opacity: 0.6; }
+.fm-vnode[data-tone="accent"] { color: var(--accent); }
+.fm-vnode[data-tone="success"] { color: var(--success); }
+.fm-vnode[data-tone="warning"] { color: var(--warning); }
+.fm-vnode[data-tone="danger"] { color: var(--danger); }
+.fm-vnode[data-tone] .fm-vicon { border-color: currentColor; }
+.fm-vnode[data-tone] .fm-vname { color: inherit; }
+.fm-vnode[data-state="done"]::before, .fm-vnode[data-state="active"]::before, .fm-vnode[data-state="halt"]::before { background: currentColor; }
+.fm-vnode[data-state="active"] .fm-vicon, .fm-vnode[data-state="halt"] .fm-vicon { background: color-mix(in srgb, currentColor 14%, var(--surface-muted)); }
+
 /* ── settle: clean source → pay & deliver ─────────────────────────────── */
 .fm[data-flow^="settle"] [data-node="wallet"] .fm-tile { stroke: var(--accent); }
 .fm[data-flow^="settle"] [data-node="wallet"] .fm-ic { stroke: var(--accent); }
@@ -442,7 +465,10 @@ body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-gate-tile { animation: fm
   .stage-rail { grid-template-columns: repeat(2, 1fr); }
   .scenario-actions { flex-direction: column; }
   .btn, .scenario { min-height: 44px; }
-  .flowmap { padding: var(--s3) var(--s3) 0; }
+  /* swap the wide SVG for the vertical re-stack — every node + outcome on-screen, no scroll */
+  .flowmap { padding: var(--s3) var(--s2) var(--s2); overflow-x: visible; }
+  .flowmap .fm { display: none; }
+  .fm-vlist { display: grid; }
 }
 
 /* ── reduced motion ───────────────────────────────────────────────────── */
