@@ -114,8 +114,6 @@ export function mountFlowMap(host, facts = {}) {
     ${node("policy", "shield", "pact policy", "allowlist · limits")}
     ${node("market", "package", "artifact market", "paid delivery")}
 
-    <!-- policy deny ring -->
-    <circle class="fm-deny-ring" cx="${X.policy}" cy="${LINE_Y}" r="${HALF + 8}" aria-hidden="true"/>
 
     <!-- procurement gate — the breaker (hero) -->
     <g class="fm-node fm-gate" data-node="gate" transform="translate(${X.gate},${LINE_Y})">
