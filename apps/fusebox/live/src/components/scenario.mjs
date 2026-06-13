@@ -20,6 +20,10 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
       <button class="btn btn-primary" id="runBtn" type="button" disabled>${icon("play")} Run scenario</button>
       <button class="btn" id="resetBtn" type="button">${icon("reset")} Reset</button>
     </div>
+    <button class="fail-toggle" id="failToggle" type="button" role="switch" aria-checked="false">
+      <span class="fail-track" aria-hidden="true"><span class="fail-knob"></span></span>
+      <span>simulate transport drop</span>
+    </button>
     <ol class="stage-rail" aria-label="Demo stage">
       ${RAIL.map((r) => `<li class="stage-pill" data-stage-id="${r.id}"><i class="stage-dot" aria-hidden="true"></i>${r.label}</li>`).join("")}
     </ol>
@@ -30,7 +34,7 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
   list.innerHTML = scenarios
     .map(
       (s) => `
-    <button class="scenario" type="button" role="radio" aria-checked="false" data-id="${s.id}" data-tone="${s.tone}">
+    <button class="scenario" type="button" role="radio" aria-checked="false" tabindex="-1" data-id="${s.id}" data-tone="${s.tone}">
       <span class="scenario-mark" aria-hidden="true">${icon(s.id === "trip" ? "breaker" : s.id === "settle" ? "shield" : "deny")}</span>
       <span class="scenario-body">
         <span class="scenario-title">${s.title}</span>
@@ -44,23 +48,54 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
   const resetBtn = host.querySelector("#resetBtn");
   const note = host.querySelector("#stageNote");
 
+  const isRunning = () => [STAGE.pending, STAGE.detected, STAGE.executing].includes(machine.state.stage);
+  const pick = (id) => machine.select(scenarios.find((s) => s.id === id));
+
   list.querySelectorAll(".scenario").forEach((btn) =>
-    btn.addEventListener("click", () => {
-      machine.select(scenarios.find((s) => s.id === btn.dataset.id));
-    }),
+    btn.addEventListener("click", () => pick(btn.dataset.id)),
   );
+
+  // APG radiogroup keyboard model: arrows/Home/End move selection + focus (roving
+  // tabindex is maintained in apply()); selection is locked while a run is in flight.
+  list.addEventListener("keydown", (e) => {
+    const items = [...list.querySelectorAll(".scenario")];
+    const i = items.indexOf(document.activeElement);
+    if (i < 0 || isRunning()) return;
+    let j = i;
+    if (e.key === "ArrowDown" || e.key === "ArrowRight") j = (i + 1) % items.length;
+    else if (e.key === "ArrowUp" || e.key === "ArrowLeft") j = (i - 1 + items.length) % items.length;
+    else if (e.key === "Home") j = 0;
+    else if (e.key === "End") j = items.length - 1;
+    else return;
+    e.preventDefault();
+    pick(items[j].dataset.id); // apply() runs synchronously and sets tabindex…
+    items[j].focus(); // …so the freshly-selected radio is focusable here
+  });
+
   runBtn.addEventListener("click", () => {
     if (machine.state.stage === STAGE.failed) machine.retry();
     else machine.run();
   });
   resetBtn.addEventListener("click", () => machine.reset());
 
+  const failToggle = host.querySelector("#failToggle");
+  failToggle.setAttribute("aria-checked", String(machine.state.failArmed)); // sync with ?fail=1
+  failToggle.addEventListener("click", () => {
+    const on = failToggle.getAttribute("aria-checked") !== "true";
+    failToggle.setAttribute("aria-checked", String(on));
+    machine.armFailure(on);
+  });
+
   function apply(ms) {
+    let anyChecked = false;
     list.querySelectorAll(".scenario").forEach((b) => {
       const sel = b.dataset.id === ms.scenarioId;
       b.setAttribute("aria-checked", String(sel));
       b.classList.toggle("is-selected", sel);
+      b.tabIndex = sel ? 0 : -1; // roving tabindex follows the checked radio
+      if (sel) anyChecked = true;
     });
+    if (!anyChecked) { const first = list.querySelector(".scenario"); if (first) first.tabIndex = 0; }
     const running = [STAGE.pending, STAGE.detected, STAGE.executing].includes(ms.stage);
     runBtn.disabled = !ms.scenario || running;
     runBtn.innerHTML =

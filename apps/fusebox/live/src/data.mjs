@@ -17,16 +17,16 @@ export const fmt = (n) => Number(n ?? 0).toLocaleString("en-US");
 export const txUrl = (hash) => `${EXPLORER}/tx/${hash}`;
 export const addrUrl = (a) => `${EXPLORER}/address/${a}`;
 
-export async function loadEvidence({ session, artifactsBase, failFlag }) {
+export async function loadEvidence({ session, artifactsBase }) {
   const base = artifactsBase ?? new URL(`../../../../docs/evidence/live/${session}/`, import.meta.url).href;
   const bundle = await fetch(new URL("proof-bundle.json", base)).then((r) => {
     if (!r.ok) throw new Error(`proof-bundle ${r.status}`);
     return r.json();
   });
-  return deriveModel(bundle, { failFlag });
+  return deriveModel(bundle);
 }
 
-function deriveModel(pb, { failFlag }) {
+function deriveModel(pb) {
   const rb = pb.replayBundle;
   const events = [...(rb.events ?? [])].sort((a, b) => a.eventSeq - b.eventSeq);
   const byKind = (k) => events.filter((e) => e.kind === k);
@@ -209,13 +209,15 @@ function deriveModel(pb, { failFlag }) {
     },
   ];
 
-  if (failFlag) {
-    for (const s of scenarios) {
-      const target = s.steps.find((x) => x.stage === STAGE.executing);
-      if (target) {
-        target.missing = true;
-        target.missingReason = "simulated transport failure (?fail=1) — retry clears it";
-      }
+  // Mark each scenario's first executing step as the fragile point a transport
+  // drop can hit. Whether it actually fails is decided at run time by the
+  // machine's one-shot failure arming (the in-UI toggle or ?fail=1) — the model
+  // stays pure input config and is never mutated by a render subscriber.
+  for (const s of scenarios) {
+    const target = s.steps.find((x) => x.stage === STAGE.executing);
+    if (target) {
+      target.fragile = true;
+      target.failReason = "transport drop before the action completed — retry clears it";
     }
   }
 
@@ -235,17 +237,17 @@ function deriveModel(pb, { failFlag }) {
       "attestation key": pb.verifierAttestation?.publicKeyHash,
     },
     metrics: [
+      { label: "settled & delivered", value: settleAmount, tone: "success", suffix: "atomic" },
+      { label: "blocked before payment", value: tripped.reduce((sum, s) => sum + Number(s.maxPriceAtomic ?? 0), 0), tone: "warning", suffix: "atomic" },
       { label: "ledger seq", value: pb.asOfEventSeq ?? events.length },
       { label: "caw audit rows", value: auditCount },
-      { label: "settled (atomic)", value: settleAmount, tone: "success" },
-      { label: "at-risk blocked (atomic)", value: tripped.reduce((sum, s) => sum + Number(s.maxPriceAtomic ?? 0), 0) },
     ],
     facts: { identity, allowance, settled, delta, challenge, lease, registry, gate, blocks },
     scenarios,
   };
 }
 
-export function fixtureModel({ failFlag } = {}) {
+export function fixtureModel() {
   const mkStep = (stage, flow, title, detail, tone) => ({
     stage,
     flow,
@@ -263,10 +265,10 @@ export function fixtureModel({ failFlag } = {}) {
     attestation: null,
     hashes: { note: "serve the repo root so docs/evidence/live artifacts can load" },
     metrics: [
+      { label: "settled & delivered", value: 0, tone: "success", suffix: "atomic" },
+      { label: "blocked before payment", value: 0, tone: "warning", suffix: "atomic" },
       { label: "evidence events", value: 0 },
       { label: "caw audit rows", value: 0 },
-      { label: "settled (atomic)", value: 0 },
-      { label: "judge check", value: 0, suffix: "/6 pass" },
     ],
     facts: {},
     scenarios: [
@@ -312,13 +314,11 @@ export function fixtureModel({ failFlag } = {}) {
       },
     ],
   };
-  if (failFlag) {
-    for (const s of model.scenarios) {
-      const t = s.steps.find((x) => x.stage === STAGE.executing);
-      if (t) {
-        t.missing = true;
-        t.missingReason = "simulated transport failure (?fail=1) — retry clears it";
-      }
+  for (const s of model.scenarios) {
+    const t = s.steps.find((x) => x.stage === STAGE.executing);
+    if (t) {
+      t.fragile = true;
+      t.failReason = "transport drop before the action completed — retry clears it";
     }
   }
   return model;

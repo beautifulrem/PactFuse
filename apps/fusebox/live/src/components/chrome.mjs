@@ -113,6 +113,8 @@ export function mountDrawers(root, model, toast) {
   `;
 
   const scrim = root.querySelector("#scrim");
+  // mirror the drawer transition so it can't desync from the token
+  const DUR_MED = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--dur-med")) || 260;
   let lastFocus = null;
   const open = (id) => {
     lastFocus = document.activeElement;
@@ -125,7 +127,7 @@ export function mountDrawers(root, model, toast) {
   const closeAll = () => {
     root.querySelectorAll(".drawer.is-open").forEach((d) => {
       d.classList.remove("is-open");
-      setTimeout(() => (d.hidden = true), 260);
+      setTimeout(() => (d.hidden = true), DUR_MED);
     });
     scrim.hidden = true;
     lastFocus?.focus?.();

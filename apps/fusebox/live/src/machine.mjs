@@ -26,6 +26,8 @@ export function createMachine() {
     error: null,
     runId: 0,
     instant: false,
+    failArmed: false, // operator toggle / ?fail=1: arm a one-shot transport drop
+    failPending: false, // resolved per-run from failArmed; a retry clears it
     log: [],
   };
 
@@ -51,12 +53,18 @@ export function createMachine() {
     emit("select");
   }
 
-  async function run() {
+  async function run(recover = false) {
     if (!state.scenario || state.stage === STAGE.pending || state.stage === STAGE.detected || state.stage === STAGE.executing) return;
     const runId = ++state.runId;
+    // one-shot failure injection: a normal run honours the armed flag; a retry
+    // (recover) always clears it, so the same scenario recovers and then re-arms
+    // on the next fresh run if the toggle is still on.
+    state.failPending = recover ? false : state.failArmed;
     state.outcome = null;
     state.error = null;
     state.stepIndex = -1;
+    state.activeStep = null; // clear the prior terminal frame before announcing
+    state.stage = STAGE.pending;
     state.log = [];
     emit("run-start");
     pushLog({ text: `scenario armed · ${state.scenario.title}`, meta: "operator" }, "info");
@@ -64,9 +72,9 @@ export function createMachine() {
     for (let i = 0; i < state.scenario.steps.length; i++) {
       if (runId !== state.runId) return;
       const step = state.scenario.steps[i];
-      if (step.missing) {
+      if (step.fragile && state.failPending) {
         state.stage = STAGE.failed;
-        state.error = step.missingReason ?? "required evidence rows are unreachable";
+        state.error = step.failReason ?? "simulated transport drop — retry clears it";
         state.activeStep = step;
         pushLog({ text: `step failed · ${state.error}`, meta: "driver" }, "danger");
         emit("stage");
@@ -100,7 +108,16 @@ export function createMachine() {
 
   function retry() {
     if (state.stage !== STAGE.failed) return;
-    run();
+    run(true);
+  }
+
+  function armFailure(v) {
+    state.failArmed = Boolean(v);
+  }
+
+  function clearLog() {
+    state.log = [];
+    emit("log-clear");
   }
 
   return {
@@ -110,6 +127,8 @@ export function createMachine() {
     run,
     reset,
     retry,
+    armFailure,
+    clearLog,
     setInstant: (v) => (state.instant = Boolean(v)),
   };
 }

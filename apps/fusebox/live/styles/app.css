@@ -89,8 +89,10 @@ a:hover { text-decoration: underline; }
 }
 .metric { display: block; padding-right: var(--s4); }
 .metric + .metric { padding-left: var(--s4); border-left: 1px solid var(--border); }
-.metric-value { font-size: var(--fs-data); font-weight: 500; }
+.metric-value { font-size: var(--fs-data); font-weight: 600; }
 .metric[data-tone="success"] .metric-value { color: var(--success); }
+.metric[data-tone="warning"] .metric-value { color: var(--warning); }
+.metric[data-tone="danger"] .metric-value { color: var(--danger); }
 .metric-suffix { color: var(--text-muted); font-size: var(--fs-meta); margin-left: 4px; }
 .metric-label { display: block; margin-top: 2px; font-size: var(--fs-micro); letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-muted); }
 
@@ -111,22 +113,25 @@ a:hover { text-decoration: underline; }
   letter-spacing: 0.07em; text-transform: uppercase;
 }
 .panel-hint { font-family: var(--font-mono); font-size: var(--fs-micro); font-weight: 400; letter-spacing: 0.04em; text-transform: none; color: var(--text-muted); }
+.panel-clear { font-family: var(--font-mono); font-size: var(--fs-micro); font-weight: 400; letter-spacing: 0.08em; text-transform: uppercase; padding: 4px 6px; }
 
-/* scenarios */
-.scenario-list { display: grid; gap: var(--s2); }
+/* scenarios — a tone-coded control rail, not boxed cards */
+.scenario-list { display: grid; }
 .scenario {
   display: flex; gap: var(--s3); align-items: flex-start; text-align: left;
-  padding: var(--s3); border-radius: var(--r-md);
-  border: 1px solid var(--border); background: var(--surface);
-  color: inherit; font: inherit; cursor: pointer;
-  transition: border-color var(--dur-fast), background var(--dur-fast);
+  padding: var(--s3); border: 0; border-left: 2px solid transparent;
+  background: transparent; color: inherit; font: inherit; cursor: pointer;
+  transition: background var(--dur-fast), border-color var(--dur-fast);
 }
-.scenario:hover { background: var(--surface-raised); }
-.scenario:active { border-color: var(--border-strong); }
-.scenario.is-selected { border-color: var(--border-strong); background: var(--surface-raised); }
-.scenario.is-selected[data-tone="danger"] { border-color: color-mix(in srgb, var(--danger) 55%, transparent); background: var(--danger-bg); }
-.scenario.is-selected[data-tone="success"] { border-color: color-mix(in srgb, var(--success) 55%, transparent); background: var(--success-bg); }
-.scenario.is-selected[data-tone="warning"] { border-color: color-mix(in srgb, var(--warning) 55%, transparent); background: var(--warning-bg); }
+.scenario + .scenario { border-top: 1px solid var(--border); }
+.scenario[data-tone="danger"] { border-left-color: color-mix(in srgb, var(--danger) 32%, transparent); }
+.scenario[data-tone="success"] { border-left-color: color-mix(in srgb, var(--success) 32%, transparent); }
+.scenario[data-tone="warning"] { border-left-color: color-mix(in srgb, var(--warning) 32%, transparent); }
+.scenario:hover:not(.is-selected) { background: var(--surface-raised); }
+.scenario.is-selected { background: var(--surface-raised); }
+.scenario.is-selected[data-tone="danger"] { border-left-color: var(--danger); background: var(--danger-bg); }
+.scenario.is-selected[data-tone="success"] { border-left-color: var(--success); background: var(--success-bg); }
+.scenario.is-selected[data-tone="warning"] { border-left-color: var(--warning); background: var(--warning-bg); }
 .scenario-mark { display: grid; place-items: center; width: 32px; height: 32px; border-radius: var(--r-sm); border: 1px solid var(--border); color: var(--text-secondary); flex: none; }
 .scenario-mark .icon { width: 17px; height: 17px; }
 .scenario[data-tone="danger"] .scenario-mark { color: var(--danger); }
@@ -141,6 +146,20 @@ a:hover { text-decoration: underline; }
 
 .scenario-actions { display: flex; gap: var(--s2); }
 .scenario-actions .btn-primary { flex: 1; justify-content: center; }
+
+/* failure-injection switch — exposes the failed/retry arc without a URL param */
+.fail-toggle {
+  display: inline-flex; align-items: center; gap: var(--s2); align-self: flex-start;
+  padding: 6px 2px; border: 0; background: transparent;
+  color: var(--text-muted); font: inherit; font-size: var(--fs-meta); cursor: pointer;
+  transition: color var(--dur-fast);
+}
+.fail-toggle:hover { color: var(--text-secondary); }
+.fail-track { position: relative; flex: none; width: 30px; height: 17px; border-radius: 999px; border: 1px solid var(--border-strong); background: var(--surface); transition: background var(--dur-fast), border-color var(--dur-fast); }
+.fail-knob { position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%; background: var(--text-muted); transition: transform var(--dur-fast) var(--ease-out), background var(--dur-fast); }
+.fail-toggle[aria-checked="true"] { color: var(--warning); }
+.fail-toggle[aria-checked="true"] .fail-track { border-color: var(--warning); background: var(--warning-bg); }
+.fail-toggle[aria-checked="true"] .fail-knob { transform: translateX(13px); background: var(--warning); }
 
 /* stage rail */
 .stage-rail { list-style: none; display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--s1); margin: 0; padding: 0; }
@@ -183,7 +202,7 @@ a:hover { text-decoration: underline; }
 .fm-sub { font-size: var(--fs-tag); letter-spacing: 0.06em; text-anchor: middle; fill: var(--text-muted); }
 .fm-tag { font-size: var(--fs-tag); letter-spacing: 0.04em; fill: var(--text-secondary); opacity: 0; transition: opacity var(--dur-med); }
 .fm-tag:not(:empty) { opacity: 1; }
-.fm-out { font-size: var(--fs-tag-lg); letter-spacing: 0.1em; text-transform: uppercase; text-anchor: middle; fill: var(--text-muted); opacity: 0; transition: opacity var(--dur-med), fill var(--dur-med); }
+.fm-out { font-size: var(--fs-out); font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; text-anchor: middle; fill: var(--text-muted); opacity: 0; transition: opacity var(--dur-med), fill var(--dur-med); }
 .fm-out:not(:empty) { opacity: 1; }
 .fm-grid-dot { fill: var(--text-muted); opacity: 0.07; }
 
@@ -325,6 +344,7 @@ body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-gate-tile { animation: fm
 .inspector-kv > div { display: flex; gap: var(--s3); padding: 6px 0; border-bottom: 1px solid var(--border); }
 .inspector-kv dt { color: var(--text-muted); min-width: 72px; text-transform: uppercase; font-size: var(--fs-micro); letter-spacing: 0.1em; padding-top: 1px; }
 .inspector-kv dd { margin: 0; color: var(--text-primary); word-break: break-all; }
+.inspector-kv .is-ph dd { color: var(--text-muted); } /* idle scaffold: dimmed em-dash values */
 
 .logpanel { padding: var(--s4); display: grid; grid-template-rows: auto 1fr; gap: var(--s2); min-height: 0; }
 .log { list-style: none; margin: 0; padding: 0; overflow-y: auto; max-height: 240px; font-size: var(--fs-meta); }
@@ -400,8 +420,17 @@ body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-gate-tile { animation: fm
   .metric:nth-child(odd) { padding-left: 0; border-left: 0; }
   .insight-row { grid-template-columns: 1fr; }
   .inspector { border-right: 0; border-bottom: 1px solid var(--border); }
-  .flowmap { overflow-x: auto; overscroll-behavior-x: contain; }
+  /* map scrolls horizontally (min-width keeps labels legible); a visible thin
+     scrollbar makes that discoverable, and flowmap.apply() pans to the active node */
+  .flowmap { overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+  .flowmap::-webkit-scrollbar { height: 6px; }
+  .flowmap::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
   .fm { min-width: 720px; }
+}
+
+/* touch devices (incl. 561-1024px tablets) get the 44px floor, not just <560 */
+@media (pointer: coarse) {
+  .btn, .scenario, .btn-ghost, .chip-copy, .panel-clear, .fail-toggle { min-height: 44px; }
 }
 @media (max-width: 560px) {
   .shell { padding-left: var(--s4); padding-right: var(--s4); }

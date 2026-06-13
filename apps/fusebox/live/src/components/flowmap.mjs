@@ -18,6 +18,7 @@
  * nodes it travels between. */
 
 import { short, fmt } from "../data.mjs";
+import { STAGE } from "../machine.mjs";
 
 // ── geometry (viewBox units) — single source of truth ──────────────────────
 const VB = { w: 920, h: 300 };
@@ -124,6 +125,21 @@ export function mountFlowMap(host, facts = {}) {
   const out = host.querySelector("#fm-out");
   const tag = (id) => host.querySelector(`#fm-tag-${id}`);
 
+  // On narrow viewports the map scrolls horizontally (min-width keeps labels
+  // legible), so pan it to keep the active/resting node on-screen — otherwise the
+  // hero breaker and one of the three outcomes clip off the edge. No-op on desktop.
+  let lastCenter = null;
+  function centerOn(nodeKey) {
+    if (!nodeKey || nodeKey === lastCenter) return; // skip repeats (e.g. per-log-line emits)
+    const max = host.scrollWidth - host.clientWidth;
+    if (max <= 1) return; // desktop: not scrollable — don't cache, so a resize still pans
+    lastCenter = nodeKey;
+    const rendered = svg.getBoundingClientRect().width || host.scrollWidth;
+    const px = (X[nodeKey] / VB.w) * rendered;
+    const left = Math.max(0, Math.min(max, px - host.clientWidth / 2));
+    host.scrollTo({ left, behavior: document.body.dataset.motion === "off" ? "auto" : "smooth" });
+  }
+
   function setTags({ sig = "", pg = "", gm = "" }) {
     tag("sig").textContent = sig;
     tag("pg").textContent = pg;
@@ -134,10 +150,10 @@ export function mountFlowMap(host, facts = {}) {
     // failure (e.g. ?fail=1) resolves on its own: the spend is stranded at the
     // step that could not execute, the breaker is NOT shown as a clean open, and
     // tone is danger — a broken action never inherits a success/in-progress look.
-    if (ms.stage === "failed") {
+    if (ms.stage === STAGE.failed) {
       const at = PACKET_AT[ms.activeStep?.flow] ?? "gate";
       svg.dataset.flow = "failed";
-      svg.dataset.stage = "failed";
+      svg.dataset.stage = STAGE.failed;
       svg.dataset.packet = "on";
       svg.style.setProperty("--pk-x", `${X[at]}px`);
       svg.dataset.halt = at;
@@ -146,14 +162,18 @@ export function mountFlowMap(host, facts = {}) {
       out.textContent = "failed";
       setTags({});
       svg.setAttribute("aria-label", `System map: protective action failed at the ${at} — retry available`);
+      centerOn(at);
       return;
     }
     delete svg.dataset.failnode;
 
     const flow =
-      ms.stage === "success"
+      ms.stage === STAGE.success
         ? `${ms.scenario?.flow}-done`
         : (ms.activeStep?.flow ?? (ms.scenario ? "armed" : "idle"));
+    if (flow !== "idle" && flow !== "armed" && !(flow in PACKET_AT)) {
+      console.warn(`[flowmap] no PACKET_AT entry for flow "${flow}" — packet/outcome will be blank`);
+    }
 
     svg.dataset.flow = flow;
     svg.dataset.stage = ms.stage;
@@ -212,6 +232,7 @@ export function mountFlowMap(host, facts = {}) {
       "aria-label",
       labels[flow] ?? `System map: ${ms.activeStep?.title ?? ms.stage} — spend at ${at ?? "origin"}`,
     );
+    centerOn(at || "gate"); // idle/armed: keep the hero breaker centred, not clipped
   }
 
   return { apply };

@@ -2,9 +2,13 @@
  * payload (kind, seq, tx, block, risk); the log appends machine entries so
  * the process is visible, not just the result. */
 
-import { icon } from "../symbols.mjs";
 import { short, txUrl } from "../data.mjs";
 import { STAGE } from "../machine.mjs";
+
+// dimmed schematic of what a run WILL bind — fills the idle inspector well
+const SCAFFOLD = ["event", "tx", "block", "risk"]
+  .map((k) => `<div class="is-ph"><dt>${k}</dt><dd>—</dd></div>`)
+  .join("");
 
 const RISK = {
   danger: { label: "high risk", tone: "danger" },
@@ -35,7 +39,7 @@ export function mountInspector(host) {
       risk.textContent = "idle";
       title.textContent = ms.scenario ? `${ms.scenario.title} — armed` : "no active event";
       detail.textContent = ms.scenario?.lede ?? "Select and run a scenario; each step binds to a verified evidence row.";
-      kv.innerHTML = "";
+      kv.innerHTML = SCAFFOLD;
       return;
     }
     const r = ms.stage === STAGE.failed ? { label: "execution failed", tone: "danger" } : RISK[step.tone ?? "info"];
@@ -43,6 +47,11 @@ export function mountInspector(host) {
     risk.textContent = ms.stage === STAGE.failed ? r.label : (step.risk ?? r.label);
     title.textContent = step.title;
     detail.textContent = ms.stage === STAGE.failed ? (ms.error ?? "failed") : step.detail;
+    if (ms.stage === STAGE.failed) {
+      // don't show tx/block evidence under "execution failed" — the action never ran
+      kv.innerHTML = `<div><dt>evidence</dt><dd>not reached · step did not execute</dd></div>`;
+      return;
+    }
     const rows = Object.entries(step.evidence ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== "");
     kv.innerHTML = rows
       .map(([k, v]) => {
@@ -59,22 +68,21 @@ export function mountInspector(host) {
   return { apply };
 }
 
-export function mountLog(host) {
+export function mountLog(host, { machine }) {
   host.innerHTML = `
-    <h2 class="panel-title">Evidence log <button class="btn btn-ghost" id="logClear" type="button" title="Clear log">${icon("close")}</button></h2>
-    <ol class="log" id="logList" aria-live="polite" aria-label="Evidence log"></ol>
+    <h2 class="panel-title">Evidence log <button class="btn btn-ghost panel-clear" id="logClear" type="button" aria-label="Clear evidence log">clear</button></h2>
+    <ol class="log" id="logList" aria-label="Evidence log"></ol>
     <p class="log-empty" id="logEmpty">log is empty — run a scenario</p>
   `;
   const list = host.querySelector("#logList");
   const empty = host.querySelector("#logEmpty");
-  host.querySelector("#logClear").addEventListener("click", () => {
-    list.innerHTML = "";
-    empty.hidden = false;
-  });
+  // route through the store so view + counter never desync (stageNote is the
+  // single spoken progress channel, so the log is a silent scrollable record)
+  host.querySelector("#logClear").addEventListener("click", () => machine.clearLog());
 
   let rendered = 0;
   function apply(ms, type) {
-    if (type === "reset" || type === "run-start" || type === "select") {
+    if (type === "reset" || type === "run-start" || type === "select" || type === "log-clear") {
       list.innerHTML = "";
       rendered = 0;
     }

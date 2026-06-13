@@ -2,7 +2,7 @@
  * build the machine, mount components, and wire subscriptions. */
 
 import { mountSymbolSprite } from "./symbols.mjs";
-import { createMachine, STAGE } from "./machine.mjs";
+import { createMachine } from "./machine.mjs";
 import { loadEvidence, fixtureModel, DEFAULT_SESSION } from "./data.mjs";
 import { mountScenarioPanel } from "./components/scenario.mjs";
 import { mountFlowMap } from "./components/flowmap.mjs";
@@ -23,17 +23,17 @@ async function boot() {
     model = await loadEvidence({
       session: qs.get("session") ?? DEFAULT_SESSION,
       artifactsBase: qs.get("artifacts") ?? undefined,
-      failFlag: qs.has("fail"),
     });
   } catch (err) {
     console.warn("[console] artifacts unreachable, fixture fallback:", err);
-    model = fixtureModel({ failFlag: qs.has("fail") });
+    model = fixtureModel();
   }
   loadingEl.remove();
-  document.body.dataset.source = model.source;
 
   const machine = createMachine();
   machine.setInstant(reduce);
+  const failParam = qs.get("fail"); // ?fail=1 arms a transport drop; the in-UI toggle drives the same flag
+  machine.armFailure(failParam !== null && failParam !== "0" && failParam !== "false");
 
   // keep motion preference live: OS toggles mid-session update both the CSS
   // gate (data-motion) and the machine's instant stepping.
@@ -51,7 +51,7 @@ async function boot() {
   const scenarioPanel = mountScenarioPanel($("scenarioPanel"), { machine, scenarios: model.scenarios });
   const flowMap = mountFlowMap($("flowMap"), model.facts);
   const inspector = mountInspector($("inspectorPanel"));
-  const log = mountLog($("logPanel"));
+  const log = mountLog($("logPanel"), { machine });
 
   const applyAll = (ms, type) => {
     scenarioPanel.apply(ms);
@@ -60,15 +60,6 @@ async function boot() {
     log.apply(ms, type);
   };
   machine.subscribe(applyAll);
-
-  machine.subscribe((ms) => {
-    if (ms.stage === STAGE.failed && !machine.state.scenario?.__failCleared) {
-      // a retry after the simulated transport failure succeeds: the flag is
-      // one-shot so the failure state is demonstrable but recoverable
-      for (const step of ms.scenario?.steps ?? []) step.missing = false;
-      if (ms.scenario) ms.scenario.__failCleared = true;
-    }
-  });
 
   $("appHeader").addEventListener("click", (e) => {
     if (e.target.closest("#sessionChip")) {

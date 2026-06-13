@@ -40,6 +40,7 @@
   --fs-micro: 10.5px;
   --fs-tag: 10.5px;
   --fs-tag-lg: 11.5px;
+  --fs-out: 14px; /* flow-map verdict word — the payoff, must out-rank node names */
 
   /* space (4pt scale) */
   --s1: 4px;
