@@ -31,6 +31,36 @@ body::after {
   opacity: 0.045;
   mix-blend-mode: overlay;
 }
+/* ambient aurora — a slow brass + cobalt + ember colour field drifting behind
+   the whole console, for depth and life. Soft radial gradients (no blur filter,
+   so it stays cheap); only background-position animates. Painted above the base
+   gradient but below all content (z-index:-1). data-motion=off / reduced-motion
+   freeze it to a static field. */
+body::before {
+  content: ""; position: fixed; inset: -25%; z-index: -1; pointer-events: none;
+  background:
+    radial-gradient(closest-side at 24% 30%, color-mix(in srgb, var(--provenance) 16%, transparent), transparent),
+    radial-gradient(closest-side at 78% 26%, color-mix(in srgb, var(--primary) 15%, transparent), transparent),
+    radial-gradient(closest-side at 62% 82%, color-mix(in srgb, var(--danger) 8%, transparent), transparent);
+  background-size: 72% 72%, 64% 64%, 82% 82%;
+  background-repeat: no-repeat;
+  opacity: 0.6;
+  transition: transform 0.6s var(--ease-out);
+}
+/* pointer parallax: the colour field leans away from the cursor a touch, so the
+   chassis feels like it has depth. --mx/--my (-0.5..0.5) are set by main.mjs and
+   only consumed under data-motion=full, so the JS toggle disables it too. */
+body[data-motion="full"]::before {
+  animation: aurora-in 1.4s var(--ease-out) both, aurora-drift 38s ease-in-out 0.4s infinite alternate;
+  transform: translate3d(calc(var(--mx, 0) * -18px), calc(var(--my, 0) * -18px), 0);
+}
+@keyframes aurora-in { from { opacity: 0; } to { opacity: 0.6; } }
+@keyframes aurora-drift {
+  0%   { background-position: 6% 2%, 94% 8%, 52% 98%; }
+  50%  { background-position: 17% 11%, 81% 0%, 65% 85%; }
+  100% { background-position: 2% 6%, 100% 13%, 45% 100%; }
+}
+
 .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -132,7 +162,7 @@ body[data-evidence] .provenance   { animation: rise var(--dur-enter) var(--ease-
 .proof-step[data-tone="accent"] .icon { color: var(--accent); }
 .proof-step[data-tone="danger"] .icon { color: var(--danger); }
 .proof-step[data-tone="success"] .icon { color: var(--success); }
-.proof-step:hover { border-color: var(--border-strong); background: var(--surface-muted); }
+.proof-step:hover { border-color: var(--border-strong); background: var(--surface-muted); transform: translateY(-2px); box-shadow: 0 10px 24px rgb(0 0 0 / 0.22); }
 .proof-lead { display: flex; flex-direction: column; align-items: center; gap: 4px; align-self: start; padding-top: 2px; }
 .proof-n { font-family: var(--font-mono); font-size: var(--fs-micro); font-weight: 600; line-height: 1; color: var(--text-muted); }
 .proof-step[data-tone="accent"] .proof-n { color: var(--accent); }

@@ -45,6 +45,19 @@ async function boot() {
     machine.setInstant(e.matches);
   });
 
+  // pointer parallax for the ambient aurora: one rAF-throttled CSS var write.
+  // The transform that consumes --mx/--my is gated to data-motion=full in CSS,
+  // so reduced-motion / the JS toggle ignore it for free.
+  let parallaxRaf = 0;
+  addEventListener("pointermove", (e) => {
+    if (parallaxRaf) return;
+    parallaxRaf = requestAnimationFrame(() => {
+      parallaxRaf = 0;
+      document.body.style.setProperty("--mx", (e.clientX / innerWidth - 0.5).toFixed(3));
+      document.body.style.setProperty("--my", (e.clientY / innerHeight - 0.5).toFixed(3));
+    });
+  }, { passive: true });
+
   const toast = makeToast($("toast"));
   mountHeader($("appHeader"), model);
   mountMetrics($("metricStrip"), model);
