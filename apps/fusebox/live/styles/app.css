@@ -21,6 +21,16 @@ body {
   line-height: 1.55;
   text-rendering: geometricPrecision;
 }
+
+/* film grain — a faint instrument-panel texture over everything. Static SVG
+   noise (no asset, no animation), kept low so it reads as depth, not pattern. */
+body::after {
+  content: ""; position: fixed; inset: 0; z-index: 200; pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 120px 120px;
+  opacity: 0.045;
+  mix-blend-mode: overlay;
+}
 .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -55,7 +65,10 @@ a:hover { text-decoration: underline; }
    shell) instead of popping in. Transform+opacity only; reduced-motion zeroes
    duration AND delay below, collapsing this to the final state with no flash. */
 @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
-body[data-evidence] .app-header   { animation: rise var(--dur-enter) var(--ease-out) both; }
+/* the hero focuses in (blur→sharp) — scoped to the header so the big console
+   panel never animates an expensive filter; reduced-motion collapses it below */
+@keyframes rise-blur { from { opacity: 0; transform: translateY(16px); filter: blur(7px); } to { opacity: 1; transform: none; filter: blur(0); } }
+body[data-evidence] .app-header   { animation: rise-blur var(--dur-enter) var(--ease-out) both; }
 body[data-evidence] .metric-strip { animation: rise var(--dur-enter) var(--ease-out) 90ms both; }
 body[data-evidence] .console      { animation: rise var(--dur-enter) var(--ease-out) 170ms both; }
 body[data-evidence] .provenance   { animation: rise var(--dur-enter) var(--ease-out) 250ms both; }
@@ -314,6 +327,13 @@ body[data-evidence] .provenance   { animation: rise var(--dur-enter) var(--ease-
 .fm a[href]:hover .fm-tag { text-decoration: underline; fill: var(--accent); }
 .fm-out { font-size: var(--fs-out); font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; text-anchor: middle; fill: var(--text-muted); opacity: 0; transition: opacity var(--dur-med), fill var(--dur-med); }
 .fm-out:not(:empty) { opacity: 1; }
+/* a soft bloom on the verdict word at the climax — colour matches its fill */
+.fm[data-flow="trip-cut"] .fm-out { filter: drop-shadow(0 0 7px color-mix(in srgb, var(--danger) 60%, transparent)); }
+.fm[data-flow="trip-done"] .fm-out,
+.fm[data-flow="settle-deliver"] .fm-out,
+.fm[data-flow="settle-done"] .fm-out { filter: drop-shadow(0 0 7px color-mix(in srgb, var(--success) 60%, transparent)); }
+.fm[data-flow="deny-block"] .fm-out,
+.fm[data-flow="deny-done"] .fm-out { filter: drop-shadow(0 0 7px color-mix(in srgb, var(--warning) 60%, transparent)); }
 .fm-grid-dot { fill: var(--text-muted); opacity: 0.07; }
 
 /* nodes — one tile language for all five */
