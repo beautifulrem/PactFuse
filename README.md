@@ -10,16 +10,10 @@ PactFuse is a fail-closed, on-chain procurement gate that lets an AI agent spend
 
 <br/>
 
-[![Live Demo](https://img.shields.io/badge/live_demo-online-000000?style=for-the-badge&logo=vercel&logoColor=white)](https://pactfuse-console.vercel.app)
-![AI×Web3 Agentic Builders — Cobo track](https://img.shields.io/badge/AI%C3%97Web3%20Agentic%20Builders-Cobo%20track-7c5cff?style=for-the-badge)
-![Live on Base Sepolia](https://img.shields.io/badge/live%20evidence-Base%20Sepolia%20(84532)-2ea44f?style=for-the-badge)
-![Fail-closed](https://img.shields.io/badge/posture-fail--closed-1f6feb?style=for-the-badge)
-
-![Node](https://img.shields.io/badge/node-%E2%89%A522-339933?logo=node.js&logoColor=white)
-![pnpm](https://img.shields.io/badge/pnpm-10.30-F69220?logo=pnpm&logoColor=white)
-![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178c6?logo=typescript&logoColor=white)
-![Solidity](https://img.shields.io/badge/Solidity-Foundry-363636?logo=solidity&logoColor=white)
-![Settlement](https://img.shields.io/badge/settlement-mock%20ERC20%20(testnet%2C%20not%20USDC)-orange)
+[![Live Demo](https://img.shields.io/badge/Live_Demo-online-000000?logo=vercel&logoColor=white)](https://pactfuse-console.vercel.app)
+&nbsp;![Cobo Agentic Wallet track](https://img.shields.io/badge/Cobo_Agentic_Wallet-track-7c5cff)
+&nbsp;![Base Sepolia](https://img.shields.io/badge/Base_Sepolia-84532-2ea44f)
+&nbsp;![fail-closed](https://img.shields.io/badge/posture-fail--closed-1f6feb)
 
 </div>
 
