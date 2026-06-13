@@ -10,6 +10,7 @@ PactFuse 是一个 fail-closed（默认拒绝）的链上采购闸门：让 AI a
 
 <br/>
 
+[![Live Demo](https://img.shields.io/badge/live_demo-online-000000?style=for-the-badge&logo=vercel&logoColor=white)](https://pactfuse-console.vercel.app)
 ![AI×Web3 Agentic Builders — Cobo 赛道](https://img.shields.io/badge/AI%C3%97Web3%20Agentic%20Builders-Cobo%20track-7c5cff?style=for-the-badge)
 ![Base Sepolia 实链证据](https://img.shields.io/badge/live%20evidence-Base%20Sepolia%20(84532)-2ea44f?style=for-the-badge)
 ![Fail-closed](https://img.shields.io/badge/posture-fail--closed-1f6feb?style=for-the-badge)

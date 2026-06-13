@@ -10,6 +10,7 @@ PactFuse is a fail-closed, on-chain procurement gate that lets an AI agent spend
 
 <br/>
 
+[![Live Demo](https://img.shields.io/badge/live_demo-online-000000?style=for-the-badge&logo=vercel&logoColor=white)](https://pactfuse-console.vercel.app)
 ![AI×Web3 Agentic Builders — Cobo track](https://img.shields.io/badge/AI%C3%97Web3%20Agentic%20Builders-Cobo%20track-7c5cff?style=for-the-badge)
 ![Live on Base Sepolia](https://img.shields.io/badge/live%20evidence-Base%20Sepolia%20(84532)-2ea44f?style=for-the-badge)
 ![Fail-closed](https://img.shields.io/badge/posture-fail--closed-1f6feb?style=for-the-badge)
