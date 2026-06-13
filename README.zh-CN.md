@@ -15,6 +15,10 @@ PactFuse 是一个 fail-closed（默认拒绝）的链上采购闸门：让 AI a
 &nbsp;![Base Sepolia](https://img.shields.io/badge/Base_Sepolia-84532-2ea44f)
 &nbsp;![fail-closed](https://img.shields.io/badge/posture-fail--closed-1f6feb)
 
+<br/>
+
+<img src="docs/assets/hero.svg" alt="PactFuse 花费线 —— 不安全来源在付款前触发链上采购闸门熔断;spend halted, 0 moved" width="840">
+
 </div>
 
 ---
@@ -208,6 +212,21 @@ pnpm dev:api   # http://127.0.0.1:8787  ·  /healthz · /readyz · /api/v1/opena
 ## 🛡️ 安全与声明边界
 
 PactFuse 的公开声明**只来自证据,绝不来自宣传偏好**。全新部署默认 fail-closed 启动(`claimMode=simulated`、`winnerClaimAllowed=false`)。
+
+### 声明台账
+
+| 能力 | 状态 |
+| --- | --- |
+| CAW 授权的支付 —— `approve` + `activate_tool` 在已批准 Pact 下经 CAW 结算 | ✅ 实链 · Base Sepolia |
+| 付款前的来源绑定熔断(`ProcurementGate`) | ✅ 实链 |
+| 链上结算 + ERC-20 余额变化证明 | ✅ 实链 · mock ERC-20 |
+| 错误目标策略拒绝(CAW 服务端) | ✅ 实链 · `live_denied` |
+| 受审计的 MCP 租约执行 transcript | ✅ 实链 |
+| 签名 proof bundle + 离线复验 | ✅ 实链 |
+| 真实价值 / 官方 **USDC** 结算 | 🔴 未声明 —— mock-ERC20 回退 |
+| **主网** | 🔴 仅测试网(Base Sepolia) |
+| 多 agent(买卖方分离)身份 | 🔴 单 CAW 钱包 —— 记录的 floor |
+| 独立第三方 MCP / artifact 工作负载 | ⏳ 团队自运营 Demo 基础设施 |
 
 **它是什么——以及明确不是什么:**
 

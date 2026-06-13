@@ -40,6 +40,23 @@
 <div id="drawerRoot"></div>
 <div id="toast" class="toast mono" role="status" aria-live="polite" hidden></div>
 
+<button id="helpHint" class="help-hint mono" type="button" aria-label="Keyboard shortcuts — press ?">? shortcuts</button>
+<div id="shortcutHelp" class="help-overlay" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts" hidden>
+  <div class="help-card">
+    <h3 class="help-title">Keyboard shortcuts</h3>
+    <dl class="help-list mono">
+      <div><dt>1 · 2 · 3</dt><dd>Select risk scenario</dd></div>
+      <div><dt>R</dt><dd>Run / retry the scenario</dd></div>
+      <div><dt>C</dt><dd>Clear evidence log</dd></div>
+      <div><dt>0</dt><dd>Reset to idle</dd></div>
+      <div><dt>J · H · T</dt><dd>Judge check · Proof hashes · Self-test</dd></div>
+      <div><dt>?</dt><dd>Toggle this help</dd></div>
+      <div><dt>Esc</dt><dd>Close</dd></div>
+    </dl>
+    <button class="btn btn-ghost" id="helpClose" type="button">close</button>
+  </div>
+</div>
+
 <script type="module" src="./src/main.mjs"></script>
 </body>
 </html>

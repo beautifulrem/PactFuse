@@ -33,6 +33,7 @@ export function mountHeader(host, model) {
       <div class="head-links">
         <button class="btn btn-ghost" id="openJudge" type="button">${icon("check")} ${model.judgeRows.length ? `judge check ${passed}/${total}` : "judge check —"}</button>
         <button class="btn btn-ghost" id="openHashes" type="button">${icon("pulse")} proof hashes</button>
+        <button class="btn btn-ghost" id="openSelfTest" type="button">${icon("shield")} self-test</button>
       </div>
       ${
         model.source === "fixture"
@@ -121,6 +122,14 @@ export function mountDrawers(root, model, toast) {
         ${model.attestation ? `<div class="hx-item"><p class="hx-k mono">ed25519 attestation</p><div class="hx-v"><code class="mono">sig ${short(model.attestation.signature, 16, 10)}</code></div></div>` : ""}
       </div>
     </div>
+    <div class="drawer" id="drawerSelfTest" role="dialog" aria-modal="true" aria-label="Self-test" hidden>
+      <header><h3>Self-test</h3><span class="mono drawer-sub">client-side integrity check</span>
+        <button class="btn btn-ghost drawer-x" type="button" data-close aria-label="Close">${icon("close")}</button></header>
+      <div class="drawer-body">
+        <ol class="st-list" id="stList"></ol>
+        <p class="st-summary mono" id="stSummary"></p>
+      </div>
+    </div>
     <div class="scrim" id="scrim" hidden></div>
   `;
 
@@ -172,7 +181,51 @@ export function mountDrawers(root, model, toast) {
     }
   });
 
-  return { openJudge: () => open("#drawerJudge"), openHashes: () => open("#drawerHashes") };
+  // Self-test: a one-click, client-side integrity check of the loaded evidence.
+  // Honest — it asserts what the bundle actually carries (verified vs fixture),
+  // and reveals each check in sequence for a 10-second confidence read.
+  function runSelfTest() {
+    const passed = model.judgeRows.filter((r) => r.status === "pass").length;
+    const total = model.judgeRows.length;
+    const hashCount = Object.values(model.hashes ?? {}).filter((v) => String(v).startsWith("0x")).length;
+    const checks = [
+      { label: "Evidence bundle loaded", pass: Boolean(model.sessionId) },
+      { label: model.source === "verified" ? "Source — verified replay" : "Source — fixture fallback", pass: model.source === "verified" },
+      { label: `Judge check ${passed}/${total || "—"}`, pass: total > 0 && passed === total },
+      { label: "Public claim authorized", pass: Boolean(model.claim) },
+      { label: `Proof hashes present (${hashCount})`, pass: hashCount > 0 },
+      { label: "Ed25519 verifier attestation", pass: Boolean(model.attestation) },
+    ];
+    const stList = root.querySelector("#stList");
+    const stSummary = root.querySelector("#stSummary");
+    stList.innerHTML = checks
+      .map((c) => `<li class="st-row" data-state="pending"><i class="st-dot" aria-hidden="true"></i><span class="st-label">${c.label}</span><span class="st-mark" aria-hidden="true"></span></li>`)
+      .join("");
+    stSummary.textContent = "";
+    stSummary.removeAttribute("data-tone");
+    const rows = [...stList.querySelectorAll(".st-row")];
+    const instant = document.body.dataset.motion === "off";
+    const reveal = (i) => {
+      if (i >= checks.length) {
+        const ok = checks.every((c) => c.pass);
+        stSummary.dataset.tone = ok ? "success" : "warning";
+        stSummary.textContent = ok
+          ? `✓ all ${checks.length} checks passed — verified replay`
+          : `${checks.filter((c) => c.pass).length}/${checks.length} checks passed — fixture / incomplete`;
+        return;
+      }
+      rows[i].dataset.state = checks[i].pass ? "pass" : "fail";
+      rows[i].querySelector(".st-mark").textContent = checks[i].pass ? "✓" : "✕";
+      setTimeout(() => reveal(i + 1), instant ? 0 : 230);
+    };
+    reveal(0);
+  }
+
+  return {
+    openJudge: () => open("#drawerJudge"),
+    openHashes: () => open("#drawerHashes"),
+    openSelfTest: () => { open("#drawerSelfTest"); runSelfTest(); },
+  };
 }
 
 export function mountFooter(host, model) {

@@ -25,6 +25,14 @@ const ADDR_KEYS = new Set(["gate", "owner", "spender", "wallet"]);
 const exLink = (href, text) => `<a href="${href}" target="_blank" rel="noopener">${text}</a>`;
 const kvRow = (k, inner) => `<div><dt>${k}</dt><dd>${inner}</dd></div>`;
 
+// the on-chain reference a log row can expand to (full untruncated value + copy)
+const REF_RE = /\/(tx|address|block)\/(.+)$/;
+const refFromLog = (item) => {
+  if (item.link) return { k: "tx", v: item.link };
+  const m = item.href && item.href.match(REF_RE);
+  return m ? { k: m[1], v: m[2] } : null;
+};
+
 export function mountInspector(host) {
   host.innerHTML = `
     <h2 class="panel-title">Inspector</h2>
@@ -94,6 +102,24 @@ export function mountLog(host, { machine }) {
   // single spoken progress channel, so the log is a silent scrollable record)
   host.querySelector("#logClear").addEventListener("click", () => machine.clearLog());
 
+  // expand a row to reveal its full on-chain value + copy (delegated, once)
+  list.addEventListener("click", (e) => {
+    const exp = e.target.closest(".log-expand");
+    if (exp) {
+      const open = exp.getAttribute("aria-expanded") === "true";
+      exp.setAttribute("aria-expanded", String(!open));
+      exp.closest(".log-row").querySelector(".log-detail").hidden = open;
+      return;
+    }
+    const cp = e.target.closest(".ld-copy");
+    if (cp) {
+      navigator.clipboard?.writeText(cp.dataset.copy);
+      cp.dataset.label = cp.dataset.label || cp.textContent;
+      cp.textContent = "copied"; cp.classList.add("is-copied");
+      setTimeout(() => { cp.textContent = cp.dataset.label; cp.classList.remove("is-copied"); }, 1200);
+    }
+  });
+
   let rendered = 0;
   function apply(ms, type) {
     if (type === "reset" || type === "run-start" || type === "select" || type === "log-clear") {
@@ -113,9 +139,14 @@ export function mountLog(host, { machine }) {
       // item.href is an explicit explorer URL (e.g. an /address line); item.link
       // is a bare tx hash kept for back-compat and resolved to /tx here.
       const href = item.href ?? (item.link ? txUrl(item.link) : null);
+      const ref = refFromLog(item);
       li.innerHTML = `<span class="log-time">${time}</span><span class="log-meta">${item.meta ?? ""}</span><span class="log-text">${
         href ? `<a href="${href}" target="_blank" rel="noopener">${item.text}</a>` : item.text
-      }</span>`;
+      }</span>${
+        ref ? `<button class="log-expand" type="button" aria-expanded="false" aria-label="Show full ${ref.k}">›</button>` : ""
+      }${
+        ref ? `<div class="log-detail mono" hidden><span class="ld-k">${ref.k}</span><code class="ld-v">${ref.v}</code><button class="ld-copy" type="button" data-copy="${ref.v}" aria-label="Copy ${ref.k}">copy</button></div>` : ""
+      }`;
       list.append(li);
     }
     if (pinnedToBottom) list.scrollTop = list.scrollHeight;

@@ -162,6 +162,31 @@ export function mountFlowMap(host, facts = {}) {
   const tag = (id) => host.querySelector(`#fm-tag-${id}`);
   const vnodes = [...host.querySelectorAll(".fm-vnode")];
 
+  // one-shot "power-up": draw the conduits in once on mount — never on state
+  // changes, so it can't compound with the travelling spend. Uses real path
+  // lengths and clears its own inline styles afterwards, so the per-state wire
+  // colour/dash rules are completely unaffected. Reduced-motion skips it.
+  if (document.body.dataset.motion === "full") {
+    // defer one frame: getTotalLength() can return 0 if measured synchronously
+    // right after innerHTML (before the SVG is laid out).
+    requestAnimationFrame(() => {
+      const wires = [...svg.querySelectorAll(".fm-wire")];
+      const lens = wires.map((w) => { try { return w.getTotalLength(); } catch { return 0; } });
+      if (!lens.some((l) => l > 0)) return; // hidden (e.g. mobile re-stack) — skip
+      wires.forEach((w, i) => { if (lens[i]) { w.style.strokeDasharray = `${lens[i]}`; w.style.strokeDashoffset = `${lens[i]}`; } });
+      requestAnimationFrame(() => {
+        wires.forEach((w, i) => {
+          if (!lens[i]) return;
+          w.style.transition = `stroke-dashoffset 0.62s cubic-bezier(0.16,1,0.3,1) ${0.18 + i * 0.1}s`;
+          w.style.strokeDashoffset = "0";
+        });
+      });
+      setTimeout(() => {
+        for (const w of wires) { w.style.strokeDasharray = ""; w.style.strokeDashoffset = ""; w.style.transition = ""; }
+      }, 1400);
+    });
+  }
+
   // Mobile vertical list: each node's state derives from how far the spend
   // reached, where it halted, and the tone — no per-flow rules.
   function applyVList(reached, tone, haltNode, outcomeWord) {

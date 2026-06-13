@@ -2,7 +2,7 @@
  * build the machine, mount components, and wire subscriptions. */
 
 import { mountSymbolSprite } from "./symbols.mjs";
-import { createMachine } from "./machine.mjs";
+import { createMachine, STAGE } from "./machine.mjs";
 import { loadEvidence, fixtureModel, DEFAULT_SESSION } from "./data.mjs";
 import { mountScenarioPanel, mountStageRail } from "./components/scenario.mjs";
 import { mountFlowMap } from "./components/flowmap.mjs";
@@ -70,6 +70,29 @@ async function boot() {
     }
     if (e.target.closest("#openJudge")) drawers.openJudge();
     if (e.target.closest("#openHashes")) drawers.openHashes();
+    if (e.target.closest("#openSelfTest")) drawers.openSelfTest?.();
+  });
+
+  // ── judge-friendly keyboard shortcuts + help overlay ──────────────────────
+  const helpEl = $("shortcutHelp");
+  const setHelp = (open) => { helpEl.hidden = !open; if (open) helpEl.querySelector("#helpClose")?.focus(); };
+  helpEl.addEventListener("click", (e) => { if (e.target === helpEl || e.target.closest("#helpClose")) setHelp(false); });
+  $("helpHint").addEventListener("click", () => setHelp(true));
+  document.addEventListener("keydown", (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const t = (e.target.tagName || "").toLowerCase();
+    if (t === "input" || t === "textarea" || e.target.isContentEditable) return;
+    if (e.key === "?") { e.preventDefault(); setHelp(helpEl.hidden); return; }
+    if (!helpEl.hidden) { if (e.key === "Escape") setHelp(false); return; }
+    if (document.querySelector(".drawer.is-open")) return; // open drawers own their keys (Esc/Tab)
+    const k = e.key.toLowerCase();
+    if (k >= "1" && k <= "3") { const s = model.scenarios[+k - 1]; if (s) machine.select(s); e.preventDefault(); }
+    else if (k === "r") { machine.state.stage === STAGE.failed ? machine.retry() : machine.run(); e.preventDefault(); }
+    else if (k === "c") { machine.clearLog(); e.preventDefault(); }
+    else if (k === "0") { machine.reset(); e.preventDefault(); }
+    else if (k === "j") { drawers.openJudge(); e.preventDefault(); }
+    else if (k === "h") { drawers.openHashes(); e.preventDefault(); }
+    else if (k === "t") { drawers.openSelfTest?.(); e.preventDefault(); }
   });
 
   machine.select(model.scenarios[0]);

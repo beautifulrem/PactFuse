@@ -15,6 +15,10 @@ PactFuse is a fail-closed, on-chain procurement gate that lets an AI agent spend
 &nbsp;![Base Sepolia](https://img.shields.io/badge/Base_Sepolia-84532-2ea44f)
 &nbsp;![fail-closed](https://img.shields.io/badge/posture-fail--closed-1f6feb)
 
+<br/>
+
+<img src="docs/assets/hero.svg" alt="PactFuse spend line — an unsafe source trips the on-chain procurement gate before payment; spend halted, 0 moved" width="840">
+
 </div>
 
 ---
@@ -208,6 +212,21 @@ The judge runner starts the backend when possible, prints evidence links, and **
 ## 🛡️ Security & Claim Boundaries
 
 PactFuse derives public claims from **evidence, never from pitch preference**. Fresh deployments boot fail-closed (`claimMode=simulated`, `winnerClaimAllowed=false`).
+
+### Claim ledger
+
+| Capability | Status |
+| --- | --- |
+| CAW-authorized spend — `approve` + `activate_tool` settle through CAW under an approved Pact | ✅ live · Base Sepolia |
+| Source-bound trip **before payment** (`ProcurementGate`) | ✅ live |
+| On-chain settlement + ERC-20 balance-delta proof | ✅ live · mock ERC-20 |
+| Wrong-target policy denial (CAW, server-side) | ✅ live · `live_denied` |
+| Audited MCP lease-execution transcript | ✅ live |
+| Signed proof bundle + offline re-verification | ✅ live |
+| Real-value / official **USDC** settlement | 🔴 not claimed — mock-ERC20 fallback |
+| **Mainnet** | 🔴 testnet only (Base Sepolia) |
+| Multi-agent (separate buyer/seller) identity | 🔴 single CAW wallet — recorded floor |
+| Independent third-party MCP / artifact workload | ⏳ team-operated demo infra |
 
 **What this is — and is explicitly not:**
 
