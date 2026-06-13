@@ -34,6 +34,7 @@ const seg = (ax, bx, hb = HALF, ha = HALF) => `M${X[ax] + ha} ${LINE_Y} H ${X[bx
 
 // which node the spend rests on for each flow state (its journey frontier)
 const PACKET_AT = {
+  "armed": "wallet",
   "settle-approve": "wallet", "settle-allow": "policy", "settle-pay": "gate",
   "settle-deliver": "market", "settle-done": "market",
   "trip-challenge": "wallet", "trip-detect": "policy", "trip-cut": "gate", "trip-done": "gate",
@@ -41,8 +42,24 @@ const PACKET_AT = {
 };
 // where the spend is stopped by a protective barrier (drives the halt ring)
 const HALT_AT = { "trip-cut": "gate", "trip-done": "gate", "deny-block": "policy", "deny-done": "policy" };
+// Resting x (px) for the travelling spend. It ALWAYS rests on a wire, never on a
+// node's glyph, so the wallet / shield / breaker / package icons are never
+// covered. The origin wallet has no inbound wire, so it rests on its outgoing
+// (right) edge — "loaded, departing"; every other node rests just before its
+// tile on the incoming wire. A halted/stranded spend sits a touch further out so
+// its pulse-ring also clears the barrier it was stopped by. "Passing through" is
+// read from the glide between two doorsteps (e.g. across the closing breaker),
+// not from parking the dot on top of the mechanism.
+const PACKET_GAP = 14; // resting clearance from a node edge
+const PACKET_HALT_GAP = 18; // extra room so the halt pulse-ring clears the barrier
+const packetX = (node, halted) => {
+  const half = node === "gate" ? GHALF : HALF;
+  if (node === "wallet") return X.wallet + half + PACKET_GAP;
+  return X[node] - half - (halted ? PACKET_HALT_GAP : PACKET_GAP);
+};
 // compact, punchy status word shown under the breaker
 const OUTCOME = {
+  "armed": "armed",
   "settle-deliver": "delivered", "settle-done": "delivered",
   "trip-cut": "spend halted", "trip-done": "spend halted",
   "deny-block": "denied", "deny-done": "denied",
@@ -190,7 +207,7 @@ export function mountFlowMap(host, facts = {}) {
       svg.dataset.flow = "failed";
       svg.dataset.stage = STAGE.failed;
       svg.dataset.packet = "on";
-      svg.style.setProperty("--pk-x", `${X[at]}px`);
+      svg.style.setProperty("--pk-x", `${packetX(at, true)}px`); // stranded: keep it off the failed node's glyph
       svg.dataset.halt = at;
       svg.dataset.tone = "danger";
       svg.dataset.failnode = at;
@@ -218,12 +235,14 @@ export function mountFlowMap(host, facts = {}) {
     // is set ONLY at a real barrier (present-attribute selectors must not match
     // an empty string), so it is removed otherwise.
     const at = PACKET_AT[flow];
+    const halt = HALT_AT[flow];
     svg.dataset.packet = at ? "on" : "off";
-    if (at) svg.style.setProperty("--pk-x", `${X[at]}px`);
-    if (HALT_AT[flow]) svg.dataset.halt = HALT_AT[flow];
+    if (at) svg.style.setProperty("--pk-x", `${packetX(at, Boolean(halt))}px`);
+    if (halt) svg.dataset.halt = halt;
     else delete svg.dataset.halt;
     svg.dataset.tone =
-      flow.startsWith("settle") ? (["settle-pay", "settle-deliver", "settle-done"].includes(flow) ? "success" : "accent")
+      flow === "armed" ? (ms.scenario?.tone ?? "accent")
+        : flow.startsWith("settle") ? (["settle-pay", "settle-deliver", "settle-done"].includes(flow) ? "success" : "accent")
         : flow.startsWith("trip") ? (["trip-cut", "trip-done"].includes(flow) ? "danger" : "warning")
           : flow.startsWith("deny") ? "warning"
             : "accent";

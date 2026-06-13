@@ -28,6 +28,7 @@ async function boot() {
     console.warn("[console] artifacts unreachable, fixture fallback:", err);
     model = fixtureModel();
   }
+  document.body.dataset.evidence = model.source;
   loadingEl.remove();
 
   const machine = createMachine();

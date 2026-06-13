@@ -93,8 +93,12 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
     if (!anyChecked) { const first = list.querySelector(".scenario"); if (first) first.tabIndex = 0; }
     const running = [STAGE.pending, STAGE.detected, STAGE.executing].includes(ms.stage);
     runBtn.disabled = !ms.scenario || running;
+    runBtn.classList.toggle("is-loading", running);
+    runBtn.setAttribute("aria-busy", String(running));
     runBtn.innerHTML =
-      ms.stage === STAGE.failed
+      running
+        ? `${icon("pulse")} Running evidence`
+        : ms.stage === STAGE.failed
         ? `${icon("retry")} Retry`
         : ms.stage === STAGE.success
           ? `${icon("play")} Run again`
@@ -109,7 +113,7 @@ const stageNote = (ms) => {
   if (ms.stage === STAGE.failed) return { text: `failed — ${ms.error}`, tone: "danger" };
   if (ms.stage === STAGE.success) return { text: ms.outcome?.label ?? "complete", tone: ms.outcome?.tone ?? "success" };
   if (ms.activeStep) return { text: ms.activeStep.title, tone: ms.activeStep.tone ?? "info" };
-  if (ms.scenario) return { text: "armed — run to replay the evidence", tone: "info" };
+  if (ms.scenario) return { text: "armed — evidence replay ready", tone: "info" };
   return { text: "select a scenario to begin", tone: "muted" };
 };
 

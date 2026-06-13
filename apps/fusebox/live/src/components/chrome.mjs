@@ -6,12 +6,19 @@ import { short, fmt } from "../data.mjs";
 
 export function mountHeader(host, model) {
   const claim = model.claim;
+  const passed = model.judgeRows.filter((r) => r.status === "pass").length;
+  const total = model.judgeRows.length;
   host.innerHTML = `
     <div class="head-brand">
-      <p class="head-kicker mono">fusebox console · cobo agentic wallet track</p>
+      <p class="head-kicker mono">Fusebox proof cockpit · Cobo Agentic Wallet track</p>
       <h1 class="head-title"><em>PactFuse</em> · source-fresh procurement for agent spending</h1>
       <p class="head-lede">PactFuse watches the chain while an agent buys tool leases with its Cobo Agentic Wallet.
       If a pinned source turns unsafe, the on-chain gate interrupts the spend <em>before payment</em>; clean leases settle and deliver — every claim below replays signed evidence.</p>
+      <div class="head-proofline" role="list" aria-label="Proof path">
+        <span class="proof-step" role="listitem" data-tone="accent">${icon("wallet")}<span><b>CAW authorizes</b><small>owner-bound spend rail</small></span></span>
+        <span class="proof-step" role="listitem" data-tone="danger">${icon("breaker")}<span><b>Gate interrupts</b><small>unsafe source before payment</small></span></span>
+        <span class="proof-step" role="listitem" data-tone="success">${icon("check")}<span><b>Receipt proves</b><small>${total ? `${passed}/${total} judge checks` : "fixture mode only"}</small></span></span>
+      </div>
     </div>
     <div class="head-side">
       <div class="head-chips">
@@ -24,9 +31,14 @@ export function mountHeader(host, model) {
         ${claim ? `<span class="chip" data-tone="provenance" title="${claim.claimMode} · ${claim.tokenSettlementClaim} · authorized ${claim.authorizedAt}">live claim · mock-ERC20 settlement (testnet)</span>` : ""}
       </div>
       <div class="head-links">
-        <button class="btn btn-ghost" id="openJudge" type="button">${icon("check")} ${model.judgeRows.length ? `judge check ${model.judgeRows.filter((r) => r.status === "pass").length}/${model.judgeRows.length}` : "judge check —"}</button>
+        <button class="btn btn-ghost" id="openJudge" type="button">${icon("check")} ${model.judgeRows.length ? `judge check ${passed}/${total}` : "judge check —"}</button>
         <button class="btn btn-ghost" id="openHashes" type="button">${icon("pulse")} proof hashes</button>
       </div>
+      ${
+        model.source === "fixture"
+          ? `<p class="evidence-alert" role="status">Proof artifacts did not load from this origin. UI is in fixture fallback and cannot claim verified pass.</p>`
+          : ""
+      }
     </div>
   `;
 }

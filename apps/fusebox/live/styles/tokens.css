@@ -1,39 +1,82 @@
-/* PactFuse Console — design tokens. Single source of truth; components must
- * reference tokens, never raw values. */
+/* PactFuse Console design tokens.
+ * Three layers: primitive -> semantic -> component. Existing short aliases are
+ * kept at the bottom so older components stay token-driven during iteration. */
 :root {
   color-scheme: dark;
-  /* color */
-  --bg: #0b0d11;
-  --surface: #11141b;
-  --surface-muted: #151a23;
-  --surface-raised: #1a2029;
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.16);
-  --text-primary: #e9edf4;
-  --text-secondary: #9aa6b7;
-  --text-muted: #7e8aa3;
-  --text-inverse: #0a0f1a;
-  --scrim: rgba(4, 6, 10, 0.55);
 
-  --accent: #5b8af6;
-  --accent-bg: rgba(91, 138, 246, 0.09);
-  --danger: #ef5350;
-  --danger-bg: rgba(239, 83, 80, 0.09);
-  --warning: #e8a13d;
-  --warning-bg: rgba(232, 161, 61, 0.1);
-  --success: #34d399;
-  --success-bg: rgba(52, 211, 153, 0.09);
-  --pending: #8b97ad;
-  --provenance: #c9a86a;
-  --provenance-bg: rgba(201, 168, 106, 0.08);
-  --fm-wire: rgba(233, 237, 244, 0.16); /* flow-map idle conduit */
+  /* primitives */
+  --color-graphite-980: #07090d;
+  --color-graphite-950: #0a0d12;
+  --color-graphite-925: #0d1118;
+  --color-graphite-900: #111720;
+  --color-graphite-850: #151d29;
+  --color-graphite-800: #1c2634;
+  --color-graphite-700: #2a3648;
+  --color-graphite-500: #627087;
+  --color-graphite-400: #8492a8;
+  --color-graphite-300: #aab5c5;
+  --color-graphite-100: #edf2f8;
+  --color-graphite-50: #f7f9fc;
+  --color-cobalt-500: #6488f4;
+  --color-cobalt-400: #82a0ff;
+  --color-cobalt-950: #111a35;
+  --color-emerald-500: #2fd19d;
+  --color-emerald-950: #0e2a22;
+  --color-amber-500: #dfa84d;
+  --color-amber-950: #302414;
+  --color-red-500: #f1605d;
+  --color-red-950: #32191b;
+  --color-brass-500: #d1b16e;
+  --color-brass-950: #2c2415;
+  --alpha-border: rgb(237 242 248 / 0.095);
+  --alpha-border-strong: rgb(237 242 248 / 0.18);
+  --alpha-hairline: rgb(237 242 248 / 0.055);
+  --shadow-soft: 0 18px 54px rgb(0 0 0 / 0.24);
+  --shadow-panel: 0 22px 70px rgb(0 0 0 / 0.36);
+  --shadow-focus: 0 0 0 3px rgb(130 160 255 / 0.22);
+
+  /* semantic colors required by the app system */
+  --background: var(--color-graphite-980);
+  --foreground: var(--color-graphite-100);
+  --muted: var(--color-graphite-850);
+  --muted-foreground: var(--color-graphite-300);
+  --card: var(--color-graphite-900);
+  --card-foreground: var(--foreground);
+  --popover: var(--color-graphite-900);
+  --popover-foreground: var(--foreground);
+  --border: var(--alpha-border);
+  --border-strong: var(--alpha-border-strong);
+  --input: var(--color-graphite-800);
+  --primary: var(--color-cobalt-500);
+  --primary-foreground: var(--color-graphite-980);
+  --secondary: var(--color-graphite-850);
+  --secondary-foreground: var(--foreground);
+  --accent: var(--color-cobalt-400);
+  --accent-foreground: var(--color-graphite-980);
+  --success: var(--color-emerald-500);
+  --warning: var(--color-amber-500);
+  --danger: var(--color-red-500);
+  --destructive: var(--danger);
+  --ring: var(--color-cobalt-400);
+
+  /* semantic state washes */
+  --primary-bg: rgb(100 136 244 / 0.12);
+  --accent-bg: rgb(130 160 255 / 0.12);
+  --success-bg: rgb(47 209 157 / 0.12);
+  --warning-bg: rgb(223 168 77 / 0.13);
+  --danger-bg: rgb(241 96 93 / 0.12);
+  --provenance: var(--color-brass-500);
+  --provenance-bg: rgb(209 177 110 / 0.12);
+  --pending: var(--color-graphite-400);
+  --scrim: rgb(4 6 10 / 0.66);
+  --fm-wire: rgb(237 242 248 / 0.17); /* flow-map idle conduit */
 
   /* type */
   --font-display: "Big Shoulders Display", "Arial Narrow", system-ui, sans-serif;
   --font-ui: "IBM Plex Sans", "Helvetica Neue", system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
-  --fs-hero: clamp(26px, 3vw, 34px);
-  --fs-data: 22px;
+  --fs-hero: clamp(32px, 5vw, 58px);
+  --fs-data: clamp(22px, 2vw, 30px);
   --fs-h2: 17px;
   --fs-body: 14px;
   --fs-meta: 12px;
@@ -50,22 +93,51 @@
   --s5: 24px;
   --s6: 32px;
   --s7: 48px;
+  --s8: 64px;
 
   /* radius */
   --r-sm: 4px;
   --r-md: 8px;
   --r-lg: 12px;
+  --r-xl: 16px;
 
   /* stroke + motion */
   --icon-stroke: 1.5;
   --dur-fast: 150ms;
   --dur-med: 260ms;
   --dur-slow: 420ms;
+  --dur-enter: 560ms; /* one-shot power-on reveal */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-snap: cubic-bezier(0.5, 0, 0.2, 1);
   --ease-spring: linear(0, 0.42 22%, 0.86 38%, 1.06 58%, 0.98 78%, 1);
 
   /* layout */
   --shell-max: 1480px;
-  --console-left: 360px;
+  --console-left: 376px;
+
+  /* component tokens */
+  --button-bg: var(--secondary);
+  --button-fg: var(--foreground);
+  --button-bg-hover: var(--color-graphite-800);
+  --button-border: var(--border-strong);
+  --button-primary-bg: var(--primary);
+  --button-primary-fg: var(--primary-foreground);
+  --button-primary-bg-hover: var(--color-cobalt-400);
+  --button-radius: var(--r-md);
+  --panel-bg: color-mix(in srgb, var(--card) 92%, black);
+  --panel-bg-muted: color-mix(in srgb, var(--muted) 90%, black);
+  --panel-border: var(--border);
+  --panel-radius: var(--r-xl);
+  --shadow-primary-glow: 0 10px 30px color-mix(in srgb, var(--color-cobalt-500) 22%, transparent);
+  --shadow-primary-glow-hover: 0 14px 36px color-mix(in srgb, var(--color-cobalt-500) 32%, transparent);
+
+  /* legacy aliases used by existing components */
+  --bg: var(--background);
+  --surface: var(--card);
+  --surface-muted: var(--muted);
+  --surface-raised: var(--color-graphite-800);
+  --text-primary: var(--foreground);
+  --text-secondary: var(--muted-foreground);
+  --text-muted: var(--color-graphite-400);
+  --text-inverse: var(--primary-foreground);
 }
