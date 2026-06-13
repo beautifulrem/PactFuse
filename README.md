@@ -11,6 +11,7 @@ PactFuse re-checks what an agent is buying at the **instant of payment**, on-cha
 <br/>
 
 [![Live Demo](https://img.shields.io/badge/Live_Demo-online-000000?logo=vercel&logoColor=white)](https://pactfuse-console.vercel.app)
+&nbsp;[![CI](https://github.com/beautifulrem/PactFuse/actions/workflows/ci.yml/badge.svg)](https://github.com/beautifulrem/PactFuse/actions/workflows/ci.yml)
 &nbsp;![Cobo Agentic Wallet track](https://img.shields.io/badge/Cobo_Agentic_Wallet-track-7c5cff)
 &nbsp;![Base Sepolia](https://img.shields.io/badge/Base_Sepolia-84532-2ea44f)
 &nbsp;![fail-closed](https://img.shields.io/badge/posture-fail--closed-1f6feb)
@@ -105,6 +106,19 @@ flowchart LR
   Replay --> Proof["signed public<br/>proof bundle"]
   Replay --> Console["PactFuse Console"]
 ```
+
+---
+
+## 🌍 Where this applies
+
+The pattern fits anywhere an autonomous payment depends on a source that some authority can flag unsafe between the decision and the settlement:
+
+- **On-chain bots / DeFi:** a liquidation or arbitrage bot acts on a price oracle that gets manipulated right before settlement. Gate the spend on the oracle's freshness and it trips instead of executing on a poisoned price.
+- **AP automation / BEC fraud:** a vendor's bank details are swapped between invoice approval and payout. Bind the payout to the account's attestation and a flagged account stops the transfer.
+- **Software / AI supply chain:** a package or model is flagged malicious (a CVE, a backdoor) right after it was pulled in. Bind the purchase to the artifact issuer's attestation and a revoked source refuses payment.
+- **Agentic commerce / A2A:** an agent pays a merchant or another agent that gets flagged fraudulent between cart and checkout, or is steered (via prompt injection) at an off-allowlist target. The freshness gate trips the first; the Pact policy denies the second before it reaches the chain.
+
+The closest match to this repo's live demo is the supply-chain case: an agent buying a source-bound tool lease, where the source can be challenged before payment.
 
 ---
 
@@ -261,6 +275,20 @@ PactFuse derives public claims from **evidence, never from pitch preference**. F
 - ❌ **Not proof of issuer honesty.** Issuer-declared source freshness is an explicit trust boundary (only the source's registered issuer can challenge or revoke it; a production hardening path is a multi-challenger / staked watcher network).
 
 The app never holds a raw private key; funds move only through CAW under an approved Pact. All demo value is testnet-only. See [`docs/evidence/`](docs/evidence) for the claim-mode rules, custody boundary, and receipt-verifier spec.
+
+---
+
+## ❓ FAQ
+
+**What is a "source"?** The external thing a purchase depends on (a data feed, a model, an API, an artifact's provenance). Each source has an on-chain identity (`sourceHash`) and a state in `SourceStateRegistry`: `Active`, `Challenged`, or `Revoked`.
+
+**Who can mark a source unsafe?** On-chain, only the source's registered issuer can `challengeSource` / `revokeSource` (anyone else reverts). In production that issuer is the source's authority (the provider self-reporting, a third-party watcher, or a governance multisig); a hardening path is a multi-challenger / staked watcher network. PactFuse provides the enforcement (provable, fail-closed gating); who is allowed to flag is a pluggable trust choice on top.
+
+**Does the check happen at decision time or payment time?** Only at payment time. `registerSpend` just commits the terms on-chain with no freshness check; the freshness check (`_allSourcesActive`) runs inside `activateTool`, the instant funds would move. That closes the decision-vs-payment (TOCTOU) gap: a source that turns unsafe after the spend was registered still trips at payment.
+
+**Is the Pact policy a smart contract?** No. The Pact is a declarative wallet policy (target allowlist + params + limits) enforced off-chain by the Cobo Agentic Wallet before it will sign; its digest is committed in evidence for audit. The on-chain contracts are the gate, registry, market, and token.
+
+**Is this mainnet / real money?** No. Everything runs on Base Sepolia testnet, settled in a self-deployed mock ERC-20 (mUSD), and the schema rejects presenting it as USDC. See the claim ledger above.
 
 ---
 
