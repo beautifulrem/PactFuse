@@ -362,6 +362,10 @@ body[data-evidence] .provenance   { animation: rise var(--dur-enter) var(--ease-
 .fm-tip.is-shown { opacity: 1; visibility: visible; transform: translate(-50%, 0); }
 .fm-tip-name { display: block; color: var(--text-primary); font-size: var(--fs-meta); font-weight: 600; margin-bottom: 3px; }
 .fm-tip-desc { display: block; color: var(--text-muted); font-size: var(--fs-micro); line-height: 1.5; }
+/* caret: a small rotated square straddling the edge, pointing at the node */
+.fm-tip::after { content: ""; position: absolute; left: var(--caret-x, 50%); width: 9px; height: 9px; background: var(--surface-raised); transform: translate(-50%, -50%) rotate(45deg); }
+.fm-tip[data-placement="above"]::after { top: 100%; border-right: 1px solid var(--border-strong); border-bottom: 1px solid var(--border-strong); }
+.fm-tip[data-placement="below"]::after { top: 0; border-left: 1px solid var(--border-strong); border-top: 1px solid var(--border-strong); }
 .fm text { font-family: var(--font-mono); fill: var(--text-muted); }
 .fm-name { font-size: var(--fs-micro); letter-spacing: 0.1em; text-transform: uppercase; text-anchor: middle; fill: var(--text-secondary); transition: fill var(--dur-med); }
 .fm-sub { font-size: var(--fs-tag); letter-spacing: 0.06em; text-anchor: middle; fill: var(--text-muted); }
@@ -452,6 +456,8 @@ body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-sig-pulse { animation: fm
 .fm-vname { display: block; font-family: var(--font-mono); font-size: var(--fs-meta); letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: color var(--dur-med); }
 .fm-vsub { display: block; font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .fm-vstate { font-family: var(--font-mono); font-size: var(--fs-micro); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: inherit; }
+.fm-vnode { cursor: pointer; }
+.fm-vdesc { grid-column: 1 / -1; margin-top: 6px; font-family: var(--font-mono); font-size: var(--fs-micro); line-height: 1.5; color: var(--text-muted); text-transform: none; letter-spacing: normal; }
 .fm-vnode[data-state="idle"] { opacity: 0.5; }
 .fm-vnode[data-state="severed"] { color: var(--text-muted); opacity: 0.5; }
 .fm-vnode[data-state="severed"]::before { background: repeating-linear-gradient(180deg, var(--danger) 0 4px, transparent 4px 9px); opacity: 0.6; }

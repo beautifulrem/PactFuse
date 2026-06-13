@@ -160,6 +160,7 @@ export function mountFlowMap(host, facts = {}) {
       <span class="fm-vicon">${icon(n.glyph)}</span>
       <span class="fm-vmain"><span class="fm-vname">${n.name}</span><span class="fm-vsub">${n.sub}</span></span>
       <span class="fm-vstate"></span>
+      <span class="fm-vdesc" hidden>${t(`tip.${n.key}`)}</span>
     </li>`).join("")}
   </ol>
   <div class="fm-tip" role="tooltip" aria-hidden="true"><b class="fm-tip-name"></b><span class="fm-tip-desc"></span></div>`;
@@ -184,10 +185,15 @@ export function mountFlowMap(host, facts = {}) {
     const r = anchor.getBoundingClientRect();
     const cx = r.left - hostRect.left + host.scrollLeft + r.width / 2;
     let top = r.top - hostRect.top - tip.offsetHeight - 10;
-    if (top < 4) top = r.bottom - hostRect.top + 10; // flip below if no room above
+    let below = false;
+    if (top < 4) { top = r.bottom - hostRect.top + 10; below = true; } // flip below if no room above
     const half = tip.offsetWidth / 2;
-    tip.style.left = `${Math.max(half + 6, Math.min(host.clientWidth - half - 6, cx))}px`;
+    const center = Math.max(half + 6, Math.min(host.clientWidth - half - 6, cx));
+    tip.style.left = `${center}px`;
     tip.style.top = `${top}px`;
+    tip.dataset.placement = below ? "below" : "above";
+    // keep the caret pointing at the node even when the bubble is clamped to the edge
+    tip.style.setProperty("--caret-x", `${Math.max(14, Math.min(tip.offsetWidth - 14, cx - (center - half)))}px`);
     tip.classList.add("is-shown");
   }
   const hideTip = () => tip.classList.remove("is-shown");
@@ -195,6 +201,16 @@ export function mountFlowMap(host, facts = {}) {
     if (!n.dataset.node) return;
     n.addEventListener("mouseenter", () => showTip(n.dataset.node, n));
     n.addEventListener("mouseleave", hideTip);
+  });
+  // touch: tap a node in the mobile re-stack to toggle its explanation inline
+  host.querySelectorAll(".fm-vnode").forEach((li) => {
+    const d = li.querySelector(".fm-vdesc");
+    if (!d) return;
+    li.addEventListener("click", () => {
+      const open = d.hidden;
+      host.querySelectorAll(".fm-vdesc").forEach((o) => { if (o !== d) o.hidden = true; });
+      d.hidden = !open;
+    });
   });
 
   // one-shot "power-up": draw the conduits in once on mount — never on state
