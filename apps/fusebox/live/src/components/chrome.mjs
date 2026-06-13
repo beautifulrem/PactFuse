@@ -3,6 +3,7 @@
 
 import { icon } from "../symbols.mjs";
 import { short, fmt } from "../data.mjs";
+import { t, getLang } from "../i18n.mjs";
 
 export function mountHeader(host, model) {
   const claim = model.claim;
@@ -10,34 +11,37 @@ export function mountHeader(host, model) {
   const total = model.judgeRows.length;
   host.innerHTML = `
     <div class="head-brand">
-      <p class="head-kicker mono">Fusebox proof cockpit · Cobo Agentic Wallet track</p>
-      <h1 class="head-title"><em>PactFuse</em> · source-fresh procurement for agent spending</h1>
-      <p class="head-lede">PactFuse watches the chain while an agent buys tool leases with its Cobo Agentic Wallet.
-      If a pinned source turns unsafe, the on-chain gate interrupts the spend <em>before payment</em>; clean leases settle and deliver — every claim below replays signed evidence.</p>
-      <div class="head-proofline" role="list" aria-label="Proof path">
-        <span class="proof-step" role="listitem" data-tone="accent">${icon("wallet")}<span><b>CAW authorizes</b><small>owner-bound spend rail</small></span></span>
-        <span class="proof-step" role="listitem" data-tone="danger">${icon("breaker")}<span><b>Gate interrupts</b><small>unsafe source before payment</small></span></span>
-        <span class="proof-step" role="listitem" data-tone="success">${icon("check")}<span><b>Receipt proves</b><small>${total ? `${passed}/${total} judge checks` : "fixture mode only"}</small></span></span>
+      <p class="head-kicker mono">${t("head.kicker")}</p>
+      <h1 class="head-title">${t("head.titleHtml")}</h1>
+      <p class="head-lede">${t("head.ledeHtml")}</p>
+      <div class="head-proofline" role="list" aria-label="${t("head.proof1b")}">
+        <span class="proof-step" role="listitem" data-tone="accent">${icon("wallet")}<span><b>${t("head.proof1b")}</b><small>${t("head.proof1s")}</small></span></span>
+        <span class="proof-step" role="listitem" data-tone="danger">${icon("breaker")}<span><b>${t("head.proof2b")}</b><small>${t("head.proof2s")}</small></span></span>
+        <span class="proof-step" role="listitem" data-tone="success">${icon("check")}<span><b>${t("head.proof3b")}</b><small>${total ? t("head.proof3s", { n: `${passed}/${total}` }) : t("head.proof3sFixture")}</small></span></span>
       </div>
     </div>
     <div class="head-side">
+      <div class="lang-toggle" role="group" aria-label="Language / 语言">
+        <button type="button" data-lang="en" class="${getLang() === "en" ? "is-active" : ""}" aria-pressed="${getLang() === "en"}">EN</button>
+        <button type="button" data-lang="zh" class="${getLang() === "zh" ? "is-active" : ""}" aria-pressed="${getLang() === "zh"}">中文</button>
+      </div>
       <div class="head-chips">
         <button class="chip chip-copy" id="sessionChip" type="button" title="Copy session id">
           ${icon("doc")} <span class="mono">${short(model.sessionId, 8, 6)}</span>
         </button>
         <span class="chip" data-tone="${model.source === "verified" ? "success" : "warning"}">
-          ${model.source === "verified" ? "verified evidence" : "fixture fallback"}
+          ${model.source === "verified" ? t("chip.verified") : t("chip.fixture")}
         </span>
-        ${claim ? `<span class="chip" data-tone="provenance" title="${claim.claimMode} · ${claim.tokenSettlementClaim} · authorized ${claim.authorizedAt}">live claim · mock-ERC20 settlement (testnet)</span>` : ""}
+        ${claim ? `<span class="chip" data-tone="provenance" title="${claim.claimMode} · ${claim.tokenSettlementClaim} · authorized ${claim.authorizedAt}">${t("chip.liveClaim")}</span>` : ""}
       </div>
       <div class="head-links">
-        <button class="btn btn-ghost" id="openJudge" type="button">${icon("check")} ${model.judgeRows.length ? `judge check ${passed}/${total}` : "judge check —"}</button>
-        <button class="btn btn-ghost" id="openHashes" type="button">${icon("pulse")} proof hashes</button>
-        <button class="btn btn-ghost" id="openSelfTest" type="button">${icon("shield")} self-test</button>
+        <button class="btn btn-ghost" id="openJudge" type="button">${icon("check")} ${model.judgeRows.length ? t("link.judge", { p: passed, t: total }) : t("link.judgeEmpty")}</button>
+        <button class="btn btn-ghost" id="openHashes" type="button">${icon("pulse")} ${t("link.hashes")}</button>
+        <button class="btn btn-ghost" id="openSelfTest" type="button">${icon("shield")} ${t("link.selftest")}</button>
       </div>
       ${
         model.source === "fixture"
-          ? `<p class="evidence-alert" role="status">Proof artifacts did not load from this origin. UI is in fixture fallback and cannot claim verified pass.</p>`
+          ? `<p class="evidence-alert" role="status">${t("alert.fixture")}</p>`
           : ""
       }
     </div>
@@ -81,8 +85,8 @@ function claimStatementItem(model) {
 
 export function mountDrawers(root, model, toast) {
   root.innerHTML = `
-    <div class="drawer" id="drawerJudge" role="dialog" aria-modal="true" aria-label="Judge check" hidden>
-      <header><h3>Judge check</h3><span class="mono drawer-sub">${short(model.sessionId, 8, 6)}</span>
+    <div class="drawer" id="drawerJudge" role="dialog" aria-modal="true" aria-label="${t("drawer.judge")}" hidden>
+      <header><h3>${t("drawer.judge")}</h3><span class="mono drawer-sub">${short(model.sessionId, 8, 6)}</span>
         <button class="btn btn-ghost drawer-x" type="button" data-close aria-label="Close">${icon("close")}</button></header>
       <div class="drawer-body">
         ${
@@ -100,12 +104,12 @@ export function mountDrawers(root, model, toast) {
           </div>`,
                 )
                 .join("")
-            : `<p class="jc-reason">fixture mode — judge rows unavailable</p>`
+            : `<p class="jc-reason">${t("judge.fixture")}</p>`
         }
       </div>
     </div>
-    <div class="drawer" id="drawerHashes" role="dialog" aria-modal="true" aria-label="Proof hashes" hidden>
-      <header><h3>Proof hashes</h3><span class="mono drawer-sub">recompute offline · verify-live-artifacts</span>
+    <div class="drawer" id="drawerHashes" role="dialog" aria-modal="true" aria-label="${t("drawer.hashes")}" hidden>
+      <header><h3>${t("drawer.hashes")}</h3><span class="mono drawer-sub">${t("drawer.hashesSub")}</span>
         <button class="btn btn-ghost drawer-x" type="button" data-close aria-label="Close">${icon("close")}</button></header>
       <div class="drawer-body">
         ${claimStatementItem(model)}
@@ -122,8 +126,8 @@ export function mountDrawers(root, model, toast) {
         ${model.attestation ? `<div class="hx-item"><p class="hx-k mono">ed25519 attestation</p><div class="hx-v"><code class="mono">sig ${short(model.attestation.signature, 16, 10)}</code></div></div>` : ""}
       </div>
     </div>
-    <div class="drawer" id="drawerSelfTest" role="dialog" aria-modal="true" aria-label="Self-test" hidden>
-      <header><h3>Self-test</h3><span class="mono drawer-sub">client-side integrity check</span>
+    <div class="drawer" id="drawerSelfTest" role="dialog" aria-modal="true" aria-label="${t("drawer.selftest")}" hidden>
+      <header><h3>${t("drawer.selftest")}</h3><span class="mono drawer-sub">${t("drawer.selftestSub")}</span>
         <button class="btn btn-ghost drawer-x" type="button" data-close aria-label="Close">${icon("close")}</button></header>
       <div class="drawer-body">
         <ol class="st-list" id="stList"></ol>
@@ -156,7 +160,7 @@ export function mountDrawers(root, model, toast) {
   root.addEventListener("click", (e) => {
     if (e.target.closest("[data-close]")) closeAll();
     const c = e.target.closest("[data-copy]");
-    if (c) navigator.clipboard.writeText(c.dataset.copy).then(() => toast("hash copied"), () => toast("copy failed"));
+    if (c) navigator.clipboard.writeText(c.dataset.copy).then(() => toast(t("toast.hash")), () => toast(t("toast.copyFail")));
   });
   scrim.addEventListener("click", closeAll);
   document.addEventListener("keydown", (e) => {
@@ -189,12 +193,12 @@ export function mountDrawers(root, model, toast) {
     const total = model.judgeRows.length;
     const hashCount = Object.values(model.hashes ?? {}).filter((v) => String(v).startsWith("0x")).length;
     const checks = [
-      { label: "Evidence bundle loaded", pass: Boolean(model.sessionId) },
-      { label: model.source === "verified" ? "Source — verified replay" : "Source — fixture fallback", pass: model.source === "verified" },
-      { label: `Judge check ${passed}/${total || "—"}`, pass: total > 0 && passed === total },
-      { label: "Public claim authorized", pass: Boolean(model.claim) },
-      { label: `Proof hashes present (${hashCount})`, pass: hashCount > 0 },
-      { label: "Ed25519 verifier attestation", pass: Boolean(model.attestation) },
+      { label: t("st.loaded"), pass: Boolean(model.sessionId) },
+      { label: model.source === "verified" ? t("st.verified") : t("st.fixture"), pass: model.source === "verified" },
+      { label: t("st.judge", { p: passed, t: total || "—" }), pass: total > 0 && passed === total },
+      { label: t("st.claim"), pass: Boolean(model.claim) },
+      { label: t("st.hashes", { n: hashCount }), pass: hashCount > 0 },
+      { label: t("st.attest"), pass: Boolean(model.attestation) },
     ];
     const stList = root.querySelector("#stList");
     const stSummary = root.querySelector("#stSummary");
@@ -210,8 +214,8 @@ export function mountDrawers(root, model, toast) {
         const ok = checks.every((c) => c.pass);
         stSummary.dataset.tone = ok ? "success" : "warning";
         stSummary.textContent = ok
-          ? `✓ all ${checks.length} checks passed — verified replay`
-          : `${checks.filter((c) => c.pass).length}/${checks.length} checks passed — fixture / incomplete`;
+          ? t("st.ok", { n: checks.length })
+          : t("st.bad", { p: checks.filter((c) => c.pass).length, n: checks.length });
         return;
       }
       rows[i].dataset.state = checks[i].pass ? "pass" : "fail";
@@ -231,8 +235,8 @@ export function mountDrawers(root, model, toast) {
 export function mountFooter(host, model) {
   host.textContent =
     model.source === "verified"
-      ? `verified replay · public claim authorized ${(model.claim?.authorizedAt ?? "").slice(0, 10)} · the console renders evidence — it never creates proof authority`
-      : `fixture fallback — proof artifacts unreachable from this origin; fixture states render no proof pass. serve the repo root to load the verified session`;
+      ? t("footer.verified", { date: (model.claim?.authorizedAt ?? "").slice(0, 10) })
+      : t("footer.fixture");
 }
 
 export function makeToast(host) {

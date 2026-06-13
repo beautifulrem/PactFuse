@@ -159,6 +159,26 @@ body[data-evidence] .provenance   { animation: rise var(--dur-enter) var(--ease-
 .chip-copy .mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .chip-copy:hover { border-color: var(--border-strong); color: var(--text-primary); background: var(--surface-muted); }
 
+/* CN/EN language toggle — a small segmented pill in the header */
+.lang-toggle {
+  display: inline-flex; align-items: center; gap: 2px; padding: 2px;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-muted) 60%, transparent);
+}
+.lang-toggle button {
+  appearance: none; cursor: pointer; border: 0; border-radius: 999px;
+  padding: 4px 12px; background: transparent; color: var(--text-muted);
+  font-family: var(--font-mono); font-size: var(--fs-micro);
+  letter-spacing: 0.06em; text-transform: uppercase; line-height: 1.4;
+  transition: color var(--dur-fast), background var(--dur-fast);
+}
+.lang-toggle button:hover { color: var(--text-primary); }
+.lang-toggle button.is-active {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.lang-toggle button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 .btn {
   display: inline-flex; align-items: center; gap: var(--s2);
   min-height: 36px;

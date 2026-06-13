@@ -4,25 +4,26 @@
 
 import { icon } from "../symbols.mjs";
 import { STAGE } from "../machine.mjs";
+import { t } from "../i18n.mjs";
 
 const RAIL = [
-  { id: STAGE.pending, label: "event" },
-  { id: STAGE.detected, label: "detect" },
-  { id: STAGE.executing, label: "respond" },
-  { id: STAGE.success, label: "done" },
+  { id: STAGE.pending, key: "stage.event" },
+  { id: STAGE.detected, key: "stage.detect" },
+  { id: STAGE.executing, key: "stage.respond" },
+  { id: STAGE.success, key: "stage.done" },
 ];
 
 export function mountScenarioPanel(host, { machine, scenarios }) {
   host.innerHTML = `
-    <h2 class="panel-title">Risk scenarios <span class="panel-hint">replayed from verified evidence</span></h2>
-    <div class="scenario-list" role="radiogroup" aria-label="Choose a risk scenario"></div>
+    <h2 class="panel-title">${t("panel.scenarios")} <span class="panel-hint">${t("panel.scenariosHint")}</span></h2>
+    <div class="scenario-list" role="radiogroup" aria-label="${t("panel.scenarios")}"></div>
     <div class="scenario-actions">
-      <button class="btn btn-primary" id="runBtn" type="button" disabled>${icon("play")} Run scenario</button>
-      <button class="btn" id="resetBtn" type="button">${icon("reset")} Reset</button>
+      <button class="btn btn-primary" id="runBtn" type="button" disabled>${icon("play")} ${t("btn.run")}</button>
+      <button class="btn" id="resetBtn" type="button">${icon("reset")} ${t("btn.reset")}</button>
     </div>
     <button class="fail-toggle" id="failToggle" type="button" role="switch" aria-checked="false">
       <span class="fail-track" aria-hidden="true"><span class="fail-knob"></span></span>
-      <span>simulate transport drop</span>
+      <span>${t("toggle.fail")}</span>
     </button>
   `;
 
@@ -97,12 +98,12 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
     runBtn.setAttribute("aria-busy", String(running));
     runBtn.innerHTML =
       running
-        ? `${icon("pulse")} Running evidence`
+        ? `${icon("pulse")} ${t("btn.running")}`
         : ms.stage === STAGE.failed
-        ? `${icon("retry")} Retry`
+        ? `${icon("retry")} ${t("btn.retry")}`
         : ms.stage === STAGE.success
-          ? `${icon("play")} Run again`
-          : `${icon("play")} Run scenario`;
+          ? `${icon("play")} ${t("btn.runAgain")}`
+          : `${icon("play")} ${t("btn.run")}`;
     host.dataset.stage = ms.stage;
   }
 
@@ -110,11 +111,11 @@ export function mountScenarioPanel(host, { machine, scenarios }) {
 }
 
 const stageNote = (ms) => {
-  if (ms.stage === STAGE.failed) return { text: `failed — ${ms.error}`, tone: "danger" };
+  if (ms.stage === STAGE.failed) return { text: `${t("note.failedPrefix")}${ms.error}`, tone: "danger" };
   if (ms.stage === STAGE.success) return { text: ms.outcome?.label ?? "complete", tone: ms.outcome?.tone ?? "success" };
   if (ms.activeStep) return { text: ms.activeStep.title, tone: ms.activeStep.tone ?? "info" };
-  if (ms.scenario) return { text: "armed — evidence replay ready", tone: "info" };
-  return { text: "select a scenario to begin", tone: "muted" };
+  if (ms.scenario) return { text: t("note.armed"), tone: "info" };
+  return { text: t("note.idle"), tone: "muted" };
 };
 
 // The stage rail + status note — the timeline beat of the narrative spine. Lives
@@ -123,7 +124,7 @@ const stageNote = (ms) => {
 export function mountStageRail(host) {
   host.innerHTML = `
     <ol class="stage-rail" aria-label="Demo stage">
-      ${RAIL.map((r) => `<li class="stage-pill" data-stage-id="${r.id}"><i class="stage-dot" aria-hidden="true"></i>${r.label}</li>`).join("")}
+      ${RAIL.map((r) => `<li class="stage-pill" data-stage-id="${r.id}"><i class="stage-dot" aria-hidden="true"></i>${t(r.key)}</li>`).join("")}
     </ol>
     <div class="stage-note" id="stageNote" role="status" aria-live="polite"></div>
   `;

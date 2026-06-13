@@ -20,6 +20,7 @@
 import { short, fmt, blockUrl } from "../data.mjs";
 import { STAGE } from "../machine.mjs";
 import { icon } from "../symbols.mjs";
+import { t } from "../i18n.mjs";
 
 // ── geometry (viewBox units) — single source of truth ──────────────────────
 const VB = { w: 920, h: 300 };
@@ -59,20 +60,20 @@ const packetX = (node, halted) => {
 };
 // compact, punchy status word shown under the breaker
 const OUTCOME = {
-  "armed": "armed",
-  "settle-deliver": "delivered", "settle-done": "delivered",
-  "trip-cut": "spend halted", "trip-done": "spend halted",
-  "deny-block": "denied", "deny-done": "denied",
+  "armed": t("verdict.armed"),
+  "settle-deliver": t("verdict.delivered"), "settle-done": t("verdict.delivered"),
+  "trip-cut": t("verdict.spendHalted"), "trip-done": t("verdict.spendHalted"),
+  "deny-block": t("verdict.denied"), "deny-done": t("verdict.denied"),
 };
 
 // Mobile (<560px) vertical re-stack of the same pipeline. Driven by the SAME
 // machine state, but index-based (reached/halt/tone) so it needs no per-flow CSS.
 const NODE_ORDER = ["wallet", "policy", "gate", "market"];
 const VNODES = [
-  { key: "wallet", glyph: "wallet", name: "agent wallet", sub: "cobo caw" },
-  { key: "policy", glyph: "shield", name: "pact policy", sub: "allowlist · limits" },
-  { key: "gate", glyph: "breaker", name: "procurement gate", sub: "source-bound breaker" },
-  { key: "market", glyph: "package", name: "artifact market", sub: "paid delivery" },
+  { key: "wallet", glyph: "wallet", name: t("node.wallet"), sub: t("node.walletSub") },
+  { key: "policy", glyph: "shield", name: t("node.policy"), sub: t("node.policySub") },
+  { key: "gate", glyph: "breaker", name: t("node.gate"), sub: t("node.gateSub") },
+  { key: "market", glyph: "package", name: t("node.market"), sub: t("node.marketSub") },
 ];
 
 const node = (key, glyph, name, sub) => `
@@ -107,12 +108,12 @@ export function mountFlowMap(host, facts = {}) {
       <g class="fm-beacon"><circle class="fm-beacon-ring" r="${HALF + 8}"/></g>
       <rect class="fm-tile" x="${-HALF}" y="${-HALF}" width="${HALF * 2}" height="${HALF * 2}" rx="14"/>
       <use class="fm-ic" href="#sym-registry" x="-15" y="-15" width="30" height="30"/>
-      <text class="fm-name" y="${-HALF - 12}">source registry</text>
+      <text class="fm-name" y="${-HALF - 12}">${t("node.registry")}</text>
     </g>
 
-    ${node("wallet", "wallet", "agent wallet", "cobo caw")}
-    ${node("policy", "shield", "pact policy", "allowlist · limits")}
-    ${node("market", "package", "artifact market", "paid delivery")}
+    ${node("wallet", "wallet", t("node.wallet"), t("node.walletSub"))}
+    ${node("policy", "shield", t("node.policy"), t("node.policySub"))}
+    ${node("market", "package", t("node.market"), t("node.marketSub"))}
 
 
     <!-- procurement gate — the breaker (hero) -->
@@ -124,7 +125,7 @@ export function mountFlowMap(host, facts = {}) {
       <circle class="fm-contact" cx="-22" cy="0" r="4.5"/>
       <circle class="fm-contact fm-contact-out" cx="22" cy="0" r="4.5"/>
       <path class="fm-arm" d="M-22 0 H 22"/>
-      <text class="fm-name" y="${GHALF + 20}">procurement gate</text>
+      <text class="fm-name" y="${GHALF + 20}">${t("node.gate")}</text>
       <text class="fm-out" id="fm-out" y="${GHALF + 36}"></text>
     </g>
 
@@ -250,11 +251,11 @@ export function mountFlowMap(host, facts = {}) {
       svg.dataset.halt = at;
       svg.dataset.tone = "danger";
       svg.dataset.failnode = at;
-      out.textContent = "failed";
+      out.textContent = t("verdict.failed");
       setTags({});
       svg.setAttribute("aria-label", `System map: protective action failed at the ${at} — retry available`);
       centerOn(at);
-      applyVList(NODE_ORDER.indexOf(at), "danger", at, "failed");
+      applyVList(NODE_ORDER.indexOf(at), "danger", at, t("verdict.failed"));
       return;
     }
     delete svg.dataset.failnode;

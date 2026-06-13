@@ -4,6 +4,7 @@
 
 import { short, txUrl, addrUrl, blockUrl } from "../data.mjs";
 import { STAGE } from "../machine.mjs";
+import { t } from "../i18n.mjs";
 
 // dimmed schematic of what a run WILL bind — fills the idle inspector well
 const SCAFFOLD = ["event", "tx", "block", "risk"]
@@ -11,10 +12,10 @@ const SCAFFOLD = ["event", "tx", "block", "risk"]
   .join("");
 
 const RISK = {
-  danger: { label: "high risk", tone: "danger" },
-  warning: { label: "policy violation", tone: "warning" },
-  success: { label: "clean path", tone: "success" },
-  info: { label: "monitored", tone: "info" },
+  danger: { key: "risk.danger", tone: "danger" },
+  warning: { key: "risk.warning", tone: "warning" },
+  success: { key: "risk.success", tone: "success" },
+  info: { key: "risk.info", tone: "info" },
 };
 
 // Which evidence values are on-chain entities that deep-link to the explorer:
@@ -35,12 +36,12 @@ const refFromLog = (item) => {
 
 export function mountInspector(host) {
   host.innerHTML = `
-    <h2 class="panel-title">Inspector</h2>
+    <h2 class="panel-title">${t("insp.title")}</h2>
     <div class="inspector-state" id="insState">
-      <span class="risk-pill" id="insRisk" data-tone="muted">idle</span>
-      <span class="inspector-title" id="insTitle">no active event</span>
+      <span class="risk-pill" id="insRisk" data-tone="muted">${t("insp.idle")}</span>
+      <span class="inspector-title" id="insTitle">${t("insp.noEvent")}</span>
     </div>
-    <p class="inspector-detail" id="insDetail">Select and run a scenario; each step binds to a verified evidence row.</p>
+    <p class="inspector-detail" id="insDetail">${t("insp.scaffold")}</p>
     <dl class="inspector-kv mono" id="insKv"></dl>
   `;
   const risk = host.querySelector("#insRisk");
@@ -52,20 +53,21 @@ export function mountInspector(host) {
     const step = ms.activeStep;
     if (!step) {
       risk.dataset.tone = "muted";
-      risk.textContent = "idle";
-      title.textContent = ms.scenario ? `${ms.scenario.title} — armed` : "no active event";
-      detail.textContent = ms.scenario?.lede ?? "Select and run a scenario; each step binds to a verified evidence row.";
+      risk.textContent = t("insp.idle");
+      title.textContent = ms.scenario ? `${ms.scenario.title}${t("insp.armedSuffix")}` : t("insp.noEvent");
+      detail.textContent = ms.scenario?.lede ?? t("insp.scaffold");
       kv.innerHTML = SCAFFOLD;
       return;
     }
-    const r = ms.stage === STAGE.failed ? { label: "execution failed", tone: "danger" } : RISK[step.tone ?? "info"];
+    const base = RISK[step.tone ?? "info"];
+    const r = ms.stage === STAGE.failed ? { label: t("risk.failed"), tone: "danger" } : { label: t(base.key), tone: base.tone };
     risk.dataset.tone = r.tone;
     risk.textContent = ms.stage === STAGE.failed ? r.label : (step.risk ?? r.label);
     title.textContent = step.title;
     detail.textContent = ms.stage === STAGE.failed ? (ms.error ?? "failed") : step.detail;
     if (ms.stage === STAGE.failed) {
       // don't show tx/block evidence under "execution failed" — the action never ran
-      kv.innerHTML = `<div><dt>evidence</dt><dd>not reached · step did not execute</dd></div>`;
+      kv.innerHTML = `<div><dt>evidence</dt><dd>${t("insp.notReached")}</dd></div>`;
       return;
     }
     const rows = Object.entries(step.evidence ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== "");
@@ -92,9 +94,9 @@ export function mountInspector(host) {
 
 export function mountLog(host, { machine }) {
   host.innerHTML = `
-    <h2 class="panel-title">Evidence log <button class="btn btn-ghost panel-clear" id="logClear" type="button" aria-label="Clear evidence log">clear</button></h2>
-    <ol class="log" id="logList" aria-label="Evidence log"></ol>
-    <p class="log-empty" id="logEmpty">log is empty — run a scenario</p>
+    <h2 class="panel-title">${t("log.title")} <button class="btn btn-ghost panel-clear" id="logClear" type="button" aria-label="${t("log.clear")}">${t("log.clear")}</button></h2>
+    <ol class="log" id="logList" aria-label="${t("log.title")}"></ol>
+    <p class="log-empty" id="logEmpty">${t("log.empty")}</p>
   `;
   const list = host.querySelector("#logList");
   const empty = host.querySelector("#logEmpty");

@@ -8,12 +8,14 @@ import { mountScenarioPanel, mountStageRail } from "./components/scenario.mjs";
 import { mountFlowMap } from "./components/flowmap.mjs";
 import { mountInspector, mountLog } from "./components/inspector.mjs";
 import { mountHeader, mountMetrics, mountDrawers, mountFooter, makeToast } from "./components/chrome.mjs";
+import { t, setLang, applyStaticI18n } from "./i18n.mjs";
 
 const qs = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
 
 async function boot() {
   mountSymbolSprite();
+  applyStaticI18n(); // translate static markup (loading text, help overlay) to the saved language
   const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
   document.body.dataset.motion = reduce ? "off" : "full";
 
@@ -65,8 +67,10 @@ async function boot() {
   machine.subscribe(applyAll);
 
   $("appHeader").addEventListener("click", (e) => {
+    const langBtn = e.target.closest(".lang-toggle [data-lang]");
+    if (langBtn) { setLang(langBtn.dataset.lang); return; } // persists + reloads in the chosen language
     if (e.target.closest("#sessionChip")) {
-      navigator.clipboard.writeText(model.sessionId).then(() => toast("session id copied"), () => toast(model.sessionId));
+      navigator.clipboard.writeText(model.sessionId).then(() => toast(t("toast.session")), () => toast(model.sessionId));
     }
     if (e.target.closest("#openJudge")) drawers.openJudge();
     if (e.target.closest("#openHashes")) drawers.openHashes();
@@ -80,8 +84,8 @@ async function boot() {
   $("helpHint").addEventListener("click", () => setHelp(true));
   document.addEventListener("keydown", (e) => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
-    const t = (e.target.tagName || "").toLowerCase();
-    if (t === "input" || t === "textarea" || e.target.isContentEditable) return;
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || e.target.isContentEditable) return;
     if (e.key === "?") { e.preventDefault(); setHelp(helpEl.hidden); return; }
     if (!helpEl.hidden) { if (e.key === "Escape") setHelp(false); return; }
     if (document.querySelector(".drawer.is-open")) return; // open drawers own their keys (Esc/Tab)
