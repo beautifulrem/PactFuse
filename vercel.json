@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "echo \"no dependencies needed for the static console build\"",
+  "buildCommand": "node scripts/build-console.mjs",
+  "outputDirectory": "dist",
+  "redirects": [
+    { "source": "/", "destination": "/apps/fusebox/live/", "permanent": false }
+  ]
+}

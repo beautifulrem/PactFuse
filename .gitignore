@@ -7,3 +7,12 @@ contracts/cache/
 contracts/out/
 *.log
 .DS_Store
+
+# AI / strategy working docs — kept locally, never published
+research/
+docs/strategy/
+docs/evidence/ai-handoff-*.md
+.claude/
+
+# deploy artifacts
+.vercel/
