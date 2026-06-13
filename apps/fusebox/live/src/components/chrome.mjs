@@ -116,6 +116,10 @@ export function mountDrawers(root, model, toast) {
     "attestation key": "hash.attestKey", "note": "hash.note",
   };
   const hashLabel = (k) => (HASH_LABEL[k] ? t(HASH_LABEL[k]) : k);
+  // contract names link to a contract literally named this, so keep the name and
+  // (in Chinese) prepend a readable label: 采购闸门(ProcurementGate)
+  const CONTRACT_KEY = { ProcurementGate: "node.gate", SourceStateRegistry: "node.registry", PaidArtifactMarket: "node.market", PaymentToken: "hash.token" };
+  const contractLabel = (name) => (getLang() === "zh" && CONTRACT_KEY[name] ? `${t(CONTRACT_KEY[name])}(${name})` : name);
   const SRC_STATE = ["unknown", "active", "challenged", "revoked"];
   const SPEND_STATE = ["unknown", "registered", "tripped", "settled"];
   const stateTone = (name) => ({ active: "success", settled: "success", registered: "info", challenged: "danger", revoked: "danger", tripped: "warning" }[name] ?? "muted");
@@ -134,7 +138,7 @@ export function mountDrawers(root, model, toast) {
             <div>
               <p class="jc-label">${jLabel(r)} <span class="mono">${sWord(r.status)} · ${aWord(r.authority)}</span></p>
               <p class="jc-reason">${jReason(r)}</p>
-              <p class="jc-ev mono">${t("jc.evidence")} ${short(r.evidenceEventId ?? "", 12, 6)}${JUDGE_TX[r.rowId] ? ` · <a href="${txUrl(JUDGE_TX[r.rowId])}" target="_blank" rel="noopener">${t("jc.viewTx")} ↗</a>` : ""}</p>
+              <p class="jc-ev mono">${t("jc.evidence")} ${short(r.evidenceEventId ?? "", 12, 6)}${JUDGE_TX[r.rowId] ? ` · <a href="${txUrl(JUDGE_TX[r.rowId])}" target="_blank" rel="noopener">${t("jc.viewTx")} ↗</a>` : ` · ${t("jc.offchain")}`}</p>
             </div>
           </div>`,
                 )
@@ -165,7 +169,7 @@ export function mountDrawers(root, model, toast) {
                 .map(
                   (c) => `
           <div class="hx-item">
-            <p class="hx-k mono">${c.name}</p>
+            <p class="hx-k mono">${contractLabel(c.name)}</p>
             <div class="hx-v"><a class="mono" href="${addrUrl(c.address)}" target="_blank" rel="noopener">${short(c.address, 8, 6)}</a>
             <button class="btn btn-ghost" type="button" data-copy="${c.address}" aria-label="Copy ${c.name} address">${icon("copy")}</button></div>
           </div>`,
