@@ -14,6 +14,7 @@ PactFuse re-checks what an agent is buying at the **instant of payment**, on-cha
 &nbsp;![Cobo Agentic Wallet track](https://img.shields.io/badge/Cobo_Agentic_Wallet-track-7c5cff)
 &nbsp;![Base Sepolia](https://img.shields.io/badge/Base_Sepolia-84532-2ea44f)
 &nbsp;![fail-closed](https://img.shields.io/badge/posture-fail--closed-1f6feb)
+&nbsp;[![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
 <br/>
 
@@ -263,19 +264,18 @@ The app never holds a raw private key; funds move only through CAW under an appr
 
 ---
 
-## 🤖 AI tools & third-party disclosure
+## 🔌 Third-party disclosure
 
 Per hackathon rules, everything external is declared.
 
 - **APIs / services**: Cobo Agentic Wallet API (`api.agenticwallet.cobo.com`); Base Sepolia public JSON-RPC; Cloudflare quick tunnels for the team-operated demo MCP / artifact endpoints; GitHub Actions for CI; Vercel for the console.
 - **SDKs / libraries**: `@cobo/agentic-wallet`, Hono, Zod, viem, `@noble/curves`, `@modelcontextprotocol/sdk`, pino, Vitest, Turborepo, pnpm, tsx, TypeScript, Foundry.
-- **AI tools**: large parts of this codebase were written with AI coding agents **under human direction**: OpenAI Codex (backend) and Anthropic Claude Code (review, release verification, frontend / console, this README). All behavior claims are backed by the machine-verifiable evidence above. The test suites, the fail-closed verifier, and the signed proof bundle are the source of truth, not authorship.
 
 ---
 
 ## 📄 License
 
-No license file is checked in yet; treat the repository as **all-rights-reserved** until a license is added.
+Released under the [MIT License](LICENSE).
 
 <div align="center">
 <br/>
