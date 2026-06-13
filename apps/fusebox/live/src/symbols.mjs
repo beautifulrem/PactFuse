@@ -50,6 +50,20 @@ const SYMBOLS = `
 <symbol id="sym-pulse" viewBox="0 0 24 24">
   <path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>
 </symbol>
+<symbol id="sym-wallet" viewBox="0 0 24 24">
+  <path d="M19 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-2"/>
+  <path d="M21 11h-5a2 2 0 0 0 0 4h5a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1z"/>
+</symbol>
+<symbol id="sym-registry" viewBox="0 0 24 24">
+  <ellipse cx="12" cy="5" rx="9" ry="3"/>
+  <path d="M3 5v6a9 3 0 0 0 18 0V5"/>
+  <path d="M3 11v6a9 3 0 0 0 18 0v-6"/>
+</symbol>
+<symbol id="sym-package" viewBox="0 0 24 24">
+  <path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/>
+  <path d="M3.3 7 12 12l8.7-5"/>
+  <path d="M12 22V12"/>
+</symbol>
 `;
 
 export function mountSymbolSprite() {

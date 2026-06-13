@@ -26,6 +26,7 @@
   --pending: #8b97ad;
   --provenance: #c9a86a;
   --provenance-bg: rgba(201, 168, 106, 0.08);
+  --fm-wire: rgba(233, 237, 244, 0.16); /* flow-map idle conduit */
 
   /* type */
   --font-display: "Big Shoulders Display", "Arial Narrow", system-ui, sans-serif;

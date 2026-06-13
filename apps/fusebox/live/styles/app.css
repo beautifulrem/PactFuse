@@ -175,100 +175,132 @@ a:hover { text-decoration: underline; }
 .stage-note[data-tone="success"] { color: var(--success); border-color: color-mix(in srgb, var(--success) 45%, transparent); background: var(--success-bg); }
 .stage-note[data-tone="warning"] { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent); background: var(--warning-bg); }
 
-/* ── flow map ─────────────────────────────────────────────────────────── */
-.flowmap { padding: var(--s4) var(--s5) 0; }
+/* ── flow map: the spend line ─────────────────────────────────────────── */
+.flowmap { padding: var(--s4) var(--s5) var(--s3); }
 .fm { width: 100%; height: auto; display: block; }
 .fm text { font-family: var(--font-mono); fill: var(--text-muted); }
-.fm-name { font-size: var(--fs-micro); letter-spacing: 0.08em; text-transform: uppercase; text-anchor: middle; }
-.fm-sub { font-size: var(--fs-tag); letter-spacing: 0.08em; text-anchor: middle; fill: var(--text-muted); }
-.fm-tag { font-size: var(--fs-tag); letter-spacing: 0.05em; text-anchor: start; fill: var(--text-secondary); }
-.fm-tag-out { font-size: var(--fs-tag-lg); text-anchor: middle; fill: var(--text-primary); }
+.fm-name { font-size: var(--fs-micro); letter-spacing: 0.1em; text-transform: uppercase; text-anchor: middle; fill: var(--text-secondary); transition: fill var(--dur-med); }
+.fm-sub { font-size: var(--fs-tag); letter-spacing: 0.06em; text-anchor: middle; fill: var(--text-muted); }
+.fm-tag { font-size: var(--fs-tag); letter-spacing: 0.04em; fill: var(--text-secondary); opacity: 0; transition: opacity var(--dur-med); }
+.fm-tag:not(:empty) { opacity: 1; }
+.fm-out { font-size: var(--fs-tag-lg); letter-spacing: 0.1em; text-transform: uppercase; text-anchor: middle; fill: var(--text-muted); opacity: 0; transition: opacity var(--dur-med), fill var(--dur-med); }
+.fm-out:not(:empty) { opacity: 1; }
+.fm-grid-dot { fill: var(--text-muted); opacity: 0.07; }
 
-.fm-shape { fill: var(--surface-muted); stroke: var(--border-strong); stroke-width: 1.5; transition: stroke var(--dur-med), fill var(--dur-med); }
-.fm-glyph { fill: none; stroke: var(--text-secondary); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; transition: stroke var(--dur-med); }
-.fm-dot { fill: var(--text-secondary); }
-.fm-path { fill: none; stroke: var(--border-strong); stroke-width: 1.5; }
-.fm-draw {
-  fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round;
-  stroke-dasharray: 100; stroke-dashoffset: 100;
-  transition: stroke-dashoffset var(--dur-slow) var(--ease-out), stroke var(--dur-med), opacity var(--dur-med);
-}
+/* nodes — one tile language for all five */
+.fm-node { transition: opacity var(--dur-med); } /* so the trip "unreached market" dim eases with its border */
+.fm-tile { fill: var(--surface-muted); stroke: var(--border-strong); stroke-width: 1.5; transition: stroke var(--dur-med), fill var(--dur-med); }
+.fm-ic { fill: none; stroke: var(--text-secondary); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; transition: stroke var(--dur-med), opacity var(--dur-med); }
 
-.fm-arm {
-  fill: none; stroke: var(--text-primary); stroke-width: 2.4; stroke-linecap: round;
-  transform-box: fill-box; transform-origin: left center;
-  transition: transform var(--dur-slow) var(--ease-spring), stroke var(--dur-med);
-}
+/* wires */
+.fm-wire { fill: none; stroke: var(--fm-wire); stroke-width: 2; stroke-linecap: round; transition: stroke var(--dur-med), stroke-width var(--dur-med), opacity var(--dur-med); }
+.fm-cut { fill: none; stroke: var(--danger); stroke-width: 2.2; stroke-linecap: round; opacity: 0; transition: opacity var(--dur-med); }
 
+/* the travelling spend — its resting node encodes the outcome */
+.fm-packet { transform: translate(var(--pk-x), var(--y-line)); opacity: 0; transition: transform var(--dur-slow) var(--ease-out), opacity var(--dur-med); }
+.fm[data-packet="on"] .fm-packet { opacity: 1; }
+.fm-packet-core { fill: var(--accent); transition: fill var(--dur-med); }
+.fm-packet-halo { fill: none; stroke: var(--accent); stroke-width: 1.5; opacity: 0.3; transform-box: fill-box; transform-origin: center; transition: stroke var(--dur-med), opacity var(--dur-med); }
+.fm[data-tone="success"] .fm-packet-core { fill: var(--success); } .fm[data-tone="success"] .fm-packet-halo { stroke: var(--success); }
+.fm[data-tone="warning"] .fm-packet-core { fill: var(--warning); } .fm[data-tone="warning"] .fm-packet-halo { stroke: var(--warning); }
+.fm[data-tone="danger"]  .fm-packet-core { fill: var(--danger);  } .fm[data-tone="danger"]  .fm-packet-halo { stroke: var(--danger);  }
+.fm[data-halt] .fm-packet-halo { opacity: 0.9; stroke-width: 2; }
+body[data-motion="full"] .fm[data-halt] .fm-packet-halo { animation: fm-halt 1.8s var(--ease-out) infinite; }
+@keyframes fm-halt { 0%, 100% { transform: scale(1); opacity: 0.9; } 50% { transform: scale(1.32); opacity: 0.35; } }
+
+/* registry watch beacon */
 .fm-beacon { opacity: 0; transition: opacity var(--dur-med); }
-.fm-beacon-core { fill: var(--warning); stroke: none; }
-.fm-beacon-ring {
-  fill: none; stroke: var(--warning); stroke-width: 1.5; opacity: 0.7;
-  transform-box: fill-box; transform-origin: center;
-}
+.fm-beacon-ring { fill: none; stroke: var(--warning); stroke-width: 1.5; opacity: 0.5; transform-box: fill-box; transform-origin: center; transition: opacity var(--dur-med); }
+.fm[data-flow^="trip"] .fm-beacon { opacity: 1; }
+.fm[data-flow="trip-done"] .fm-beacon-ring { opacity: 0.26; } /* calm once protected */
 body[data-motion="full"] .fm[data-flow="trip-challenge"] .fm-beacon-ring,
 body[data-motion="full"] .fm[data-flow="trip-detect"] .fm-beacon-ring,
-body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-beacon-ring { animation: beacon 1.6s var(--ease-out) infinite; }
-.fm[data-flow="trip-done"] .fm-beacon-ring { opacity: 0; }
-@keyframes beacon { from { transform: scale(0.4); opacity: 0.8; } to { transform: scale(1.6); opacity: 0; } }
+body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-beacon-ring { animation: fm-ping 1.9s var(--ease-out) infinite; }
+@keyframes fm-ping { from { transform: scale(0.62); opacity: 0.8; } to { transform: scale(1.5); opacity: 0; } }
 
-.fm-deny-ring { fill: none; stroke: var(--warning); stroke-width: 1.5; opacity: 0; transition: opacity var(--dur-med); }
-.fm-market-check { stroke-dasharray: 100; stroke-dashoffset: 100; transition: stroke-dashoffset var(--dur-slow) var(--ease-out) 120ms; }
+/* trip signal travelling down registry → breaker (the visible cause) */
+.fm-sig-pulse { fill: var(--warning); opacity: 0; transform-box: fill-box; transform-origin: center; }
+body[data-motion="full"] .fm[data-flow="trip-detect"] .fm-sig-pulse,
+body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-sig-pulse { animation: fm-sig 1.15s var(--ease-out) infinite; }
+@keyframes fm-sig { 0% { transform: translateY(0); opacity: 0; } 18% { opacity: 1; } 82% { opacity: 1; } 100% { transform: translateY(52px); opacity: 0; } }
 
-/* flow states: settle */
-.fm[data-flow^="settle"] #fm-d-ap { stroke-dashoffset: 0; }
-.fm[data-flow^="settle"] .fm-agent .fm-shape { stroke: var(--accent); }
-.fm[data-flow="settle-allow"] #fm-d-pg,
-.fm[data-flow="settle-pay"] #fm-d-pg,
-.fm[data-flow="settle-deliver"] #fm-d-pg,
-.fm[data-flow="settle-done"] #fm-d-pg { stroke-dashoffset: 0; }
-.fm[data-flow="settle-allow"] .fm-policy .fm-shape { stroke: var(--accent); }
-.fm[data-flow="settle-pay"] #fm-d-gm,
-.fm[data-flow="settle-deliver"] #fm-d-gm,
-.fm[data-flow="settle-done"] #fm-d-gm { stroke-dashoffset: 0; stroke: var(--success); }
-.fm[data-flow="settle-pay"] .fm-gate .fm-shape,
-.fm[data-flow="settle-deliver"] .fm-gate .fm-shape,
-.fm[data-flow="settle-done"] .fm-gate .fm-shape { stroke: var(--success); }
-.fm[data-flow="settle-pay"] .fm-arm,
-.fm[data-flow="settle-deliver"] .fm-arm,
-.fm[data-flow="settle-done"] .fm-arm { stroke: var(--success); }
-.fm[data-flow="settle-deliver"] .fm-market .fm-shape,
-.fm[data-flow="settle-done"] .fm-market .fm-shape { stroke: var(--success); }
-.fm[data-flow="settle-deliver"] .fm-market-check,
-.fm[data-flow="settle-done"] .fm-market-check { stroke-dashoffset: 0; stroke: var(--success); }
-
-/* flow states: trip */
-.fm[data-flow^="trip"] #fm-d-sig { stroke-dashoffset: 0; stroke: var(--warning); }
-.fm[data-flow^="trip"] .fm-registry .fm-shape { stroke: var(--warning); }
-.fm[data-flow^="trip"] .fm-beacon { opacity: 1; }
-.fm[data-flow="trip-detect"] .fm-gate .fm-shape { stroke: var(--warning); }
-.fm[data-flow="trip-cut"] .fm-gate .fm-shape,
-.fm[data-flow="trip-done"] .fm-gate .fm-shape { stroke: var(--danger); }
-.fm[data-flow="trip-cut"] .fm-arm,
-.fm[data-flow="trip-done"] .fm-arm { transform: rotate(-36deg); stroke: var(--danger); }
-.fm[data-flow="trip-cut"] #fm-p-gm,
-.fm[data-flow="trip-done"] #fm-p-gm { stroke-dasharray: 3 7; stroke: color-mix(in srgb, var(--danger) 55%, transparent); }
-.fm[data-flow="trip-cut"] .fm-market .fm-shape,
-.fm[data-flow="trip-done"] .fm-market .fm-shape { stroke: var(--border); }
-.fm[data-flow="trip-cut"] .fm-market .fm-glyph,
-.fm[data-flow="trip-done"] .fm-market .fm-glyph { stroke: var(--text-muted); opacity: 0.5; }
-.fm[data-flow="trip-cut"] .fm-tag-out { fill: var(--danger); }
-.fm[data-flow="trip-done"] .fm-tag-out { fill: var(--success); }
-
-/* flow states: deny */
-.fm[data-flow^="deny"] #fm-d-ap { stroke-dashoffset: 0; stroke: var(--warning); }
-.fm[data-flow^="deny"] .fm-agent .fm-shape { stroke: var(--warning); }
-.fm[data-flow="deny-check"] .fm-policy .fm-shape,
-.fm[data-flow="deny-block"] .fm-policy .fm-shape,
-.fm[data-flow="deny-done"] .fm-policy .fm-shape { stroke: var(--warning); }
-.fm[data-flow="deny-check"] .fm-deny-ring { opacity: 0.85; }
-body[data-motion="full"] .fm[data-flow="deny-check"] .fm-deny-ring { animation: beacon 1.4s var(--ease-out) infinite; transform-box: fill-box; transform-origin: center; }
+/* policy deny ring */
+.fm-deny-ring { fill: none; stroke: var(--warning); stroke-width: 1.5; opacity: 0; transform-box: fill-box; transform-origin: center; transition: opacity var(--dur-med); }
+.fm[data-flow="deny-check"] .fm-deny-ring { opacity: 0.9; }
+body[data-motion="full"] .fm[data-flow="deny-check"] .fm-deny-ring { animation: fm-ping 1.6s var(--ease-out) infinite; }
 .fm[data-flow="deny-block"] .fm-deny-ring, .fm[data-flow="deny-done"] .fm-deny-ring { opacity: 1; }
-.fm[data-flow="deny-block"] #fm-p-pg, .fm[data-flow="deny-done"] #fm-p-pg,
-.fm[data-flow="deny-block"] #fm-p-gm, .fm[data-flow="deny-done"] #fm-p-gm { opacity: 0.35; }
-.fm[data-flow="deny-block"] .fm-tag-out, .fm[data-flow="deny-done"] .fm-tag-out { fill: var(--warning); }
 
-.fm[data-stage="failed"] .fm-gate .fm-shape { stroke: var(--danger); stroke-dasharray: 4 4; }
+/* breaker mechanism (hero) */
+.fm-gate-ring { fill: none; stroke: var(--border); stroke-width: 1.5; opacity: 0; transition: stroke var(--dur-med), opacity var(--dur-med); }
+.fm-stub { fill: none; stroke: var(--text-secondary); stroke-width: 2.4; stroke-linecap: round; transition: stroke var(--dur-med), opacity var(--dur-med); }
+.fm-contact { fill: var(--text-secondary); transition: fill var(--dur-med); }
+.fm-arm { fill: none; stroke: var(--text-primary); stroke-width: 2.8; stroke-linecap: round; transform-box: fill-box; transform-origin: left center; transition: transform var(--dur-slow) var(--ease-spring), stroke var(--dur-med); }
+
+/* success check badge on the market */
+.fm-check { fill: none; stroke: var(--success); stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; opacity: 0; stroke-dasharray: 36; stroke-dashoffset: 36; transition: stroke-dashoffset var(--dur-slow) var(--ease-out) 120ms, opacity var(--dur-med); }
+
+/* deny no-entry badge on the policy wall (shape cue, not colour alone) */
+.fm-deny-badge { fill: none; stroke: var(--warning); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; opacity: 0; transition: opacity var(--dur-med); }
+.fm[data-flow^="deny"]:not([data-flow="deny-call"]) .fm-deny-badge { opacity: 1; }
+
+/* ── settle: clean source → pay & deliver ─────────────────────────────── */
+.fm[data-flow^="settle"] [data-node="wallet"] .fm-tile { stroke: var(--accent); }
+.fm[data-flow^="settle"] [data-node="wallet"] .fm-ic { stroke: var(--accent); }
+.fm[data-flow^="settle"] [data-seg="w1"] { stroke: var(--accent); }
+.fm[data-flow^="settle"]:not([data-flow="settle-approve"]) [data-node="policy"] .fm-tile { stroke: var(--accent); }
+.fm[data-flow^="settle"]:not([data-flow="settle-approve"]) [data-node="policy"] .fm-ic { stroke: var(--accent); }
+.fm[data-flow^="settle"]:not([data-flow="settle-approve"]) [data-seg="w2"] { stroke: var(--accent); }
+.fm[data-flow^="settle"]:not([data-flow="settle-approve"]):not([data-flow="settle-allow"]) [data-node="gate"] .fm-tile { stroke: var(--success); }
+.fm[data-flow^="settle"]:not([data-flow="settle-approve"]):not([data-flow="settle-allow"]) .fm-gate-ring { stroke: var(--success); opacity: 0.55; }
+.fm[data-flow^="settle"]:not([data-flow="settle-approve"]):not([data-flow="settle-allow"]) .fm-arm,
+.fm[data-flow^="settle"]:not([data-flow="settle-approve"]):not([data-flow="settle-allow"]) .fm-stub { stroke: var(--success); }
+.fm[data-flow^="settle"]:not([data-flow="settle-approve"]):not([data-flow="settle-allow"]) .fm-contact { fill: var(--success); }
+.fm[data-flow^="settle"]:not([data-flow="settle-approve"]):not([data-flow="settle-allow"]) [data-seg="w3"] { stroke: var(--success); }
+.fm[data-flow="settle-deliver"] [data-node="market"] .fm-tile, .fm[data-flow="settle-done"] [data-node="market"] .fm-tile { stroke: var(--success); }
+.fm[data-flow="settle-deliver"] [data-node="market"] .fm-ic, .fm[data-flow="settle-done"] [data-node="market"] .fm-ic { stroke: var(--success); }
+.fm[data-flow="settle-deliver"] .fm-check, .fm[data-flow="settle-done"] .fm-check { opacity: 1; stroke-dashoffset: 0; }
+.fm[data-flow="settle-deliver"] .fm-out, .fm[data-flow="settle-done"] .fm-out { fill: var(--success); }
+
+/* ── trip: unsafe source → breaker interrupts before payment ──────────── */
+.fm[data-flow^="trip"] [data-node="registry"] .fm-tile { stroke: var(--warning); }
+.fm[data-flow^="trip"] [data-node="registry"] .fm-ic { stroke: var(--warning); }
+.fm[data-flow^="trip"] [data-node="wallet"] .fm-tile { stroke: var(--warning); }
+.fm[data-flow^="trip"] [data-node="wallet"] .fm-ic { stroke: var(--warning); }
+.fm[data-flow^="trip"] [data-seg="w1"] { stroke: var(--warning); }
+.fm[data-flow^="trip"]:not([data-flow="trip-challenge"]) [data-node="policy"] .fm-tile { stroke: var(--warning); }
+.fm[data-flow^="trip"]:not([data-flow="trip-challenge"]) [data-node="policy"] .fm-ic { stroke: var(--warning); }
+.fm[data-flow^="trip"]:not([data-flow="trip-challenge"]) [data-seg="w2"] { stroke: var(--warning); }
+.fm[data-flow^="trip"]:not([data-flow="trip-challenge"]) [data-seg="sig"] { stroke: var(--warning); stroke-width: 2.4; }
+.fm[data-flow="trip-detect"] [data-node="gate"] .fm-tile { stroke: var(--warning); }
+.fm[data-flow="trip-cut"] [data-node="gate"] .fm-tile, .fm[data-flow="trip-done"] [data-node="gate"] .fm-tile { stroke: var(--danger); }
+.fm[data-flow="trip-cut"] .fm-gate-ring, .fm[data-flow="trip-done"] .fm-gate-ring { stroke: var(--danger); opacity: 1; }
+.fm[data-flow="trip-cut"] .fm-arm, .fm[data-flow="trip-done"] .fm-arm { transform: rotate(-42deg); stroke: var(--danger); }
+.fm[data-flow="trip-cut"] .fm-contact-out, .fm[data-flow="trip-done"] .fm-contact-out { fill: var(--danger); }
+.fm[data-flow="trip-cut"] .fm-stub-out, .fm[data-flow="trip-done"] .fm-stub-out { stroke: var(--danger); opacity: 0.3; }
+.fm[data-flow="trip-cut"] [data-seg="w3"], .fm[data-flow="trip-done"] [data-seg="w3"] { stroke: var(--danger); stroke-dasharray: 5 6; opacity: 0.4; }
+.fm[data-flow="trip-cut"] .fm-cut, .fm[data-flow="trip-done"] .fm-cut { opacity: 1; }
+.fm[data-flow="trip-cut"] [data-node="market"] .fm-tile, .fm[data-flow="trip-done"] [data-node="market"] .fm-tile { stroke: var(--border); }
+.fm[data-flow="trip-cut"] [data-node="market"] .fm-ic, .fm[data-flow="trip-done"] [data-node="market"] .fm-ic { stroke: var(--text-muted); }
+.fm[data-flow="trip-cut"] [data-node="market"], .fm[data-flow="trip-done"] [data-node="market"] { opacity: 0.4; } /* destination unreached */
+.fm[data-flow="trip-cut"] .fm-out { fill: var(--danger); }
+.fm[data-flow="trip-done"] .fm-out { fill: var(--success); }
+body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-gate-tile { animation: fm-flash 0.55s var(--ease-out) 1; }
+@keyframes fm-flash { 0% { fill: var(--surface-muted); } 28% { fill: color-mix(in srgb, var(--danger) 38%, var(--surface-muted)); } 100% { fill: var(--surface-muted); } }
+
+/* ── deny: wrong target → stopped at the policy wall ──────────────────── */
+.fm[data-flow^="deny"] [data-node="wallet"] .fm-tile { stroke: var(--warning); }
+.fm[data-flow^="deny"] [data-node="wallet"] .fm-ic { stroke: var(--warning); }
+.fm[data-flow^="deny"] [data-seg="w1"] { stroke: var(--warning); }
+.fm[data-flow^="deny"]:not([data-flow="deny-call"]) [data-node="policy"] .fm-tile { stroke: var(--warning); }
+.fm[data-flow^="deny"]:not([data-flow="deny-call"]) [data-node="policy"] .fm-ic { stroke: var(--warning); }
+.fm[data-flow="deny-block"] [data-seg="w2"], .fm[data-flow="deny-done"] [data-seg="w2"],
+.fm[data-flow="deny-block"] [data-seg="w3"], .fm[data-flow="deny-done"] [data-seg="w3"] { opacity: 0.28; }
+.fm[data-flow="deny-block"] .fm-out, .fm[data-flow="deny-done"] .fm-out { fill: var(--warning); }
+
+/* failed transport (?fail=1) — spend stranded at the step that could not run */
+.fm[data-stage="failed"][data-failnode="gate"] [data-node="gate"] .fm-tile,
+.fm[data-stage="failed"][data-failnode="policy"] [data-node="policy"] .fm-tile { stroke: var(--danger); stroke-dasharray: 4 4; }
+.fm[data-stage="failed"] .fm-out { fill: var(--danger); }
 
 /* ── insight row ──────────────────────────────────────────────────────── */
 .insight-row {
@@ -368,8 +400,8 @@ body[data-motion="full"] .fm[data-flow="deny-check"] .fm-deny-ring { animation: 
   .metric:nth-child(odd) { padding-left: 0; border-left: 0; }
   .insight-row { grid-template-columns: 1fr; }
   .inspector { border-right: 0; border-bottom: 1px solid var(--border); }
-  .flowmap { overflow-x: auto; }
-  .fm { min-width: 640px; }
+  .flowmap { overflow-x: auto; overscroll-behavior-x: contain; }
+  .fm { min-width: 720px; }
 }
 @media (max-width: 560px) {
   .shell { padding-left: var(--s4); padding-right: var(--s4); }
@@ -387,5 +419,12 @@ body[data-motion="full"] .fm[data-flow="deny-check"] .fm-deny-ring { animation: 
     transition-duration: 0.01ms !important;
   }
 }
-body[data-motion="off"] .fm-draw { transition: none; }
-body[data-motion="off"] .stage-dot, body[data-motion="off"] .fm-beacon-ring, body[data-motion="off"] .fm-deny-ring { animation: none !important; }
+body[data-motion="off"] .fm-packet, body[data-motion="off"] .fm-arm { transition: none; }
+body[data-motion="off"] .stage-dot,
+body[data-motion="off"] .fm-beacon-ring,
+body[data-motion="off"] .fm-deny-ring,
+body[data-motion="off"] .fm-sig-pulse,
+body[data-motion="off"] .fm-packet-halo { animation: none !important; }
+/* reduced-motion: the trip signal can't travel, so surface it statically on-wire */
+body[data-motion="off"] .fm[data-flow="trip-detect"] .fm-sig-pulse,
+body[data-motion="off"] .fm[data-flow="trip-cut"] .fm-sig-pulse { opacity: 0.9; }

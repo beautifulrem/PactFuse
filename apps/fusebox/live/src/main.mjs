@@ -35,6 +35,13 @@ async function boot() {
   const machine = createMachine();
   machine.setInstant(reduce);
 
+  // keep motion preference live: OS toggles mid-session update both the CSS
+  // gate (data-motion) and the machine's instant stepping.
+  matchMedia("(prefers-reduced-motion: reduce)").addEventListener("change", (e) => {
+    document.body.dataset.motion = e.matches ? "off" : "full";
+    machine.setInstant(e.matches);
+  });
+
   const toast = makeToast($("toast"));
   mountHeader($("appHeader"), model);
   mountMetrics($("metricStrip"), model);

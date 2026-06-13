@@ -37,7 +37,10 @@ const server = createServer(async (req, res) => {
     const info = await stat(file).catch(() => null);
     const target = info?.isDirectory() ? join(file, "index.html") : file;
     const body = await readFile(target);
-    res.writeHead(200, { "content-type": TYPES[extname(target)] ?? "application/octet-stream" });
+    res.writeHead(200, {
+      "content-type": TYPES[extname(target)] ?? "application/octet-stream",
+      "cache-control": "no-store", // local demo: always serve fresh modules/artifacts
+    });
     res.end(body);
   } catch {
     res.writeHead(404, { "content-type": "text/plain" }).end("not found");
