@@ -118,6 +118,8 @@ The pattern fits anywhere an autonomous payment depends on a source that some au
 - **Software / AI supply chain:** a package or model is flagged malicious (a CVE, a backdoor) right after it was pulled in. Bind the purchase to the artifact issuer's attestation and a revoked source refuses payment.
 - **Agentic commerce / A2A:** an agent pays a merchant or another agent that gets flagged fraudulent between cart and checkout, or is steered (via prompt injection) at an off-allowlist target. The freshness gate trips the first; the Pact policy denies the second before it reaches the chain.
 
+**Why AI agents especially.** An LLM agent is just the executor most likely to act on stale or fabricated facts: weak search, lagging knowledge, hallucinated citations, prompt injection. PactFuse downgrades an LLM's "looks safe" from a permission into a mere *intent*, and re-checks the source the instant money moves. Detection stays pluggable (CVE feeds, risk monitors, auditors, oracle health raise the challenge); enforcement is guaranteed (challenged source → no payment). *Search is not settlement-grade truth; LLM citations are not execution permissions.*
+
 The closest match to this repo's live demo is the supply-chain case: an agent buying a source-bound tool lease, where the source can be challenged before payment.
 
 ---
