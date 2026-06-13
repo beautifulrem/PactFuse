@@ -58,6 +58,12 @@ function deriveModel(pb) {
     ...trips.map((tp) => (tp.txHash ? { kind: "SpendTripped", txHash: tp.txHash, blockNumber: tp.blockNumber } : null)),
     challenge.txHash ? { kind: "SourceChallenged", txHash: challenge.txHash, blockNumber: challenge.blockNumber } : null,
   ].filter(Boolean);
+  // deployed Base Sepolia contracts (real /address entities), gate first
+  const contractOrder = ["ProcurementGate", "SourceStateRegistry", "PaidArtifactMarket", "PaymentToken"];
+  const onchainContracts = (rb.deploymentRegistry?.entries ?? [])
+    .filter((e) => e.address)
+    .map((e) => ({ name: e.contractName, address: e.address }))
+    .sort((a, b) => (contractOrder.indexOf(a.name) + 1 || 99) - (contractOrder.indexOf(b.name) + 1 || 99));
 
   const ev = (e) => ({ seq: e?.eventSeq, kind: e?.kind, at: e?.createdAt });
   const gate = settled.contractAddress;
@@ -251,7 +257,7 @@ function deriveModel(pb) {
       { label: t("metric.cawAudit"), value: auditCount },
     ],
     facts: { identity, allowance, settled, delta, challenge, lease, registry, gate, blocks },
-    onchain: { chainId: 84532, txs: onchainTxs },
+    onchain: { chainId: 84532, txs: onchainTxs, contracts: onchainContracts },
     scenarios,
   };
 }
@@ -280,7 +286,7 @@ export function fixtureModel() {
       { label: "caw audit rows", value: 0 },
     ],
     facts: {},
-    onchain: { chainId: 84532, txs: [] },
+    onchain: { chainId: 84532, txs: [], contracts: [] },
     scenarios: [
       {
         id: "trip",

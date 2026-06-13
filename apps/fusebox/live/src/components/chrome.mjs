@@ -2,7 +2,7 @@
  * and hash drawers, footer provenance line, toast. */
 
 import { icon } from "../symbols.mjs";
-import { short, fmt, txUrl } from "../data.mjs";
+import { short, fmt, txUrl, addrUrl } from "../data.mjs";
 import { t, getLang } from "../i18n.mjs";
 import { getHead, getTxBlock } from "../chain.mjs";
 
@@ -155,6 +155,20 @@ export function mountDrawers(root, model, toast) {
           )
           .join("")}
         ${model.attestation ? `<div class="hx-item"><p class="hx-k mono">${t("hash.attest")}</p><div class="hx-v"><code class="mono">sig ${short(model.attestation.signature, 16, 10)}</code></div></div>` : ""}
+        ${
+          model.onchain?.contracts?.length
+            ? `<p class="hx-sub mono">${t("hash.contracts")}</p>${model.onchain.contracts
+                .map(
+                  (c) => `
+          <div class="hx-item">
+            <p class="hx-k mono">${c.name}</p>
+            <div class="hx-v"><a class="mono" href="${addrUrl(c.address)}" target="_blank" rel="noopener">${short(c.address, 8, 6)}</a>
+            <button class="btn btn-ghost" type="button" data-copy="${c.address}" aria-label="Copy ${c.name} address">${icon("copy")}</button></div>
+          </div>`,
+                )
+                .join("")}`
+            : ""
+        }
       </div>
     </div>
     <div class="drawer" id="drawerSelfTest" role="dialog" aria-modal="true" aria-label="${t("drawer.selftest")}" hidden>

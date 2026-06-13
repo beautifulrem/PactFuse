@@ -627,6 +627,9 @@ body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-gate-tile { animation: fm
 .jc-ev { margin: 3px 0 0; color: var(--text-muted); font-size: var(--fs-micro); }
 
 .hx-item { padding: var(--s3) 0; border-bottom: 1px solid var(--border); }
+.hx-sub { margin: var(--s4) 0 0; color: var(--text-secondary); font-size: var(--fs-micro); letter-spacing: 0.12em; text-transform: uppercase; border-top: 1px solid var(--border); padding-top: var(--s3); }
+.hx-v a { color: var(--provenance); font-size: var(--fs-tag-lg); word-break: break-all; }
+.hx-v a:hover { text-decoration: underline; }
 .hx-k { margin: 0; font-size: var(--fs-micro); letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-muted); }
 .hx-v { display: flex; align-items: center; gap: var(--s2); margin-top: var(--s1); }
 .hx-v code { font-size: var(--fs-tag-lg); color: var(--provenance); word-break: break-all; }
