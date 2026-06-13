@@ -110,8 +110,11 @@ export function mountLog(host, { machine }) {
       li.className = "log-row";
       li.dataset.tone = item.tone;
       const time = new Date(item.at).toLocaleTimeString("en-GB", { hour12: false });
+      // item.href is an explicit explorer URL (e.g. an /address line); item.link
+      // is a bare tx hash kept for back-compat and resolved to /tx here.
+      const href = item.href ?? (item.link ? txUrl(item.link) : null);
       li.innerHTML = `<span class="log-time">${time}</span><span class="log-meta">${item.meta ?? ""}</span><span class="log-text">${
-        item.link ? `<a href="${txUrl(item.link)}" target="_blank" rel="noopener">${item.text}</a>` : item.text
+        href ? `<a href="${href}" target="_blank" rel="noopener">${item.text}</a>` : item.text
       }</span>`;
       list.append(li);
     }

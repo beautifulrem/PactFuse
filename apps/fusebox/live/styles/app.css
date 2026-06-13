@@ -31,6 +31,20 @@ a:hover { text-decoration: underline; }
   box-shadow: var(--shadow-focus);
 }
 
+/* ── modern, theme-matched scrollbars (replace the default OS bars) ───────── */
+* { scrollbar-width: thin; scrollbar-color: var(--alpha-border-strong) transparent; }
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--alpha-border-strong);
+  border: 4px solid transparent; /* insets + thins the visible thumb to ~4px */
+  border-radius: 999px;
+  background-clip: content-box;
+  transition: background var(--dur-fast);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--color-graphite-500); background-clip: content-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+
 .icon { width: 16px; height: 16px; stroke: currentColor; stroke-width: var(--icon-stroke); fill: none; stroke-linecap: round; flex: none; }
 
 .shell { max-width: var(--shell-max); margin: 0 auto; padding-left: var(--s5); padding-right: var(--s5); }
@@ -295,6 +309,9 @@ body[data-evidence] .provenance   { animation: rise var(--dur-enter) var(--ease-
 .fm-sub { font-size: var(--fs-tag); letter-spacing: 0.06em; text-anchor: middle; fill: var(--text-muted); }
 .fm-tag { font-size: var(--fs-tag); letter-spacing: 0.04em; fill: var(--text-secondary); opacity: 0; transition: opacity var(--dur-med); }
 .fm-tag:not(:empty) { opacity: 1; }
+/* a block-number caption that resolves to an explorer link */
+.fm a[href] { cursor: pointer; }
+.fm a[href]:hover .fm-tag { text-decoration: underline; fill: var(--accent); }
 .fm-out { font-size: var(--fs-out); font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; text-anchor: middle; fill: var(--text-muted); opacity: 0; transition: opacity var(--dur-med), fill var(--dur-med); }
 .fm-out:not(:empty) { opacity: 1; }
 .fm-grid-dot { fill: var(--text-muted); opacity: 0.07; }
@@ -470,7 +487,7 @@ body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-gate-tile { animation: fm
 .inspector-kv .is-ph dd { color: var(--text-muted); } /* idle scaffold: dimmed em-dash values */
 
 .logpanel { padding: var(--s4); display: grid; grid-template-rows: auto 1fr; gap: var(--s2); min-height: 0; }
-.log { list-style: none; margin: 0; padding: 0; overflow-y: auto; max-height: 240px; font-size: var(--fs-meta); }
+.log { list-style: none; margin: 0; padding: 0; overflow-y: auto; overscroll-behavior: contain; max-height: 240px; font-size: var(--fs-meta); }
 .log-row {
   display: grid; grid-template-columns: 64px 64px 1fr; gap: var(--s3);
   padding: 6px 2px; border-bottom: 1px solid var(--border);

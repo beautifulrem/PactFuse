@@ -123,7 +123,7 @@ function deriveModel(pb) {
           title: "Agent approves the gate through CAW",
           detail: "ERC20 approval signed inside the Pact policy boundary",
           evidence: { owner: allowance.owner, spender: allowance.spender }, // full addresses → /address links
-          log: [{ text: `caw approve · owner ${short(allowance.owner, 10, 4)}`, meta: "caw" }],
+          log: [{ text: `caw approve · owner ${short(allowance.owner, 10, 4)}`, meta: "caw", href: allowance.owner ? addrUrl(allowance.owner) : undefined }],
         },
         {
           stage: STAGE.detected,

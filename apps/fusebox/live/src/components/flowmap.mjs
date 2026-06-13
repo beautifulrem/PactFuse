@@ -17,7 +17,7 @@
  * is published to CSS as custom properties, so the packet never drifts from the
  * nodes it travels between. */
 
-import { short, fmt } from "../data.mjs";
+import { short, fmt, blockUrl } from "../data.mjs";
 import { STAGE } from "../machine.mjs";
 import { icon } from "../symbols.mjs";
 
@@ -132,7 +132,7 @@ export function mountFlowMap(host, facts = {}) {
 
     <!-- evidence tags, anchored to segments (computed, not magic) -->
     <g class="fm-tags" aria-hidden="true">
-      <text id="fm-tag-sig" class="fm-tag" x="${REG.x + 18}" y="${(REG.y + HALF + LINE_Y - GHALF) / 2 + 4}" text-anchor="start"></text>
+      <a id="fm-tag-sig-link" target="_blank" rel="noopener" tabindex="-1"><text id="fm-tag-sig" class="fm-tag" x="${REG.x + 18}" y="${(REG.y + HALF + LINE_Y - GHALF) / 2 + 4}" text-anchor="start"></text></a>
       <text id="fm-tag-pg"  class="fm-tag" x="${(X.policy + X.gate) / 2}" y="${LINE_Y - 18}" text-anchor="middle"></text>
       <text id="fm-tag-gm"  class="fm-tag" x="${(X.gate + X.market) / 2}" y="${LINE_Y - 18}" text-anchor="middle"></text>
     </g>
@@ -192,10 +192,19 @@ export function mountFlowMap(host, facts = {}) {
     host.scrollTo({ left, behavior: document.body.dataset.motion === "off" ? "auto" : "smooth" });
   }
 
-  function setTags({ sig = "", pg = "", gm = "" }) {
+  function setTags({ sig = "", pg = "", gm = "", sigBlock = null }) {
     tag("sig").textContent = sig;
     tag("pg").textContent = pg;
     tag("gm").textContent = gm;
+    // the registry→gate caption deep-links to its block when it names one
+    const sigLink = host.querySelector("#fm-tag-sig-link");
+    if (sigLink) {
+      if (sigBlock != null && String(sigBlock) !== "—" && String(sigBlock) !== "") {
+        sigLink.setAttribute("href", blockUrl(sigBlock));
+      } else {
+        sigLink.removeAttribute("href");
+      }
+    }
   }
 
   function apply(ms) {
@@ -253,11 +262,13 @@ export function mountFlowMap(host, facts = {}) {
     const f = facts ?? {};
     const sc = ms.scenario?.id;
     if (sc === "trip") {
+      const b = f.challenge?.blockNumber;
+      const tail = f.blocks?.slice(-2);
       setTags({
         "trip-challenge": { sig: "challenge submitted" },
-        "trip-detect": { sig: `finalized · block ${f.challenge?.blockNumber ?? "—"}` },
-        "trip-cut": { sig: `block ${f.challenge?.blockNumber ?? "—"}`, gm: "0 moved" },
-        "trip-done": { sig: `blocks ${f.blocks?.slice(-2).join(", ") ?? "—"}`, gm: "0 moved" },
+        "trip-detect": { sig: `finalized · block ${b ?? "—"}`, sigBlock: b },
+        "trip-cut": { sig: `block ${b ?? "—"}`, gm: "0 moved", sigBlock: b },
+        "trip-done": { sig: `blocks ${tail?.join(", ") ?? "—"}`, gm: "0 moved", sigBlock: tail?.at(-1) },
       }[flow] ?? {});
     } else if (sc === "settle") {
       const moved = fmt((f.delta?.marketAfter ?? 0) - (f.delta?.marketBefore ?? 0));
