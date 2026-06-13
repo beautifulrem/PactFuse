@@ -386,11 +386,14 @@ body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-sig-pulse { animation: fm
 .fm-contact { fill: var(--text-secondary); transition: fill var(--dur-med); }
 .fm-arm { fill: none; stroke: var(--text-primary); stroke-width: 2.8; stroke-linecap: round; transform-box: fill-box; transform-origin: left center; transition: transform var(--dur-slow) var(--ease-spring), stroke var(--dur-med); }
 
-/* success check badge on the market */
-.fm-check { fill: none; stroke: var(--success); stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; opacity: 0; stroke-dasharray: 36; stroke-dashoffset: 36; transition: stroke-dashoffset var(--dur-slow) var(--ease-out) 120ms, opacity var(--dur-med); }
-
-/* deny no-entry badge on the policy wall (shape cue, not colour alone) */
-.fm-deny-badge { fill: none; stroke: var(--warning); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; opacity: 0; transition: opacity var(--dur-med); }
+/* outcome corner pips — an opaque disc (covers the node outline beneath it, so
+   no tangled overlap) + a tone ring + a clear glyph. market ✓ / policy ✕. */
+.fm-check, .fm-deny-badge { opacity: 0; transition: opacity var(--dur-med); }
+.fm-badge-bg { fill: var(--background); stroke-width: 1.5; }
+.fm-check .fm-badge-bg { stroke: var(--success); }
+.fm-deny-badge .fm-badge-bg { stroke: var(--warning); }
+.fm-check-tick { fill: none; stroke: var(--success); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 26; stroke-dashoffset: 26; transition: stroke-dashoffset var(--dur-slow) var(--ease-out) 140ms; }
+.fm-deny-x { fill: none; stroke: var(--warning); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
 .fm[data-flow^="deny"]:not([data-flow="deny-call"]) .fm-deny-badge { opacity: 1; }
 
 /* ── mobile vertical re-stack (shown <560px; same state, index-driven) ──── */
@@ -431,7 +434,8 @@ body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-sig-pulse { animation: fm
 .fm[data-flow^="settle"]:not([data-flow="settle-approve"]):not([data-flow="settle-allow"]) [data-seg="w3"] { stroke: var(--success); }
 .fm[data-flow="settle-deliver"] [data-node="market"] .fm-tile, .fm[data-flow="settle-done"] [data-node="market"] .fm-tile { stroke: var(--success); }
 .fm[data-flow="settle-deliver"] [data-node="market"] .fm-ic, .fm[data-flow="settle-done"] [data-node="market"] .fm-ic { stroke: var(--success); }
-.fm[data-flow="settle-deliver"] .fm-check, .fm[data-flow="settle-done"] .fm-check { opacity: 1; stroke-dashoffset: 0; }
+.fm[data-flow="settle-deliver"] .fm-check, .fm[data-flow="settle-done"] .fm-check { opacity: 1; }
+.fm[data-flow="settle-deliver"] .fm-check-tick, .fm[data-flow="settle-done"] .fm-check-tick { stroke-dashoffset: 0; }
 .fm[data-flow="settle-deliver"] .fm-out, .fm[data-flow="settle-done"] .fm-out { fill: var(--success); }
 
 /* ── trip: unsafe source → breaker interrupts before payment ──────────── */

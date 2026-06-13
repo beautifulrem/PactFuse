@@ -135,9 +135,16 @@ export function mountFlowMap(host, facts = {}) {
       <text id="fm-tag-gm"  class="fm-tag" x="${(X.gate + X.market) / 2}" y="${LINE_Y - 18}" text-anchor="middle"></text>
     </g>
 
-    <!-- outcome badges: market delivered ✓ / policy denied ⊘ -->
-    <use class="fm-check" href="#sym-check" x="${X.market + HALF - 16}" y="${LINE_Y - HALF - 4}" width="22" height="22" aria-hidden="true"/>
-    <use class="fm-deny-badge" href="#sym-deny" x="${X.policy + HALF - 16}" y="${LINE_Y - HALF - 4}" width="22" height="22" aria-hidden="true"/>
+    <!-- outcome pips: market delivered ✓ / policy denied ✕ — opaque corner chips
+         that cleanly cover the node outline beneath them (no tangled overlap) -->
+    <g class="fm-check" aria-hidden="true">
+      <circle class="fm-badge-bg" cx="${X.market + HALF}" cy="${LINE_Y - HALF}" r="12"/>
+      <use class="fm-check-tick" href="#sym-check" x="${X.market + HALF - 9}" y="${LINE_Y - HALF - 9}" width="18" height="18"/>
+    </g>
+    <g class="fm-deny-badge" aria-hidden="true">
+      <circle class="fm-badge-bg" cx="${X.policy + HALF}" cy="${LINE_Y - HALF}" r="12"/>
+      <use class="fm-deny-x" href="#sym-close" x="${X.policy + HALF - 9}" y="${LINE_Y - HALF - 9}" width="18" height="18"/>
+    </g>
 
     <!-- top layer: the travelling spend + the trip signal -->
     <g class="fm-packet" aria-hidden="true">
