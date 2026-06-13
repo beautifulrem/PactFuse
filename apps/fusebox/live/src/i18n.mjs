@@ -57,6 +57,11 @@ const STR = {
     "node.gate": "procurement gate", "node.gateSub": "source-bound breaker",
     "node.market": "artifact market", "node.marketSub": "paid delivery",
     "node.registry": "source registry",
+    "tip.wallet": "The agent's Cobo Agentic Wallet. It can spend only within the owner's Pact policy.",
+    "tip.policy": "The Pact policy: the allowlist and spend limits the agent must stay inside.",
+    "tip.gate": "The on-chain circuit breaker. If the pinned source turns unsafe, it cuts the payment before any funds move.",
+    "tip.market": "Where the tool lease is delivered once a clean spend settles.",
+    "tip.registry": "Watches source freshness on-chain. A challenge raised here is what trips the gate.",
     "verdict.armed": "armed", "verdict.delivered": "delivered",
     "verdict.spendHalted": "spend halted", "verdict.denied": "denied", "verdict.failed": "failed",
 
@@ -143,6 +148,11 @@ const STR = {
     "node.gate": "采购闸门", "node.gateSub": "来源绑定断路器",
     "node.market": "Artifact 市场", "node.marketSub": "付费交付",
     "node.registry": "来源登记表",
+    "tip.wallet": "Agent 的 Cobo Agentic Wallet,只能在 owner 的 Pact 策略范围内支付。",
+    "tip.policy": "Pact 策略:规定 Agent 必须遵守的白名单与支付限额。",
+    "tip.gate": "链上断路器。钉住的来源一旦不安全,它会在资金转移前切断付款。",
+    "tip.market": "干净的支付结算后,工具租约在这里交付。",
+    "tip.registry": "在链上盯住来源新鲜度;这里发起的挑战会触发闸门熔断。",
     "verdict.armed": "已就绪", "verdict.delivered": "已交付",
     "verdict.spendHalted": "支付已熔断", "verdict.denied": "已拒绝", "verdict.failed": "失败",
 

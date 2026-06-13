@@ -161,12 +161,41 @@ export function mountFlowMap(host, facts = {}) {
       <span class="fm-vmain"><span class="fm-vname">${n.name}</span><span class="fm-vsub">${n.sub}</span></span>
       <span class="fm-vstate"></span>
     </li>`).join("")}
-  </ol>`;
+  </ol>
+  <div class="fm-tip" role="tooltip" aria-hidden="true"><b class="fm-tip-name"></b><span class="fm-tip-desc"></span></div>`;
 
   const svg = host.querySelector("svg");
   const out = host.querySelector("#fm-out");
   const tag = (id) => host.querySelector(`#fm-tag-${id}`);
   const vnodes = [...host.querySelectorAll(".fm-vnode")];
+
+  // Hover bubble: explain each node on mouseover. The tip keeps layout while
+  // hidden (opacity/visibility, not display:none), so it can be measured and
+  // positioned before it fades in — no flash at a stale spot.
+  const tip = host.querySelector(".fm-tip");
+  const tipName = tip.querySelector(".fm-tip-name");
+  const tipDesc = tip.querySelector(".fm-tip-desc");
+  function showTip(key, anchor) {
+    const desc = t(`tip.${key}`);
+    if (!desc || desc === `tip.${key}`) return; // no copy for this node
+    tipName.textContent = t(`node.${key}`);
+    tipDesc.textContent = desc;
+    const hostRect = host.getBoundingClientRect();
+    const r = anchor.getBoundingClientRect();
+    const cx = r.left - hostRect.left + host.scrollLeft + r.width / 2;
+    let top = r.top - hostRect.top - tip.offsetHeight - 10;
+    if (top < 4) top = r.bottom - hostRect.top + 10; // flip below if no room above
+    const half = tip.offsetWidth / 2;
+    tip.style.left = `${Math.max(half + 6, Math.min(host.clientWidth - half - 6, cx))}px`;
+    tip.style.top = `${top}px`;
+    tip.classList.add("is-shown");
+  }
+  const hideTip = () => tip.classList.remove("is-shown");
+  host.querySelectorAll(".fm-node").forEach((n) => {
+    if (!n.dataset.node) return;
+    n.addEventListener("mouseenter", () => showTip(n.dataset.node, n));
+    n.addEventListener("mouseleave", hideTip);
+  });
 
   // one-shot "power-up": draw the conduits in once on mount — never on state
   // changes, so it can't compound with the travelling spend. Uses real path
