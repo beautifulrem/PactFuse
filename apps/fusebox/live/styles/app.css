@@ -642,6 +642,9 @@ body[data-motion="full"] .fm[data-flow="trip-cut"] .fm-gate-tile { animation: fm
 .st-mark { font-family: var(--font-mono); font-size: var(--fs-body); color: var(--text-muted); }
 .st-row[data-state="pass"] .st-mark { color: var(--success); }
 .st-row[data-state="fail"] .st-mark { color: var(--danger); }
+.st-live { margin-top: var(--s4); border-top: 1px solid var(--border); padding-top: var(--s3); }
+.st-live-h { margin: 0 0 var(--s2); display: flex; flex-wrap: wrap; gap: var(--s2); align-items: baseline; color: var(--text-secondary); font-size: var(--fs-meta); }
+.st-live-sub { color: var(--text-muted); font-size: var(--fs-micro); }
 .st-summary { margin: var(--s4) 0 0; font-size: var(--fs-meta); color: var(--text-muted); }
 .st-summary[data-tone="success"] { color: var(--success); }
 .st-summary[data-tone="warning"] { color: var(--warning); }

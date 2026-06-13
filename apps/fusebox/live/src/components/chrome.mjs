@@ -4,6 +4,7 @@
 import { icon } from "../symbols.mjs";
 import { short, fmt } from "../data.mjs";
 import { t, getLang } from "../i18n.mjs";
+import { getHead, getTxBlock } from "../chain.mjs";
 
 export function mountHeader(host, model) {
   const claim = model.claim;
@@ -142,6 +143,10 @@ export function mountDrawers(root, model, toast) {
       <div class="drawer-body">
         <ol class="st-list" id="stList"></ol>
         <p class="st-summary mono" id="stSummary"></p>
+        <div class="st-live" id="stLive" hidden>
+          <p class="st-live-h mono">${t("st.live")} <span class="st-live-sub" id="stLiveSub">${t("st.liveSub")}</span></p>
+          <ol class="st-list" id="stLiveList"></ol>
+        </div>
       </div>
     </div>
     <div class="scrim" id="scrim" hidden></div>
@@ -233,6 +238,51 @@ export function mountDrawers(root, model, toast) {
       setTimeout(() => reveal(i + 1), instant ? 0 : 230);
     };
     reveal(0);
+    runLiveChecks();
+  }
+
+  // Live on-chain re-verification: re-fetch each real Base Sepolia tx from a
+  // public RPC right now (read-only, keyless), so the Network tab shows genuine
+  // chain reads and judges can see the replayed evidence is still confirmed.
+  async function runLiveChecks() {
+    const txs = model.onchain?.txs ?? [];
+    const wrap = root.querySelector("#stLive");
+    const list = root.querySelector("#stLiveList");
+    const sub = root.querySelector("#stLiveSub");
+    if (!txs.length) { wrap.hidden = true; return; }
+    wrap.hidden = false;
+    sub.textContent = t("st.liveChecking");
+    list.innerHTML = txs
+      .map((x) => `<li class="st-row" data-state="pending" data-tx="${x.txHash}"><i class="st-dot" aria-hidden="true"></i><span class="st-label">${x.kind} · ${short(x.txHash, 10, 6)}</span><span class="st-mark" aria-hidden="true"></span></li>`)
+      .join("");
+    let head;
+    try {
+      head = await getHead();
+    } catch {
+      sub.textContent = t("st.rpcError");
+      list.querySelectorAll(".st-row").forEach((r) => { r.dataset.state = "fail"; r.querySelector(".st-mark").textContent = "—"; });
+      return;
+    }
+    sub.textContent = t("st.head", { n: fmt(head) });
+    await Promise.all(txs.map(async (x) => {
+      const row = list.querySelector(`[data-tx="${x.txHash}"]`);
+      try {
+        const block = await getTxBlock(x.txHash);
+        if (block != null) {
+          const confs = Math.max(1, head - block + 1);
+          row.dataset.state = "pass";
+          row.querySelector(".st-mark").textContent = "✓";
+          row.querySelector(".st-label").textContent = `${x.kind} · ${short(x.txHash, 10, 6)} · ${t("st.confs", { c: fmt(confs) })}`;
+        } else {
+          row.dataset.state = "fail";
+          row.querySelector(".st-mark").textContent = "✕";
+          row.querySelector(".st-label").textContent = `${x.kind} · ${t("st.notFound")}`;
+        }
+      } catch {
+        row.dataset.state = "fail";
+        row.querySelector(".st-mark").textContent = "—";
+      }
+    }));
   }
 
   return {

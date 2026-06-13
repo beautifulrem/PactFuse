@@ -52,6 +52,12 @@ function deriveModel(pb) {
   const settleAmount = delta.marketAfter && delta.marketBefore ? Number(delta.marketAfter) - Number(delta.marketBefore) : 0;
   const judgeRows = rb.judgeCheck?.rows ?? [];
   const blocks = [challenge.blockNumber, settled.blockNumber, ...trips.map((t) => t.blockNumber)].filter(Boolean);
+  // the real Base Sepolia txs the console can re-verify live (read-only, keyless)
+  const onchainTxs = [
+    settled.txHash ? { kind: "SpendSettled", txHash: settled.txHash, blockNumber: settled.blockNumber } : null,
+    ...trips.map((tp) => (tp.txHash ? { kind: "SpendTripped", txHash: tp.txHash, blockNumber: tp.blockNumber } : null)),
+    challenge.txHash ? { kind: "SourceChallenged", txHash: challenge.txHash, blockNumber: challenge.blockNumber } : null,
+  ].filter(Boolean);
 
   const ev = (e) => ({ seq: e?.eventSeq, kind: e?.kind, at: e?.createdAt });
   const gate = settled.contractAddress;
@@ -245,6 +251,7 @@ function deriveModel(pb) {
       { label: t("metric.cawAudit"), value: auditCount },
     ],
     facts: { identity, allowance, settled, delta, challenge, lease, registry, gate, blocks },
+    onchain: { chainId: 84532, txs: onchainTxs },
     scenarios,
   };
 }
@@ -273,6 +280,7 @@ export function fixtureModel() {
       { label: "caw audit rows", value: 0 },
     ],
     facts: {},
+    onchain: { chainId: 84532, txs: [] },
     scenarios: [
       {
         id: "trip",

@@ -84,6 +84,10 @@ const STR = {
     "st.attest": "Ed25519 verifier attestation",
     "st.ok": "✓ all {n} checks passed · verified replay",
     "st.bad": "{p}/{n} checks passed · fixture / incomplete",
+    "st.live": "Live on-chain re-verification", "st.liveSub": "Base Sepolia · live read",
+    "st.liveChecking": "querying Base Sepolia…", "st.head": "chain head {n} · re-checked just now",
+    "st.confs": "{c} confirmations", "st.notFound": "not found on-chain",
+    "st.rpcError": "could not reach Base Sepolia RPC from this origin",
 
     "help.title": "Keyboard shortcuts",
     "help.r1": "Select risk scenario", "help.r2": "Run / retry the scenario",
@@ -175,6 +179,10 @@ const STR = {
     "st.attest": "Ed25519 验证器签名",
     "st.ok": "✓ 全部 {n} 项检查通过 · 已验证重放",
     "st.bad": "{p}/{n} 项检查通过 · fixture / 不完整",
+    "st.live": "链上实时复核", "st.liveSub": "Base Sepolia · 实时读取",
+    "st.liveChecking": "正在查询 Base Sepolia…", "st.head": "链头 {n} · 刚刚复核",
+    "st.confs": "{c} 个确认", "st.notFound": "链上未找到",
+    "st.rpcError": "无法从此来源访问 Base Sepolia RPC",
 
     "help.title": "键盘快捷键",
     "help.r1": "选择风险场景", "help.r2": "运行 / 重试场景",
