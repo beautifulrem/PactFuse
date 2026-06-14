@@ -157,7 +157,7 @@
     <p class="lead" style="margin-top:20px">面向 Agent 支付的<em>链上断路器</em>。付款那一刻重新验证来源,不安全就拦住,干净的才放行。</p>
     <div class="badges">
       <span class="pill">Base Sepolia · 84532</span>
-      <span class="pill">fail-closed</span>
+      <span class="pill">有疑必拦</span>
       <span class="pill">证据可现场复核</span>
     </div>
     <div class="stamp">3-5 min demo<br/>pactfuse-console.vercel.app</div>
@@ -276,37 +276,39 @@
 
   <!-- 3 · WHY EXISTING FALLS SHORT -->
   <section class="slide">
-    <div class="kicker">为什么现有做法不够</div>
-    <h2><span class="hl-c">检测</span> ≠ <span class="hl-g">强制</span></h2>
+    <div class="kicker">现有方案的盲区</div>
+    <h2><span class="hl-c">决策时</span> ≠ <span class="hl-g">付款时</span></h2>
     <div class="cols c2" style="align-items:center">
       <div>
         <ul class="clean">
-          <li><span class="dot c"></span><span><b>风控/打分/告警</b>:能发现风险,但只是"提醒",拦不住已经签出去的交易。</span></li>
-          <li><span class="dot c"></span><span><b>事后审计</b>:钱上链后才发现,链上<b class="hl-r">不可逆</b>。</span></li>
-          <li><span class="dot c"></span><span><b>搜索/检索结果</b>不是结算级真相,Agent 不该拿它直接付款。</span></li>
+          <li><span class="dot c"></span><span><b>Cobo CAW / Pact 白名单</b>:约束的是"Agent 能不能发起这笔操作"。这是<b>决策时</b>的安全。</span></li>
+          <li><span class="dot c"></span><span><b>LLM 风控 / 搜索判断</b>:Agent 用模型去查"这个供应商靠不靠谱"。但 LLM 的搜索能力有限,结果可以被投毒。也是<b>决策时</b>的事。</span></li>
+          <li><span class="dot r"></span><span>问题是:在 web3 上,<b class="hl-r">交易一旦提交就不可逆</b>。从 Agent 做决定到钱真正打出去,中间可能隔了几分钟,来源状态已经变了。</span></li>
+          <li><span class="dot g"></span><span>PactFuse 管的是<b class="hl-g">付款时</b>:在交易真正执行的那一刻,在链上重新检查。不依赖 LLM 的判断,用合约里的确定性逻辑。</span></li>
         </ul>
       </div>
       <div class="card">
-        <svg viewBox="0 0 460 230" style="width:100%">
+        <svg viewBox="0 0 460 280" style="width:100%">
           <defs><marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#8492a8"/></marker></defs>
-          <text x="14" y="40" fill="#82a0ff" font-family="var(--mono)" font-size="14">检测 · detect</text>
-          <rect x="14" y="54" width="120" height="44" rx="9" fill="none" stroke="#6488f4" stroke-width="1.6"/>
-          <text x="30" y="81" fill="#aab5c5" font-size="13" font-family="monospace">风险打分</text>
-          <path d="M138 76 H300" stroke="#8492a8" stroke-width="1.6" stroke-dasharray="5 5" marker-end="url(#ah)"/>
-          <text x="150" y="66" fill="#8492a8" font-size="12" font-family="monospace">只发告警</text>
-          <rect x="306" y="54" width="140" height="44" rx="9" fill="rgb(241 96 93/.12)" stroke="#f1605d" stroke-width="1.6"/>
-          <text x="322" y="81" fill="#f1605d" font-size="13" font-family="monospace">钱已上链 ✕</text>
-          <text x="14" y="150" fill="#2fd19d" font-family="monospace" font-size="14">强制 · enforce</text>
-          <rect x="14" y="164" width="120" height="44" rx="9" fill="none" stroke="#2fd19d" stroke-width="1.6"/>
-          <text x="24" y="191" fill="#aab5c5" font-size="13" font-family="monospace">链上闸门</text>
-          <path d="M138 186 H300" stroke="#2fd19d" stroke-width="2" marker-end="url(#ah)"/>
-          <text x="150" y="176" fill="#2fd19d" font-size="12" font-family="monospace">付款前熔断</text>
-          <rect x="306" y="164" width="140" height="44" rx="9" fill="rgb(47 209 157/.12)" stroke="#2fd19d" stroke-width="1.6"/>
-          <text x="322" y="191" fill="#2fd19d" font-size="13" font-family="monospace">0 资金转移 ✓</text>
+          <text x="14" y="30" fill="#82a0ff" font-family="monospace" font-size="14">决策时 · decision-time</text>
+          <text x="14" y="48" fill="#627087" font-family="monospace" font-size="11">其他项目和传统方案都在这一层</text>
+          <rect x="14" y="58" width="128" height="44" rx="9" fill="none" stroke="#6488f4" stroke-width="1.4"/>
+          <text x="26" y="85" fill="#aab5c5" font-size="13" font-family="monospace">LLM 判断</text>
+          <rect x="152" y="58" width="128" height="44" rx="9" fill="none" stroke="#6488f4" stroke-width="1.4"/>
+          <text x="164" y="85" fill="#aab5c5" font-size="13" font-family="monospace">Pact 白名单</text>
+          <rect x="290" y="58" width="156" height="44" rx="9" fill="none" stroke="#6488f4" stroke-width="1.4"/>
+          <text x="302" y="85" fill="#aab5c5" font-size="13" font-family="monospace">链下风控打分</text>
+          <path d="M230 114 V134" stroke="#dfa84d" stroke-width="1.4" stroke-dasharray="5 5"/>
+          <text x="120" y="148" fill="#dfa84d" font-family="monospace" font-size="12">↓ 中间可能过了几分钟,来源状态已经变了</text>
+          <text x="14" y="182" fill="#2fd19d" font-family="monospace" font-size="14">付款时 · payment-time</text>
+          <text x="14" y="200" fill="#627087" font-family="monospace" font-size="11">只有 PactFuse 在这一层</text>
+          <rect x="14" y="210" width="432" height="52" rx="10" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.8"/>
+          <text x="30" y="237" fill="#2fd19d" font-size="14" font-family="monospace" font-weight="600">链上合约 · sourceState 实时读取</text>
+          <text x="30" y="253" fill="#8492a8" font-size="11" font-family="monospace">不靠 LLM 判断 · 不怕投毒 · 确定性逻辑</text>
         </svg>
       </div>
     </div>
-    <p class="sub" style="margin-top:20px">行业趋势:OWASP、Visa、Mastercard 都在补<b class="hl-g">付款前的验证层</b>。PactFuse 做的就是这件事,而且直接用<em>链上合约</em>来执行,不靠人为审批。</p>
+    <p class="sub" style="margin-top:18px">大多数项目在研究怎么让 LLM 判断得更准,或者加链下限制。<em>但 LLM 本身就有搜索盲区,而且能被投毒</em>。PactFuse 换了一条路:不改进判断,直接在<b class="hl-g">链上执行层</b>加一道硬卡。</p>
   </section>
 
   <!-- 3b · POSITIONING QUADRANT -->
@@ -320,13 +322,13 @@
           <!-- axes -->
           <line x1="60" y1="340" x2="460" y2="340" stroke="#627087" stroke-width="1.4" marker-end="url(#aq)"/>
           <line x1="60" y1="340" x2="60" y2="30" stroke="#627087" stroke-width="1.4" marker-end="url(#aq)"/>
-          <text x="260" y="372" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">付款前 ← 介入时机 → 付款后</text>
-          <text x="20" y="190" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11" transform="rotate(-90 20 190)">检测 ← 强制力 → 强制</text>
+          <text x="260" y="372" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">决策时 ← 介入时机 → 付款时</text>
+          <text x="20" y="190" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11" transform="rotate(-90 20 190)">链下 ← 执行层 → 链上</text>
           <!-- quadrant labels -->
-          <text x="150" y="60" text-anchor="middle" fill="#2fd19d" font-family="monospace" font-size="12" font-weight="600">付款前 + 强制</text>
-          <text x="370" y="60" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">付款后 + 强制</text>
-          <text x="150" y="310" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">付款前 + 检测</text>
-          <text x="370" y="310" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">付款后 + 检测</text>
+          <text x="150" y="60" text-anchor="middle" fill="#2fd19d" font-family="monospace" font-size="12" font-weight="600">付款时 + 链上</text>
+          <text x="370" y="60" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">决策时 + 链上</text>
+          <text x="150" y="310" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">付款时 + 链下</text>
+          <text x="370" y="310" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">决策时 + 链下</text>
           <!-- dots -->
           <circle cx="370" cy="280" r="8" fill="rgb(100 136 244/.5)" stroke="#6488f4" stroke-width="1.6"/>
           <text x="390" y="285" fill="#8492a8" font-family="monospace" font-size="11">审计工具</text>
@@ -336,7 +338,7 @@
           <text x="360" y="145" fill="#8492a8" font-family="monospace" font-size="11">多签 / MPC</text>
           <circle cx="150" cy="100" r="14" fill="rgb(47 209 157/.3)" stroke="#2fd19d" stroke-width="2.4"/>
           <text x="170" y="96" fill="#2fd19d" font-family="monospace" font-size="13" font-weight="700">PactFuse</text>
-          <text x="170" y="112" fill="#8492a8" font-family="monospace" font-size="10">链上 fail-closed</text>
+          <text x="170" y="112" fill="#8492a8" font-family="monospace" font-size="10">链上 · 付款时</text>
           <!-- dividers -->
           <line x1="260" y1="36" x2="260" y2="340" stroke="#2a3648" stroke-width="1" stroke-dasharray="6 6"/>
           <line x1="60" y1="190" x2="460" y2="190" stroke="#2a3648" stroke-width="1" stroke-dasharray="6 6"/>
@@ -344,10 +346,10 @@
       </div>
       <div>
         <ul class="clean">
-          <li><span class="dot g"></span><span><b>左上角</b>:付款前介入 + 链上强制。只有 PactFuse 在这个位置。</span></li>
-          <li><span class="dot c"></span><span><b>风控/打分</b>:付款前能发现风险,但拦不住交易。</span></li>
-          <li><span class="dot c"></span><span><b>审计工具</b>:钱花完了才查,发现问题也追不回。</span></li>
-          <li><span class="dot c"></span><span><b>多签/MPC</b>:能拦交易,但不看来源是否安全,且通常在付款后结算阶段。</span></li>
+          <li><span class="dot g"></span><span><b>左上角</b>:付款时介入 + 链上判断。只有 PactFuse 在这个位置。</span></li>
+          <li><span class="dot c"></span><span><b>LLM 风控 / 打分</b>:决策时判断,链下执行。判断能力受限于 LLM,可被投毒。</span></li>
+          <li><span class="dot c"></span><span><b>审计工具</b>:决策时检查,但拦不住交易本身。</span></li>
+          <li><span class="dot c"></span><span><b>多签/MPC</b>:链上能拦,但只管"谁签了",不管"来源还安不安全"。</span></li>
         </ul>
       </div>
     </div>
@@ -357,13 +359,13 @@
   <section class="slide">
     <div class="kicker">解法</div>
     <h2>付款<span class="hl-r">前</span>,在链上<em>熔断</em></h2>
-    <p class="lead">PactFuse 是一个链上的断路器。在支付真正执行的那一刻,它会重新检查来源状态:不安全就<em>直接拦住</em>,一分钱都不会打出去。</p>
+    <p class="lead">别的方案管<b>决策时</b>,PactFuse 管<b class="hl-g">付款时</b>。在交易真正落地的那一刻,链上合约重新读来源状态:不安全就<em>直接拦住</em>,一分钱都不会打出去。</p>
     <div class="cols c3">
       <div class="card"><h3 class="hl-r">熔断</h3><p>来源被挑战 → 闸门跳开,所有钉住它的支付在付款前被切断。</p></div>
       <div class="card"><h3 class="hl-g">结算</h3><p>来源干净 → 在策略边界内授权、支付、交付 artifact。</p></div>
       <div class="card"><h3 class="hl-a">拒绝</h3><p>目标不在 Pact 白名单 → 任何东西上链前直接拒绝。</p></div>
     </div>
-    <p class="sub" style="margin-top:24px">设计原则是 fail-closed:查不到"安全"就不放行。宁可多拦一次,也不放过一笔有问题的付款。</p>
+    <p class="sub" style="margin-top:24px">设计原则:有疑必拦。合约查不到"来源安全"这个状态,交易就直接失败。宁可多拦一次,也不放过一笔有问题的付款。</p>
   </section>
 
   <!-- 5 · ARCHITECTURE -->
@@ -576,7 +578,7 @@
   <section class="slide cover">
     <div class="kicker">收尾</div>
     <h1 style="font-size:clamp(34px,5.6vw,82px)">先<span class="hl-r">熔断</span>,<br/>再谈付款。</h1>
-    <p class="lead" style="margin-top:22px">PactFuse 在付款前加了一道链上强制检查,而且所有证据都能当场验证。让 Agent 花钱这件事变得安全、可控、可审计。</p>
+    <p class="lead" style="margin-top:22px">别的方案在"决策时"帮 Agent 想清楚,PactFuse 在"付款时"帮它拦住。而且每一步证据都能当场验证。</p>
     <div class="badges">
       <span class="pill">github.com/beautifulrem/PactFuse</span>
       <span class="pill">pactfuse-console.vercel.app</span>
