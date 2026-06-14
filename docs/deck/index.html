@@ -206,13 +206,13 @@
   <section class="slide">
     <div class="kicker">问题</div>
     <h2>AI Agent 正在<span class="hl-r">自己花钱</span></h2>
-    <p class="lead">它能下单、签名、付款。可是它被骗了怎么办?它要买的东西在付款前一秒变了怎么办?<em>谁来拦?</em></p>
+    <p class="lead">它能下单、签名、付款。被骗了怎么办?买的东西变了怎么办?<em>谁来拦?</em></p>
     <div class="cols c3">
-      <div class="card"><h3><span class="dot r"></span>被注入</h3><p>提示注入让 Agent 把钱付给<b class="hl-r">错误的合约地址</b>,它自己不会怀疑。</p></div>
-      <div class="card"><h3><span class="dot a"></span>来源失效</h3><p>报价时来源是安全的,<b class="hl-a">付款前却被吊销/挑战</b>,钱照样打出去。</p></div>
-      <div class="card"><h3><span class="dot r"></span>付款拿不到货</h3><p>钱已上链,<b class="hl-r">交付却没发生</b>,链上不可逆。</p></div>
+      <div class="card"><h3><span class="dot r"></span>被注入</h3><p>付给<b class="hl-r">错误地址</b></p></div>
+      <div class="card"><h3><span class="dot a"></span>来源失效</h3><p><b class="hl-a">付款前被吊销</b></p></div>
+      <div class="card"><h3><span class="dot r"></span>没拿到货</h3><p>钱出去了,<b class="hl-r">不可逆</b></p></div>
     </div>
-    <p class="sub" style="margin-top:24px"><b class="hl-r">80%</b> 的组织踩过 agent 的坑(<a href="https://www.mckinsey.com/capabilities/mckinsey-digital/our-insights" target="_blank" rel="noopener" style="color:#627087;font-size:.82em">McKinsey ↗</a>)。链上交易没有"撤销"按钮,发现得再快也没用。</p>
+    <p class="sub" style="margin-top:24px"><b class="hl-r">80%</b> 的组织踩过 agent 的坑(<a href="https://www.mckinsey.com/capabilities/mckinsey-digital/our-insights" target="_blank" rel="noopener" style="color:#627087;font-size:.82em">McKinsey ↗</a>)。链上没有"撤销"按钮。</p>
   </section>
 
   <!-- 2b · CONCRETE SCENARIO STORY -->
@@ -221,11 +221,11 @@
     <h2>你的 Agent<em>买了一份过期数据</em></h2>
     <div class="cols c2" style="align-items:start;gap:clamp(20px,2.4vw,36px)">
       <div>
-        <p class="lead" style="margin-bottom:14px">你的交易 Agent 要从链上数据商买一份 24 小时实时行情喂价。</p>
+        <p class="lead" style="margin-bottom:14px">交易 Agent 从链上数据商买 24h 实时行情喂价。</p>
         <ul class="clean">
-          <li><span class="dot g"></span><span><b>调查时</b>:Agent 检查了供应商,Base 上有注册,数据质量评分正常,报价 500 mUSD / 24h。决定买入。</span></li>
-          <li><span class="dot a"></span><span><b>30 分钟后</b>:攻击者劫持了供应商的 API 端点,把真实行情替换成了操纵过的价格数据。链上监控者把该数据源标记为<b class="hl-r">Challenged</b>。</span></li>
-          <li><span class="dot r"></span><span><b>付款时</b>:Agent 还在用 30 分钟前的检查结果。它付了 500 mUSD,<b class="hl-r">拿到的是假行情</b>,接下来所有交易决策都建立在错误数据上。</span></li>
+          <li><span class="dot g"></span><span><b>调查时</b>:供应商 Base 注册,评分正常,500 mUSD / 24h。决定买。</span></li>
+          <li><span class="dot a"></span><span><b>30 分钟后</b>:API 被劫持,行情被替换。来源标记为<b class="hl-r">Challenged</b>。</span></li>
+          <li><span class="dot r"></span><span><b>付款时</b>:Agent 用旧结果付款。<b class="hl-r">500 mUSD 买到假行情</b>,后续决策全错。</span></li>
         </ul>
         <p class="sub" style="margin-top:14px">88% 的组织踩过这种坑。<a href="https://beam.ai/agentic-insights/ai-agent-security-breaches-2026-lessons" target="_blank" rel="noopener" style="color:var(--g500);font-size:.82em">beam.ai 2026 ↗</a></p>
       </div>
@@ -271,9 +271,9 @@
     <div class="cols c2" style="align-items:center">
       <div>
         <ul class="clean">
-          <li><span class="dot c"></span><span><b>白名单 / LLM / 风控</b>:管"能不能发起"这个操作</span></li>
-          <li><span class="dot r"></span><span>Web3 交易<b class="hl-r">没法撤</b>,中间那几分钟来源可能变了</span></li>
-          <li><span class="dot g"></span><span><b class="hl-g">PactFuse</b>:管"钱<b>真的打出去那一刻</b>"</span></li>
+          <li><span class="dot c"></span><span>白名单 / LLM / 风控 → 管"<b>能不能发起</b>"</span></li>
+          <li><span class="dot r"></span><span>Web3 交易<b class="hl-r">不可逆</b>,中间来源可能变了</span></li>
+          <li><span class="dot g"></span><span><b class="hl-g">PactFuse</b> → 管"<b>付的那一刻</b>"</span></li>
         </ul>
       </div>
       <div class="card">
@@ -301,7 +301,7 @@
         </svg>
       </div>
     </div>
-    <p class="sub" style="margin-top:16px">只靠 CAW 的链下判断和 LLM 的软限制,<em>无法解决链上数据源的问题。</em></p>
+    <p class="sub" style="margin-top:16px">链下判断 + LLM 软限制,<em>管不了链上数据源。</em></p>
   </section>
 
   <!-- 3b · WHY CAW + LLM ALONE CAN'T SOLVE IT -->
@@ -343,10 +343,10 @@
           <!-- the gap -->
           <rect x="40" y="230" width="400" height="56" rx="10" fill="rgb(241 96 93/.08)" stroke="#f1605d" stroke-width="1.4"/>
           <text x="60" y="254" fill="#f1605d" font-size="14" font-weight="600">✕ 管不了的事</text>
-          <text x="60" y="274" fill="#8492a8" font-size="11">"决策到付款"那几分钟,来源状态变了怎么办?</text>
+          <text x="60" y="274" fill="#8492a8" font-size="11">决策到付款之间,来源变了怎么办?</text>
 
-          <text x="60" y="322" fill="#627087" font-size="11">LLM 可以被投毒,搜索结果可以过期</text>
-          <text x="60" y="340" fill="#627087" font-size="11">白名单管"去哪",不管"去的那一刻还安不安全"</text>
+          <text x="60" y="322" fill="#627087" font-size="11">LLM 可被投毒 · 搜索可过期</text>
+          <text x="60" y="340" fill="#627087" font-size="11">白名单管"去哪",不管"还安不安全"</text>
 
           <!-- right: what PactFuse adds -->
           <rect x="500" y="16" width="540" height="340" rx="16" fill="rgb(47 209 157/.05)" stroke="#2fd19d" stroke-width="1.4"/>
@@ -404,10 +404,10 @@
       </div>
       <div>
         <ul class="clean">
-          <li><span class="dot g"></span><span><b>左上角</b>:付款时介入 + 链上判断。只有 PactFuse 在这个位置。</span></li>
-          <li><span class="dot c"></span><span><b>LLM 风控 / 打分</b>:决策时判断,链下执行。判断能力受限于 LLM,可被投毒。</span></li>
-          <li><span class="dot c"></span><span><b>审计工具</b>:决策时检查,但拦不住交易本身。</span></li>
-          <li><span class="dot c"></span><span><b>多签/MPC</b>:链上能拦,但只管"谁签了",不管"来源还安不安全"。</span></li>
+          <li><span class="dot g"></span><span><b>左上角</b>:付款时 + 链上。只有 PactFuse。</span></li>
+          <li><span class="dot c"></span><span><b>风控</b>:决策时,链下,可被投毒。</span></li>
+          <li><span class="dot c"></span><span><b>审计</b>:事后查,拦不住交易。</span></li>
+          <li><span class="dot c"></span><span><b>多签</b>:管"谁签",不管"来源安全"。</span></li>
         </ul>
       </div>
     </div>
@@ -487,10 +487,10 @@
     <h2>真实链上交易,<em>现场复核</em></h2>
     <div class="cols c2" style="align-items:center">
       <ul class="clean">
-        <li><span class="dot g"></span><span>所有声明均由<b>真实 Base Sepolia 交易</b>支撑,非模拟数据。</span></li>
-        <li><span class="dot c"></span><span>通过 eth_call 直接读取合约状态,<b class="hl-c">无需私钥,无需后端服务</b>。</span></li>
-        <li><span class="dot a"></span><span>每笔 tx 及合约地址均可<b>跳转至 Basescan 独立验证</b>。</span></li>
-        <li><span class="dot"></span><span>控制台仅作为<b>证据展示界面</b>,证明数据存储于链上。</span></li>
+        <li><span class="dot g"></span><span><b>真实 Base Sepolia 交易</b>,非模拟</span></li>
+        <li><span class="dot c"></span><span>eth_call 读合约状态,<b class="hl-c">无需私钥/后端</b></span></li>
+        <li><span class="dot a"></span><span>tx / 地址可<b>跳转 Basescan 验证</b></span></li>
+        <li><span class="dot"></span><span>控制台是展示窗口,<b>证据在链上</b></span></li>
       </ul>
       <div class="card mono" style="font-size:clamp(11px,1.05vw,15px);line-height:1.95">
         <div class="row" style="justify-content:space-between;margin-bottom:12px">
