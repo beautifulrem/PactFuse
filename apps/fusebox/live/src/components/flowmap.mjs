@@ -131,6 +131,7 @@ export function mountFlowMap(host, facts = {}) {
       <circle class="fm-contact" cx="-22" cy="0" r="4.5"/>
       <circle class="fm-contact fm-contact-out" cx="22" cy="0" r="4.5"/>
       <path class="fm-arm" d="M-22 0 H 22"/>
+      <g class="fm-spark" aria-hidden="true"><path d="M16 -2 l9 -8"/><path d="M16 -2 l12 4"/><path d="M16 -2 l-2 -13"/></g>
       <text class="fm-name" y="${GHALF + 20}">${t("node.gate")}</text>
       <text class="fm-out" id="fm-out" y="${GHALF + 36}"></text>
       ${addrLine(facts.nodeAddr?.gate, GHALF + 52)}
