@@ -64,6 +64,33 @@
   /* the architecture trip arrow flows downward while its slide is up */
   .slide.active .flow-arrow{animation:dashflow .9s linear infinite}
   @keyframes dashflow{to{stroke-dashoffset:-24}}
+  /* SVG diagram entrance: rects/circles fade+scale in, text fades in, staggered */
+  .slide.active .card svg rect,
+  .slide.active .card svg circle{animation:svgPop .5s var(--ez) both;transform-box:fill-box;transform-origin:center}
+  .slide.active .card svg text{animation:svgText .4s ease both}
+  .slide.active .card svg path[d*="H"],
+  .slide.active .card svg path[d*="V"],
+  .slide.active .card svg line{animation:svgLine .6s var(--ez) both}
+  /* stagger by element index via nth-of-type */
+  .slide.active .card svg rect:nth-of-type(1){animation-delay:.05s}
+  .slide.active .card svg rect:nth-of-type(2){animation-delay:.12s}
+  .slide.active .card svg rect:nth-of-type(3){animation-delay:.19s}
+  .slide.active .card svg rect:nth-of-type(4){animation-delay:.26s}
+  .slide.active .card svg rect:nth-of-type(5){animation-delay:.33s}
+  .slide.active .card svg rect:nth-of-type(6){animation-delay:.40s}
+  .slide.active .card svg text:nth-of-type(1){animation-delay:.08s}
+  .slide.active .card svg text:nth-of-type(2){animation-delay:.16s}
+  .slide.active .card svg text:nth-of-type(3){animation-delay:.24s}
+  .slide.active .card svg text:nth-of-type(4){animation-delay:.32s}
+  @keyframes svgPop{from{opacity:0;transform:scale(.85)}to{opacity:1;transform:none}}
+  @keyframes svgText{from{opacity:0}to{opacity:1}}
+  @keyframes svgLine{from{opacity:0;stroke-dasharray:200;stroke-dashoffset:200}to{opacity:1;stroke-dashoffset:0}}
+  /* SVG interactive hover: rects glow, text brightens */
+  .card svg rect[rx]{transition:filter .2s,stroke-width .2s;cursor:default}
+  .card svg rect[rx]:hover{filter:brightness(1.3) drop-shadow(0 0 6px currentColor);stroke-width:2.4}
+  .card svg text{transition:fill .2s}
+  .card svg g:hover text{fill:var(--g100)}
+
   /* concrete scenario: poison box pulses red, gap badge blinks amber */
   .slide.active .scene-poison{animation:scenePulse 2.2s ease-in-out infinite}
   @keyframes scenePulse{0%,100%{stroke:var(--red);filter:none}50%{stroke:#ff8472;filter:drop-shadow(0 0 8px rgb(241 96 93/.4))}}
@@ -182,13 +209,13 @@
     <h2>你的 Agent<em>买了一份过期数据</em></h2>
     <div class="cols c2" style="align-items:start;gap:clamp(20px,2.4vw,36px)">
       <div>
-        <p class="lead" style="margin-bottom:16px">你让 AI Agent 去买一份市场数据 API 的调用额度。</p>
+        <p class="lead" style="margin-bottom:14px">Agent 要买一份数据 API 额度。</p>
         <ul class="clean">
-          <li><span class="dot g"></span><span><b>Agent 调查了供应商</b>,数据源状态正常,报价合理。它决定买。</span></li>
-          <li><span class="dot a"></span><span>但在 Agent 做完调查到真正付款的<b>这 30 分钟里</b>,供应商的 API 端点被攻击者替换成了投毒数据。监控者已经把这个数据源标记为<b class="hl-r">不可信</b>。</span></li>
-          <li><span class="dot r"></span><span>Agent 不知道。它还在用 30 分钟前的"调查结果"。<b class="hl-r">钱照样打出去了</b>,买到的是一堆假数据,而且链上交易没法撤。</span></li>
+          <li><span class="dot g"></span><span><b>调查时</b>:供应商正常,报价合理。</span></li>
+          <li><span class="dot a"></span><span><b>30 分钟后</b>:API 被替换成投毒数据,来源被标记为<b class="hl-r">不可信</b>。</span></li>
+          <li><span class="dot r"></span><span><b>付款时</b>:Agent 用旧结果付款,<b class="hl-r">钱打出去了</b>,不可逆。</span></li>
         </ul>
-        <p class="sub" style="margin-top:18px">这不是假设。88% 运行 AI agent 的组织已经报告过类似安全事件。<span style="color:var(--g500);font-size:.82em">beam.ai 2026</span></p>
+        <p class="sub" style="margin-top:14px">88% 运行 AI agent 的组织报告过类似事件。<span style="color:var(--g500);font-size:.82em">beam.ai 2026</span></p>
       </div>
       <div class="card" style="padding:0;overflow:hidden">
         <svg viewBox="0 0 440 420" style="width:100%">
@@ -281,14 +308,13 @@
     <div class="cols c2" style="align-items:center">
       <div>
         <ul class="clean">
-          <li><span class="dot c"></span><span><b>Cobo CAW / Pact 白名单</b>:约束的是"Agent 能不能发起这笔操作"。这是<b>决策时</b>的安全。</span></li>
-          <li><span class="dot c"></span><span><b>LLM 风控 / 搜索判断</b>:Agent 用模型去查"这个供应商靠不靠谱"。但 LLM 的搜索能力有限,结果可以被投毒。也是<b>决策时</b>的事。</span></li>
-          <li><span class="dot r"></span><span>问题是:在 web3 上,<b class="hl-r">交易一旦提交就不可逆</b>。从 Agent 做决定到钱真正打出去,中间可能隔了几分钟,来源状态已经变了。</span></li>
-          <li><span class="dot g"></span><span>PactFuse 管的是<b class="hl-g">付款时</b>:在交易真正执行的那一刻,在链上重新检查。不依赖 LLM 的判断,用合约里的确定性逻辑。</span></li>
+          <li><span class="dot c"></span><span><b>CAW / LLM / 风控</b> → 管 Agent <b>能不能发起</b>操作(决策时)</span></li>
+          <li><span class="dot r"></span><span>Web3 交易<b class="hl-r">不可逆</b>,决策到付款之间来源可能已变</span></li>
+          <li><span class="dot g"></span><span><b class="hl-g">PactFuse</b> → 管钱<b>真正打出去的那一刻</b>(付款时)</span></li>
         </ul>
       </div>
       <div class="card">
-        <svg viewBox="0 0 460 280" style="width:100%">
+        <svg viewBox="0 0 500 280" style="width:100%">
           <defs><marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#8492a8"/></marker></defs>
           <text x="14" y="30" fill="#82a0ff" font-family="monospace" font-size="14">决策时 · decision-time</text>
           <text x="14" y="48" fill="#627087" font-family="monospace" font-size="11">其他项目和传统方案都在这一层</text>
@@ -296,19 +322,19 @@
           <text x="26" y="85" fill="#aab5c5" font-size="13" font-family="monospace">LLM 判断</text>
           <rect x="152" y="58" width="128" height="44" rx="9" fill="none" stroke="#6488f4" stroke-width="1.4"/>
           <text x="164" y="85" fill="#aab5c5" font-size="13" font-family="monospace">Pact 白名单</text>
-          <rect x="290" y="58" width="156" height="44" rx="9" fill="none" stroke="#6488f4" stroke-width="1.4"/>
+          <rect x="290" y="58" width="186" height="44" rx="9" fill="none" stroke="#6488f4" stroke-width="1.4"/>
           <text x="302" y="85" fill="#aab5c5" font-size="13" font-family="monospace">链下风控打分</text>
           <path d="M230 114 V134" stroke="#dfa84d" stroke-width="1.4" stroke-dasharray="5 5"/>
           <text x="120" y="148" fill="#dfa84d" font-family="monospace" font-size="12">↓ 中间可能过了几分钟,来源状态已经变了</text>
           <text x="14" y="182" fill="#2fd19d" font-family="monospace" font-size="14">付款时 · payment-time</text>
           <text x="14" y="200" fill="#627087" font-family="monospace" font-size="11">只有 PactFuse 在这一层</text>
-          <rect x="14" y="210" width="432" height="52" rx="10" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.8"/>
+          <rect x="14" y="210" width="472" height="52" rx="10" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.8"/>
           <text x="30" y="237" fill="#2fd19d" font-size="14" font-family="monospace" font-weight="600">链上合约 · sourceState 实时读取</text>
           <text x="30" y="253" fill="#8492a8" font-size="11" font-family="monospace">不靠 LLM 判断 · 不怕投毒 · 确定性逻辑</text>
         </svg>
       </div>
     </div>
-    <p class="sub" style="margin-top:18px">大多数项目在研究怎么让 LLM 判断得更准,或者加链下限制。<em>但 LLM 本身就有搜索盲区,而且能被投毒</em>。PactFuse 换了一条路:不改进判断,直接在<b class="hl-g">链上执行层</b>加一道硬卡。</p>
+    <p class="sub" style="margin-top:16px">别的项目改进判断,PactFuse 在<b class="hl-g">链上执行层</b>加硬卡。<em>LLM 有盲区、能被投毒,合约不会。</em></p>
   </section>
 
   <!-- 3b · POSITIONING QUADRANT -->
@@ -359,13 +385,13 @@
   <section class="slide">
     <div class="kicker">解法</div>
     <h2>付款<span class="hl-r">前</span>,在链上<em>熔断</em></h2>
-    <p class="lead">别的方案管<b>决策时</b>,PactFuse 管<b class="hl-g">付款时</b>。在交易真正落地的那一刻,链上合约重新读来源状态:不安全就<em>直接拦住</em>,一分钱都不会打出去。</p>
+    <p class="lead">别的方案管<b>决策时</b>,PactFuse 管<b class="hl-g">付款时</b>。交易落地那一刻,链上重新读来源状态,不安全就拦。</p>
     <div class="cols c3">
-      <div class="card"><h3 class="hl-r">熔断</h3><p>来源被挑战 → 闸门跳开,所有钉住它的支付在付款前被切断。</p></div>
-      <div class="card"><h3 class="hl-g">结算</h3><p>来源干净 → 在策略边界内授权、支付、交付 artifact。</p></div>
-      <div class="card"><h3 class="hl-a">拒绝</h3><p>目标不在 Pact 白名单 → 任何东西上链前直接拒绝。</p></div>
+      <div class="card"><h3 class="hl-r">熔断</h3><p>来源不安全 → 闸门跳开,0 转移</p></div>
+      <div class="card"><h3 class="hl-g">结算</h3><p>来源干净 → 授权、支付、交付</p></div>
+      <div class="card"><h3 class="hl-a">拒绝</h3><p>目标不在白名单 → 链下拒绝</p></div>
     </div>
-    <p class="sub" style="margin-top:24px">设计原则:有疑必拦。合约查不到"来源安全"这个状态,交易就直接失败。宁可多拦一次,也不放过一笔有问题的付款。</p>
+    <p class="sub" style="margin-top:20px">有疑必拦:查不到"安全",交易直接失败。</p>
   </section>
 
   <!-- 5 · ARCHITECTURE -->
@@ -473,17 +499,17 @@
       <div class="card"><div class="row"><span class="pill tone-r">TRIP · 熔断</span></div>
         <p style="margin-top:14px"><b>不安全来源 → 自动熔断</b></p>
         <div class="flow flow-r"><span>挑战</span><i>›</i><span>链上确认</span><i>›</i><span>闸门跳闸</span><i>›</i><b>0 转移</b></div>
-        <p>报价之后、付款之前,来源被标记为不安全。闸门自动跳开,关联的付款全部拦截。</p>
+        <p class="sub">闸门跳开,关联付款全部拦截。</p>
         <p class="mono hl-r" style="margin-top:10px">已保护 · 0 资金转移</p></div>
       <div class="card"><div class="row"><span class="pill tone-g">SETTLE · 结算</span></div>
         <p style="margin-top:14px"><b>新鲜来源 → 结算并交付</b></p>
         <div class="flow flow-g"><span>授权</span><i>›</i><span>额度↑</span><i>›</i><span>支付</span><i>›</i><b>交付 artifact</b></div>
-        <p>来源状态正常,在白名单额度内完成授权、支付,然后交付工具/数据。</p>
+        <p class="sub">额度内授权、支付、交付。</p>
         <p class="mono hl-g" style="margin-top:10px">已结算 · 转移 1,000 最小单位</p></div>
       <div class="card"><div class="row"><span class="pill tone-a">DENY · 拒绝</span></div>
         <p style="margin-top:14px"><b>错误目标 → 策略拒绝</b></p>
         <div class="flow flow-a"><span>错误目标</span><i>›</i><span>策略不符</span><i>›</i><span>链下拒绝</span><i>›</i><b>0 上链</b></div>
-        <p>Agent 要付款的合约地址不在白名单里,钱包直接拒绝,交易根本不会提交到链上。</p>
+        <p class="sub">钱包直接拒绝,不上链。</p>
         <p class="mono hl-a" style="margin-top:10px">已拒绝 · 从未触达链</p></div>
     </div>
     <p class="sub" style="margin-top:24px">控制台里按 <span class="mono">1 / 2 / 3</span> 选场景,按 <span class="mono">R</span> 运行。三条路走的是同一套代码和同一条支付线。</p>
