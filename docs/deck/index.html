@@ -64,6 +64,11 @@
   /* the architecture trip arrow flows downward while its slide is up */
   .slide.active .flow-arrow{animation:dashflow .9s linear infinite}
   @keyframes dashflow{to{stroke-dashoffset:-24}}
+  /* concrete scenario: poison box pulses red, gap badge blinks amber */
+  .slide.active .scene-poison{animation:scenePulse 2.2s ease-in-out infinite}
+  @keyframes scenePulse{0%,100%{stroke:var(--red);filter:none}50%{stroke:#ff8472;filter:drop-shadow(0 0 8px rgb(241 96 93/.4))}}
+  .slide.active .scene-gap{animation:gapBlink 1.6s ease-in-out infinite}
+  @keyframes gapBlink{0%,100%{opacity:1}50%{opacity:.5}}
 
   .kicker{font-family:var(--mono);font-size:clamp(11px,1.1vw,14px);letter-spacing:.24em;text-transform:uppercase;color:var(--brass);margin-bottom:18px}
   h1{font-family:var(--display);font-weight:800;text-transform:uppercase;letter-spacing:.01em;line-height:.96;
@@ -171,7 +176,57 @@
     <p class="sub" style="margin-top:24px"><b class="hl-r">80%</b> 的组织报告过 AI agent 的风险行为(McKinsey)。问题是:<em>交易一旦上链就没法撤销</em>,发现得再快,钱已经没了。<span style="color:#627087;font-size:.82em">来源:McKinsey · OWASP Agentic Top 10</span></p>
   </section>
 
-  <!-- 2b · ATTACK SEQUENCE -->
+  <!-- 2b · CONCRETE SCENARIO STORY -->
+  <section class="slide">
+    <div class="kicker">真实会发生的事</div>
+    <h2>你的 Agent<em>买了一份过期数据</em></h2>
+    <div class="cols c2" style="align-items:start;gap:clamp(20px,2.4vw,36px)">
+      <div>
+        <p class="lead" style="margin-bottom:16px">你让 AI Agent 去买一份市场数据 API 的调用额度。</p>
+        <ul class="clean">
+          <li><span class="dot g"></span><span><b>Agent 调查了供应商</b>,数据源状态正常,报价合理。它决定买。</span></li>
+          <li><span class="dot a"></span><span>但在 Agent 做完调查到真正付款的<b>这 30 分钟里</b>,供应商的 API 端点被攻击者替换成了投毒数据。监控者已经把这个数据源标记为<b class="hl-r">不可信</b>。</span></li>
+          <li><span class="dot r"></span><span>Agent 不知道。它还在用 30 分钟前的"调查结果"。<b class="hl-r">钱照样打出去了</b>,买到的是一堆假数据,而且链上交易没法撤。</span></li>
+        </ul>
+        <p class="sub" style="margin-top:18px">这不是假设。88% 运行 AI agent 的组织已经报告过类似安全事件。<span style="color:var(--g500);font-size:.82em">beam.ai 2026</span></p>
+      </div>
+      <div class="card" style="padding:0;overflow:hidden">
+        <svg viewBox="0 0 440 420" style="width:100%">
+          <g font-family="monospace" font-size="12">
+            <!-- t0: investigation -->
+            <text x="32" y="34" fill="#627087" font-size="11">Agent 的视角</text>
+            <rect x="24" y="48" width="392" height="72" rx="12" fill="rgb(47 209 157/.08)" stroke="#2fd19d" stroke-width="1.4"/>
+            <text x="40" y="74" fill="#2fd19d" font-size="14" font-weight="600">✓ 调查:一切正常</text>
+            <text x="40" y="96" fill="#8492a8">供应商状态 Active · 报价 500 mUSD · 白名单 ✓</text>
+            <!-- gap: 30 min -->
+            <rect class="scene-gap" x="190" y="134" width="60" height="28" rx="6" fill="rgb(223 168 77/.15)" stroke="#dfa84d" stroke-width="1.2"/>
+            <text x="220" y="153" text-anchor="middle" fill="#dfa84d" font-size="11" font-weight="600">30 分钟</text>
+            <line x1="220" y1="120" x2="220" y2="134" stroke="#dfa84d" stroke-width="1.2" stroke-dasharray="3 3"/>
+            <line x1="220" y1="162" x2="220" y2="178" stroke="#dfa84d" stroke-width="1.2" stroke-dasharray="3 3"/>
+            <!-- t1: reality changed (animated) -->
+            <text x="32" y="194" fill="#627087" font-size="11">真实世界(Agent 不知道)</text>
+            <rect class="scene-poison" x="24" y="208" width="392" height="72" rx="12" fill="rgb(241 96 93/.08)" stroke="#f1605d" stroke-width="1.4"/>
+            <text x="40" y="234" fill="#f1605d" font-size="14" font-weight="600">✕ 来源已被投毒</text>
+            <text x="40" y="256" fill="#8492a8">API 端点被替换 · 监控者标记 Challenged · 数据不可信</text>
+            <!-- t2: payment -->
+            <text x="32" y="310" fill="#627087" font-size="11">付款时刻</text>
+            <!-- without -->
+            <rect x="24" y="322" width="186" height="80" rx="12" fill="rgb(241 96 93/.08)" stroke="#f1605d" stroke-width="1.4"/>
+            <text x="36" y="348" fill="#f1605d" font-size="13" font-weight="600">没有 PactFuse</text>
+            <text x="36" y="368" fill="#8492a8" font-size="11">钱打出去了,买到假数据</text>
+            <text x="36" y="386" fill="#f1605d" font-size="13">💸 不可逆</text>
+            <!-- with -->
+            <rect x="230" y="322" width="186" height="80" rx="12" fill="rgb(47 209 157/.08)" stroke="#2fd19d" stroke-width="1.4"/>
+            <text x="242" y="348" fill="#2fd19d" font-size="13" font-weight="600">有 PactFuse</text>
+            <text x="242" y="368" fill="#8492a8" font-size="11">付款前重新读链上状态</text>
+            <text x="242" y="386" fill="#2fd19d" font-size="13">🛡 拦住了,0 损失</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2c · ATTACK SEQUENCE -->
   <section class="slide">
     <div class="kicker">攻击是怎么发生的</div>
     <h2>一次典型的<em>来源投毒攻击</em></h2>
