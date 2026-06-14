@@ -310,7 +310,72 @@
     <p class="sub" style="margin-top:16px">别人想办法让 AI 判断更准,我们直接在合约里卡。<em>AI 可以被骗,合约骗不了。</em></p>
   </section>
 
-  <!-- 3b · POSITIONING QUADRANT -->
+  <!-- 3b · WHY CAW + LLM ALONE CAN'T SOLVE IT -->
+  <section class="slide">
+    <div class="kicker">为什么光靠 CAW + LLM 不行</div>
+    <h2>它们管得了<span class="hl-c">决策</span>,管不了<span class="hl-r">付款那一秒</span></h2>
+    <div class="card" style="margin-top:14px">
+      <svg class="caw-svg" viewBox="0 0 960 370" style="width:100%">
+        <g font-family="monospace">
+          <!-- left: CAW + LLM (what they do) -->
+          <rect x="20" y="16" width="440" height="340" rx="16" fill="rgb(100 136 244/.05)" stroke="#6488f4" stroke-width="1.4" stroke-dasharray="6 6"/>
+          <text x="40" y="46" fill="#82a0ff" font-size="15" font-weight="600">Cobo CAW + LLM 风控</text>
+          <text x="40" y="68" fill="#627087" font-size="12">决策时做的事(都很有用,但不够)</text>
+
+          <g class="caw-item">
+          <rect x="40" y="86" width="180" height="54" rx="10" fill="none" stroke="#6488f4" stroke-width="1.2"/>
+          <text x="56" y="110" fill="#aab5c5" font-size="13">✓ Pact 白名单</text>
+          <text x="56" y="128" fill="#627087" font-size="10">限制 Agent 能调哪些合约</text>
+          </g>
+
+          <g class="caw-item">
+          <rect x="240" y="86" width="200" height="54" rx="10" fill="none" stroke="#6488f4" stroke-width="1.2"/>
+          <text x="256" y="110" fill="#aab5c5" font-size="13">✓ MPC 多方签名</text>
+          <text x="256" y="128" fill="#627087" font-size="10">没有合法签名,交易发不出</text>
+          </g>
+
+          <g class="caw-item">
+          <rect x="40" y="156" width="180" height="54" rx="10" fill="none" stroke="#6488f4" stroke-width="1.2"/>
+          <text x="56" y="180" fill="#aab5c5" font-size="13">✓ LLM 搜索判断</text>
+          <text x="56" y="198" fill="#627087" font-size="10">查供应商靠不靠谱</text>
+          </g>
+
+          <g class="caw-item">
+          <rect x="240" y="156" width="200" height="54" rx="10" fill="none" stroke="#6488f4" stroke-width="1.2"/>
+          <text x="256" y="180" fill="#aab5c5" font-size="13">✓ Kill Switch</text>
+          <text x="256" y="198" fill="#627087" font-size="10">人工紧急冻结</text>
+          </g>
+
+          <!-- the gap -->
+          <rect x="40" y="230" width="400" height="56" rx="10" fill="rgb(241 96 93/.08)" stroke="#f1605d" stroke-width="1.4"/>
+          <text x="60" y="254" fill="#f1605d" font-size="14" font-weight="600">✕ 管不了的事</text>
+          <text x="60" y="274" fill="#8492a8" font-size="11">"决策到付款"那几分钟,来源状态变了怎么办?</text>
+
+          <text x="60" y="322" fill="#627087" font-size="11">LLM 可以被投毒,搜索结果可以过期</text>
+          <text x="60" y="340" fill="#627087" font-size="11">白名单管"去哪",不管"去的那一刻还安不安全"</text>
+
+          <!-- right: what PactFuse adds -->
+          <rect x="500" y="16" width="440" height="340" rx="16" fill="rgb(47 209 157/.05)" stroke="#2fd19d" stroke-width="1.4"/>
+          <text x="520" y="46" fill="#2fd19d" font-size="15" font-weight="600">+ PactFuse</text>
+          <text x="520" y="68" fill="#627087" font-size="12">补上"付款那一秒"的检查</text>
+
+          <rect x="520" y="90" width="400" height="70" rx="12" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.6"/>
+          <text x="540" y="118" fill="#2fd19d" font-size="14" font-weight="600">链上合约读 sourceState</text>
+          <text x="540" y="140" fill="#8492a8" font-size="12">交易执行的那一刻,合约自己检查。不是 Active 就 revert</text>
+
+          <rect x="520" y="178" width="400" height="50" rx="12" fill="none" stroke="#2fd19d" stroke-width="1.2"/>
+          <text x="540" y="206" fill="#aab5c5" font-size="13">不依赖 LLM,不怕投毒,骗不了</text>
+
+          <rect x="520" y="246" width="400" height="50" rx="12" fill="none" stroke="#2fd19d" stroke-width="1.2"/>
+          <text x="540" y="274" fill="#aab5c5" font-size="13">和 CAW 配合:CAW 管"能不能发起",PactFuse 管"能不能完成"</text>
+
+          <text x="520" y="332" fill="#2fd19d" font-size="13" font-weight="600">CAW + PactFuse = 决策到付款全覆盖</text>
+        </g>
+      </svg>
+    </div>
+  </section>
+
+  <!-- 3c · POSITIONING QUADRANT -->
   <section class="slide">
     <div class="kicker">我们在哪</div>
     <h2>PactFuse 的<em>定位</em></h2>
