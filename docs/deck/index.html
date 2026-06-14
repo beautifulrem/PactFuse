@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>PactFuse · 演示 Deck</title>
+<link rel="icon" type="image/svg+xml" href="../../apps/fusebox/live/icons/icon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --bg:#07090d; --g950:#0a0d12; --g900:#111720; --g850:#151d29; --g800:#1c2634; --g700:#2a3648;
+    --g500:#627087; --g400:#8492a8; --g300:#aab5c5; --g100:#edf2f8;
+    --cobalt:#6488f4; --cobalt2:#82a0ff; --emerald:#2fd19d; --amber:#dfa84d; --red:#f1605d; --brass:#d1b16e;
+    --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+    --sans:"IBM Plex Sans","Helvetica Neue",system-ui,sans-serif;
+    --display:"Big Shoulders Display","Arial Narrow",var(--sans);
+    --border:rgb(237 242 248 / .10); --border2:rgb(237 242 248 / .18); --hair:rgb(237 242 248 / .055);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:
+      radial-gradient(1100px 540px at 8% -10%, color-mix(in srgb,var(--brass) 12%,transparent), transparent 60%),
+      radial-gradient(960px 480px at 96% -12%, color-mix(in srgb,var(--cobalt) 11%,transparent), transparent 58%),
+      radial-gradient(900px 600px at 78% 118%, color-mix(in srgb,var(--red) 7%,transparent), transparent 60%),
+      linear-gradient(90deg,transparent 0 25px,var(--hair) 26px),
+      linear-gradient(180deg,transparent 0 25px,var(--hair) 26px),
+      var(--bg);
+    background-size:auto,auto,auto,26px 26px,26px 26px,auto;
+    color:var(--g100); font-family:var(--sans); overflow:hidden;
+  }
+  /* film grain */
+  body::after{content:"";position:fixed;inset:0;z-index:60;pointer-events:none;opacity:.04;mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");}
+
+  .deck{position:relative;height:100dvh;width:100vw}
+  .slide{position:absolute;inset:0;display:none;flex-direction:column;justify-content:center;
+    padding:clamp(28px,5.2vw,90px);opacity:0;transition:opacity .42s ease}
+  .slide.active{display:flex;opacity:1;animation:fade .5s ease both}
+  @keyframes fade{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+
+  .kicker{font-family:var(--mono);font-size:clamp(11px,1.1vw,14px);letter-spacing:.24em;text-transform:uppercase;color:var(--brass);margin-bottom:18px}
+  h1{font-family:var(--display);font-weight:800;text-transform:uppercase;letter-spacing:.01em;line-height:.96;
+    font-size:clamp(40px,7vw,104px)}
+  h2{font-family:var(--display);font-weight:700;text-transform:uppercase;letter-spacing:.012em;line-height:1.0;
+    font-size:clamp(30px,4.6vw,62px);margin-bottom:8px}
+  .lead{color:var(--g300);font-size:clamp(16px,1.7vw,25px);line-height:1.5;max-width:30ch}
+  .sub{color:var(--g400);font-size:clamp(13px,1.25vw,18px);line-height:1.55}
+  em{font-style:normal;color:var(--brass)}
+  .hl-c{color:var(--cobalt2)} .hl-g{color:var(--emerald)} .hl-a{color:var(--amber)} .hl-r{color:var(--red)} .mono{font-family:var(--mono)}
+
+  .cols{display:grid;gap:clamp(16px,2vw,30px);margin-top:clamp(18px,2.6vw,40px)}
+  .c2{grid-template-columns:1fr 1fr} .c3{grid-template-columns:repeat(3,1fr)}
+  .card{border:1px solid var(--border);border-radius:16px;padding:clamp(16px,1.7vw,26px);
+    background:color-mix(in srgb,var(--g900) 60%,transparent)}
+  .card h3{font-size:clamp(15px,1.5vw,21px);margin-bottom:8px;display:flex;align-items:center;gap:10px}
+  .card p{color:var(--g400);font-size:clamp(12px,1.15vw,16px);line-height:1.55}
+  .pill{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border2);border-radius:999px;
+    padding:6px 14px;font-family:var(--mono);font-size:clamp(10px,1vw,13px);letter-spacing:.05em;color:var(--g300)}
+  .tone-r{border-color:color-mix(in srgb,var(--red) 50%,transparent);color:var(--red);background:rgb(241 96 93/.1)}
+  .tone-g{border-color:color-mix(in srgb,var(--emerald) 50%,transparent);color:var(--emerald);background:rgb(47 209 157/.1)}
+  .tone-a{border-color:color-mix(in srgb,var(--amber) 50%,transparent);color:var(--amber);background:rgb(223 168 77/.1)}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  ul.clean{list-style:none;display:flex;flex-direction:column;gap:12px;margin-top:8px}
+  ul.clean li{display:flex;gap:12px;align-items:flex-start;color:var(--g300);font-size:clamp(13px,1.3vw,19px);line-height:1.45}
+  ul.clean li b{color:var(--g100);font-weight:600}
+  .dot{flex:none;width:9px;height:9px;border-radius:50%;margin-top:8px;background:var(--brass)}
+  .dot.r{background:var(--red)}.dot.g{background:var(--emerald)}.dot.a{background:var(--amber)}.dot.c{background:var(--cobalt)}
+
+  pre{font-family:var(--mono);font-size:clamp(10px,1.02vw,15px);line-height:1.62;border:1px solid var(--border);
+    border-radius:14px;padding:clamp(14px,1.5vw,24px);background:color-mix(in srgb,var(--g950) 70%,#000);overflow:auto;color:var(--g300)}
+  pre .k{color:var(--cobalt2)} pre .s{color:var(--emerald)} pre .c{color:var(--g500)} pre .r{color:var(--red)} pre .b{color:var(--brass)} pre .w{color:var(--g100)}
+  figure{margin:0}img.shot{width:100%;border:1px solid var(--border2);border-radius:14px;display:block}
+  figcaption{color:var(--g500);font-family:var(--mono);font-size:clamp(10px,1vw,13px);margin-top:8px}
+
+  /* footer + chrome */
+  .foot{position:fixed;left:0;right:0;bottom:0;z-index:40;display:flex;justify-content:space-between;align-items:center;
+    padding:12px clamp(20px,3vw,48px);font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--g500);pointer-events:none}
+  .foot .brand{display:flex;align-items:center;gap:9px;color:var(--g400)}
+  .foot .brand svg{width:18px;height:18px}
+  .bar{position:fixed;top:0;left:0;height:3px;background:linear-gradient(90deg,var(--brass),var(--cobalt));z-index:50;transition:width .42s ease}
+  .nav{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);z-index:45;display:flex;gap:7px}
+  .nav i{width:8px;height:8px;border-radius:50%;background:var(--g700);cursor:pointer;transition:background .2s,transform .2s}
+  .nav i.on{background:var(--brass);transform:scale(1.3)}
+  .arrow{position:fixed;top:50%;transform:translateY(-50%);z-index:45;border:1px solid var(--border2);background:rgb(17 23 32/.6);
+    color:var(--g300);width:42px;height:42px;border-radius:50%;cursor:pointer;font-size:20px;display:grid;place-items:center;backdrop-filter:blur(6px)}
+  .arrow:hover{color:var(--g100);border-color:var(--g500)} .arrow.prev{left:18px} .arrow.next{right:18px}
+
+  /* cover */
+  .cover{align-items:flex-start}
+  .cover .mark{width:clamp(96px,11vw,164px);height:clamp(96px,11vw,164px);margin-bottom:26px}
+  .cover h1 .fuse{color:var(--g100)}
+  .badges{margin-top:30px;display:flex;gap:10px;flex-wrap:wrap}
+
+  .stamp{position:absolute;top:clamp(28px,5vw,72px);right:clamp(28px,5vw,90px);font-family:var(--mono);
+    font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--g500);text-align:right;line-height:1.7}
+
+  @media print{
+    @page{size:1280px 720px;margin:0}
+    html,body{overflow:visible;height:auto}
+    body::after{display:none}
+    .deck{height:auto}
+    .slide{display:flex!important;opacity:1!important;position:relative;inset:auto;height:720px;width:1280px;page-break-after:always;animation:none}
+    .bar,.nav,.arrow{display:none!important}
+  }
+</style>
+</head>
+<body>
+<div class="bar" id="bar"></div>
+<div class="deck" id="deck">
+
+  <!-- 1 · COVER -->
+  <section class="slide cover">
+    <svg class="mark" viewBox="0 0 256 256" aria-hidden="true">
+      <defs><radialGradient id="b1" cx="32%" cy="20%" r="95%"><stop offset="0" stop-color="#1b2433"/><stop offset="55%" stop-color="#0d1118"/><stop offset="100%" stop-color="#080b10"/></radialGradient>
+      <linearGradient id="a1" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#c69a4f"/><stop offset="1" stop-color="#ecd49a"/></linearGradient></defs>
+      <rect x="6" y="6" width="244" height="244" rx="58" fill="url(#b1)" stroke="#2c3a4e" stroke-width="2.5"/>
+      <path d="M40 142 H86" stroke="#9aa7bb" stroke-width="15" stroke-linecap="round"/>
+      <path d="M170 142 H216" stroke="#f1605d" stroke-width="15" stroke-linecap="round" stroke-opacity=".42"/>
+      <circle cx="86" cy="142" r="13.5" fill="#ecd49a"/><circle cx="170" cy="142" r="13.5" fill="#f1605d"/>
+      <path d="M86 142 L158 90" stroke="url(#a1)" stroke-width="22" stroke-linecap="round"/>
+      <g stroke="#ff8472" stroke-width="7.5" stroke-linecap="round"><path d="M158 90 l17 -13"/><path d="M158 90 l22 7"/><path d="M158 90 l-3 -23"/></g>
+    </svg>
+    <div class="kicker">Cobo Agentic Wallet 赛道</div>
+    <h1>PACT<span class="fuse">FUSE</span></h1>
+    <p class="lead" style="margin-top:20px">面向 Agent 支付的<em>链上断路器</em>。在付款前熔断不安全来源,干净的才结算交付。</p>
+    <div class="badges">
+      <span class="pill">Base Sepolia · 84532</span>
+      <span class="pill">fail-closed</span>
+      <span class="pill">证据可现场复核</span>
+    </div>
+    <div class="stamp">3-5 min demo<br/>pactfuse-console.vercel.app</div>
+  </section>
+
+  <!-- 2 · PROBLEM -->
+  <section class="slide">
+    <div class="kicker">问题</div>
+    <h2>AI Agent 正在<span class="hl-r">自己花钱</span></h2>
+    <p class="lead">它能自己下单、签名、付款。可一旦它被骗、或它买的东西在付款瞬间已经变质,<em>谁来拦?</em></p>
+    <div class="cols c3">
+      <div class="card"><h3><span class="dot r"></span>被注入</h3><p>提示注入让 Agent 把钱付给<b class="hl-r">错误的合约地址</b>,它自己不会怀疑。</p></div>
+      <div class="card"><h3><span class="dot a"></span>来源失效</h3><p>报价时来源是安全的,<b class="hl-a">付款前却被吊销/挑战</b>,钱照样打出去。</p></div>
+      <div class="card"><h3><span class="dot r"></span>付款拿不到货</h3><p>钱已上链,<b class="hl-r">交付却没发生</b>,链上不可逆。</p></div>
+    </div>
+    <p class="sub" style="margin-top:26px">共同点:出问题的瞬间,<em>钱已经在路上</em>。事后再聪明也追不回。</p>
+  </section>
+
+  <!-- 3 · WHY EXISTING FALLS SHORT -->
+  <section class="slide">
+    <div class="kicker">为什么现有做法不够</div>
+    <h2><span class="hl-c">检测</span> ≠ <span class="hl-g">强制</span></h2>
+    <div class="cols c2" style="align-items:center">
+      <div>
+        <ul class="clean">
+          <li><span class="dot c"></span><span><b>风控/打分/告警</b>:能发现风险,但只是"提醒",拦不住已经签出去的交易。</span></li>
+          <li><span class="dot c"></span><span><b>事后审计</b>:钱上链后才发现,链上<b class="hl-r">不可逆</b>。</span></li>
+          <li><span class="dot c"></span><span><b>搜索/检索结果</b>不是结算级真相,Agent 不该拿它直接付款。</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <svg viewBox="0 0 460 230" style="width:100%">
+          <defs><marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#8492a8"/></marker></defs>
+          <text x="14" y="40" fill="#82a0ff" font-family="var(--mono)" font-size="14">检测 · detect</text>
+          <rect x="14" y="54" width="120" height="44" rx="9" fill="none" stroke="#6488f4" stroke-width="1.6"/>
+          <text x="30" y="81" fill="#aab5c5" font-size="13" font-family="monospace">风险打分</text>
+          <path d="M138 76 H300" stroke="#8492a8" stroke-width="1.6" stroke-dasharray="5 5" marker-end="url(#ah)"/>
+          <text x="150" y="66" fill="#8492a8" font-size="12" font-family="monospace">只发告警</text>
+          <rect x="306" y="54" width="140" height="44" rx="9" fill="rgb(241 96 93/.12)" stroke="#f1605d" stroke-width="1.6"/>
+          <text x="322" y="81" fill="#f1605d" font-size="13" font-family="monospace">钱已上链 ✕</text>
+          <text x="14" y="150" fill="#2fd19d" font-family="monospace" font-size="14">强制 · enforce</text>
+          <rect x="14" y="164" width="120" height="44" rx="9" fill="none" stroke="#2fd19d" stroke-width="1.6"/>
+          <text x="24" y="191" fill="#aab5c5" font-size="13" font-family="monospace">链上闸门</text>
+          <path d="M138 186 H300" stroke="#2fd19d" stroke-width="2" marker-end="url(#ah)"/>
+          <text x="150" y="176" fill="#2fd19d" font-size="12" font-family="monospace">付款前熔断</text>
+          <rect x="306" y="164" width="140" height="44" rx="9" fill="rgb(47 209 157/.12)" stroke="#2fd19d" stroke-width="1.6"/>
+          <text x="322" y="191" fill="#2fd19d" font-size="13" font-family="monospace">0 资金转移 ✓</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4 · SOLUTION -->
+  <section class="slide">
+    <div class="kicker">解法</div>
+    <h2>付款<span class="hl-r">前</span>,在链上<em>熔断</em></h2>
+    <p class="lead">PactFuse 是一个 <b>fail-closed 的链上断路器</b>:在支付落地的那一刻重新核验来源,不安全就<em>切断回路</em>,一个 atomic 都不动。</p>
+    <div class="cols c3">
+      <div class="card"><h3 class="hl-r">熔断</h3><p>来源被挑战 → 闸门跳开,所有钉住它的支付在付款前被切断。</p></div>
+      <div class="card"><h3 class="hl-g">结算</h3><p>来源干净 → 在策略边界内授权、支付、交付 artifact。</p></div>
+      <div class="card"><h3 class="hl-a">拒绝</h3><p>目标不在 Pact 白名单 → 任何东西上链前直接拒绝。</p></div>
+    </div>
+    <p class="sub" style="margin-top:24px">默认即安全(fail-closed):有疑问就不放行,而不是先付了再说。</p>
+  </section>
+
+  <!-- 5 · ARCHITECTURE -->
+  <section class="slide">
+    <div class="kicker">怎么做 · 架构</div>
+    <h2>一次支付的<em>三道关卡</em></h2>
+    <div class="card" style="margin-top:18px">
+      <svg viewBox="0 0 1000 360" style="width:100%">
+        <defs>
+          <marker id="a2" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#d1b16e"/></marker>
+          <marker id="a2r" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#f1605d"/></marker>
+        </defs>
+        <!-- registry -->
+        <g transform="translate(500 28)">
+          <rect x="-95" y="0" width="190" height="64" rx="12" fill="rgb(223 168 77/.1)" stroke="#dfa84d" stroke-width="1.6"/>
+          <text x="0" y="28" text-anchor="middle" fill="#dfa84d" font-family="monospace" font-size="15">SourceStateRegistry</text>
+          <text x="0" y="48" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="12">谁可以挑战/吊销来源</text>
+        </g>
+        <path d="M500 92 V150" stroke="#f1605d" stroke-width="2" stroke-dasharray="6 6" marker-end="url(#a2r)"/>
+        <text x="512" y="128" fill="#f1605d" font-family="monospace" font-size="12">challenge → trip</text>
+        <!-- line of nodes -->
+        <g font-family="monospace">
+          <!-- agent -->
+          <rect x="40" y="168" width="170" height="80" rx="14" fill="rgb(100 136 244/.10)" stroke="#6488f4" stroke-width="1.6"/>
+          <text x="125" y="202" text-anchor="middle" fill="#82a0ff" font-size="15">Agent + CAW</text>
+          <text x="125" y="224" text-anchor="middle" fill="#8492a8" font-size="12">Cobo Agentic Wallet</text>
+          <!-- pact -->
+          <rect x="270" y="168" width="170" height="80" rx="14" fill="none" stroke="#2a3648" stroke-width="1.6"/>
+          <text x="355" y="202" text-anchor="middle" fill="#aab5c5" font-size="15">Pact 策略</text>
+          <text x="355" y="224" text-anchor="middle" fill="#8492a8" font-size="12">白名单 · 限额</text>
+          <!-- gate -->
+          <rect x="500" y="160" width="190" height="96" rx="16" fill="rgb(241 96 93/.08)" stroke="#f1605d" stroke-width="1.8"/>
+          <text x="595" y="198" text-anchor="middle" fill="#f1605d" font-size="16">ProcurementGate</text>
+          <text x="595" y="220" text-anchor="middle" fill="#aab5c5" font-size="12">断路器:付款前核验</text>
+          <text x="595" y="238" text-anchor="middle" fill="#8492a8" font-size="11">sourceState 卡住 spend</text>
+          <!-- market -->
+          <rect x="760" y="168" width="170" height="80" rx="14" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.6"/>
+          <text x="845" y="202" text-anchor="middle" fill="#2fd19d" font-size="15">Artifact 市场</text>
+          <text x="845" y="224" text-anchor="middle" fill="#8492a8" font-size="12">付费交付</text>
+          <!-- conduits -->
+          <path d="M210 208 H266" stroke="#d1b16e" stroke-width="2.4" marker-end="url(#a2)"/>
+          <path d="M440 208 H496" stroke="#d1b16e" stroke-width="2.4" marker-end="url(#a2)"/>
+          <path d="M690 208 H756" stroke="#d1b16e" stroke-width="2.4" marker-end="url(#a2)"/>
+        </g>
+        <text x="500" y="316" text-anchor="middle" fill="#627087" font-family="monospace" font-size="13">每一步都落成可验证的签名证据 · evidence ledger</text>
+      </svg>
+    </div>
+  </section>
+
+  <!-- 6 · SCENARIOS -->
+  <section class="slide">
+    <div class="kicker">三个场景 · 一键复现</div>
+    <h2>同一条支付线,<em>三种结局</em></h2>
+    <div class="cols c3">
+      <div class="card"><div class="row"><span class="pill tone-r">TRIP · 熔断</span></div>
+        <p style="margin-top:14px"><b>不安全来源 → 自动熔断</b></p>
+        <p>来源在报价后被挑战,断路器跳开,钉住它的支付在付款前被切断。</p>
+        <p class="mono hl-r" style="margin-top:12px">已保护 · 0 资金转移</p></div>
+      <div class="card"><div class="row"><span class="pill tone-g">SETTLE · 结算</span></div>
+        <p style="margin-top:14px"><b>新鲜来源 → 结算并交付</b></p>
+        <p>来源干净,闸门在策略内授权、支付、释放 artifact。</p>
+        <p class="mono hl-g" style="margin-top:12px">已结算 · 转移 1,000 atomic</p></div>
+      <div class="card"><div class="row"><span class="pill tone-a">DENY · 拒绝</span></div>
+        <p style="margin-top:14px"><b>错误目标 → 策略拒绝</b></p>
+        <p>目标不在 Pact 白名单,CAW 在任何东西上链前拒绝。</p>
+        <p class="mono hl-a" style="margin-top:12px">已拒绝 · 从未触达链</p></div>
+    </div>
+    <p class="sub" style="margin-top:24px">控制台里按 <span class="mono">1 / 2 / 3</span> 选场景,<span class="mono">R</span> 运行,全程驱动自同一个状态机。</p>
+  </section>
+
+  <!-- 7 · EVIDENCE -->
+  <section class="slide">
+    <div class="kicker">证据 · 不是录像重放</div>
+    <h2>真实链上交易,<em>现场复核</em></h2>
+    <div class="cols c2" style="align-items:center">
+      <ul class="clean">
+        <li><span class="dot g"></span><span>每条声明背后都是<b>真实的 Base Sepolia 交易</b>(SpendTripped / SpendSettled / SourceChallenged)。</span></li>
+        <li><span class="dot c"></span><span>控制台用 <b>eth_call</b> 直接读合约当前状态,<b class="hl-c">无需私钥、无需后端</b>(keyless)。</span></li>
+        <li><span class="dot a"></span><span>每个 tx / 合约地址都能点开<b>区块浏览器</b>当场对账。</span></li>
+        <li><span class="dot"></span><span>控制台只<b>渲染</b>证据,<em>从不创造证明权威</em>。</span></li>
+      </ul>
+      <div class="card mono" style="font-size:clamp(11px,1.05vw,15px);line-height:1.95">
+        <div class="row" style="justify-content:space-between;margin-bottom:12px">
+          <span class="hl-c">eth_call · keyless 复核</span>
+          <span class="pill tone-g">Base Sepolia · 84532</span>
+        </div>
+        <div style="color:var(--g500)">SourceChallenged · block 42758087</div>
+        <div style="color:var(--cobalt2)">tx 0xe64dd353c8…3ad3e4 ↗</div>
+        <div style="color:var(--g500)">SpendTripped · blocks 42758099, 42758112</div>
+        <div style="color:var(--g500)">registry <a href="https://sepolia.basescan.org/address/0xad8673a2bbd4f3d45678bd8cd929de70b0bd063f" target="_blank" rel="noopener" style="color:var(--amber)">0xad86…063f</a></div>
+        <div>sourceState(src) → <span class="hl-r">2 · Challenged</span></div>
+        <div style="border-top:1px solid var(--border);margin-top:12px;padding-top:12px" class="hl-r">→ 已保护 · 0 资金转移</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8 · REAL-WORLD -->
+  <section class="slide">
+    <div class="kicker">现实场景</div>
+    <h2>把三场景<em>映射到真实采购</em></h2>
+    <div class="cols c3">
+      <div class="card"><h3><span class="dot r"></span>数据/API 被吊销</h3><p>Agent 订阅的数据源在付款前被标记为投毒/失效 → <b class="hl-r">熔断</b>,不为坏数据付费。</p></div>
+      <div class="card"><h3><span class="dot a"></span>算力/模型跑路</h3><p>供应商合约不在白名单或临时换了收款地址 → <b class="hl-a">拒绝</b>,钱不出门。</p></div>
+      <div class="card"><h3><span class="dot g"></span>正常工具租约</h3><p>来源持续可信 → <b class="hl-g">结算并交付</b>,租约可执行、可审计。</p></div>
+    </div>
+    <p class="sub" style="margin-top:26px">凡是"<em>Agent 自动为外部来源付费</em>"的场景,都需要一个付款前的最后一道闸。</p>
+  </section>
+
+  <!-- 9 · CODE -->
+  <section class="slide">
+    <div class="kicker">关键代码</div>
+    <h2>强制力<em>写在合约里</em></h2>
+    <div class="cols c2">
+      <div>
+        <p class="sub" style="margin-bottom:8px">① 闸门:来源不 Active 就 revert,支付无法落地</p>
+<pre><span class="c">// ProcurementGate (示意)</span>
+<span class="k">function</span> <span class="w">settleSpend</span>(bytes32 src, ...) {
+  <span class="k">require</span>(
+    sourceState[src] == <span class="b">Active</span>,
+    <span class="s">"source not active"</span>   <span class="c">// 跳闸 → 0 转移</span>
+  );
+  <span class="c">/* …授权 + 支付 + 交付… */</span>
+}</pre>
+      </div>
+      <div>
+        <p class="sub" style="margin-bottom:8px">② 浏览器 keyless 复核:eth_call 直读链上状态</p>
+<pre><span class="c">// chain.mjs (示意)</span>
+<span class="k">const</span> data = <span class="b">"0x447c24c0"</span> + pad(srcHash); <span class="c">// sourceState(bytes32)</span>
+<span class="k">const</span> r = <span class="k">await</span> rpc(<span class="s">"eth_call"</span>, [{
+  to: registry, data
+}, <span class="s">"latest"</span>]);
+<span class="c">// 0=Unknown 1=Active 2=</span><span class="r">Challenged</span><span class="c"> 3=Revoked</span></pre>
+      </div>
+    </div>
+    <p class="sub" style="margin-top:18px">还内置一次性<b>传输中断注入</b>(<span class="mono">?fail=1</span>):动作失败 → 资金停在原地、可重试,证明 fail-closed 不是说说。</p>
+  </section>
+
+  <!-- 10 · DEMO -->
+  <section class="slide">
+    <div class="kicker">现场 Demo</div>
+    <h2>切到控制台,<em>跑给你看</em></h2>
+    <div class="cols c2" style="align-items:center">
+      <ul class="clean">
+        <li><span class="dot r"></span><span>按 <b class="mono">1</b> → <b class="mono">R</b>:不安全来源熔断,看断路器跳开、<b class="hl-r">0 资金转移</b>。</span></li>
+        <li><span class="dot g"></span><span>按 <b class="mono">2</b> → <b class="mono">R</b>:干净来源结算交付。</span></li>
+        <li><span class="dot c"></span><span>打开<b>链上实时状态</b> / <b>证明哈希</b>抽屉,点开 tx 到 Basescan。</span></li>
+        <li><span class="dot a"></span><span>右上角切 <b>中文 / EN</b>,顺手开 <b class="mono">?</b> 看快捷键。</span></li>
+      </ul>
+      <figure>
+        <img class="shot" src="../assets/console-demo.gif" alt="PactFuse 控制台演示" />
+        <figcaption>pactfuse-console.vercel.app</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- 11 · CLOSE -->
+  <section class="slide cover">
+    <div class="kicker">收尾</div>
+    <h1 style="font-size:clamp(34px,5.6vw,82px)">先<span class="hl-r">熔断</span>,<br/>再谈付款。</h1>
+    <p class="lead" style="margin-top:22px">PactFuse 把"付款前的最后一道闸"做成链上强制 + 可现场复核的证据。给 Agent 经济一个 fail-closed 的底座。</p>
+    <div class="badges">
+      <span class="pill">github.com/beautifulrem/PactFuse</span>
+      <span class="pill">pactfuse-console.vercel.app</span>
+    </div>
+  </section>
+
+</div>
+
+<button class="arrow prev" id="prev" aria-label="上一页">‹</button>
+<button class="arrow next" id="next" aria-label="下一页">›</button>
+<div class="nav" id="nav"></div>
+<div class="foot">
+  <span class="brand">
+    <svg viewBox="0 0 256 256" aria-hidden="true"><rect x="6" y="6" width="244" height="244" rx="58" fill="#0d1118" stroke="#2c3a4e" stroke-width="6"/><path d="M40 142 H86" stroke="#9aa7bb" stroke-width="15" stroke-linecap="round"/><path d="M170 142 H216" stroke="#f1605d" stroke-width="15" stroke-linecap="round" stroke-opacity=".5"/><circle cx="86" cy="142" r="14" fill="#ecd49a"/><circle cx="170" cy="142" r="14" fill="#f1605d"/><path d="M86 142 L158 90" stroke="#d1b16e" stroke-width="22" stroke-linecap="round"/></svg>
+    PactFuse
+  </span>
+  <span id="pageno">01 / 11</span>
+</div>
+
+<script>
+  const slides=[...document.querySelectorAll('.slide')];
+  const nav=document.getElementById('nav'), bar=document.getElementById('bar'), pageno=document.getElementById('pageno');
+  let i=0;
+  slides.forEach((_,n)=>{const d=document.createElement('i');d.onclick=()=>go(n);nav.appendChild(d)});
+  const dots=[...nav.children];
+  function go(n){
+    i=Math.max(0,Math.min(slides.length-1,n));
+    slides.forEach((s,k)=>s.classList.toggle('active',k===i));
+    dots.forEach((d,k)=>d.classList.toggle('on',k===i));
+    bar.style.width=((i+1)/slides.length*100)+'%';
+    pageno.textContent=String(i+1).padStart(2,'0')+' / '+String(slides.length).padStart(2,'0');
+    location.hash=i+1;
+  }
+  function next(){go(i+1)} function prev(){go(i-1)}
+  document.getElementById('next').onclick=next;
+  document.getElementById('prev').onclick=prev;
+  addEventListener('keydown',e=>{
+    if(['ArrowRight','ArrowDown',' ','PageDown'].includes(e.key)){e.preventDefault();next()}
+    else if(['ArrowLeft','ArrowUp','PageUp'].includes(e.key)){e.preventDefault();prev()}
+    else if(e.key==='Home')go(0); else if(e.key==='End')go(slides.length-1);
+  });
+  let sx=0; addEventListener('touchstart',e=>sx=e.touches[0].clientX,{passive:true});
+  addEventListener('touchend',e=>{const dx=e.changedTouches[0].clientX-sx; if(Math.abs(dx)>50)dx<0?next():prev()},{passive:true});
+  go(parseInt(location.hash.slice(1))-1||0);
+</script>
+</body>
+</html>
