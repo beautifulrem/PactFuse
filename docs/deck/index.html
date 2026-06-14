@@ -149,7 +149,7 @@
     <img class="mark" src="../../apps/fusebox/live/icons/icon-512.png" alt="PactFuse" />
     <div class="kicker">Cobo Agentic Wallet 赛道</div>
     <h1>PACT<span class="fuse">FUSE</span></h1>
-    <p class="lead" style="margin-top:20px">面向 Agent 支付的<em>链上断路器</em>。在付款前熔断不安全来源,干净的才结算交付。</p>
+    <p class="lead" style="margin-top:20px">面向 Agent 支付的<em>链上断路器</em>。付款那一刻重新验证来源,不安全就拦住,干净的才放行。</p>
     <div class="badges">
       <span class="pill">Base Sepolia · 84532</span>
       <span class="pill">fail-closed</span>
@@ -168,7 +168,55 @@
       <div class="card"><h3><span class="dot a"></span>来源失效</h3><p>报价时来源是安全的,<b class="hl-a">付款前却被吊销/挑战</b>,钱照样打出去。</p></div>
       <div class="card"><h3><span class="dot r"></span>付款拿不到货</h3><p>钱已上链,<b class="hl-r">交付却没发生</b>,链上不可逆。</p></div>
     </div>
-    <p class="sub" style="margin-top:24px"><b class="hl-r">80%</b> 的组织已踩过 AI agent 风险行为;出问题的瞬间<em>钱已经在路上</em>,链上不可逆,事后追不回。<span style="color:#627087;font-size:.82em">来源:McKinsey · OWASP Agentic Top 10</span></p>
+    <p class="sub" style="margin-top:24px"><b class="hl-r">80%</b> 的组织报告过 AI agent 的风险行为(McKinsey)。问题是:<em>交易一旦上链就没法撤销</em>,发现得再快,钱已经没了。<span style="color:#627087;font-size:.82em">来源:McKinsey · OWASP Agentic Top 10</span></p>
+  </section>
+
+  <!-- 2b · ATTACK SEQUENCE -->
+  <section class="slide">
+    <div class="kicker">攻击是怎么发生的</div>
+    <h2>一次典型的<em>来源投毒攻击</em></h2>
+    <div class="card" style="margin-top:14px">
+      <svg viewBox="0 0 1000 310" style="width:100%;max-height:38vh">
+        <defs>
+          <marker id="at" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#d1b16e"/></marker>
+          <marker id="atr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#f1605d"/></marker>
+        </defs>
+        <g font-family="monospace" font-size="13">
+          <!-- timeline -->
+          <text x="30" y="26" fill="#627087" font-size="11">时间 →</text>
+          <line x1="80" y1="22" x2="970" y2="22" stroke="#2a3648" stroke-width="1.4"/>
+          <!-- t0: quote -->
+          <text x="100" y="56" fill="#d1b16e" font-size="12">t₀ 报价</text>
+          <rect x="80" y="68" width="140" height="52" rx="10" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.4"/>
+          <text x="96" y="90" fill="#2fd19d">来源 Active ✓</text>
+          <text x="96" y="108" fill="#8492a8" font-size="11">Agent 拿到价格</text>
+          <path d="M220 94 H310" stroke="#d1b16e" stroke-width="1.8" marker-end="url(#at)"/>
+          <!-- t1: source poisoned -->
+          <text x="332" y="56" fill="#f1605d" font-size="12">t₁ 来源被挑战</text>
+          <rect x="314" y="68" width="160" height="52" rx="10" fill="rgb(241 96 93/.10)" stroke="#f1605d" stroke-width="1.4"/>
+          <text x="330" y="90" fill="#f1605d">SourceChallenged</text>
+          <text x="330" y="108" fill="#8492a8" font-size="11">供应商跑路 / 数据投毒</text>
+          <path d="M474 94 H560" stroke="#d1b16e" stroke-width="1.8" marker-end="url(#at)"/>
+          <!-- t2: without pactfuse -->
+          <text x="580" y="56" fill="#8492a8" font-size="12">t₂ 付款</text>
+          <rect x="564" y="68" width="190" height="104" rx="10" fill="none" stroke="#2a3648" stroke-width="1.4"/>
+          <text x="580" y="90" fill="#8492a8">没有 PactFuse:</text>
+          <text x="580" y="112" fill="#f1605d">钱已上链,追不回 ✕</text>
+          <line x1="564" y1="132" x2="754" y2="132" stroke="#2a3648" stroke-width="1"/>
+          <text x="580" y="152" fill="#2fd19d">有 PactFuse:</text>
+          <text x="580" y="172" fill="#2fd19d">闸门读到 Challenged</text>
+          <!-- outcome -->
+          <path d="M754 100 H830" stroke="#f1605d" stroke-width="1.6" stroke-dasharray="5 5" marker-end="url(#atr)"/>
+          <rect x="834" y="68" width="140" height="44" rx="10" fill="rgb(241 96 93/.10)" stroke="#f1605d" stroke-width="1.4"/>
+          <text x="850" y="96" fill="#f1605d" font-size="14">💸 损失</text>
+          <path d="M754 160 H830" stroke="#2fd19d" stroke-width="2" marker-end="url(#at)"/>
+          <rect x="834" y="140" width="140" height="44" rx="10" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.4"/>
+          <text x="850" y="168" fill="#2fd19d" font-size="14">🛡 0 损失</text>
+        </g>
+        <text x="500" y="260" text-anchor="middle" fill="#627087" font-family="monospace" font-size="12">关键窗口:报价(t₀)和付款(t₂)之间,来源状态可能已经变了</text>
+        <text x="500" y="282" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="12">PactFuse 在 t₂ 重新读一次链上状态,不安全就拦</text>
+      </svg>
+    </div>
   </section>
 
   <!-- 3 · WHY EXISTING FALLS SHORT -->
@@ -203,20 +251,64 @@
         </svg>
       </div>
     </div>
-    <p class="sub" style="margin-top:20px">行业正转向<b class="hl-g">确定性强制</b>(deterministic enforcement):OWASP Agentic Top 10、Visa/Mastercard 都在补"验证层"。<em>PactFuse 把这道强制直接放到链上。</em></p>
+    <p class="sub" style="margin-top:20px">行业趋势:OWASP、Visa、Mastercard 都在补<b class="hl-g">付款前的验证层</b>。PactFuse 做的就是这件事,而且直接用<em>链上合约</em>来执行,不靠人为审批。</p>
+  </section>
+
+  <!-- 3b · POSITIONING QUADRANT -->
+  <section class="slide">
+    <div class="kicker">我们在哪</div>
+    <h2>PactFuse 的<em>定位</em></h2>
+    <div class="cols c2" style="align-items:center">
+      <div class="card" style="padding:0;overflow:hidden">
+        <svg viewBox="0 0 480 380" style="width:100%">
+          <defs><marker id="aq" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 Z" fill="#627087"/></marker></defs>
+          <!-- axes -->
+          <line x1="60" y1="340" x2="460" y2="340" stroke="#627087" stroke-width="1.4" marker-end="url(#aq)"/>
+          <line x1="60" y1="340" x2="60" y2="30" stroke="#627087" stroke-width="1.4" marker-end="url(#aq)"/>
+          <text x="260" y="372" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">付款前 ← 介入时机 → 付款后</text>
+          <text x="20" y="190" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11" transform="rotate(-90 20 190)">检测 ← 强制力 → 强制</text>
+          <!-- quadrant labels -->
+          <text x="150" y="60" text-anchor="middle" fill="#2fd19d" font-family="monospace" font-size="12" font-weight="600">付款前 + 强制</text>
+          <text x="370" y="60" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">付款后 + 强制</text>
+          <text x="150" y="310" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">付款前 + 检测</text>
+          <text x="370" y="310" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">付款后 + 检测</text>
+          <!-- dots -->
+          <circle cx="370" cy="280" r="8" fill="rgb(100 136 244/.5)" stroke="#6488f4" stroke-width="1.6"/>
+          <text x="390" y="285" fill="#8492a8" font-family="monospace" font-size="11">审计工具</text>
+          <circle cx="170" cy="270" r="8" fill="rgb(223 168 77/.5)" stroke="#dfa84d" stroke-width="1.6"/>
+          <text x="190" y="275" fill="#8492a8" font-family="monospace" font-size="11">风控打分</text>
+          <circle cx="340" cy="140" r="8" fill="rgb(100 136 244/.5)" stroke="#6488f4" stroke-width="1.6"/>
+          <text x="360" y="145" fill="#8492a8" font-family="monospace" font-size="11">多签 / MPC</text>
+          <circle cx="150" cy="100" r="14" fill="rgb(47 209 157/.3)" stroke="#2fd19d" stroke-width="2.4"/>
+          <text x="170" y="96" fill="#2fd19d" font-family="monospace" font-size="13" font-weight="700">PactFuse</text>
+          <text x="170" y="112" fill="#8492a8" font-family="monospace" font-size="10">链上 fail-closed</text>
+          <!-- dividers -->
+          <line x1="260" y1="36" x2="260" y2="340" stroke="#2a3648" stroke-width="1" stroke-dasharray="6 6"/>
+          <line x1="60" y1="190" x2="460" y2="190" stroke="#2a3648" stroke-width="1" stroke-dasharray="6 6"/>
+        </svg>
+      </div>
+      <div>
+        <ul class="clean">
+          <li><span class="dot g"></span><span><b>左上角</b>:付款前介入 + 链上强制。只有 PactFuse 在这个位置。</span></li>
+          <li><span class="dot c"></span><span><b>风控/打分</b>:付款前能发现风险,但拦不住交易。</span></li>
+          <li><span class="dot c"></span><span><b>审计工具</b>:钱花完了才查,发现问题也追不回。</span></li>
+          <li><span class="dot c"></span><span><b>多签/MPC</b>:能拦交易,但不看来源是否安全,且通常在付款后结算阶段。</span></li>
+        </ul>
+      </div>
+    </div>
   </section>
 
   <!-- 4 · SOLUTION -->
   <section class="slide">
     <div class="kicker">解法</div>
     <h2>付款<span class="hl-r">前</span>,在链上<em>熔断</em></h2>
-    <p class="lead">PactFuse 是一个 <b>fail-closed 的链上断路器</b>:在支付落地的那一刻重新核验来源,不安全就<em>切断回路</em>,一个 atomic 都不动。</p>
+    <p class="lead">PactFuse 是一个链上的断路器。在支付真正执行的那一刻,它会重新检查来源状态:不安全就<em>直接拦住</em>,一分钱都不会打出去。</p>
     <div class="cols c3">
       <div class="card"><h3 class="hl-r">熔断</h3><p>来源被挑战 → 闸门跳开,所有钉住它的支付在付款前被切断。</p></div>
       <div class="card"><h3 class="hl-g">结算</h3><p>来源干净 → 在策略边界内授权、支付、交付 artifact。</p></div>
       <div class="card"><h3 class="hl-a">拒绝</h3><p>目标不在 Pact 白名单 → 任何东西上链前直接拒绝。</p></div>
     </div>
-    <p class="sub" style="margin-top:24px">默认即安全(fail-closed):有疑问就不放行,而不是先付了再说。</p>
+    <p class="sub" style="margin-top:24px">设计原则是 fail-closed:查不到"安全"就不放行。宁可多拦一次,也不放过一笔有问题的付款。</p>
   </section>
 
   <!-- 5 · ARCHITECTURE -->
@@ -313,7 +405,7 @@
         </g>
       </svg>
     </div>
-    <p class="sub" style="margin-top:14px">关键在 <b class="hl-r">读 sourceState</b> 这一步:它是<b>链上确定性</b>判断,不是模型猜测。不安全就 revert,钱落不了地。</p>
+    <p class="sub" style="margin-top:14px">关键就在 <b class="hl-r">读 sourceState</b> 这一步:合约里写死的判断,不是 AI 猜的。查到不安全,交易直接失败,钱根本打不出去。</p>
   </section>
 
   <!-- 6 · SCENARIOS -->
@@ -324,20 +416,20 @@
       <div class="card"><div class="row"><span class="pill tone-r">TRIP · 熔断</span></div>
         <p style="margin-top:14px"><b>不安全来源 → 自动熔断</b></p>
         <div class="flow flow-r"><span>挑战</span><i>›</i><span>链上确认</span><i>›</i><span>闸门跳闸</span><i>›</i><b>0 转移</b></div>
-        <p>来源在报价后被挑战,断路器跳开,钉住它的支付在付款前被切断。</p>
+        <p>报价之后、付款之前,来源被标记为不安全。闸门自动跳开,关联的付款全部拦截。</p>
         <p class="mono hl-r" style="margin-top:10px">已保护 · 0 资金转移</p></div>
       <div class="card"><div class="row"><span class="pill tone-g">SETTLE · 结算</span></div>
         <p style="margin-top:14px"><b>新鲜来源 → 结算并交付</b></p>
         <div class="flow flow-g"><span>授权</span><i>›</i><span>额度↑</span><i>›</i><span>支付</span><i>›</i><b>交付 artifact</b></div>
-        <p>来源干净,闸门在策略内授权、支付、释放 artifact。</p>
-        <p class="mono hl-g" style="margin-top:10px">已结算 · 转移 1,000 atomic</p></div>
+        <p>来源状态正常,在白名单额度内完成授权、支付,然后交付工具/数据。</p>
+        <p class="mono hl-g" style="margin-top:10px">已结算 · 转移 1,000 最小单位</p></div>
       <div class="card"><div class="row"><span class="pill tone-a">DENY · 拒绝</span></div>
         <p style="margin-top:14px"><b>错误目标 → 策略拒绝</b></p>
         <div class="flow flow-a"><span>错误目标</span><i>›</i><span>策略不符</span><i>›</i><span>链下拒绝</span><i>›</i><b>0 上链</b></div>
-        <p>目标不在 Pact 白名单,CAW 在任何东西上链前拒绝。</p>
+        <p>Agent 要付款的合约地址不在白名单里,钱包直接拒绝,交易根本不会提交到链上。</p>
         <p class="mono hl-a" style="margin-top:10px">已拒绝 · 从未触达链</p></div>
     </div>
-    <p class="sub" style="margin-top:24px">控制台里按 <span class="mono">1 / 2 / 3</span> 选场景,<span class="mono">R</span> 运行,全程驱动自同一个状态机。</p>
+    <p class="sub" style="margin-top:24px">控制台里按 <span class="mono">1 / 2 / 3</span> 选场景,按 <span class="mono">R</span> 运行。三条路走的是同一套代码和同一条支付线。</p>
   </section>
 
   <!-- 7 · EVIDENCE -->
@@ -349,7 +441,7 @@
         <li><span class="dot g"></span><span>每条声明背后都是<b>真实的 Base Sepolia 交易</b>(SpendTripped / SpendSettled / SourceChallenged)。</span></li>
         <li><span class="dot c"></span><span>控制台用 <b>eth_call</b> 直接读合约当前状态,<b class="hl-c">无需私钥、无需后端</b>(keyless)。</span></li>
         <li><span class="dot a"></span><span>每个 tx / 合约地址都能点开<b>区块浏览器</b>当场对账。</span></li>
-        <li><span class="dot"></span><span>控制台只<b>渲染</b>证据,<em>从不创造证明权威</em>。</span></li>
+        <li><span class="dot"></span><span>控制台只是个<b>展示窗口</b>,证据本身在链上,不是我们生成的。</span></li>
       </ul>
       <div class="card mono" style="font-size:clamp(11px,1.05vw,15px);line-height:1.95">
         <div class="row" style="justify-content:space-between;margin-bottom:12px">
@@ -375,13 +467,13 @@
       <div class="card"><h3><span class="dot a"></span>算力/模型跑路</h3><p>供应商合约不在白名单或临时换了收款地址 → <b class="hl-a">拒绝</b>,钱不出门。</p></div>
       <div class="card"><h3><span class="dot g"></span>正常工具租约</h3><p>来源持续可信 → <b class="hl-g">结算并交付</b>,租约可执行、可审计。</p></div>
     </div>
-    <p class="sub" style="margin-top:26px">凡是"<em>Agent 自动为外部来源付费</em>"的场景,都需要一个付款前的最后一道闸。</p>
+    <p class="sub" style="margin-top:26px">只要是 Agent 自己掏钱买外部服务,就需要一个<em>付款前的最后检查</em>。</p>
   </section>
 
   <!-- 9 · CODE -->
   <section class="slide">
     <div class="kicker">关键代码</div>
-    <h2>强制力<em>写在合约里</em></h2>
+    <h2>"能不能付"<em>写在合约里</em></h2>
     <div class="cols c2">
       <div>
         <p class="sub" style="margin-bottom:8px">① 闸门:来源不 Active 就 revert,支付无法落地</p>
@@ -404,7 +496,7 @@
 <span class="c">// 0=Unknown 1=Active 2=</span><span class="r">Challenged</span><span class="c"> 3=Revoked</span></pre>
       </div>
     </div>
-    <p class="sub" style="margin-top:18px">还内置一次性<b>传输中断注入</b>(<span class="mono">?fail=1</span>):动作失败 → 资金停在原地、可重试,证明 fail-closed 不是说说。</p>
+    <p class="sub" style="margin-top:18px">我们还能模拟网络中断(<span class="mono">?fail=1</span>):操作失败时资金留在原地,重试就行。证明系统在出错时也不会把钱打出去。</p>
   </section>
 
   <!-- 10 · DEMO -->
@@ -429,7 +521,7 @@
   <section class="slide cover">
     <div class="kicker">收尾</div>
     <h1 style="font-size:clamp(34px,5.6vw,82px)">先<span class="hl-r">熔断</span>,<br/>再谈付款。</h1>
-    <p class="lead" style="margin-top:22px">PactFuse 把"付款前的最后一道闸"做成链上强制 + 可现场复核的证据。给 Agent 经济一个 fail-closed 的底座。</p>
+    <p class="lead" style="margin-top:22px">PactFuse 在付款前加了一道链上强制检查,而且所有证据都能当场验证。让 Agent 花钱这件事变得安全、可控、可审计。</p>
     <div class="badges">
       <span class="pill">github.com/beautifulrem/PactFuse</span>
       <span class="pill">pactfuse-console.vercel.app</span>
