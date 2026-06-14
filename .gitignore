@@ -17,3 +17,4 @@ docs/evidence/ai-handoff-*.md
 # deploy artifacts
 .vercel/
 .vercel
+docs/deck/script.md
