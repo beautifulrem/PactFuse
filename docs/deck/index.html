@@ -230,40 +230,34 @@
         <p class="sub" style="margin-top:14px">88% 的组织踩过这种坑。<a href="https://beam.ai/agentic-insights/ai-agent-security-breaches-2026-lessons" target="_blank" rel="noopener" style="color:var(--g500);font-size:.82em">beam.ai 2026 ↗</a></p>
       </div>
       <div class="card" style="padding:0;overflow:hidden">
-        <svg class="story-svg" viewBox="0 0 440 420" style="width:100%">
+        <svg class="story-svg" viewBox="0 0 440 340" style="width:100%">
           <g font-family="monospace" font-size="12">
-            <!-- t0: investigation (phase 1, always visible) -->
+            <!-- phase 1: investigation -->
             <g class="phase show" data-phase="1">
-            <text x="32" y="34" fill="#627087" font-size="11">Agent 的视角</text>
-            <rect x="24" y="48" width="392" height="72" rx="12" fill="rgb(47 209 157/.08)" stroke="#2fd19d" stroke-width="1.4"/>
-            <text x="40" y="74" fill="#2fd19d" font-size="14" font-weight="600">✓ 调查:一切正常</text>
-            <text x="40" y="96" fill="#8492a8">供应商状态 Active · 报价 500 mUSD · 白名单 ✓</text>
+            <text x="32" y="30" fill="#627087" font-size="11">Agent 的视角</text>
+            <rect x="24" y="42" width="392" height="66" rx="12" fill="rgb(47 209 157/.08)" stroke="#2fd19d" stroke-width="1.4"/>
+            <text x="40" y="66" fill="#2fd19d" font-size="14" font-weight="600">✓ 调查:一切正常</text>
+            <text x="40" y="86" fill="#8492a8">供应商状态 Active · 报价 500 mUSD · 白名单 ✓</text>
             </g>
             <!-- phase 2: gap + poison -->
             <g class="phase" data-phase="2">
-            <rect class="scene-gap" x="190" y="134" width="60" height="28" rx="6" fill="rgb(223 168 77/.15)" stroke="#dfa84d" stroke-width="1.2"/>
-            <text x="220" y="153" text-anchor="middle" fill="#dfa84d" font-size="11" font-weight="600">30 分钟</text>
-            <line x1="220" y1="120" x2="220" y2="134" stroke="#dfa84d" stroke-width="1.2" stroke-dasharray="3 3"/>
-            <line x1="220" y1="162" x2="220" y2="178" stroke="#dfa84d" stroke-width="1.2" stroke-dasharray="3 3"/>
-            <text x="32" y="194" fill="#627087" font-size="11">真实世界(Agent 不知道)</text>
-            <rect class="scene-poison" x="24" y="208" width="392" height="72" rx="12" fill="rgb(241 96 93/.08)" stroke="#f1605d" stroke-width="1.4"/>
-            <text x="40" y="234" fill="#f1605d" font-size="14" font-weight="600">✕ 来源已被投毒</text>
-            <text x="40" y="256" fill="#8492a8">API 端点被替换 · 监控者标记 Challenged · 数据不可信</text>
+            <rect class="scene-gap" x="190" y="120" width="60" height="26" rx="6" fill="rgb(223 168 77/.15)" stroke="#dfa84d" stroke-width="1.2"/>
+            <text x="220" y="138" text-anchor="middle" fill="#dfa84d" font-size="11" font-weight="600">30 分钟</text>
+            <line x1="220" y1="108" x2="220" y2="120" stroke="#dfa84d" stroke-width="1.2" stroke-dasharray="3 3"/>
+            <line x1="220" y1="146" x2="220" y2="158" stroke="#dfa84d" stroke-width="1.2" stroke-dasharray="3 3"/>
+            <text x="32" y="174" fill="#627087" font-size="11">真实世界(Agent 不知道)</text>
+            <rect class="scene-poison" x="24" y="186" width="392" height="66" rx="12" fill="rgb(241 96 93/.08)" stroke="#f1605d" stroke-width="1.4"/>
+            <text x="40" y="210" fill="#f1605d" font-size="14" font-weight="600">✕ 来源已被投毒</text>
+            <text x="40" y="230" fill="#8492a8">API 端点被替换 · 监控者标记 Challenged · 数据不可信</text>
             </g>
-            <!-- phase 3: payment comparison -->
+            <!-- phase 3: result (no PactFuse mention) -->
             <g class="phase" data-phase="3">
-            <text x="32" y="310" fill="#627087" font-size="11">付款时刻</text>
-            <rect x="24" y="322" width="186" height="80" rx="12" fill="rgb(241 96 93/.08)" stroke="#f1605d" stroke-width="1.4"/>
-            <text x="36" y="348" fill="#f1605d" font-size="13" font-weight="600">没有 PactFuse</text>
-            <text x="36" y="368" fill="#8492a8" font-size="11">钱打出去了,买到假数据</text>
-            <text x="36" y="386" fill="#f1605d" font-size="13">💸 不可逆</text>
-            <rect x="230" y="322" width="186" height="80" rx="12" fill="rgb(47 209 157/.08)" stroke="#2fd19d" stroke-width="1.4"/>
-            <text x="242" y="348" fill="#2fd19d" font-size="13" font-weight="600">有 PactFuse</text>
-            <text x="242" y="368" fill="#8492a8" font-size="11">付款前重新读链上状态</text>
-            <text x="242" y="386" fill="#2fd19d" font-size="13">🛡 拦住了,0 损失</text>
+            <text x="32" y="278" fill="#627087" font-size="11">结果</text>
+            <rect x="24" y="288" width="392" height="40" rx="10" fill="rgb(241 96 93/.10)" stroke="#f1605d" stroke-width="1.4"/>
+            <text x="220" y="314" text-anchor="middle" fill="#f1605d" font-size="14" font-weight="600">💸 Agent 付了款,买到的是假数据,不可撤销</text>
             </g>
             <!-- click prompt -->
-            <text class="phase-prompt" x="220" y="410" text-anchor="middle" fill="#627087" font-size="11" style="cursor:pointer">点击逐步展开 ▶</text>
+            <text class="phase-prompt" x="220" y="338" text-anchor="middle" fill="#627087" font-size="11" style="cursor:pointer">点击逐步展开 ▶</text>
           </g>
         </svg>
       </div>
