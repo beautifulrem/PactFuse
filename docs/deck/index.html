@@ -52,15 +52,15 @@
   .slide.active{display:flex;opacity:1;animation:fade .4s ease both}
   @keyframes fade{from{opacity:0}to{opacity:1}}
   /* staggered content reveal: each slide's blocks cascade up on entry */
-  .slide.active > *{animation:deckRise .55s var(--ez) both}
-  .slide.active > :nth-child(1){animation-delay:.06s}
-  .slide.active > :nth-child(2){animation-delay:.14s}
-  .slide.active > :nth-child(3){animation-delay:.22s}
-  .slide.active > :nth-child(4){animation-delay:.30s}
-  .slide.active > :nth-child(5){animation-delay:.38s}
-  .slide.active > :nth-child(6){animation-delay:.46s}
-  .slide.active > :nth-child(7){animation-delay:.54s}
-  @keyframes deckRise{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+  .slide.active > *{animation:deckRise .42s var(--ez) both}
+  .slide.active > :nth-child(1){animation-delay:.03s}
+  .slide.active > :nth-child(2){animation-delay:.09s}
+  .slide.active > :nth-child(3){animation-delay:.15s}
+  .slide.active > :nth-child(4){animation-delay:.21s}
+  .slide.active > :nth-child(5){animation-delay:.27s}
+  .slide.active > :nth-child(6){animation-delay:.33s}
+  .slide.active > :nth-child(7){animation-delay:.39s}
+  @keyframes deckRise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
   /* the architecture trip arrow flows downward while its slide is up */
   .slide.active .flow-arrow{animation:dashflow .9s linear infinite}
   @keyframes dashflow{to{stroke-dashoffset:-24}}
@@ -87,6 +87,11 @@
   .tone-g{border-color:color-mix(in srgb,var(--emerald) 50%,transparent);color:var(--emerald);background:rgb(47 209 157/.1)}
   .tone-a{border-color:color-mix(in srgb,var(--amber) 50%,transparent);color:var(--amber);background:rgb(223 168 77/.1)}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .flow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:12px 0 2px;font-family:var(--mono);font-size:clamp(10px,1vw,13px);color:var(--g400)}
+  .flow span{border:1px solid var(--border);border-radius:6px;padding:3px 8px}
+  .flow i{color:#627087;font-style:normal}
+  .flow b{color:var(--g100);font-weight:600}
+  .flow-r b{color:var(--red)}.flow-g b{color:var(--emerald)}.flow-a b{color:var(--amber)}
   ul.clean{list-style:none;display:flex;flex-direction:column;gap:12px;margin-top:8px}
   ul.clean li{display:flex;gap:12px;align-items:flex-start;color:var(--g300);font-size:clamp(13px,1.3vw,19px);line-height:1.45}
   ul.clean li b{color:var(--g100);font-weight:600}
@@ -163,7 +168,7 @@
       <div class="card"><h3><span class="dot a"></span>来源失效</h3><p>报价时来源是安全的,<b class="hl-a">付款前却被吊销/挑战</b>,钱照样打出去。</p></div>
       <div class="card"><h3><span class="dot r"></span>付款拿不到货</h3><p>钱已上链,<b class="hl-r">交付却没发生</b>,链上不可逆。</p></div>
     </div>
-    <p class="sub" style="margin-top:26px">共同点:出问题的瞬间,<em>钱已经在路上</em>。事后再聪明也追不回。</p>
+    <p class="sub" style="margin-top:24px"><b class="hl-r">80%</b> 的组织已踩过 AI agent 风险行为;出问题的瞬间<em>钱已经在路上</em>,链上不可逆,事后追不回。<span style="color:#627087;font-size:.82em">来源:McKinsey · OWASP Agentic Top 10</span></p>
   </section>
 
   <!-- 3 · WHY EXISTING FALLS SHORT -->
@@ -198,6 +203,7 @@
         </svg>
       </div>
     </div>
+    <p class="sub" style="margin-top:20px">行业正转向<b class="hl-g">确定性强制</b>(deterministic enforcement):OWASP Agentic Top 10、Visa/Mastercard 都在补"验证层"。<em>PactFuse 把这道强制直接放到链上。</em></p>
   </section>
 
   <!-- 4 · SOLUTION -->
@@ -260,6 +266,56 @@
     </div>
   </section>
 
+  <!-- 5b · PAYMENT LIFECYCLE / DECISION FLOW -->
+  <section class="slide">
+    <div class="kicker">付款前的决策流</div>
+    <h2>每一笔支付,<em>先过这道判断</em></h2>
+    <div class="card" style="margin-top:16px">
+      <svg viewBox="0 0 1000 380" style="width:100%;max-height:42vh">
+        <defs>
+          <marker id="fg" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#d1b16e"/></marker>
+          <marker id="fr" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#f1605d"/></marker>
+          <marker id="fa" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#dfa84d"/></marker>
+          <marker id="fe" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#2fd19d"/></marker>
+        </defs>
+        <g font-family="monospace">
+          <rect x="22" y="150" width="150" height="64" rx="14" fill="rgb(100 136 244/.10)" stroke="#6488f4" stroke-width="1.6"/>
+          <text x="97" y="178" text-anchor="middle" fill="#82a0ff" font-size="14">Agent 发起支付</text>
+          <text x="97" y="198" text-anchor="middle" fill="#8492a8" font-size="11">via CAW</text>
+          <path d="M172 182 H224" stroke="#d1b16e" stroke-width="2.2" marker-end="url(#fg)"/>
+          <rect x="228" y="146" width="158" height="72" rx="14" fill="none" stroke="#aab5c5" stroke-width="1.6"/>
+          <text x="307" y="176" text-anchor="middle" fill="#edf2f8" font-size="13">在 Pact 白名单?</text>
+          <text x="307" y="196" text-anchor="middle" fill="#8492a8" font-size="11">policy allowlist</text>
+          <path d="M307 218 V300" stroke="#dfa84d" stroke-width="2" marker-end="url(#fa)"/>
+          <text x="316" y="266" fill="#dfa84d" font-size="12">否</text>
+          <rect x="232" y="300" width="150" height="58" rx="12" fill="rgb(223 168 77/.12)" stroke="#dfa84d" stroke-width="1.6"/>
+          <text x="307" y="326" text-anchor="middle" fill="#dfa84d" font-size="13">DENY · 策略拒绝</text>
+          <text x="307" y="345" text-anchor="middle" fill="#8492a8" font-size="11">从未上链</text>
+          <path d="M386 182 H446" stroke="#d1b16e" stroke-width="2.2" marker-end="url(#fg)"/>
+          <text x="406" y="172" fill="#2fd19d" font-size="12">是</text>
+          <rect x="450" y="146" width="172" height="72" rx="14" fill="rgb(241 96 93/.06)" stroke="#f1605d" stroke-width="1.8"/>
+          <text x="536" y="174" text-anchor="middle" fill="#f1605d" font-size="14">ProcurementGate</text>
+          <text x="536" y="194" text-anchor="middle" fill="#aab5c5" font-size="11">读 sourceState · 链上</text>
+          <path d="M622 182 H682" stroke="#d1b16e" stroke-width="2.2" marker-end="url(#fg)"/>
+          <rect x="686" y="146" width="150" height="72" rx="14" fill="none" stroke="#aab5c5" stroke-width="1.6"/>
+          <text x="761" y="176" text-anchor="middle" fill="#edf2f8" font-size="13">来源 = Active?</text>
+          <text x="761" y="196" text-anchor="middle" fill="#8492a8" font-size="11">2 = Challenged</text>
+          <path d="M740 218 L660 300" stroke="#f1605d" stroke-width="2" marker-end="url(#fr)"/>
+          <text x="676" y="252" fill="#f1605d" font-size="12">否</text>
+          <rect x="548" y="300" width="150" height="58" rx="12" fill="rgb(241 96 93/.12)" stroke="#f1605d" stroke-width="1.6"/>
+          <text x="623" y="326" text-anchor="middle" fill="#f1605d" font-size="13">TRIP · 熔断</text>
+          <text x="623" y="345" text-anchor="middle" fill="#8492a8" font-size="11">0 资金转移</text>
+          <path d="M790 218 L858 300" stroke="#2fd19d" stroke-width="2.2" marker-end="url(#fe)"/>
+          <text x="836" y="252" fill="#2fd19d" font-size="12">是</text>
+          <rect x="788" y="300" width="182" height="58" rx="12" fill="rgb(47 209 157/.12)" stroke="#2fd19d" stroke-width="1.6"/>
+          <text x="879" y="326" text-anchor="middle" fill="#2fd19d" font-size="13">SETTLE · 结算交付</text>
+          <text x="879" y="345" text-anchor="middle" fill="#8492a8" font-size="11">额度内支付 + artifact</text>
+        </g>
+      </svg>
+    </div>
+    <p class="sub" style="margin-top:14px">关键在 <b class="hl-r">读 sourceState</b> 这一步:它是<b>链上确定性</b>判断,不是模型猜测。不安全就 revert,钱落不了地。</p>
+  </section>
+
   <!-- 6 · SCENARIOS -->
   <section class="slide">
     <div class="kicker">三个场景 · 一键复现</div>
@@ -267,16 +323,19 @@
     <div class="cols c3">
       <div class="card"><div class="row"><span class="pill tone-r">TRIP · 熔断</span></div>
         <p style="margin-top:14px"><b>不安全来源 → 自动熔断</b></p>
+        <div class="flow flow-r"><span>挑战</span><i>›</i><span>链上确认</span><i>›</i><span>闸门跳闸</span><i>›</i><b>0 转移</b></div>
         <p>来源在报价后被挑战,断路器跳开,钉住它的支付在付款前被切断。</p>
-        <p class="mono hl-r" style="margin-top:12px">已保护 · 0 资金转移</p></div>
+        <p class="mono hl-r" style="margin-top:10px">已保护 · 0 资金转移</p></div>
       <div class="card"><div class="row"><span class="pill tone-g">SETTLE · 结算</span></div>
         <p style="margin-top:14px"><b>新鲜来源 → 结算并交付</b></p>
+        <div class="flow flow-g"><span>授权</span><i>›</i><span>额度↑</span><i>›</i><span>支付</span><i>›</i><b>交付 artifact</b></div>
         <p>来源干净,闸门在策略内授权、支付、释放 artifact。</p>
-        <p class="mono hl-g" style="margin-top:12px">已结算 · 转移 1,000 atomic</p></div>
+        <p class="mono hl-g" style="margin-top:10px">已结算 · 转移 1,000 atomic</p></div>
       <div class="card"><div class="row"><span class="pill tone-a">DENY · 拒绝</span></div>
         <p style="margin-top:14px"><b>错误目标 → 策略拒绝</b></p>
+        <div class="flow flow-a"><span>错误目标</span><i>›</i><span>策略不符</span><i>›</i><span>链下拒绝</span><i>›</i><b>0 上链</b></div>
         <p>目标不在 Pact 白名单,CAW 在任何东西上链前拒绝。</p>
-        <p class="mono hl-a" style="margin-top:12px">已拒绝 · 从未触达链</p></div>
+        <p class="mono hl-a" style="margin-top:10px">已拒绝 · 从未触达链</p></div>
     </div>
     <p class="sub" style="margin-top:24px">控制台里按 <span class="mono">1 / 2 / 3</span> 选场景,<span class="mono">R</span> 运行,全程驱动自同一个状态机。</p>
   </section>
