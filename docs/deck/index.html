@@ -64,32 +64,44 @@
   /* the architecture trip arrow flows downward while its slide is up */
   .slide.active .flow-arrow{animation:dashflow .9s linear infinite}
   @keyframes dashflow{to{stroke-dashoffset:-24}}
-  /* SVG diagram entrance: rects/circles fade+scale in, text fades in, staggered */
-  .slide.active .card svg rect,
-  .slide.active .card svg circle{animation:svgPop .5s var(--ez) both;transform-box:fill-box;transform-origin:center}
-  .slide.active .card svg text{animation:svgText .4s ease both}
-  .slide.active .card svg path[d*="H"],
-  .slide.active .card svg path[d*="V"],
-  .slide.active .card svg line{animation:svgLine .6s var(--ez) both}
-  /* stagger by element index via nth-of-type */
-  .slide.active .card svg rect:nth-of-type(1){animation-delay:.05s}
-  .slide.active .card svg rect:nth-of-type(2){animation-delay:.12s}
-  .slide.active .card svg rect:nth-of-type(3){animation-delay:.19s}
-  .slide.active .card svg rect:nth-of-type(4){animation-delay:.26s}
-  .slide.active .card svg rect:nth-of-type(5){animation-delay:.33s}
-  .slide.active .card svg rect:nth-of-type(6){animation-delay:.40s}
-  .slide.active .card svg text:nth-of-type(1){animation-delay:.08s}
-  .slide.active .card svg text:nth-of-type(2){animation-delay:.16s}
-  .slide.active .card svg text:nth-of-type(3){animation-delay:.24s}
-  .slide.active .card svg text:nth-of-type(4){animation-delay:.32s}
-  @keyframes svgPop{from{opacity:0;transform:scale(.85)}to{opacity:1;transform:none}}
-  @keyframes svgText{from{opacity:0}to{opacity:1}}
-  @keyframes svgLine{from{opacity:0;stroke-dasharray:200;stroke-dashoffset:200}to{opacity:1;stroke-dashoffset:0}}
-  /* SVG interactive hover: rects glow, text brightens */
-  .card svg rect[rx]{transition:filter .2s,stroke-width .2s;cursor:default}
-  .card svg rect[rx]:hover{filter:brightness(1.3) drop-shadow(0 0 6px currentColor);stroke-width:2.4}
-  .card svg text{transition:fill .2s}
-  .card svg g:hover text{fill:var(--g100)}
+  /* ── per-diagram interactions ── */
+  /* SVG 1 (story): click-to-reveal phases. JS adds .phase-N classes */
+  .story-svg .phase{opacity:0;transition:opacity .5s var(--ez),transform .5s var(--ez);transform:translateY(12px)}
+  .story-svg .phase.show{opacity:1;transform:none}
+  .story-svg .phase-btn{cursor:pointer}
+  .story-svg .phase-btn:hover rect{filter:brightness(1.3)}
+
+  /* SVG 2 (attack): hover a stage to spotlight it, dim others */
+  .attack-svg .stage{transition:opacity .3s,filter .3s}
+  .attack-svg:hover .stage{opacity:.3;filter:none}
+  .attack-svg:hover .stage:hover{opacity:1;filter:drop-shadow(0 0 10px rgb(209 177 110/.4))}
+  .attack-svg:not(:hover) .stage{opacity:1}
+
+  /* SVG 3 (decision-time): click toggles decision/payment layer highlight */
+  .dt-svg .layer{transition:opacity .4s,filter .4s}
+  .dt-svg.show-payment .dt-layer{opacity:.25}
+  .dt-svg.show-payment .pt-layer{filter:drop-shadow(0 0 12px rgb(47 209 157/.5))}
+  .dt-svg .pt-layer,.dt-svg .dt-layer{cursor:pointer}
+
+  /* SVG 4 (quadrant): PactFuse dot pulses; competitor dots grow on hover */
+  .quad-svg .pf-dot{animation:qPulse 2s ease-in-out infinite}
+  @keyframes qPulse{0%,100%{r:14}50%{r:18}}
+  .quad-svg .comp{transition:r .2s,opacity .2s;cursor:pointer}
+  .quad-svg .comp:hover{r:14;opacity:1}
+  .quad-svg .comp-label{opacity:0;transition:opacity .25s}
+  .quad-svg .comp:hover+.comp-label,.quad-svg .comp:hover~.comp-label{opacity:1}
+
+  /* SVG 5 (architecture): hover a node to glow it + brighten its connected wires */
+  .arch-svg .anode{transition:filter .3s;cursor:pointer}
+  .arch-svg .anode:hover{filter:drop-shadow(0 0 10px currentColor) brightness(1.2)}
+  .arch-svg .anode:hover text{fill:var(--g100)}
+
+  /* SVG 6 (decision flow): click a result to highlight its path */
+  .flow-svg .flow-path{transition:opacity .4s,stroke-width .4s}
+  .flow-svg.hl .flow-path{opacity:.15}
+  .flow-svg.hl .flow-path.active{opacity:1;stroke-width:3}
+  .flow-svg .result{cursor:pointer}
+  .flow-svg .result:hover rect{filter:brightness(1.3)}
 
   /* concrete scenario: poison box pulses red, gap badge blinks amber */
   .slide.active .scene-poison{animation:scenePulse 2.2s ease-in-out infinite}
@@ -218,35 +230,40 @@
         <p class="sub" style="margin-top:14px">88% 运行 AI agent 的组织报告过类似事件。<span style="color:var(--g500);font-size:.82em">beam.ai 2026</span></p>
       </div>
       <div class="card" style="padding:0;overflow:hidden">
-        <svg viewBox="0 0 440 420" style="width:100%">
+        <svg class="story-svg" viewBox="0 0 440 420" style="width:100%">
           <g font-family="monospace" font-size="12">
-            <!-- t0: investigation -->
+            <!-- t0: investigation (phase 1, always visible) -->
+            <g class="phase show" data-phase="1">
             <text x="32" y="34" fill="#627087" font-size="11">Agent 的视角</text>
             <rect x="24" y="48" width="392" height="72" rx="12" fill="rgb(47 209 157/.08)" stroke="#2fd19d" stroke-width="1.4"/>
             <text x="40" y="74" fill="#2fd19d" font-size="14" font-weight="600">✓ 调查:一切正常</text>
             <text x="40" y="96" fill="#8492a8">供应商状态 Active · 报价 500 mUSD · 白名单 ✓</text>
-            <!-- gap: 30 min -->
+            </g>
+            <!-- phase 2: gap + poison -->
+            <g class="phase" data-phase="2">
             <rect class="scene-gap" x="190" y="134" width="60" height="28" rx="6" fill="rgb(223 168 77/.15)" stroke="#dfa84d" stroke-width="1.2"/>
             <text x="220" y="153" text-anchor="middle" fill="#dfa84d" font-size="11" font-weight="600">30 分钟</text>
             <line x1="220" y1="120" x2="220" y2="134" stroke="#dfa84d" stroke-width="1.2" stroke-dasharray="3 3"/>
             <line x1="220" y1="162" x2="220" y2="178" stroke="#dfa84d" stroke-width="1.2" stroke-dasharray="3 3"/>
-            <!-- t1: reality changed (animated) -->
             <text x="32" y="194" fill="#627087" font-size="11">真实世界(Agent 不知道)</text>
             <rect class="scene-poison" x="24" y="208" width="392" height="72" rx="12" fill="rgb(241 96 93/.08)" stroke="#f1605d" stroke-width="1.4"/>
             <text x="40" y="234" fill="#f1605d" font-size="14" font-weight="600">✕ 来源已被投毒</text>
             <text x="40" y="256" fill="#8492a8">API 端点被替换 · 监控者标记 Challenged · 数据不可信</text>
-            <!-- t2: payment -->
+            </g>
+            <!-- phase 3: payment comparison -->
+            <g class="phase" data-phase="3">
             <text x="32" y="310" fill="#627087" font-size="11">付款时刻</text>
-            <!-- without -->
             <rect x="24" y="322" width="186" height="80" rx="12" fill="rgb(241 96 93/.08)" stroke="#f1605d" stroke-width="1.4"/>
             <text x="36" y="348" fill="#f1605d" font-size="13" font-weight="600">没有 PactFuse</text>
             <text x="36" y="368" fill="#8492a8" font-size="11">钱打出去了,买到假数据</text>
             <text x="36" y="386" fill="#f1605d" font-size="13">💸 不可逆</text>
-            <!-- with -->
             <rect x="230" y="322" width="186" height="80" rx="12" fill="rgb(47 209 157/.08)" stroke="#2fd19d" stroke-width="1.4"/>
             <text x="242" y="348" fill="#2fd19d" font-size="13" font-weight="600">有 PactFuse</text>
             <text x="242" y="368" fill="#8492a8" font-size="11">付款前重新读链上状态</text>
             <text x="242" y="386" fill="#2fd19d" font-size="13">🛡 拦住了,0 损失</text>
+            </g>
+            <!-- click prompt -->
+            <text class="phase-prompt" x="220" y="410" text-anchor="middle" fill="#627087" font-size="11" style="cursor:pointer">点击逐步展开 ▶</text>
           </g>
         </svg>
       </div>
@@ -258,28 +275,32 @@
     <div class="kicker">攻击是怎么发生的</div>
     <h2>一次典型的<em>来源投毒攻击</em></h2>
     <div class="card" style="margin-top:14px">
-      <svg viewBox="0 0 1000 310" style="width:100%;max-height:38vh">
+      <svg class="attack-svg" viewBox="0 0 1000 310" style="width:100%;max-height:38vh">
         <defs>
           <marker id="at" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#d1b16e"/></marker>
           <marker id="atr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#f1605d"/></marker>
         </defs>
         <g font-family="monospace" font-size="13">
-          <!-- timeline -->
           <text x="30" y="26" fill="#627087" font-size="11">时间 →</text>
           <line x1="80" y1="22" x2="970" y2="22" stroke="#2a3648" stroke-width="1.4"/>
-          <!-- t0: quote -->
+          <!-- t0 stage -->
+          <g class="stage">
           <text x="100" y="56" fill="#d1b16e" font-size="12">t₀ 报价</text>
           <rect x="80" y="68" width="140" height="52" rx="10" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.4"/>
           <text x="96" y="90" fill="#2fd19d">来源 Active ✓</text>
           <text x="96" y="108" fill="#8492a8" font-size="11">Agent 拿到价格</text>
+          </g>
           <path d="M220 94 H310" stroke="#d1b16e" stroke-width="1.8" marker-end="url(#at)"/>
-          <!-- t1: source poisoned -->
+          <!-- t1 stage -->
+          <g class="stage">
           <text x="332" y="56" fill="#f1605d" font-size="12">t₁ 来源被挑战</text>
           <rect x="314" y="68" width="160" height="52" rx="10" fill="rgb(241 96 93/.10)" stroke="#f1605d" stroke-width="1.4"/>
           <text x="330" y="90" fill="#f1605d">SourceChallenged</text>
           <text x="330" y="108" fill="#8492a8" font-size="11">供应商跑路 / 数据投毒</text>
+          </g>
           <path d="M474 94 H560" stroke="#d1b16e" stroke-width="1.8" marker-end="url(#at)"/>
-          <!-- t2: without pactfuse -->
+          <!-- t2 stage -->
+          <g class="stage">
           <text x="580" y="56" fill="#8492a8" font-size="12">t₂ 付款</text>
           <rect x="564" y="68" width="190" height="104" rx="10" fill="none" stroke="#2a3648" stroke-width="1.4"/>
           <text x="580" y="90" fill="#8492a8">没有 PactFuse:</text>
@@ -287,13 +308,13 @@
           <line x1="564" y1="132" x2="754" y2="132" stroke="#2a3648" stroke-width="1"/>
           <text x="580" y="152" fill="#2fd19d">有 PactFuse:</text>
           <text x="580" y="172" fill="#2fd19d">闸门读到 Challenged</text>
-          <!-- outcome -->
           <path d="M754 100 H830" stroke="#f1605d" stroke-width="1.6" stroke-dasharray="5 5" marker-end="url(#atr)"/>
           <rect x="834" y="68" width="140" height="44" rx="10" fill="rgb(241 96 93/.10)" stroke="#f1605d" stroke-width="1.4"/>
           <text x="850" y="96" fill="#f1605d" font-size="14">💸 损失</text>
           <path d="M754 160 H830" stroke="#2fd19d" stroke-width="2" marker-end="url(#at)"/>
           <rect x="834" y="140" width="140" height="44" rx="10" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.4"/>
           <text x="850" y="168" fill="#2fd19d" font-size="14">🛡 0 损失</text>
+          </g>
         </g>
         <text x="500" y="260" text-anchor="middle" fill="#627087" font-family="monospace" font-size="12">关键窗口:报价(t₀)和付款(t₂)之间,来源状态可能已经变了</text>
         <text x="500" y="282" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="12">PactFuse 在 t₂ 重新读一次链上状态,不安全就拦</text>
@@ -314,8 +335,9 @@
         </ul>
       </div>
       <div class="card">
-        <svg viewBox="0 0 500 280" style="width:100%">
+        <svg class="dt-svg" viewBox="0 0 500 280" style="width:100%">
           <defs><marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#8492a8"/></marker></defs>
+          <g class="dt-layer">
           <text x="14" y="30" fill="#82a0ff" font-family="monospace" font-size="14">决策时 · decision-time</text>
           <text x="14" y="48" fill="#627087" font-family="monospace" font-size="11">其他项目和传统方案都在这一层</text>
           <rect x="14" y="58" width="128" height="44" rx="9" fill="none" stroke="#6488f4" stroke-width="1.4"/>
@@ -324,13 +346,16 @@
           <text x="164" y="85" fill="#aab5c5" font-size="13" font-family="monospace">Pact 白名单</text>
           <rect x="290" y="58" width="186" height="44" rx="9" fill="none" stroke="#6488f4" stroke-width="1.4"/>
           <text x="302" y="85" fill="#aab5c5" font-size="13" font-family="monospace">链下风控打分</text>
+          </g>
           <path d="M230 114 V134" stroke="#dfa84d" stroke-width="1.4" stroke-dasharray="5 5"/>
           <text x="120" y="148" fill="#dfa84d" font-family="monospace" font-size="12">↓ 中间可能过了几分钟,来源状态已经变了</text>
+          <g class="pt-layer">
           <text x="14" y="182" fill="#2fd19d" font-family="monospace" font-size="14">付款时 · payment-time</text>
           <text x="14" y="200" fill="#627087" font-family="monospace" font-size="11">只有 PactFuse 在这一层</text>
           <rect x="14" y="210" width="472" height="52" rx="10" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.8"/>
           <text x="30" y="237" fill="#2fd19d" font-size="14" font-family="monospace" font-weight="600">链上合约 · sourceState 实时读取</text>
           <text x="30" y="253" fill="#8492a8" font-size="11" font-family="monospace">不靠 LLM 判断 · 不怕投毒 · 确定性逻辑</text>
+          </g>
         </svg>
       </div>
     </div>
@@ -343,7 +368,7 @@
     <h2>PactFuse 的<em>定位</em></h2>
     <div class="cols c2" style="align-items:center">
       <div class="card" style="padding:0;overflow:hidden">
-        <svg viewBox="0 0 480 380" style="width:100%">
+        <svg class="quad-svg" viewBox="0 0 480 380" style="width:100%">
           <defs><marker id="aq" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 Z" fill="#627087"/></marker></defs>
           <!-- axes -->
           <line x1="60" y1="340" x2="460" y2="340" stroke="#627087" stroke-width="1.4" marker-end="url(#aq)"/>
@@ -399,7 +424,7 @@
     <div class="kicker">怎么做 · 架构</div>
     <h2>一次支付的<em>三道关卡</em></h2>
     <div class="card" style="margin-top:18px">
-      <svg viewBox="0 0 1000 360" style="width:100%">
+      <svg class="arch-svg" viewBox="0 0 1000 360" style="width:100%">
         <defs>
           <marker id="a2" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#d1b16e"/></marker>
           <marker id="a2r" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#f1605d"/></marker>
@@ -414,23 +439,27 @@
         <text x="512" y="128" fill="#f1605d" font-family="monospace" font-size="12">challenge → trip</text>
         <!-- line of nodes -->
         <g font-family="monospace">
-          <!-- agent -->
+          <g class="anode" style="color:#6488f4">
           <rect x="40" y="168" width="170" height="80" rx="14" fill="rgb(100 136 244/.10)" stroke="#6488f4" stroke-width="1.6"/>
           <text x="125" y="202" text-anchor="middle" fill="#82a0ff" font-size="15">Agent + CAW</text>
           <text x="125" y="224" text-anchor="middle" fill="#8492a8" font-size="12">Cobo Agentic Wallet</text>
-          <!-- pact -->
+          </g>
+          <g class="anode" style="color:#aab5c5">
           <rect x="270" y="168" width="170" height="80" rx="14" fill="none" stroke="#2a3648" stroke-width="1.6"/>
           <text x="355" y="202" text-anchor="middle" fill="#aab5c5" font-size="15">Pact 策略</text>
           <text x="355" y="224" text-anchor="middle" fill="#8492a8" font-size="12">白名单 · 限额</text>
-          <!-- gate -->
+          </g>
+          <g class="anode" style="color:#f1605d">
           <rect x="500" y="160" width="190" height="96" rx="16" fill="rgb(241 96 93/.08)" stroke="#f1605d" stroke-width="1.8"/>
           <text x="595" y="198" text-anchor="middle" fill="#f1605d" font-size="16">ProcurementGate</text>
           <text x="595" y="220" text-anchor="middle" fill="#aab5c5" font-size="12">断路器:付款前核验</text>
           <text x="595" y="238" text-anchor="middle" fill="#8492a8" font-size="11">sourceState 卡住 spend</text>
-          <!-- market -->
+          </g>
+          <g class="anode" style="color:#2fd19d">
           <rect x="760" y="168" width="170" height="80" rx="14" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.6"/>
           <text x="845" y="202" text-anchor="middle" fill="#2fd19d" font-size="15">Artifact 市场</text>
           <text x="845" y="224" text-anchor="middle" fill="#8492a8" font-size="12">付费交付</text>
+          </g>
           <!-- conduits -->
           <path d="M210 208 H266" stroke="#d1b16e" stroke-width="2.4" marker-end="url(#a2)"/>
           <path d="M440 208 H496" stroke="#d1b16e" stroke-width="2.4" marker-end="url(#a2)"/>
@@ -446,7 +475,7 @@
     <div class="kicker">付款前的决策流</div>
     <h2>每一笔支付,<em>先过这道判断</em></h2>
     <div class="card" style="margin-top:16px">
-      <svg viewBox="0 0 1000 380" style="width:100%;max-height:42vh">
+      <svg class="flow-svg" viewBox="0 0 1000 380" style="width:100%;max-height:42vh">
         <defs>
           <marker id="fg" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#d1b16e"/></marker>
           <marker id="fr" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#f1605d"/></marker>
@@ -461,11 +490,13 @@
           <rect x="228" y="146" width="158" height="72" rx="14" fill="none" stroke="#aab5c5" stroke-width="1.6"/>
           <text x="307" y="176" text-anchor="middle" fill="#edf2f8" font-size="13">在 Pact 白名单?</text>
           <text x="307" y="196" text-anchor="middle" fill="#8492a8" font-size="11">policy allowlist</text>
-          <path d="M307 218 V300" stroke="#dfa84d" stroke-width="2" marker-end="url(#fa)"/>
+          <path class="flow-path" data-path="deny" d="M307 218 V300" stroke="#dfa84d" stroke-width="2" marker-end="url(#fa)"/>
           <text x="316" y="266" fill="#dfa84d" font-size="12">否</text>
+          <g class="result" data-result="deny">
           <rect x="232" y="300" width="150" height="58" rx="12" fill="rgb(223 168 77/.12)" stroke="#dfa84d" stroke-width="1.6"/>
           <text x="307" y="326" text-anchor="middle" fill="#dfa84d" font-size="13">DENY · 策略拒绝</text>
           <text x="307" y="345" text-anchor="middle" fill="#8492a8" font-size="11">从未上链</text>
+          </g>
           <path d="M386 182 H446" stroke="#d1b16e" stroke-width="2.2" marker-end="url(#fg)"/>
           <text x="406" y="172" fill="#2fd19d" font-size="12">是</text>
           <rect x="450" y="146" width="172" height="72" rx="14" fill="rgb(241 96 93/.06)" stroke="#f1605d" stroke-width="1.8"/>
@@ -475,16 +506,20 @@
           <rect x="686" y="146" width="150" height="72" rx="14" fill="none" stroke="#aab5c5" stroke-width="1.6"/>
           <text x="761" y="176" text-anchor="middle" fill="#edf2f8" font-size="13">来源 = Active?</text>
           <text x="761" y="196" text-anchor="middle" fill="#8492a8" font-size="11">2 = Challenged</text>
-          <path d="M740 218 L660 300" stroke="#f1605d" stroke-width="2" marker-end="url(#fr)"/>
+          <path class="flow-path" data-path="trip" d="M740 218 L660 300" stroke="#f1605d" stroke-width="2" marker-end="url(#fr)"/>
           <text x="676" y="252" fill="#f1605d" font-size="12">否</text>
+          <g class="result" data-result="trip">
           <rect x="548" y="300" width="150" height="58" rx="12" fill="rgb(241 96 93/.12)" stroke="#f1605d" stroke-width="1.6"/>
           <text x="623" y="326" text-anchor="middle" fill="#f1605d" font-size="13">TRIP · 熔断</text>
           <text x="623" y="345" text-anchor="middle" fill="#8492a8" font-size="11">0 资金转移</text>
-          <path d="M790 218 L858 300" stroke="#2fd19d" stroke-width="2.2" marker-end="url(#fe)"/>
+          </g>
+          <path class="flow-path" data-path="settle" d="M790 218 L858 300" stroke="#2fd19d" stroke-width="2.2" marker-end="url(#fe)"/>
           <text x="836" y="252" fill="#2fd19d" font-size="12">是</text>
+          <g class="result" data-result="settle">
           <rect x="788" y="300" width="182" height="58" rx="12" fill="rgb(47 209 157/.12)" stroke="#2fd19d" stroke-width="1.6"/>
           <text x="879" y="326" text-anchor="middle" fill="#2fd19d" font-size="13">SETTLE · 结算交付</text>
           <text x="879" y="345" text-anchor="middle" fill="#8492a8" font-size="11">额度内支付 + artifact</text>
+          </g>
         </g>
       </svg>
     </div>
@@ -649,6 +684,61 @@
   let sx=0; addEventListener('touchstart',e=>sx=e.touches[0].clientX,{passive:true});
   addEventListener('touchend',e=>{const dx=e.changedTouches[0].clientX-sx; if(Math.abs(dx)>50)dx<0?next():prev()},{passive:true});
   go(parseInt(location.hash.slice(1))-1||0);
+
+  // ── per-diagram interactions ──
+
+  // SVG 1 (story): click to reveal phases 2 then 3
+  document.querySelectorAll('.story-svg').forEach(svg=>{
+    let phase=1;
+    svg.style.cursor='pointer';
+    svg.addEventListener('click',()=>{
+      phase=Math.min(phase+1,3);
+      svg.querySelectorAll('.phase').forEach(p=>{
+        p.classList.toggle('show',parseInt(p.dataset.phase)<=phase);
+      });
+      const prompt=svg.querySelector('.phase-prompt');
+      if(prompt) prompt.textContent=phase>=3?'':'点击继续 ▶';
+    });
+    // reset phases when navigating away
+    const obs=new MutationObserver(()=>{
+      if(!svg.closest('.slide.active')){
+        phase=1;
+        svg.querySelectorAll('.phase').forEach(p=>p.classList.toggle('show',p.dataset.phase==='1'));
+        const prompt=svg.querySelector('.phase-prompt');
+        if(prompt) prompt.textContent='点击逐步展开 ▶';
+      }
+    });
+    obs.observe(svg.closest('.slide'),{attributes:true,attributeFilter:['class']});
+  });
+
+  // SVG 3 (decision-time): click to toggle decision/payment layer focus
+  document.querySelectorAll('.dt-svg').forEach(svg=>{
+    svg.style.cursor='pointer';
+    svg.addEventListener('click',()=>svg.classList.toggle('show-payment'));
+    // reset on slide leave
+    const obs=new MutationObserver(()=>{
+      if(!svg.closest('.slide.active')) svg.classList.remove('show-payment');
+    });
+    obs.observe(svg.closest('.slide'),{attributes:true,attributeFilter:['class']});
+  });
+
+  // SVG 6 (decision flow): click a result to highlight its path
+  document.querySelectorAll('.flow-svg .result').forEach(r=>{
+    r.addEventListener('click',()=>{
+      const svg=r.closest('.flow-svg');
+      const id=r.dataset.result;
+      // toggle: if already highlighted, clear
+      if(svg.classList.contains('hl')&&r.classList.contains('active')){
+        svg.classList.remove('hl');
+        svg.querySelectorAll('.active').forEach(a=>a.classList.remove('active'));
+      }else{
+        svg.classList.add('hl');
+        svg.querySelectorAll('.active').forEach(a=>a.classList.remove('active'));
+        svg.querySelectorAll(`[data-path="${id}"],.result[data-result="${id}"]`).forEach(a=>a.classList.add('active'));
+        r.classList.add('active');
+      }
+    });
+  });
 </script>
 </body>
 </html>
