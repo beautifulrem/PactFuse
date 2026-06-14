@@ -8,7 +8,7 @@
 
 PactFuse re-checks what an agent is buying at the **instant of payment**, on-chain, and cuts the payment **before any token moves** if the source turned unsafe. Every claim replays signed on-chain evidence you can re-verify live.
 
-[**▶ Live Console**](https://pactfuse-console.vercel.app) · [Verify it yourself](#-verify-it-yourself) · [How it works](#-how-it-works) · [中文文档](./README.zh-CN.md)
+[**▶ Live Console**](https://pactfuse-console.vercel.app) · [**▶ Demo Video**](https://youtu.be/BjnNCgbXQAY) · [Verify it yourself](#-verify-it-yourself) · [How it works](#-how-it-works) · [中文文档](./README.zh-CN.md)
 
 <br/>
 

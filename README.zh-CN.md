@@ -8,7 +8,7 @@
 
 PactFuse 在**付款的那一刻**于链上重新核验 Agent 要买的东西,一旦来源变得不安全,就在**任何代币转移之前**切断这笔支付。每一条声明都由可重放、带签名的链上证据支撑,而且你能实时复验。
 
-[**▶ 在线 Console**](https://pactfuse-console.vercel.app) · [自己验证](#-自己验证) · [工作原理](#-工作原理) · [English](./README.md)
+[**▶ 在线 Console**](https://pactfuse-console.vercel.app) · [**▶ 演示视频**](https://youtu.be/BjnNCgbXQAY) · [自己验证](#-自己验证) · [工作原理](#-工作原理) · [English](./README.md)
 
 <br/>
 
