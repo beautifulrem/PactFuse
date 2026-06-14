@@ -193,7 +193,7 @@
     <img class="mark" src="../../apps/fusebox/live/icons/icon-512.png" alt="PactFuse" />
     <div class="kicker">Cobo Agentic Wallet 赛道</div>
     <h1>PACT<span class="fuse">FUSE</span></h1>
-    <p class="lead" style="margin-top:20px">面向 Agent 支付的<em>链上断路器</em>。付款那一刻重新验证来源,不安全就拦住,干净的才放行。</p>
+    <p class="lead" style="margin-top:20px">Agent 掏钱的那一秒,我们在链上再查一遍。<em>不安全?拦住。干净?放行。</em></p>
     <div class="badges">
       <span class="pill">Base Sepolia · 84532</span>
       <span class="pill">有疑必拦</span>
@@ -206,13 +206,13 @@
   <section class="slide">
     <div class="kicker">问题</div>
     <h2>AI Agent 正在<span class="hl-r">自己花钱</span></h2>
-    <p class="lead">它能自己下单、签名、付款。可一旦它被骗、或它买的东西在付款瞬间已经变质,<em>谁来拦?</em></p>
+    <p class="lead">它能下单、签名、付款。可是它被骗了怎么办?它要买的东西在付款前一秒变了怎么办?<em>谁来拦?</em></p>
     <div class="cols c3">
       <div class="card"><h3><span class="dot r"></span>被注入</h3><p>提示注入让 Agent 把钱付给<b class="hl-r">错误的合约地址</b>,它自己不会怀疑。</p></div>
       <div class="card"><h3><span class="dot a"></span>来源失效</h3><p>报价时来源是安全的,<b class="hl-a">付款前却被吊销/挑战</b>,钱照样打出去。</p></div>
       <div class="card"><h3><span class="dot r"></span>付款拿不到货</h3><p>钱已上链,<b class="hl-r">交付却没发生</b>,链上不可逆。</p></div>
     </div>
-    <p class="sub" style="margin-top:24px"><b class="hl-r">80%</b> 的组织报告过 AI agent 的风险行为(McKinsey)。问题是:<em>交易一旦上链就没法撤销</em>,发现得再快,钱已经没了。<span style="color:#627087;font-size:.82em">来源:McKinsey · OWASP Agentic Top 10</span></p>
+    <p class="sub" style="margin-top:24px"><b class="hl-r">80%</b> 的组织踩过 agent 的坑(<a href="https://www.mckinsey.com/capabilities/mckinsey-digital/our-insights" target="_blank" rel="noopener" style="color:#627087;font-size:.82em">McKinsey ↗</a>)。链上交易没有"撤销"按钮,发现得再快也没用。</p>
   </section>
 
   <!-- 2b · CONCRETE SCENARIO STORY -->
@@ -227,7 +227,7 @@
           <li><span class="dot a"></span><span><b>30 分钟后</b>:API 被替换成投毒数据,来源被标记为<b class="hl-r">不可信</b>。</span></li>
           <li><span class="dot r"></span><span><b>付款时</b>:Agent 用旧结果付款,<b class="hl-r">钱打出去了</b>,不可逆。</span></li>
         </ul>
-        <p class="sub" style="margin-top:14px">88% 运行 AI agent 的组织报告过类似事件。<span style="color:var(--g500);font-size:.82em">beam.ai 2026</span></p>
+        <p class="sub" style="margin-top:14px">88% 的组织踩过这种坑。<a href="https://beam.ai/agentic-insights/ai-agent-security-breaches-2026-lessons" target="_blank" rel="noopener" style="color:var(--g500);font-size:.82em">beam.ai 2026 ↗</a></p>
       </div>
       <div class="card" style="padding:0;overflow:hidden">
         <svg class="story-svg" viewBox="0 0 440 420" style="width:100%">
@@ -270,58 +270,6 @@
     </div>
   </section>
 
-  <!-- 2c · ATTACK SEQUENCE -->
-  <section class="slide">
-    <div class="kicker">攻击是怎么发生的</div>
-    <h2>一次典型的<em>来源投毒攻击</em></h2>
-    <div class="card" style="margin-top:14px">
-      <svg class="attack-svg" viewBox="0 0 1000 310" style="width:100%;max-height:38vh">
-        <defs>
-          <marker id="at" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#d1b16e"/></marker>
-          <marker id="atr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#f1605d"/></marker>
-        </defs>
-        <g font-family="monospace" font-size="13">
-          <text x="30" y="26" fill="#627087" font-size="11">时间 →</text>
-          <line x1="80" y1="22" x2="970" y2="22" stroke="#2a3648" stroke-width="1.4"/>
-          <!-- t0 stage -->
-          <g class="stage">
-          <text x="100" y="56" fill="#d1b16e" font-size="12">t₀ 报价</text>
-          <rect x="80" y="68" width="140" height="52" rx="10" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.4"/>
-          <text x="96" y="90" fill="#2fd19d">来源 Active ✓</text>
-          <text x="96" y="108" fill="#8492a8" font-size="11">Agent 拿到价格</text>
-          </g>
-          <path d="M220 94 H310" stroke="#d1b16e" stroke-width="1.8" marker-end="url(#at)"/>
-          <!-- t1 stage -->
-          <g class="stage">
-          <text x="332" y="56" fill="#f1605d" font-size="12">t₁ 来源被挑战</text>
-          <rect x="314" y="68" width="160" height="52" rx="10" fill="rgb(241 96 93/.10)" stroke="#f1605d" stroke-width="1.4"/>
-          <text x="330" y="90" fill="#f1605d">SourceChallenged</text>
-          <text x="330" y="108" fill="#8492a8" font-size="11">供应商跑路 / 数据投毒</text>
-          </g>
-          <path d="M474 94 H560" stroke="#d1b16e" stroke-width="1.8" marker-end="url(#at)"/>
-          <!-- t2 stage -->
-          <g class="stage">
-          <text x="580" y="56" fill="#8492a8" font-size="12">t₂ 付款</text>
-          <rect x="564" y="68" width="190" height="104" rx="10" fill="none" stroke="#2a3648" stroke-width="1.4"/>
-          <text x="580" y="90" fill="#8492a8">没有 PactFuse:</text>
-          <text x="580" y="112" fill="#f1605d">钱已上链,追不回 ✕</text>
-          <line x1="564" y1="132" x2="754" y2="132" stroke="#2a3648" stroke-width="1"/>
-          <text x="580" y="152" fill="#2fd19d">有 PactFuse:</text>
-          <text x="580" y="172" fill="#2fd19d">闸门读到 Challenged</text>
-          <path d="M754 100 H830" stroke="#f1605d" stroke-width="1.6" stroke-dasharray="5 5" marker-end="url(#atr)"/>
-          <rect x="834" y="68" width="140" height="44" rx="10" fill="rgb(241 96 93/.10)" stroke="#f1605d" stroke-width="1.4"/>
-          <text x="850" y="96" fill="#f1605d" font-size="14">💸 损失</text>
-          <path d="M754 160 H830" stroke="#2fd19d" stroke-width="2" marker-end="url(#at)"/>
-          <rect x="834" y="140" width="140" height="44" rx="10" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.4"/>
-          <text x="850" y="168" fill="#2fd19d" font-size="14">🛡 0 损失</text>
-          </g>
-        </g>
-        <text x="500" y="260" text-anchor="middle" fill="#627087" font-family="monospace" font-size="12">关键窗口:报价(t₀)和付款(t₂)之间,来源状态可能已经变了</text>
-        <text x="500" y="282" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="12">PactFuse 在 t₂ 重新读一次链上状态,不安全就拦</text>
-      </svg>
-    </div>
-  </section>
-
   <!-- 3 · WHY EXISTING FALLS SHORT -->
   <section class="slide">
     <div class="kicker">现有方案的盲区</div>
@@ -329,9 +277,9 @@
     <div class="cols c2" style="align-items:center">
       <div>
         <ul class="clean">
-          <li><span class="dot c"></span><span><b>CAW / LLM / 风控</b> → 管 Agent <b>能不能发起</b>操作(决策时)</span></li>
-          <li><span class="dot r"></span><span>Web3 交易<b class="hl-r">不可逆</b>,决策到付款之间来源可能已变</span></li>
-          <li><span class="dot g"></span><span><b class="hl-g">PactFuse</b> → 管钱<b>真正打出去的那一刻</b>(付款时)</span></li>
+          <li><span class="dot c"></span><span><b>白名单 / LLM / 风控</b>:管"能不能发起"这个操作</span></li>
+          <li><span class="dot r"></span><span>Web3 交易<b class="hl-r">没法撤</b>,中间那几分钟来源可能变了</span></li>
+          <li><span class="dot g"></span><span><b class="hl-g">PactFuse</b>:管"钱<b>真的打出去那一刻</b>"</span></li>
         </ul>
       </div>
       <div class="card">
@@ -354,12 +302,12 @@
           <text x="14" y="200" fill="#627087" font-family="monospace" font-size="11">只有 PactFuse 在这一层</text>
           <rect x="14" y="210" width="472" height="52" rx="10" fill="rgb(47 209 157/.10)" stroke="#2fd19d" stroke-width="1.8"/>
           <text x="30" y="237" fill="#2fd19d" font-size="14" font-family="monospace" font-weight="600">链上合约 · sourceState 实时读取</text>
-          <text x="30" y="253" fill="#8492a8" font-size="11" font-family="monospace">不靠 LLM 判断 · 不怕投毒 · 确定性逻辑</text>
+          <text x="30" y="253" fill="#8492a8" font-size="11" font-family="monospace">不靠 LLM · 不怕投毒 · 写死在合约里</text>
           </g>
         </svg>
       </div>
     </div>
-    <p class="sub" style="margin-top:16px">别的项目改进判断,PactFuse 在<b class="hl-g">链上执行层</b>加硬卡。<em>LLM 有盲区、能被投毒,合约不会。</em></p>
+    <p class="sub" style="margin-top:16px">别人想办法让 AI 判断更准,我们直接在合约里卡。<em>AI 可以被骗,合约骗不了。</em></p>
   </section>
 
   <!-- 3b · POSITIONING QUADRANT -->
@@ -374,7 +322,7 @@
           <line x1="60" y1="340" x2="460" y2="340" stroke="#627087" stroke-width="1.4" marker-end="url(#aq)"/>
           <line x1="60" y1="340" x2="60" y2="30" stroke="#627087" stroke-width="1.4" marker-end="url(#aq)"/>
           <text x="260" y="372" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">决策时 ← 介入时机 → 付款时</text>
-          <text x="20" y="190" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11" transform="rotate(-90 20 190)">链下 ← 执行层 → 链上</text>
+          <text x="20" y="190" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11" transform="rotate(-90 20 190)">链下 ← 在哪检查 → 链上</text>
           <!-- quadrant labels -->
           <text x="150" y="60" text-anchor="middle" fill="#2fd19d" font-family="monospace" font-size="12" font-weight="600">付款时 + 链上</text>
           <text x="370" y="60" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="11">决策时 + 链上</text>
@@ -410,13 +358,13 @@
   <section class="slide">
     <div class="kicker">解法</div>
     <h2>付款<span class="hl-r">前</span>,在链上<em>熔断</em></h2>
-    <p class="lead">别的方案管<b>决策时</b>,PactFuse 管<b class="hl-g">付款时</b>。交易落地那一刻,链上重新读来源状态,不安全就拦。</p>
+    <p class="lead">别人管"要不要付",我们管"付的那一刻还安不安全"。不安全?交易直接打回去。</p>
     <div class="cols c3">
       <div class="card"><h3 class="hl-r">熔断</h3><p>来源不安全 → 闸门跳开,0 转移</p></div>
       <div class="card"><h3 class="hl-g">结算</h3><p>来源干净 → 授权、支付、交付</p></div>
       <div class="card"><h3 class="hl-a">拒绝</h3><p>目标不在白名单 → 链下拒绝</p></div>
     </div>
-    <p class="sub" style="margin-top:20px">有疑必拦:查不到"安全",交易直接失败。</p>
+    <p class="sub" style="margin-top:20px">有疑必拦:不确定就不放行,宁愿多拦一笔。</p>
   </section>
 
   <!-- 5 · ARCHITECTURE -->
@@ -523,7 +471,7 @@
         </g>
       </svg>
     </div>
-    <p class="sub" style="margin-top:14px">关键就在 <b class="hl-r">读 sourceState</b> 这一步:合约里写死的判断,不是 AI 猜的。查到不安全,交易直接失败,钱根本打不出去。</p>
+    <p class="sub" style="margin-top:14px"><b class="hl-r">sourceState</b> 这个值写在合约里,改不了也骗不了。不是 Active,交易就过不去。</p>
   </section>
 
   <!-- 6 · SCENARIOS -->
@@ -556,10 +504,10 @@
     <h2>真实链上交易,<em>现场复核</em></h2>
     <div class="cols c2" style="align-items:center">
       <ul class="clean">
-        <li><span class="dot g"></span><span>每条声明背后都是<b>真实的 Base Sepolia 交易</b>(SpendTripped / SpendSettled / SourceChallenged)。</span></li>
-        <li><span class="dot c"></span><span>控制台用 <b>eth_call</b> 直接读合约当前状态,<b class="hl-c">无需私钥、无需后端</b>(keyless)。</span></li>
-        <li><span class="dot a"></span><span>每个 tx / 合约地址都能点开<b>区块浏览器</b>当场对账。</span></li>
-        <li><span class="dot"></span><span>控制台只是个<b>展示窗口</b>,证据本身在链上,不是我们生成的。</span></li>
+        <li><span class="dot g"></span><span>每条声明背后是<b>真的 Base Sepolia 交易</b>,不是模拟的。</span></li>
+        <li><span class="dot c"></span><span>用 eth_call 读合约状态,<b class="hl-c">不要私钥,不走后端</b>。</span></li>
+        <li><span class="dot a"></span><span>tx 和合约地址都能<b>点到 Basescan 看</b>。</span></li>
+        <li><span class="dot"></span><span>控制台就是个<b>展示窗口</b>,证据在链上。</span></li>
       </ul>
       <div class="card mono" style="font-size:clamp(11px,1.05vw,15px);line-height:1.95">
         <div class="row" style="justify-content:space-between;margin-bottom:12px">
@@ -576,17 +524,6 @@
     </div>
   </section>
 
-  <!-- 8 · REAL-WORLD -->
-  <section class="slide">
-    <div class="kicker">现实场景</div>
-    <h2>把三场景<em>映射到真实采购</em></h2>
-    <div class="cols c3">
-      <div class="card"><h3><span class="dot r"></span>数据/API 被吊销</h3><p>Agent 订阅的数据源在付款前被标记为投毒/失效 → <b class="hl-r">熔断</b>,不为坏数据付费。</p></div>
-      <div class="card"><h3><span class="dot a"></span>算力/模型跑路</h3><p>供应商合约不在白名单或临时换了收款地址 → <b class="hl-a">拒绝</b>,钱不出门。</p></div>
-      <div class="card"><h3><span class="dot g"></span>正常工具租约</h3><p>来源持续可信 → <b class="hl-g">结算并交付</b>,租约可执行、可审计。</p></div>
-    </div>
-    <p class="sub" style="margin-top:26px">只要是 Agent 自己掏钱买外部服务,就需要一个<em>付款前的最后检查</em>。</p>
-  </section>
 
   <!-- 9 · CODE -->
   <section class="slide">
@@ -614,7 +551,7 @@
 <span class="c">// 0=Unknown 1=Active 2=</span><span class="r">Challenged</span><span class="c"> 3=Revoked</span></pre>
       </div>
     </div>
-    <p class="sub" style="margin-top:18px">我们还能模拟网络中断(<span class="mono">?fail=1</span>):操作失败时资金留在原地,重试就行。证明系统在出错时也不会把钱打出去。</p>
+    <p class="sub" style="margin-top:18px">还能模拟断网(<span class="mono">?fail=1</span>):出错了钱也不会跑,重试就行。</p>
   </section>
 
   <!-- 10 · DEMO -->
@@ -639,7 +576,7 @@
   <section class="slide cover">
     <div class="kicker">收尾</div>
     <h1 style="font-size:clamp(34px,5.6vw,82px)">先<span class="hl-r">熔断</span>,<br/>再谈付款。</h1>
-    <p class="lead" style="margin-top:22px">别的方案在"决策时"帮 Agent 想清楚,PactFuse 在"付款时"帮它拦住。而且每一步证据都能当场验证。</p>
+    <p class="lead" style="margin-top:22px">别人帮 Agent 想清楚要不要买,我们在它真要掏钱的时候再检查一遍。每一步都有证据,当场就能验。</p>
     <div class="badges">
       <span class="pill">github.com/beautifulrem/PactFuse</span>
       <span class="pill">pactfuse-console.vercel.app</span>
