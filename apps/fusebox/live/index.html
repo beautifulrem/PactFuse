@@ -34,9 +34,11 @@
 </head>
 <body data-motion="full">
 
-<div id="appLoading" class="app-loading" role="status">
-  <i class="spinner" aria-hidden="true"></i>
-  <p data-i18n="loading">loading signed proof artifacts…</p>
+<div id="splashScreen" class="splash" role="status" aria-label="Loading PactFuse">
+  <img class="splash-logo" src="./icons/icon-512.png" alt="" />
+  <h1 class="splash-title">PACT<span>FUSE</span></h1>
+  <p class="splash-sub mono" data-i18n="loading">loading signed proof artifacts…</p>
+  <div class="splash-bar"><div class="splash-bar-fill"></div></div>
 </div>
 
 <header id="appHeader" class="shell app-header" role="banner"></header>

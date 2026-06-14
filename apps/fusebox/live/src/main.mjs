@@ -19,7 +19,7 @@ async function boot() {
   const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
   document.body.dataset.motion = reduce ? "off" : "full";
 
-  const loadingEl = $("appLoading");
+  const splash = $("splashScreen");
   let model;
   try {
     model = await loadEvidence({
@@ -31,7 +31,11 @@ async function boot() {
     model = fixtureModel();
   }
   document.body.dataset.evidence = model.source;
-  loadingEl.remove();
+  // dismiss splash with a fade after a minimum visible time (let the bar animation finish)
+  const minSplash = new Promise((r) => setTimeout(r, 2200));
+  await minSplash;
+  splash.hidden = true;
+  setTimeout(() => splash.remove(), 700);
 
   const machine = createMachine();
   machine.setInstant(reduce);
