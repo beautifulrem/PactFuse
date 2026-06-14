@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="color-scheme" content="dark" />
 <title>PactFuse · 演示 Deck</title>
-<link rel="icon" type="image/svg+xml" href="../../apps/fusebox/live/icons/icon.svg" />
+<link rel="icon" type="image/png" href="../../apps/fusebox/live/icons/favicon-32.png" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -80,7 +80,7 @@
   .foot{position:fixed;left:0;right:0;bottom:0;z-index:40;display:flex;justify-content:space-between;align-items:center;
     padding:12px clamp(20px,3vw,48px);font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--g500);pointer-events:none}
   .foot .brand{display:flex;align-items:center;gap:9px;color:var(--g400)}
-  .foot .brand svg{width:18px;height:18px}
+  .foot .brand svg,.foot .brand img{width:20px;height:20px;border-radius:5px}
   .bar{position:fixed;top:0;left:0;height:3px;background:linear-gradient(90deg,var(--brass),var(--cobalt));z-index:50;transition:width .42s ease}
   .nav{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);z-index:45;display:flex;gap:7px}
   .nav i{width:8px;height:8px;border-radius:50%;background:var(--g700);cursor:pointer;transition:background .2s,transform .2s}
@@ -91,7 +91,7 @@
 
   /* cover */
   .cover{align-items:flex-start}
-  .cover .mark{width:clamp(96px,11vw,164px);height:clamp(96px,11vw,164px);margin-bottom:26px}
+  .cover .mark{width:clamp(96px,11vw,164px);height:clamp(96px,11vw,164px);margin-bottom:26px;border-radius:clamp(20px,2.4vw,36px);display:block}
   .cover h1 .fuse{color:var(--g100)}
   .badges{margin-top:30px;display:flex;gap:10px;flex-wrap:wrap}
 
@@ -114,16 +114,7 @@
 
   <!-- 1 · COVER -->
   <section class="slide cover">
-    <svg class="mark" viewBox="0 0 256 256" aria-hidden="true">
-      <defs><radialGradient id="b1" cx="32%" cy="20%" r="95%"><stop offset="0" stop-color="#1b2433"/><stop offset="55%" stop-color="#0d1118"/><stop offset="100%" stop-color="#080b10"/></radialGradient>
-      <linearGradient id="a1" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#c69a4f"/><stop offset="1" stop-color="#ecd49a"/></linearGradient></defs>
-      <rect x="6" y="6" width="244" height="244" rx="58" fill="url(#b1)" stroke="#2c3a4e" stroke-width="2.5"/>
-      <path d="M40 142 H86" stroke="#9aa7bb" stroke-width="15" stroke-linecap="round"/>
-      <path d="M170 142 H216" stroke="#f1605d" stroke-width="15" stroke-linecap="round" stroke-opacity=".42"/>
-      <circle cx="86" cy="142" r="13.5" fill="#ecd49a"/><circle cx="170" cy="142" r="13.5" fill="#f1605d"/>
-      <path d="M86 142 L158 90" stroke="url(#a1)" stroke-width="22" stroke-linecap="round"/>
-      <g stroke="#ff8472" stroke-width="7.5" stroke-linecap="round"><path d="M158 90 l17 -13"/><path d="M158 90 l22 7"/><path d="M158 90 l-3 -23"/></g>
-    </svg>
+    <img class="mark" src="../../apps/fusebox/live/icons/icon-512.png" alt="PactFuse" />
     <div class="kicker">Cobo Agentic Wallet 赛道</div>
     <h1>PACT<span class="fuse">FUSE</span></h1>
     <p class="lead" style="margin-top:20px">面向 Agent 支付的<em>链上断路器</em>。在付款前熔断不安全来源,干净的才结算交付。</p>
@@ -366,7 +357,7 @@
 <div class="nav" id="nav"></div>
 <div class="foot">
   <span class="brand">
-    <svg viewBox="0 0 256 256" aria-hidden="true"><rect x="6" y="6" width="244" height="244" rx="58" fill="#0d1118" stroke="#2c3a4e" stroke-width="6"/><path d="M40 142 H86" stroke="#9aa7bb" stroke-width="15" stroke-linecap="round"/><path d="M170 142 H216" stroke="#f1605d" stroke-width="15" stroke-linecap="round" stroke-opacity=".5"/><circle cx="86" cy="142" r="14" fill="#ecd49a"/><circle cx="170" cy="142" r="14" fill="#f1605d"/><path d="M86 142 L158 90" stroke="#d1b16e" stroke-width="22" stroke-linecap="round"/></svg>
+    <img src="../../apps/fusebox/live/icons/icon-512.png" alt="" />
     PactFuse
   </span>
   <span id="pageno">01 / 11</span>
