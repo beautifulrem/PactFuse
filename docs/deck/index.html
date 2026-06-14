@@ -439,17 +439,22 @@
     <div class="card" style="margin-top:18px">
       <svg class="arch-svg" viewBox="0 0 1000 360" style="width:100%">
         <defs>
-          <marker id="a2" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#d1b16e"/></marker>
-          <marker id="a2r" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 Z" fill="#f1605d"/></marker>
+          <marker id="a2" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto"><path d="M0 0 L9 4 L0 8 Z" fill="#d1b16e"/></marker>
+          <marker id="a2r" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto"><path d="M0 0 L9 4 L0 8 Z" fill="#f1605d"/></marker>
+          <marker id="a2u" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto"><path d="M0 0 L9 4 L0 8 Z" fill="#dfa84d"/></marker>
         </defs>
         <!-- registry -->
-        <g transform="translate(500 28)">
+        <g transform="translate(595 28)">
           <rect x="-95" y="0" width="190" height="64" rx="12" fill="rgb(223 168 77/.1)" stroke="#dfa84d" stroke-width="1.6"/>
           <text x="0" y="28" text-anchor="middle" fill="#dfa84d" font-family="monospace" font-size="15">SourceStateRegistry</text>
-          <text x="0" y="48" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="12">谁可以挑战/吊销来源</text>
+          <text x="0" y="48" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="12">来源状态(Active / Challenged)</text>
         </g>
-        <path class="flow-arrow" d="M500 92 V150" stroke="#f1605d" stroke-width="2" stroke-dasharray="6 6" marker-end="url(#a2r)"/>
-        <text x="512" y="128" fill="#f1605d" font-family="monospace" font-size="12">challenge → trip</text>
+        <!-- Gate reads UP from Registry (query arrow) -->
+        <path d="M570 160 V96" stroke="#dfa84d" stroke-width="2" marker-end="url(#a2u)"/>
+        <text x="520" y="132" fill="#dfa84d" font-family="monospace" font-size="11">Gate 读取</text>
+        <!-- Challenge signal DOWN (event arrow, dashed) -->
+        <path class="flow-arrow" d="M620 92 V150" stroke="#f1605d" stroke-width="2" stroke-dasharray="6 6" marker-end="url(#a2r)"/>
+        <text x="632" y="132" fill="#f1605d" font-family="monospace" font-size="11">挑战信号</text>
         <!-- line of nodes -->
         <g font-family="monospace">
           <g class="anode" style="color:#6488f4">
