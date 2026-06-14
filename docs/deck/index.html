@@ -18,6 +18,7 @@
     --sans:"IBM Plex Sans","Helvetica Neue",system-ui,sans-serif;
     --display:"Big Shoulders Display","Arial Narrow",var(--sans);
     --border:rgb(237 242 248 / .10); --border2:rgb(237 242 248 / .18); --hair:rgb(237 242 248 / .055);
+    --ez:cubic-bezier(.16,1,.3,1);
   }
   *{box-sizing:border-box;margin:0;padding:0}
   html,body{height:100%}
@@ -32,6 +33,15 @@
     background-size:auto,auto,auto,26px 26px,26px 26px,auto;
     color:var(--g100); font-family:var(--sans); overflow:hidden;
   }
+  /* ambient aurora: a slow brass + cobalt + ember field drifting behind the deck */
+  body::before{content:"";position:fixed;inset:-25%;z-index:-1;pointer-events:none;opacity:.55;
+    background:
+      radial-gradient(closest-side at 22% 28%, color-mix(in srgb,var(--brass) 16%,transparent), transparent),
+      radial-gradient(closest-side at 80% 24%, color-mix(in srgb,var(--cobalt) 14%,transparent), transparent),
+      radial-gradient(closest-side at 62% 84%, color-mix(in srgb,var(--red) 8%,transparent), transparent);
+    background-size:70% 70%,64% 64%,80% 80%;background-repeat:no-repeat;
+    animation:auroraDrift 40s ease-in-out infinite alternate}
+  @keyframes auroraDrift{0%{background-position:6% 2%,94% 8%,52% 98%}50%{background-position:17% 11%,81% 0%,65% 85%}100%{background-position:2% 6%,100% 13%,45% 100%}}
   /* film grain */
   body::after{content:"";position:fixed;inset:0;z-index:60;pointer-events:none;opacity:.04;mix-blend-mode:overlay;
     background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");}
@@ -39,8 +49,21 @@
   .deck{position:relative;height:100dvh;width:100vw}
   .slide{position:absolute;inset:0;display:none;flex-direction:column;justify-content:center;
     padding:clamp(28px,5.2vw,90px);opacity:0;transition:opacity .42s ease}
-  .slide.active{display:flex;opacity:1;animation:fade .5s ease both}
-  @keyframes fade{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+  .slide.active{display:flex;opacity:1;animation:fade .4s ease both}
+  @keyframes fade{from{opacity:0}to{opacity:1}}
+  /* staggered content reveal: each slide's blocks cascade up on entry */
+  .slide.active > *{animation:deckRise .55s var(--ez) both}
+  .slide.active > :nth-child(1){animation-delay:.06s}
+  .slide.active > :nth-child(2){animation-delay:.14s}
+  .slide.active > :nth-child(3){animation-delay:.22s}
+  .slide.active > :nth-child(4){animation-delay:.30s}
+  .slide.active > :nth-child(5){animation-delay:.38s}
+  .slide.active > :nth-child(6){animation-delay:.46s}
+  .slide.active > :nth-child(7){animation-delay:.54s}
+  @keyframes deckRise{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+  /* the architecture trip arrow flows downward while its slide is up */
+  .slide.active .flow-arrow{animation:dashflow .9s linear infinite}
+  @keyframes dashflow{to{stroke-dashoffset:-24}}
 
   .kicker{font-family:var(--mono);font-size:clamp(11px,1.1vw,14px);letter-spacing:.24em;text-transform:uppercase;color:var(--brass);margin-bottom:18px}
   h1{font-family:var(--display);font-weight:800;text-transform:uppercase;letter-spacing:.01em;line-height:.96;
@@ -101,10 +124,14 @@
   @media print{
     @page{size:1280px 720px;margin:0}
     html,body{overflow:visible;height:auto}
-    body::after{display:none}
+    body::after,body::before{display:none}
     .deck{height:auto}
     .slide{display:flex!important;opacity:1!important;position:relative;inset:auto;height:720px;width:1280px;page-break-after:always;animation:none}
+    .slide>*{animation:none!important;opacity:1!important;transform:none!important}
     .bar,.nav,.arrow{display:none!important}
+  }
+  @media (prefers-reduced-motion: reduce){
+    *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;animation-delay:0s!important;transition-duration:.001ms!important}
   }
 </style>
 </head>
@@ -202,7 +229,7 @@
           <text x="0" y="28" text-anchor="middle" fill="#dfa84d" font-family="monospace" font-size="15">SourceStateRegistry</text>
           <text x="0" y="48" text-anchor="middle" fill="#8492a8" font-family="monospace" font-size="12">谁可以挑战/吊销来源</text>
         </g>
-        <path d="M500 92 V150" stroke="#f1605d" stroke-width="2" stroke-dasharray="6 6" marker-end="url(#a2r)"/>
+        <path class="flow-arrow" d="M500 92 V150" stroke="#f1605d" stroke-width="2" stroke-dasharray="6 6" marker-end="url(#a2r)"/>
         <text x="512" y="128" fill="#f1605d" font-family="monospace" font-size="12">challenge → trip</text>
         <!-- line of nodes -->
         <g font-family="monospace">
