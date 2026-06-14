@@ -571,10 +571,10 @@
     <h2>真实链上交易,<em>现场复核</em></h2>
     <div class="cols c2" style="align-items:center">
       <ul class="clean">
-        <li><span class="dot g"></span><span>每条声明背后是<b>真的 Base Sepolia 交易</b>,不是模拟的。</span></li>
-        <li><span class="dot c"></span><span>用 eth_call 读合约状态,<b class="hl-c">不要私钥,不走后端</b>。</span></li>
-        <li><span class="dot a"></span><span>tx 和合约地址都能<b>点到 Basescan 看</b>。</span></li>
-        <li><span class="dot"></span><span>控制台就是个<b>展示窗口</b>,证据在链上。</span></li>
+        <li><span class="dot g"></span><span>所有声明均由<b>真实 Base Sepolia 交易</b>支撑,非模拟数据。</span></li>
+        <li><span class="dot c"></span><span>通过 eth_call 直接读取合约状态,<b class="hl-c">无需私钥,无需后端服务</b>。</span></li>
+        <li><span class="dot a"></span><span>每笔 tx 及合约地址均可<b>跳转至 Basescan 独立验证</b>。</span></li>
+        <li><span class="dot"></span><span>控制台仅作为<b>证据展示界面</b>,证明数据存储于链上。</span></li>
       </ul>
       <div class="card mono" style="font-size:clamp(11px,1.05vw,15px);line-height:1.95">
         <div class="row" style="justify-content:space-between;margin-bottom:12px">
@@ -618,7 +618,7 @@
 <span class="c">// 0=Unknown 1=Active 2=</span><span class="r">Challenged</span><span class="c"> 3=Revoked</span></pre>
       </div>
     </div>
-    <p class="sub" style="margin-top:18px">还能模拟断网(<span class="mono">?fail=1</span>):出错了钱也不会跑,重试就行。</p>
+    <p class="sub" style="margin-top:18px">内置传输中断模拟(<span class="mono">?fail=1</span>):即使执行中断,资金仍留在原地,重试即可恢复。</p>
   </section>
 
   <!-- 10 · DEMO -->
