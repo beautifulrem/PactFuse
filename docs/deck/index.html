@@ -167,6 +167,16 @@
   .cover h1 .fuse{color:var(--g100)}
   .badges{margin-top:30px;display:flex;gap:10px;flex-wrap:wrap}
 
+  /* title card: video opener, just logo + name, slow cinematic fade */
+  .title-card{align-items:center;text-align:center}
+  .tc-logo{width:clamp(100px,14vw,180px);height:clamp(100px,14vw,180px);border-radius:clamp(22px,3vw,40px);margin-bottom:28px}
+  .tc-name{font-family:var(--display);font-weight:800;font-size:clamp(48px,8vw,120px);text-transform:uppercase;letter-spacing:.02em;line-height:1;color:var(--brass)}
+  .tc-name span{color:var(--g100)}
+  .slide.title-card.active > *{animation:tcReveal 1.2s ease both}
+  .slide.title-card.active > :nth-child(1){animation-delay:.3s}
+  .slide.title-card.active > :nth-child(2){animation-delay:.7s}
+  @keyframes tcReveal{from{opacity:0;transform:scale(.88) translateY(12px)}to{opacity:1;transform:none}}
+
   .stamp{position:absolute;top:clamp(28px,5vw,72px);right:clamp(28px,5vw,90px);font-family:var(--mono);
     font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--g500);text-align:right;line-height:1.7}
 
@@ -187,6 +197,12 @@
 <body>
 <div class="bar" id="bar"></div>
 <div class="deck" id="deck">
+
+  <!-- 0 · TITLE CARD (fade-in opener for video recording) -->
+  <section class="slide title-card">
+    <img class="tc-logo" src="../../apps/fusebox/live/icons/icon-512.png" alt="" />
+    <h1 class="tc-name">PACT<span>FUSE</span></h1>
+  </section>
 
   <!-- 1 · COVER -->
   <section class="slide cover">
